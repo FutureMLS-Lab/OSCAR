@@ -56,12 +56,6 @@ so users can download calibrated rotations directly instead of recomputing them.
 <img width="1404" height="1052" alt="image" src="https://github.com/user-attachments/assets/4f16b546-f93d-4393-a4c0-b882c09674a5" />
 </details>
 
-OSCAR is the only INT2 method that stays within a few pp of BF16 across
-every model. QuaRot-INT2 and naive INT2 collapse on reasoning + coding
-tasks. Saw-INT4 is a strong INT4 reference, but OSCAR matches or beats it
-**at roughly half the storage** (≈2 bits per KV element).
-
-
 <details>
 <summary><b>Baseline notes</b> — TurboQuant / QuaRot / Saw-INT4 / Naive INT2 configurations</summary>
 
@@ -81,6 +75,11 @@ rotation per layer). **Saw-INT4** is an INT4 reference for context.
 slow for repeated 32K-context evaluations under our compute budget.
 
 </details>
+
+OSCAR is the only INT2 method that stays within a few pp of BF16 across
+every model. QuaRot-INT2 and naive INT2 collapse on reasoning + coding
+tasks. Saw-INT4 is a strong INT4 reference, but OSCAR matches or beats it
+**at roughly half the storage** (≈2 bits per KV element).
 
 ## Layout
 
