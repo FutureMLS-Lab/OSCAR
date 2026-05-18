@@ -303,8 +303,7 @@ class OscarPoolSanityTest(unittest.TestCase):
 
             # ``envs.*.override`` is read by ``load_oscar_rotation_config`` at
             # pool-construction time, so no module reload is needed.
-            with envs.SGLANG_OSCAR_ROTATION_MODE.override("oscar"), \
-                 envs.SGLANG_OSCAR_K_ROTATION_PATH.override(k_pt), \
+            with envs.SGLANG_OSCAR_K_ROTATION_PATH.override(k_pt), \
                  envs.SGLANG_OSCAR_V_ROTATION_PATH.override(v_pt), \
                  envs.SGLANG_OSCAR_K_CLIP_RATIO.override(0.0), \
                  envs.SGLANG_OSCAR_V_CLIP_RATIO.override(0.0):
@@ -328,7 +327,6 @@ class OscarPoolSanityTest(unittest.TestCase):
                     scale_dtype=torch.bfloat16,
                 )
 
-                self.assertEqual(pool._rotation_mode, "oscar")
                 self.assertIsNotNone(pool._R_k)
                 self.assertTrue(
                     torch.equal(

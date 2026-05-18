@@ -2,8 +2,9 @@
 
 These utilities were originally inline methods on :class:`TritonAttnBackend`.
 They're factored out here so other attention backends (notably FA3) can reuse
-the same rotation (Hadamard / Oscar / off) and HP+int2 aware dequantization
-pipeline, keeping a single source of truth for int2 prefill semantics.
+the same rotation (Hadamard for MHA-int2, Oscar for unified HP+int2) and
+HP+int2 aware dequantization pipeline, keeping a single source of truth for
+int2 prefill semantics.
 
 Callers are expected to drive the higher level flow themselves:
 
@@ -20,7 +21,8 @@ Callers are expected to drive the higher level flow themselves:
      Oscar).
 
 The module is intentionally framework-light: it only depends on torch +
-``fast_hadamard_transform`` (with the jit fallback) and on the pool surface
+the JIT Hadamard kernel (``sglang.jit_kernel.hadamard``, with an optional
+``fast_hadamard_transform`` fast path) and on the pool surface
 (``get_raw_key_buffer`` / ``get_key_scales_zeros`` / ...) that both
 ``MHATokenToKVPool`` and ``UnifiedInt2HPKVPool`` already implement.
 """
@@ -87,14 +89,12 @@ def apply_segmented_hadamard_transform(
 _apply_segmented_hadamard_transform = apply_segmented_hadamard_transform
 
 
-def _kv_pool_rotation_mode(kv_pool) -> str:
-    """Return the rotation mode of the KV pool.
-
-    Non-oscar pools (MHA / MLA without mixed HP+int2 storage) don't carry a
-    ``_rotation_mode`` attribute; they implicitly follow the legacy Hadamard
-    path, so return ``"hadamard"`` as the default.
+def _pool_uses_oscar_rotation(kv_pool) -> bool:
+    """True for the mixed HP+int2 unified pool that loads per-layer Oscar
+    rotation matrices. Non-oscar int2 pools (MHA without mixed HP+int2
+    storage) implicitly use the legacy segmented Hadamard rotation.
     """
-    return getattr(kv_pool, "_rotation_mode", "hadamard")
+    return getattr(kv_pool, "_R_k", None) is not None
 
 
 def _apply_oscar_rotation(tensor: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
@@ -124,8 +124,7 @@ def prepare_quantized_extend_qkv(
     if kv_dtype != "int2":
         return q, k, v, need_v_inverse
 
-    mode = _kv_pool_rotation_mode(kv_pool)
-    if mode == "oscar":
+    if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_k = kv_pool._R_k[layer_idx]
         R_v = kv_pool._R_v[layer_idx]
@@ -141,9 +140,6 @@ def prepare_quantized_extend_qkv(
             else:
                 v = _apply_oscar_rotation(v, R_v)
         need_v_inverse = True
-        return q, k, v, need_v_inverse
-
-    if mode == "off":
         return q, k, v, need_v_inverse
 
     if not q_already_hadamard_transformed:
@@ -381,13 +377,10 @@ def apply_inverse_v_rotation(
     """
     if not need_v_inverse or kv_pool.dtype != "int2":
         return result
-    mode = _kv_pool_rotation_mode(kv_pool)
-    if mode == "oscar":
+    if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_v = kv_pool._R_v[layer_idx]
         return (result.to(R_v.dtype) @ R_v.T).contiguous()
-    if mode == "off":
-        return result
     return _apply_segmented_hadamard_transform(result)
 
 

@@ -639,8 +639,6 @@ def maybe_absorb_oscar_v_rotation_into_qkv(
         return False
 
     oscar_cfg = load_oscar_rotation_config()
-    if oscar_cfg.mode != "oscar":
-        return False
 
     start_layer = model.start_layer
     end_layer = model.end_layer

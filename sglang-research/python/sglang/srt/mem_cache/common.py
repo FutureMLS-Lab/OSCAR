@@ -694,9 +694,8 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
             k_num_scale_groups=kv_pool.k_num_scale_groups,
             v_num_scale_groups=kv_pool.v_num_scale_groups,
             num_layers=kv_pool.layer_num,
-            rotation_mode=getattr(kv_pool, "_rotation_mode", "hadamard"),
-            k_clip_ratio=getattr(kv_pool, "_k_clip_ratio", 0.0),
-            v_clip_ratio=getattr(kv_pool, "_v_clip_ratio", 0.0),
+            k_clip_ratio=kv_pool._k_clip_ratio,
+            v_clip_ratio=kv_pool._v_clip_ratio,
         )
 
     if batch.model_config.is_encoder_decoder:

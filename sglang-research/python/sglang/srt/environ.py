@@ -219,10 +219,8 @@ class Envs:
     # Shared HP-prefix pool size (in HP slot units; rounded up to N_Q).
     # 0 = use the default of ``max_running_requests * P * 16``.
     SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS = EnvInt(0)
-    # Oscar rotation + per-row clip for int2 KV cache. Switches between the
-    # fixed segmented Hadamard rotation and a learned per-layer orthogonal
-    # matrix loaded from a checkpoint. Defaults preserve legacy Hadamard.
-    SGLANG_OSCAR_ROTATION_MODE = EnvStr("hadamard")
+    # Oscar rotation + per-row clip for int2 KV cache. Learned per-layer
+    # orthogonal matrices loaded from K/V rotation checkpoints.
     SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")
     SGLANG_OSCAR_V_ROTATION_PATH = EnvStr("")
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)

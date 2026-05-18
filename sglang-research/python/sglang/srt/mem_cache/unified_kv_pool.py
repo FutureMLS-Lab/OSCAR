@@ -18,9 +18,7 @@ import triton
 import triton.language as tl
 
 from sglang.QuantKernel.fused_hadamard_int2_kv import (
-    quantized_set_kv_int2_hadamard_fused_triton,
     quantized_set_kv_int2_pretransformed_triton,
-    validate_hadamard_order_for_kv_fuse_int2,
 )
 from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
     quantized_set_kv_int2_oscar_rotate_k_clip_triton,
@@ -33,7 +31,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     OscarRotationConfig,
-    _apply_segmented_hadamard_transform,
     _set_kv_buffer_impl,
     get_tensor_size_bytes,
     load_oscar_rotation_config,
@@ -248,40 +245,34 @@ class UnifiedInt2HPKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim  # for store_cache helpers
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
-        # Oscar rotation + clip. In ``hadamard``/``off`` mode this is a no-op
-        # bookkeeping struct and ``_R_k`` / ``_R_v`` stay ``None``. In
-        # ``oscar`` mode we load per-layer orthogonal matrices [head_dim,
-        # head_dim] / [v_head_dim, v_head_dim] in ``hp_dtype`` so the
-        # ``rows @ R`` pre-pass and ``result @ R.T`` inverse are plain bf16
-        # GEMMs.
+        # Oscar rotation + clip. Per-layer orthogonal matrices [head_dim,
+        # head_dim] / [v_head_dim, v_head_dim] are loaded in ``hp_dtype`` so
+        # the ``rows @ R`` pre-pass and ``result @ R.T`` inverse are plain
+        # bf16 GEMMs.
         self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
-        self._rotation_mode: str = self._oscar_cfg.mode
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
-        self._R_k: Optional[torch.Tensor] = None
-        self._R_v: Optional[torch.Tensor] = None
-        if self._rotation_mode == "oscar":
-            self._R_k = load_oscar_rotations(
-                self._oscar_cfg.k_rotation_path,
-                layer_num=self.layer_num,
-                start_layer=self.start_layer,
-                head_dim=self.head_dim,
-                device=torch.device(self.device),
-                dtype=self.hp_dtype,
-            )
-            self._R_v = load_oscar_rotations(
-                self._oscar_cfg.v_rotation_path,
-                layer_num=self.layer_num,
-                start_layer=self.start_layer,
-                head_dim=self.v_head_dim,
-                device=torch.device(self.device),
-                dtype=self.hp_dtype,
-            )
-            logger.info(
-                "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f)",
-                self._k_clip_ratio,
-                self._v_clip_ratio,
-            )
+        self._R_k: torch.Tensor = load_oscar_rotations(
+            self._oscar_cfg.k_rotation_path,
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=self.head_dim,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+        )
+        self._R_v: torch.Tensor = load_oscar_rotations(
+            self._oscar_cfg.v_rotation_path,
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=self.v_head_dim,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+        )
+        logger.info(
+            "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f)",
+            self._k_clip_ratio,
+            self._v_clip_ratio,
+        )
 
         hp_total_slots = (
             self.num_hp_prefix_slots
@@ -582,9 +573,6 @@ class UnifiedInt2HPKVPool(KVCache):
         ``R_k`` / ``R_v`` are ``[head_dim, head_dim]`` bf16 on the KV device,
         loaded in ``__init__``.
         """
-        assert self._R_k is not None and self._R_v is not None, (
-            "Oscar rotation requested but R matrices are not loaded"
-        )
         idx = self._layer_index(layer_id)
         k_hp = cache_k.to(self.hp_dtype) @ self._R_k[idx]
         if v_rotation_absorbed:
@@ -601,25 +589,14 @@ class UnifiedInt2HPKVPool(KVCache):
         already_rotated: bool,
         v_rotation_absorbed: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply the active rotation (hadamard / oscar / none) to HP K/V and
-        cast to ``hp_dtype``. ``already_rotated`` skips the rotation pre-pass.
+        """Apply the Oscar rotation to HP K/V and cast to ``hp_dtype``.
+        ``already_rotated`` skips the rotation pre-pass.
         """
         if already_rotated:
             return cache_k.to(self.hp_dtype), cache_v.to(self.hp_dtype)
-        if self._rotation_mode == "oscar":
-            return self._rotate_kv_inplace(
-                layer_id, cache_k, cache_v, v_rotation_absorbed
-            )
-        if self._rotation_mode == "off":
-            return cache_k.to(self.hp_dtype), cache_v.to(self.hp_dtype)
-        hadamard_order = envs.HADAMARD_ORDER.get()
-        cache_k = _apply_segmented_hadamard_transform(
-            cache_k, hadamard_order, self.hp_dtype
+        return self._rotate_kv_inplace(
+            layer_id, cache_k, cache_v, v_rotation_absorbed
         )
-        cache_v = _apply_segmented_hadamard_transform(
-            cache_v, hadamard_order, self.hp_dtype
-        )
-        return cache_k, cache_v
 
     def _set_hp_kv_buffer(
         self,
@@ -652,77 +629,39 @@ class UnifiedInt2HPKVPool(KVCache):
         mixed_hp_offset: Optional[int] = None,
         v_rotation_absorbed: bool = False,
     ):
-        """Prefill/extend-only: rotate (hadamard or oscar R) + optional per-row
-        clip + int2-pack + write quant slots.
+        """Prefill/extend-only: rotate (oscar R) + optional per-row clip +
+        int2-pack + write quant slots.
 
         Decode-time flushes go through the dedicated GPU flush kernel
         (see ``gpu_flush_int2``); this method is *not* used for those.
         """
         idx = self._layer_index(layer_id)
+        clip_on = self._k_clip_ratio > 0.0 or self._v_clip_ratio > 0.0
 
-        if self._rotation_mode == "oscar":
-            clip_on = self._k_clip_ratio > 0.0 or self._v_clip_ratio > 0.0
-
-            # Fused rotate(K) + clip(KV) + quantize(KV) + set(KV). Skips the
-            # standalone ``K @ R_k`` GEMM and its bf16 staging tensor by doing
-            # the rotation inside the int2 pack kernel via ``tl.dot``. V must
-            # already be in R_v space (rotation absorbed) — the kernel does
-            # not rotate V. Requires single-scale layout (num_groups == 1) for
-            # both K and V scales/zeros.
-            if envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get():
-                assert v_rotation_absorbed, (
-                    "V rotation must be absorbed for fused oscar K-rotation + clip + quant + set"
-                )
-
-            use_fused_rotate = (
-                envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get()
-                and not already_hadamard_transformed
-                and v_rotation_absorbed
-                and clip_on
-                and _get_num_scale_groups(self.k_scales_zeros[idx]) == 1
-                and _get_num_scale_groups(self.v_scales_zeros[idx]) == 1
-                and self._R_k is not None
+        # Fused rotate(K) + clip(KV) + quantize(KV) + set(KV). Skips the
+        # standalone ``K @ R_k`` GEMM and its bf16 staging tensor by doing
+        # the rotation inside the int2 pack kernel via ``tl.dot``. V must
+        # already be in R_v space (rotation absorbed) — the kernel does
+        # not rotate V. Requires single-scale layout (num_groups == 1) for
+        # both K and V scales/zeros.
+        if envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get():
+            assert v_rotation_absorbed, (
+                "V rotation must be absorbed for fused oscar K-rotation + clip + quant + set"
             )
-            if use_fused_rotate:
-                quantized_set_kv_int2_oscar_rotate_k_clip_triton(
-                    cache_k.to(self.hp_dtype),
-                    cache_v.to(self.hp_dtype),
-                    self._R_k[idx],
-                    quant_loc,
-                    self.k_buffer[idx],
-                    self.v_buffer[idx],
-                    self.k_scales_zeros[idx],
-                    self.v_scales_zeros[idx],
-                    self._k_clip_ratio,
-                    self._v_clip_ratio,
-                    hp_global_offset=mixed_hp_offset,
-                )
-                return
 
-            if not already_hadamard_transformed:
-                cache_k, cache_v = self._rotate_kv_inplace(
-                    layer_id, cache_k, cache_v, v_rotation_absorbed
-                )
-            else:
-                cache_k = cache_k.to(self.hp_dtype)
-                cache_v = cache_v.to(self.hp_dtype)
-
-            if not clip_on:
-                quantized_set_kv_int2_pretransformed_triton(
-                    cache_k,
-                    cache_v,
-                    quant_loc,
-                    self.k_buffer[idx],
-                    self.v_buffer[idx],
-                    self.k_scales_zeros[idx],
-                    self.v_scales_zeros[idx],
-                    hp_global_offset=mixed_hp_offset,
-                )
-                return
-
-            quantized_set_kv_int2_pretransformed_clip_triton(
-                cache_k,
-                cache_v,
+        use_fused_rotate = (
+            envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get()
+            and not already_hadamard_transformed
+            and v_rotation_absorbed
+            and clip_on
+            and _get_num_scale_groups(self.k_scales_zeros[idx]) == 1
+            and _get_num_scale_groups(self.v_scales_zeros[idx]) == 1
+        )
+        if use_fused_rotate:
+            quantized_set_kv_int2_oscar_rotate_k_clip_triton(
+                cache_k.to(self.hp_dtype),
+                cache_v.to(self.hp_dtype),
+                self._R_k[idx],
                 quant_loc,
                 self.k_buffer[idx],
                 self.v_buffer[idx],
@@ -734,11 +673,15 @@ class UnifiedInt2HPKVPool(KVCache):
             )
             return
 
-        hadamard_order = envs.HADAMARD_ORDER.get()
-        validate_hadamard_order_for_kv_fuse_int2(hadamard_order, cache_k.shape[-1])
-        validate_hadamard_order_for_kv_fuse_int2(hadamard_order, cache_v.shape[-1])
+        if not already_hadamard_transformed:
+            cache_k, cache_v = self._rotate_kv_inplace(
+                layer_id, cache_k, cache_v, v_rotation_absorbed
+            )
+        else:
+            cache_k = cache_k.to(self.hp_dtype)
+            cache_v = cache_v.to(self.hp_dtype)
 
-        if already_hadamard_transformed or self._rotation_mode == "off":
+        if not clip_on:
             quantized_set_kv_int2_pretransformed_triton(
                 cache_k,
                 cache_v,
@@ -751,7 +694,7 @@ class UnifiedInt2HPKVPool(KVCache):
             )
             return
 
-        quantized_set_kv_int2_hadamard_fused_triton(
+        quantized_set_kv_int2_pretransformed_clip_triton(
             cache_k,
             cache_v,
             quant_loc,
@@ -759,7 +702,8 @@ class UnifiedInt2HPKVPool(KVCache):
             self.v_buffer[idx],
             self.k_scales_zeros[idx],
             self.v_scales_zeros[idx],
-            hadamard_order,
+            self._k_clip_ratio,
+            self._v_clip_ratio,
             hp_global_offset=mixed_hp_offset,
         )
 

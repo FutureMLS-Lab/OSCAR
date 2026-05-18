@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import tempfile
 import unittest
 
 import torch
@@ -27,6 +28,32 @@ def _ensure_cuda():
 
 def _resolve_dtypes():
     return torch.bfloat16, torch.bfloat16
+
+
+# Process-wide tempdir for identity rotation .pt files used by ``_make_pool``.
+# The unified pool now requires SGLANG_OSCAR_K/V_ROTATION_PATH; tests that only
+# exercise the allocator / flush kernels get identity rotations so the pool
+# constructs without changing semantics for non-rotation code paths.
+_IDENTITY_ROT_DIR = tempfile.mkdtemp(prefix="sglang_unified_int2_test_")
+_IDENTITY_ROT_CACHE: dict[int, tuple[str, str]] = {}
+
+
+def _identity_rotation_paths(head_dim: int, layer_num: int) -> tuple[str, str]:
+    key = (head_dim << 16) | layer_num
+    if key in _IDENTITY_ROT_CACHE:
+        return _IDENTITY_ROT_CACHE[key]
+    state = {
+        "layers": {
+            i: {"rotation": torch.eye(head_dim, dtype=torch.float32)}
+            for i in range(layer_num)
+        }
+    }
+    k_path = os.path.join(_IDENTITY_ROT_DIR, f"k_d{head_dim}_l{layer_num}.pt")
+    v_path = os.path.join(_IDENTITY_ROT_DIR, f"v_d{head_dim}_l{layer_num}.pt")
+    torch.save(state, k_path)
+    torch.save(state, v_path)
+    _IDENTITY_ROT_CACHE[key] = (k_path, v_path)
+    return k_path, v_path
 
 
 def _make_pool(
@@ -43,32 +70,43 @@ def _make_pool(
     # Backward-compat for tests that still pass ``num_pages``.
     num_pages: int = None,
 ):
+    from sglang.srt.environ import envs
     from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 
     if num_pages is not None:
         num_quant_pages = num_pages
     os.environ.setdefault("HADAMARD_ORDER", "16")
     hp_dtype, scale_dtype = _resolve_dtypes()
-    return UnifiedInt2HPKVPool(
-        num_quant_pages=num_quant_pages,
-        hp_dtype=hp_dtype,
-        hp_prefix_tokens=hp_prefix_tokens,
-        hp_recent_tokens=hp_recent_tokens,
-        dtype="int2",
-        head_num=head_num,
-        head_dim=head_dim,
-        layer_num=layer_num,
-        device="cuda",
-        enable_memory_saver=False,
-        max_req_slots=max_req_slots,
-        v_head_dim=v_head_dim,
-        start_layer=0,
-        end_layer=layer_num - 1,
-        model_dtype=torch.bfloat16,
-        kv_cache_quant_group_size=kv_cache_quant_group_size,
-        scale_dtype=scale_dtype,
-        num_hp_prefix_slots=num_hp_prefix_slots,
+    assert head_dim == v_head_dim, (
+        "identity rotation fixture assumes head_dim == v_head_dim"
     )
+    k_path, v_path = _identity_rotation_paths(head_dim, layer_num)
+    with (
+        envs.SGLANG_OSCAR_K_ROTATION_PATH.override(k_path),
+        envs.SGLANG_OSCAR_V_ROTATION_PATH.override(v_path),
+        envs.SGLANG_OSCAR_K_CLIP_RATIO.override(0.0),
+        envs.SGLANG_OSCAR_V_CLIP_RATIO.override(0.0),
+    ):
+        return UnifiedInt2HPKVPool(
+            num_quant_pages=num_quant_pages,
+            hp_dtype=hp_dtype,
+            hp_prefix_tokens=hp_prefix_tokens,
+            hp_recent_tokens=hp_recent_tokens,
+            dtype="int2",
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            max_req_slots=max_req_slots,
+            v_head_dim=v_head_dim,
+            start_layer=0,
+            end_layer=layer_num - 1,
+            model_dtype=torch.bfloat16,
+            kv_cache_quant_group_size=kv_cache_quant_group_size,
+            scale_dtype=scale_dtype,
+            num_hp_prefix_slots=num_hp_prefix_slots,
+        )
 
 
 def _make_allocator(pool=None, **overrides):

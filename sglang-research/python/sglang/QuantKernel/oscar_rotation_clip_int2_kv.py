@@ -1,9 +1,9 @@
 """
 Oscar-style per-row quantile clip + int2 KV cache pack kernels.
 
-This module hosts the Triton kernels used when
-``SGLANG_OSCAR_ROTATION_MODE == "oscar"``. Rotation itself is done as a bf16
-GEMM (``rows @ R[layer]``) outside these kernels; what lives here is:
+This module hosts the Triton kernels used by the unified HP+int2 KV cache
+pool's Oscar rotation path. Rotation itself is done as a bf16 GEMM
+(``rows @ R[layer]``) outside these kernels; what lives here is:
 
 * ``quantized_set_kv_int2_pretransformed_clip_triton`` -- single fused
   kernel that loads each rotated ``(token, head)`` row, derives the per-row

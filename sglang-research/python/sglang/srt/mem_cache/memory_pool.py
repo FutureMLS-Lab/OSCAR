@@ -92,33 +92,27 @@ _is_fp8_fnuz = is_fp8_fnuz()
 @dataclass(frozen=True)
 class OscarRotationConfig:
     """Config for the Oscar-style learned rotation + per-row clip applied to
-    int2 KV cache. When ``mode == "oscar"`` the rotation matrices in
-    ``k_rotation_path`` / ``v_rotation_path`` (loaded via
-    :func:`load_oscar_rotations`) replace the fixed segmented Hadamard.
-    ``mode == "hadamard"`` preserves legacy behavior; ``mode == "off"`` skips
-    rotation altogether (debug only)."""
+    int2 KV cache. The rotation matrices in ``k_rotation_path`` /
+    ``v_rotation_path`` (loaded via :func:`load_oscar_rotations`) are applied
+    to K/V rows; clip ratios drive per-row quantile clipping. Empty rotation
+    paths disable the Oscar path (the unified pool then has no rotations
+    loaded and rejects construction)."""
 
-    mode: str
     k_rotation_path: str
     v_rotation_path: str
     k_clip_ratio: float
     v_clip_ratio: float
 
     def __post_init__(self):
-        if self.mode not in ("hadamard", "oscar", "off"):
-            raise ValueError(
-                f"SGLANG_OSCAR_ROTATION_MODE must be one of "
-                f"'hadamard', 'oscar', 'off'; got {self.mode!r}"
-            )
         for name, r in (("k", self.k_clip_ratio), ("v", self.v_clip_ratio)):
             if not (0.0 <= r <= 1.0):
                 raise ValueError(
                     f"SGLANG_OSCAR_{name.upper()}_CLIP_RATIO must be in [0, 1], got {r}"
                 )
-        if self.mode == "oscar" and not (self.k_rotation_path and self.v_rotation_path):
+        if not (self.k_rotation_path and self.v_rotation_path):
             raise ValueError(
-                "SGLANG_OSCAR_ROTATION_MODE='oscar' requires both "
-                "SGLANG_OSCAR_K_ROTATION_PATH and SGLANG_OSCAR_V_ROTATION_PATH"
+                "Oscar int2 KV cache requires both SGLANG_OSCAR_K_ROTATION_PATH "
+                "and SGLANG_OSCAR_V_ROTATION_PATH to point at rotation checkpoints"
             )
 
 
@@ -132,7 +126,6 @@ def load_oscar_rotation_config() -> OscarRotationConfig:
     module.
     """
     return OscarRotationConfig(
-        mode=envs.SGLANG_OSCAR_ROTATION_MODE.get().lower(),
         k_rotation_path=envs.SGLANG_OSCAR_K_ROTATION_PATH.get(),
         v_rotation_path=envs.SGLANG_OSCAR_V_ROTATION_PATH.get(),
         k_clip_ratio=envs.SGLANG_OSCAR_K_CLIP_RATIO.get(),

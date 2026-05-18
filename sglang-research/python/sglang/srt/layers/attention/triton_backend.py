@@ -12,7 +12,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.quantized_kv_prefill import (
     _apply_oscar_rotation,
-    _kv_pool_rotation_mode,
+    _pool_uses_oscar_rotation,
     apply_inverse_v_rotation,
     apply_segmented_hadamard_transform,
     dequantize_prefix_kv,
@@ -1748,11 +1748,7 @@ class TritonAttnBackend(AttentionBackend):
         # Int2 quantized KV cache path (the only supported quant tier).
         kv_pool = forward_batch.token_to_kv_pool
         if hasattr(kv_pool, "dtype") and kv_pool.dtype == "int2":
-            grouped_quant_scales = (
-                getattr(kv_pool, "k_num_scale_groups", 1) not in (None, 1)
-                or getattr(kv_pool, "v_num_scale_groups", 1) not in (None, 1)
-            )
-            rotation_mode = _kv_pool_rotation_mode(kv_pool)
+            uses_oscar = _pool_uses_oscar_rotation(kv_pool)
 
             q_for_decode = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             mixed_decode_metadata_available = (
@@ -1796,20 +1792,12 @@ class TritonAttnBackend(AttentionBackend):
 
             oscar_layer_idx = layer.layer_id - kv_pool.start_layer
 
-            if mixed_decode_enabled:
-                if rotation_mode == "oscar":
-                    q_for_decode = _apply_oscar_rotation(
-                        q_for_decode, kv_pool._R_k[oscar_layer_idx]
-                    )
-                elif rotation_mode != "off":
-                    q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
+            if uses_oscar:
+                q_for_decode = _apply_oscar_rotation(
+                    q_for_decode, kv_pool._R_k[oscar_layer_idx]
+                )
             else:
-                if rotation_mode == "oscar":
-                    q_for_decode = _apply_oscar_rotation(
-                        q_for_decode, kv_pool._R_k[oscar_layer_idx]
-                    )
-                elif rotation_mode != "off":
-                    q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
+                q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
             if mixed_decode_enabled:
                 bs = q_for_decode.shape[0]
                 self.decode_attention_fwd_int2_unified(
@@ -1859,12 +1847,12 @@ class TritonAttnBackend(AttentionBackend):
                 )
             # int2: V is always rotated, so apply the inverse rotation to the
             # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
-            # the segmented FWHT (self-inverse with 1/sqrt(N)); off mode skips.
-            if rotation_mode == "oscar":
+            # the segmented FWHT (self-inverse with 1/sqrt(N)).
+            if uses_oscar:
                 R_v = kv_pool._R_v[oscar_layer_idx]
                 o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                 o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
-            elif rotation_mode != "off":
+            else:
                 o = apply_segmented_hadamard_transform(o)
         else:
             # Standard attention with dequantized or non-quantized KV cache
