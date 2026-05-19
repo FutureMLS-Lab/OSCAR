@@ -79,6 +79,27 @@ slow for repeated 32K-context evaluations under our compute budget.
 
 </details>
 
+<details>
+<summary><b>Comparison with other INT2 KV-cache methods on AIME25</b></summary>
+
+Most prior INT2 KV-cache methods do not provide framework-level support for
+efficient long-context generation, so 32K-generation evaluations are extremely
+slow and their papers do not report the full benchmark suite above. For this
+reason, we compare against the reported AIME25 setting where public numbers are
+available.
+
+| Method | BPE | Qwen3-8B | Qwen3-32B |
+|:---|:---:|:---:|:---:|
+| Original BF16 | 16.00 | 66.00 +/- 7.33 | 72.59 +/- 7.41 |
+| KIVI-KV2 | 2.25 | 52.33 +/- 9.00 | 57.41 +/- 9.26 |
+| KIVI-KV2* | 2.26 | 57.67 +/- 9.00 | 59.05 +/- 12.38 |
+| Kitty | 2.39 | 59.67 +/- 10.33 | 69.26 +/- 9.26 |
+| **OSCAR (ours)** | **2.38** | **66.67 +/- 3.33** | **74.00 +/- 5.48** |
+
+OSCAR is the only INT2 method in this comparison that reaches BF16-level AIME25
+accuracy at 32K generation while staying near a 2-bit KV-cache budget.
+
+</details>
 OSCAR is the only INT2 method that stays within a few pp of BF16 across
 every model. QuaRot-INT2 and naive INT2 collapse on reasoning + coding
 tasks. Saw-INT4 is a strong INT4 reference, but OSCAR matches or beats it
