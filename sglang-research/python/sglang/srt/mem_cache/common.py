@@ -608,7 +608,43 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
 
     # Worst case: every req flushes -> bs*N_Q quant slots needed.
     quant_need = bs * flush_interval
-    evict_from_tree_cache(batch.tree_cache, quant_need)
+    # ``evict_from_tree_cache`` gates on ``allocator.available_size()`` which
+    # for the unified pool sums quant + HP-prefix free slots. When quant is
+    # drained but HP-prefix has slack, the combined check skips eviction and
+    # ``alloc_quant`` below crashes. Force quant-tier-specific eviction here.
+    quant_pages_have = (
+        allocator.free_pages.numel() + allocator.release_pages.numel()
+    )
+    if (
+        quant_pages_have < bs
+        and batch.tree_cache is not None
+        and not batch.tree_cache.is_chunk_cache()
+    ):
+        # Tree leaves may be quant or HP-prefix; some leaves are big. Loop a
+        # few times in case the first leaves popped are HP-prefix, but cap
+        # work so we don't spin if everything left is pinned.
+        for attempt in range(8):
+            prev_quant = quant_pages_have
+            prev_hp = (
+                allocator.hp_prefix_free_pages.numel()
+                + allocator.hp_prefix_release_pages.numel()
+            )
+            # Ramp up the budget each attempt: 1x, 2x, 4x ... up to 16x.
+            mult = 1 << min(attempt, 4)
+            evict_slots = max(bs - quant_pages_have, 1) * flush_interval * mult
+            batch.tree_cache.evict(EvictParams(num_tokens=evict_slots))
+            quant_pages_have = (
+                allocator.free_pages.numel() + allocator.release_pages.numel()
+            )
+            if quant_pages_have >= bs:
+                break
+            cur_hp = (
+                allocator.hp_prefix_free_pages.numel()
+                + allocator.hp_prefix_release_pages.numel()
+            )
+            if quant_pages_have == prev_quant and cur_hp == prev_hp:
+                # Tree had nothing to evict — leaves all pinned. Stop.
+                break
 
     out_cache_loc = allocator.alloc_hp_recent(
         req_pool_indices_int64, [token_per_req] * bs
