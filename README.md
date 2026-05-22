@@ -34,6 +34,7 @@ so users can download calibrated rotations directly instead of recomputing them.
 ## Main results
 <details>
 <summary><b>Multi-Modal & LongBench</b> </summary>
+Use Rotation and Run Script in zhongzhu/VL branch.
 LongBench-E comparison
 
 | Method                          | Qwen3-8B    |
