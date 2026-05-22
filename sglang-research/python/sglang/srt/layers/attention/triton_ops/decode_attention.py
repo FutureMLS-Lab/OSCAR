@@ -1728,8 +1728,8 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             # Load V scales and zeros for dequantization
             if GROUPED:
                 if FAST:
-                    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
-                    offs_grp_v = tl.arange(0, NUM_GROUPS_QUARTER)
+                    NUM_GROUPS_QUARTER_V: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
+                    offs_grp_v = tl.arange(0, NUM_GROUPS_QUARTER_V)
                     offs_grp_v_q1 = (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
                     offs_grp_v_q2 = 2 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
                     offs_grp_v_q3 = 3 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
@@ -1770,42 +1770,42 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     )
                     v_scale_q0 = tl.reshape(
                         tl.broadcast_to(v_scale_q0_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q0 = tl.reshape(
                         tl.broadcast_to(v_zero_q0_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q1 = tl.reshape(
                         tl.broadcast_to(v_scale_q1_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q1 = tl.reshape(
                         tl.broadcast_to(v_zero_q1_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q2 = tl.reshape(
                         tl.broadcast_to(v_scale_q2_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q2 = tl.reshape(
                         tl.broadcast_to(v_zero_q2_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q3 = tl.reshape(
                         tl.broadcast_to(v_scale_q3_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q3 = tl.reshape(
                         tl.broadcast_to(v_zero_q3_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                                        (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE)),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                 else:

@@ -106,30 +106,51 @@ def _pretransformed_int2_set_kv_clip_single_kernel(
             thr[:, None],
         )
 
-    val_min = tl.min(rows, axis=1)  # [BLOCK_TOK]
-    val_max = tl.max(rows, axis=1)
-    val_range = tl.maximum(val_max - val_min, 1e-8)
-    scale = val_range / 3.0
-    zero = -val_min / scale
+    # LM-optimal INT2 bucketize on standardized z + uniform-equivalent
+    # (scale, zero) so the legacy `(q - zero) * scale` dequant reconstructs
+    # at LM-aligned magnitudes (LM_RATIO=1.16 matches the original
+    # CLIP=0.96 uniform-asym dynamic range).
+    #
+    # Why approximate-LM via uniform dequant instead of exact
+    # `centroid[q]*std+mean` everywhere? The exact path is numerically
+    # correct in isolation (verify_exact_lm.py + 300-step stress test
+    # both PASS), but in production multi-step decode the fused stage-1
+    # attention kernel produces degenerate output after a few hundred
+    # tokens (samples start coherent, then collapse into looping
+    # CJK/Miller token spam ~> score ~0.25). Root cause not isolated
+    # — likely a Triton + CUDA-graph + tl.dot interaction with the
+    # larger inlined LM-dequant body. The LM_RATIO=1.16 path below is
+    # the production-stable approximation.
+    row_mean = tl.sum(rows, axis=1) / HEAD_DIM            # [BLOCK_TOK]
+    row_diff = rows - row_mean[:, None]
+    row_var = tl.sum(row_diff * row_diff, axis=1) / HEAD_DIM
+    row_std = tl.sqrt(row_var + 1e-8)
+    z = row_diff / row_std[:, None]
 
-    # Quartered split via reshape + permute + repeated split.
-    # rows: [BLOCK_TOK, 4*BLOCK_QUARTER] -> [BLOCK_TOK, BLOCK_QUARTER, 2, 2]
-    # so tl.split (which only splits a size-2 last dim) can carve out the
-    # 4 quarters in two passes. The 2x2 layout picks
-    # ``[[v0, v1], [v2, v3]]``, so split on the outer 2 yields
-    # ``even=[v0, v2]`` and ``odd=[v1, v3]``; split on inner 2 yields
-    # ``v0, v2`` and ``v1, v3`` respectively.
-    rows_r = tl.reshape(rows, (BLOCK_TOK, 4, BLOCK_QUARTER))
-    rows_p = tl.permute(rows_r, (0, 2, 1))  # [BLOCK_TOK, BLOCK_QUARTER, 4]
-    rows_s = tl.reshape(rows_p, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
-    even, odd = tl.split(rows_s)            # each [BLOCK_TOK, BLOCK_QUARTER, 2]
-    vals0, vals2 = tl.split(even)           # each [BLOCK_TOK, BLOCK_QUARTER]
-    vals1, vals3 = tl.split(odd)
+    # Quartered split on standardized z (same idiom as the uniform path).
+    z_r = tl.reshape(z, (BLOCK_TOK, 4, BLOCK_QUARTER))
+    z_p = tl.permute(z_r, (0, 2, 1))
+    z_s = tl.reshape(z_p, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
+    even, odd = tl.split(z_s)
+    z0, z2 = tl.split(even)
+    z1, z3 = tl.split(odd)
 
-    q0 = (vals0 / scale[:, None] + zero[:, None] + 0.5).to(tl.uint8)
-    q1 = (vals1 / scale[:, None] + zero[:, None] + 0.5).to(tl.uint8)
-    q2 = (vals2 / scale[:, None] + zero[:, None] + 0.5).to(tl.uint8)
-    q3 = (vals3 / scale[:, None] + zero[:, None] + 0.5).to(tl.uint8)
+    # LM midpoints for MSE-optimal bucketization of N(0,1).
+    LM_M0: tl.constexpr = -0.9810652732849121
+    LM_M1: tl.constexpr = 0.0
+    LM_M2: tl.constexpr = 0.9810652732849121
+    q0 = ((z0 >= LM_M0).to(tl.uint8)
+          + (z0 >= LM_M1).to(tl.uint8)
+          + (z0 >= LM_M2).to(tl.uint8))
+    q1 = ((z1 >= LM_M0).to(tl.uint8)
+          + (z1 >= LM_M1).to(tl.uint8)
+          + (z1 >= LM_M2).to(tl.uint8))
+    q2 = ((z2 >= LM_M0).to(tl.uint8)
+          + (z2 >= LM_M1).to(tl.uint8)
+          + (z2 >= LM_M2).to(tl.uint8))
+    q3 = ((z3 >= LM_M0).to(tl.uint8)
+          + (z3 >= LM_M1).to(tl.uint8)
+          + (z3 >= LM_M2).to(tl.uint8))
 
     packed = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6)
 
@@ -141,15 +162,24 @@ def _pretransformed_int2_set_kv_clip_single_kernel(
     )
     tl.store(cache_ptr + cache_offset, packed, mask=active[:, None])
 
+    # Uniform-equivalent (scale, zero) chosen so the legacy
+    # `(q - zero)*scale` dequant reconstructs at LM-aligned outer levels
+    # stretched by LM_RATIO=1.16 to match CLIP=0.96 magnitudes.
+    LM_C0_EFF: tl.constexpr = -1.5095585584640503
+    LM_C3_EFF: tl.constexpr = 1.5095585584640503
+    LM_SPAN: tl.constexpr = LM_C3_EFF - LM_C0_EFF   # 3.0191
+    LM_RATIO: tl.constexpr = 1.16
+    uniform_scale = (LM_SPAN / 3.0) * LM_RATIO * row_std
+    uniform_zero = (-LM_C0_EFF) / (LM_SPAN / 3.0) - row_mean / uniform_scale
     sz_offset_base = cache_loc * sz_stride_loc + head_idx * sz_stride_head
     tl.store(
         scales_zeros_ptr + sz_offset_base + 0 * sz_stride_dim,
-        scale,
+        uniform_scale,
         mask=active,
     )
     tl.store(
         scales_zeros_ptr + sz_offset_base + 1 * sz_stride_dim,
-        zero,
+        uniform_zero,
         mask=active,
     )
 
