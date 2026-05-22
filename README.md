@@ -36,18 +36,6 @@ so users can download calibrated rotations directly instead of recomputing them.
 <summary><b>Multi-Modal & LongBench</b> </summary>
 Use Rotation and Run Script in zhongzhu/VL branch.
 
-LongBench-E comparison
-
-| Method                          | Qwen3-8B    |
-|---------------------------------|------------:|
-| 16-bit Baseline                 | 49.56       |
-| QuaRot (INT2)                   | 40.13       |
-| RotateKV (INT2)                 | 42.95       |
-| KIVI (INT2)                     | 47.95       |
-| OTT (INT2)                      | 48.21       |
-| TurboQuant+ (2.5-bit)           | 47.56       |
-| **OSCAR**                       | **50.25**   |
-
 OCRBench comparison
 
 | Method                          | Qwen3-VL-8B | Qwen3-VL-4B |
@@ -60,6 +48,27 @@ OCRBench comparison
 | TurboQuant+ (2.5-bit)           | 847         | 828         |
 | **OSCAR (Lloyd-Max)**           | **854**     | **848**     |
 
+Omni-Modal LLMs: MMAU-Pro
+
+| Method (Qwen3-Omni-30B-A3B) | Open-ended | Good Rate | AIF |
+|:---------------------------|:----------:|:---------:|:---:|
+| 16-bit Baseline | 66.2 | 27.8 | 87.4 |
+| KIVI (INT2) | 65.8 | 27.0 | 78.2 |
+| OTT (INT2) | 65.8 | 26.9 | 83.9 |
+| TurboQuant+ (2.5-bit) | 66.6 | 27.0 | 79.3 |
+| **OSCAR** | **67.4** | **33.8** | **89.7** |
+
+LongBench-E comparison
+
+| Method                          | Qwen3-8B    |
+|---------------------------------|------------:|
+| 16-bit Baseline                 | 49.56       |
+| QuaRot (INT2)                   | 40.13       |
+| RotateKV (INT2)                 | 42.95       |
+| KIVI (INT2)                     | 47.95       |
+| OTT (INT2)                      | 48.21       |
+| TurboQuant+ (2.5-bit)           | 47.56       |
+| **OSCAR**                       | **50.25**   |
 </details>
 
 **Setup.** Each cell is the **MEAN across 5 reasoning / coding benchmarks** — **GPQA**, **HumanEval**, **LiveCodeBench v6**, **AIME 25**, **MATH-500**. To control single-seed variance, **every benchmark is evaluated 5 times per (model, method) cell** (3 times for GLM-4.7-FP8) and the per-seed scores are averaged before being averaged across benchmarks. TurboQuant rows are single-run (\*) because its vLLM path is too slow for repeated 32K-context evaluations under our compute budget. All runs use **32K-token max generation length**. **BPE** = effective bits per KV element at 128K context length. Higher is better; the BF16 row is the upper bound.
