@@ -31,6 +31,22 @@ set up the single environment, and run the dump, rotation, and evaluation
 scripts end to end. It works out of the box, and we also provide a rotation zoo
 so users can download calibrated rotations directly instead of recomputing them.
 
+## 🔥 Latest News
+- **[Upcoming]** OSCAR is testing minimax-m2.7 and GLM in long horizon Agentic Tasks.  Happy to see OSCAR being used in the wild!
+- **[2026-05-18]** Full release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), and [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) are all live — runs out of the box on SGLang.
+
+## 📖 Table of Contents
+- [Main results](#main-results)
+- [Layout](#layout)
+- [Setup](#setup)
+- [Quick start (Qwen3-8B example)](#quick-start-qwen3-8b-example)
+- [All configured models](#all-configured-models)
+- [How the rotation is fit (spectral covariance)](#how-the-rotation-is-fit-spectral-covariance)
+- [Serving with the rotation](#serving-with-the-rotation)
+- [Calibration knobs](#calibration-knobs)
+- [Citation](#citation)
+- [License & acknowledgements](#license--acknowledgements)
+
 ## Main results
 <details>
 <summary><b>Multi-Modal & LongBench</b> </summary>
