@@ -252,6 +252,7 @@ class UnifiedInt2HPKVPool(KVCache):
         self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
+        self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
         self._R_k: torch.Tensor = load_oscar_rotations(
             self._oscar_cfg.k_rotation_path,
             layer_num=self.layer_num,
@@ -269,9 +270,10 @@ class UnifiedInt2HPKVPool(KVCache):
             dtype=self.hp_dtype,
         )
         logger.info(
-            "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f)",
+            "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
             self._k_clip_ratio,
             self._v_clip_ratio,
+            self._lloyd_max,
         )
 
         hp_total_slots = (
@@ -705,6 +707,7 @@ class UnifiedInt2HPKVPool(KVCache):
             self._k_clip_ratio,
             self._v_clip_ratio,
             hp_global_offset=mixed_hp_offset,
+            lloyd_max=self._lloyd_max,
         )
 
     def _set_mixed_hp_kv_buffer(

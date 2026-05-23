@@ -232,6 +232,10 @@ class Envs:
     # absorbed (so V skips rotation), per-row scale (single-scale int2), and
     # at least one of K/V clip ratios > 0. Off by default; safe to leave off.
     SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT = EnvBool(False)
+    # Use Lloyd-Max MSE-optimal buckets for INT2 KV quantization instead of
+    # the default uniform min-max. Applies only to single-scale pretransformed
+    # clip kernels (num_groups == 1). Requires oscar rotation + clip enabled.
+    SGLANG_LLOYD_MAX = EnvBool(False)
     SGLANG_MIXED_KV_HP_MAX_SPLITS = EnvInt(8)
     HADAMARD_ORDER = EnvInt(16)
 
