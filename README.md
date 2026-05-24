@@ -49,6 +49,27 @@ so users can download calibrated rotations directly instead of recomputing them.
 
 ## Main results
 <details>
+<summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
+
+Qwen3.5
+| Model | Mode | GPQA (198) | Δ vs BF16 |
+|-------|------|------------|-----------|
+| Qwen3.5-4B | baseline | **75.25%** | — |
+| Qwen3.5-4B | OSCAR | **74.75%** | −0.50 pp |
+| Qwen3.5-35B-A3B | baseline | **80.30%** | — |
+| Qwen3.5-35B-A3B | OSCAR | **82.32%** | +2.02 pp |
+
+MiniMax2.7
+| Benchmark | BF16 | INT2 (LM_RATIO=1.16) | Δ |
+|---|---|---|---|
+| GPQA-Diamond | 0.7828 | 0.7929 | +1.0 pp |
+| HumanEval | **0.8817** | **0.8854** | +0.4 pp |
+| AIME 2025 | **0.7667** | **0.7667** | 0.0 pp |
+| MATH500 | **0.9379** | **0.9279** | −1.0 pp |
+
+</details>
+
+<details>
 <summary><b>Multi-Modal & LongBench</b> </summary>
 Use Rotation and Run Script in zhongzhu/VL branch. Baseline numbers taken from arxiv.org/abs/2605.19660 (Su et al., 2026).
 
