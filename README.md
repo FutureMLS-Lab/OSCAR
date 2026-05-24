@@ -31,9 +31,69 @@ set up the single environment, and run the dump, rotation, and evaluation
 scripts end to end. It works out of the box, and we also provide a rotation zoo
 so users can download calibrated rotations directly instead of recomputing them.
 
+## 🔥 Latest News
+- **[Upcoming]** OSCAR is testing minimax-m2.7 and GLM in 200K long horizon Agentic Tasks.  Happy to see OSCAR being used in the wild!
+- **[2026-05-18]** Full release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), and [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) are all live — runs out of the box on SGLang.
+
+## 📖 Table of Contents
+- [Main results](#main-results)
+- [Layout](#layout)
+- [Setup](#setup)
+- [Quick start (Qwen3-8B example)](#quick-start-qwen3-8b-example)
+- [All configured models](#all-configured-models)
+- [How the rotation is fit (spectral covariance)](#how-the-rotation-is-fit-spectral-covariance)
+- [Serving with the rotation](#serving-with-the-rotation)
+- [Calibration knobs](#calibration-knobs)
+- [Citation](#citation)
+- [License & acknowledgements](#license--acknowledgements)
+
 ## Main results
 <details>
+<summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
+
+Qwen3.5
+| Model | Mode | GPQA (198) | Δ vs BF16 |
+|-------|------|------------|-----------|
+| Qwen3.5-4B | baseline | **75.25%** | — |
+| Qwen3.5-4B | OSCAR | **74.75%** | −0.50 pp |
+| Qwen3.5-35B-A3B | baseline | **80.30%** | — |
+| Qwen3.5-35B-A3B | OSCAR | **82.32%** | +2.02 pp |
+
+MiniMax2.7
+| Benchmark | BF16 | OSCAR (LM_RATIO=1.16) | Δ |
+|---|---|---|---|
+| GPQA-Diamond | 0.7828 | **0.7929** | +1.0 pp |
+| HumanEval | 0.8817 | **0.8854** | +0.4 pp |
+| AIME 2025 | 0.7667 | **0.7667** | 0.0 pp |
+| MATH500 | 0.9379 | **0.9279** | −1.0 pp |
+
+</details>
+
+<details>
 <summary><b>Multi-Modal & LongBench</b> </summary>
+Use Rotation and Run Script in zhongzhu/VL branch. Baseline numbers taken from arxiv.org/abs/2605.19660 (Su et al., 2026).
+
+OCRBench comparison
+| Method                          | Qwen3-VL-8B | Qwen3-VL-4B |
+|---------------------------------|------------:|------------:|
+| 16-bit Baseline                 | 858         | 852         |
+| QuaRot (INT2)                   | 722         | 773         |
+| RotateKV (INT2)                 | 754         | 638         |
+| KIVI (INT2)                     | 851         | 813         |
+| OTT (INT2)                      | 850         | 831         |
+| TurboQuant+ (2.5-bit)           | 847         | 828         |
+| **OSCAR (Lloyd-Max)**           | **854**     | **848**     |
+
+Omni-Modal LLMs: MMAU-Pro
+
+| Method (Qwen3-Omni-30B-A3B) | Open-ended | Good Rate | AIF |
+|:---------------------------|:----------:|:---------:|:---:|
+| 16-bit Baseline | 66.2 | 27.8 | 87.4 |
+| KIVI (INT2) | 65.8 | 27.0 | 78.2 |
+| OTT (INT2) | 65.8 | 26.9 | 83.9 |
+| TurboQuant+ (2.5-bit) | 66.6 | 27.0 | 79.3 |
+| **OSCAR** | **67.4** | **33.8** | **89.7** |
+
 LongBench-E comparison
 
 | Method                          | Qwen3-8B    |
@@ -45,19 +105,6 @@ LongBench-E comparison
 | OTT (INT2)                      | 48.21       |
 | TurboQuant+ (2.5-bit)           | 47.56       |
 | **OSCAR**                       | **50.25**   |
-
-OCRBench comparison
-
-| Method                          | Qwen3-VL-8B | Qwen3-VL-4B |
-|---------------------------------|------------:|------------:|
-| 16-bit Baseline                 | 858         | 852         |
-| QuaRot (INT2)                   | 722         | 773         |
-| RotateKV (INT2)                 | 754         | 638         |
-| KIVI (INT2)                     | 851         | 813         |
-| OTT (INT2)                      | 850         | 831         |
-| TurboQuant+ (2.5-bit)           | 847         | 828         |
-| **OSCAR (Lloyd-Max)**           | **854**     | **848**     |
-
 </details>
 
 **Setup.** Each cell is the **MEAN across 5 reasoning / coding benchmarks** — **GPQA**, **HumanEval**, **LiveCodeBench v6**, **AIME 25**, **MATH-500**. To control single-seed variance, **every benchmark is evaluated 5 times per (model, method) cell** (3 times for GLM-4.7-FP8) and the per-seed scores are averaged before being averaged across benchmarks. TurboQuant rows are single-run (\*) because its vLLM path is too slow for repeated 32K-context evaluations under our compute budget. All runs use **32K-token max generation length**. **BPE** = effective bits per KV element at 128K context length. Higher is better; the BF16 row is the upper bound.
