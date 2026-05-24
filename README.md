@@ -60,7 +60,7 @@ Qwen3.5
 | Qwen3.5-35B-A3B | OSCAR | **82.32%** | +2.02 pp |
 
 MiniMax2.7
-| Benchmark | BF16 | INT2 (LM_RATIO=1.16) | Δ |
+| Benchmark | BF16 | OSCAR (LM_RATIO=1.16) | Δ |
 |---|---|---|---|
 | GPQA-Diamond | 0.7828 | 0.7929 | +1.0 pp |
 | HumanEval | **0.8817** | **0.8854** | +0.4 pp |
