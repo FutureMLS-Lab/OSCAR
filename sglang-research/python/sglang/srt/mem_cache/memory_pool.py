@@ -140,6 +140,7 @@ def load_oscar_rotations(
     head_dim: int,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    layer_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Load per-layer Oscar rotation matrices from ``path``.
 
@@ -152,6 +153,12 @@ def load_oscar_rotations(
     (``global_layer_id - start_layer``). Raises ``ValueError`` if any layer in
     ``[start_layer, start_layer + layer_num)`` is missing or has mismatched
     head_dim.
+
+    If ``layer_ids`` is provided, those global layer IDs (in the listed order)
+    are used to populate the local indices 0..len(layer_ids)-1, overriding the
+    default contiguous range. This is required for hybrid models where the
+    full-attention layers are sparse (e.g. Qwen3.5: layers 3, 7, 11, ...).
+    ``layer_num`` must equal ``len(layer_ids)`` in that case.
     """
     state = torch.load(path, map_location="cpu")
     if "layers" not in state:
@@ -159,9 +166,17 @@ def load_oscar_rotations(
             f"Oscar rotation checkpoint at {path} missing 'layers' key"
         )
     layers = state["layers"]
+    if layer_ids is not None:
+        if len(layer_ids) != layer_num:
+            raise ValueError(
+                f"load_oscar_rotations: layer_ids has {len(layer_ids)} entries "
+                f"but layer_num={layer_num}"
+            )
+        global_layer_ids = list(layer_ids)
+    else:
+        global_layer_ids = [start_layer + local for local in range(layer_num)]
     out = torch.empty((layer_num, head_dim, head_dim), dtype=dtype)
-    for local in range(layer_num):
-        global_lid = start_layer + local
+    for local, global_lid in enumerate(global_layer_ids):
         if global_lid not in layers and str(global_lid) not in layers:
             raise ValueError(
                 f"Oscar rotation checkpoint at {path} missing layer {global_lid}"
@@ -175,10 +190,10 @@ def load_oscar_rotations(
             )
         out[local] = R.to(dtype)
     logger.info(
-        "Loaded Oscar rotation from %s for layers [%d, %d) head_dim=%d dtype=%s",
+        "Loaded Oscar rotation from %s for layers %s head_dim=%d dtype=%s",
         path,
-        start_layer,
-        start_layer + layer_num,
+        global_layer_ids if layer_ids is not None
+        else f"[{start_layer}, {start_layer + layer_num})",
         head_dim,
         dtype,
     )
@@ -1546,6 +1561,38 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class _OscarRotationProxy:
+    """Index-translating view onto an inner UnifiedInt2HPKVPool's per-layer
+    rotation tensor. The triton OSCAR decode path indexes the outer pool's
+    ``_R_k`` / ``_R_v`` via ``layer.layer_id - outer_pool.start_layer`` and
+    expects a single ``[head_dim, head_dim]`` matrix back. For hybrid models
+    the inner pool stores only the full-attention rotations (size N, not the
+    full layer count), so this proxy resolves the global layer id through
+    ``full_attention_layer_id_mapping`` before indexing.
+    """
+
+    __slots__ = ("_inner", "_map", "_outer_start")
+
+    def __init__(
+        self,
+        inner_R: torch.Tensor,
+        full_attention_layer_id_mapping: dict,
+        outer_start_layer: int,
+    ):
+        self._inner = inner_R
+        self._map = full_attention_layer_id_mapping
+        self._outer_start = int(outer_start_layer)
+
+    def __getitem__(self, idx):
+        global_id = int(idx) + self._outer_start
+        if global_id not in self._map:
+            raise KeyError(
+                f"_OscarRotationProxy: layer {global_id} is not a "
+                f"full-attention layer (known: {sorted(self._map.keys())})"
+            )
+        return self._inner[self._map[global_id]]
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -1566,6 +1613,7 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        full_kv_pool: Optional["KVCache"] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1580,7 +1628,12 @@ class HybridLinearKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
-        if not use_mla:
+        if full_kv_pool is not None:
+            # Externally constructed pool (e.g. UnifiedInt2HPKVPool for OSCAR
+            # INT2 path). The caller is responsible for matching layer_num,
+            # head_dim, etc. against ``full_attention_layer_ids``.
+            self.full_kv_pool = full_kv_pool
+        elif not use_mla:
 
             TokenToKVPoolClass = MHATokenToKVPool
 
@@ -1707,17 +1760,27 @@ class HybridLinearKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        is_decode: bool = False,
+        already_hadamard_transformed: bool = False,
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
+            # Pass ``layer`` (not None) so the inner UnifiedInt2HPKVPool sees
+            # ``layer.oscar_v_rotation_absorbed`` — otherwise it re-rotates V
+            # by R_v on every write, double-rotating the already-absorbed V
+            # and producing gibberish at attention time. ``layer_id_override``
+            # still drives the local-index lookup; ``layer.layer_id`` is only
+            # read for the absorption flag.
             self.full_kv_pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id,
+                already_hadamard_transformed=already_hadamard_transformed,
+                is_decode=is_decode,
             )
         else:
             with self._transfer_id_context(layer):
@@ -1732,7 +1795,106 @@ class HybridLinearKVPool(KVCache):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def get_v_head_dim(self):
-        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        # When the inner pool is a UnifiedInt2HPKVPool, ``get_value_buffer``
+        # returns the int2-packed view whose last dim is ``v_head_dim // 4`` —
+        # not the logical head dim the triton backend expects. Prefer the
+        # ``v_head_dim`` attribute (set by both MHATokenToKVPool and
+        # UnifiedInt2HPKVPool), and fall back to the buffer shape only when
+        # the inner pool predates it (MLA path).
+        inner = self.full_kv_pool
+        v_head_dim_attr = getattr(inner, "v_head_dim", None)
+        if v_head_dim_attr is not None:
+            return v_head_dim_attr
+        return inner.get_value_buffer(0).shape[-1]
+
+    def mixed_kv_enabled(self) -> bool:
+        """Forward to the inner full_kv_pool. Returns True only when the inner
+        pool is a UnifiedInt2HPKVPool (OSCAR INT2 hybrid path), so the
+        allocator selection in model_runner_kv_cache_mixin picks the
+        UnifiedInt2HPKVAllocator instead of the standard paged allocator.
+        """
+        inner = getattr(self, "full_kv_pool", None)
+        if inner is None:
+            return False
+        fn = getattr(inner, "mixed_kv_enabled", None)
+        return bool(fn()) if callable(fn) else False
+
+    # --- Forwards for the OSCAR INT2 hybrid path. -------------------------
+    # When the inner full_kv_pool is a UnifiedInt2HPKVPool, the Triton
+    # attention backend and the mixed-KV scheduler path read many
+    # pool-level configs and flush-kernel pointers directly off
+    # ``model_runner.token_to_kv_pool`` — which, for mambaish models, is
+    # *this* wrapper. The ``__getattr__`` below forwards anything we don't
+    # explicitly define here to the inner pool. The per-layer accessors
+    # that take a layer_id need explicit overrides so the inner pool sees
+    # contiguous local indices [0, N) instead of sparse global ids.
+
+    @property
+    def _R_k(self):
+        return _OscarRotationProxy(
+            self.full_kv_pool._R_k,
+            self.full_attention_layer_id_mapping,
+            self.start_layer,
+        )
+
+    @property
+    def _R_v(self):
+        return _OscarRotationProxy(
+            self.full_kv_pool._R_v,
+            self.full_attention_layer_id_mapping,
+            self.start_layer,
+        )
+
+    # Per-layer accessors used by the triton OSCAR decode path. Each call
+    # remaps the global layer id to the inner pool's local index before
+    # forwarding so the inner pool sees a contiguous [0, N) namespace.
+    def get_hp_key_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_hp_key_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_hp_value_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_hp_value_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_raw_key_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_raw_key_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_raw_value_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_raw_value_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_key_scales_zeros(self, layer_id: int):
+        return self.full_kv_pool.get_key_scales_zeros(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_value_scales_zeros(self, layer_id: int):
+        return self.full_kv_pool.get_value_scales_zeros(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_raw_kv_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_raw_kv_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def __getattr__(self, name: str):
+        # Only invoked when normal lookup fails. Forward to the inner
+        # full_kv_pool so the OSCAR-INT2 hybrid path can read attributes
+        # like _flush_counter, hp_k_buffer, layer_num, _k_clip_ratio, etc.
+        # ``full_kv_pool`` itself goes through __getattribute__ first, but
+        # guard against early-init recursion just in case.
+        if name == "full_kv_pool":
+            raise AttributeError(name)
+        inner = self.__dict__.get("full_kv_pool")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
 
     def set_mla_kv_buffer(
         self,

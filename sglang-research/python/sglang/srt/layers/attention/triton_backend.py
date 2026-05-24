@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -19,7 +20,11 @@ from sglang.srt.layers.attention.quantized_kv_prefill import (
     prepare_quantized_extend_qkv,
 )
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -240,6 +245,12 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
+        # Ported from the dump fork: per-layer state for the env-driven
+        # DUMP_KVCACHE Q/K/V hook in ``forward_extend``. Inert unless
+        # ``DUMP_KVCACHE=true`` so it's safe in production.
+        self._dump_kv_done_layers = set()
+        self._dump_saved_tokens = {}
+        self._dump_chunk_idx = {}
         # The decode triton kernel derives attn_lse offsets from attn_logits
         # strides via integer division by v_head_dim (the "// Lv" trick in
         # _fwd_kernel_stage1/stage2), so attn_logits.shape[-1] must exactly
@@ -1391,6 +1402,73 @@ class TritonAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+
+        # Env-driven post-RoPE Q/K/V dump for OSCAR calibration. Ported from the
+        # sglang-dump-qkv fork. Inert unless DUMP_KVCACHE=true. Saves up to
+        # DUMP_KVCACHE_TOKENS tokens per layer to DUMP_KVCACHE_DIR/layer_<id>/{q,k,v}/<chunk>.pt
+        # plus a parallel seq_lens dir so the calibration script can split chunks
+        # back into per-request samples. For hybrid models (Qwen3.5, etc.) this
+        # only fires for layers that actually go through the triton attention
+        # backend — full-attention layers — so the dump naturally skips
+        # linear/mamba layers without any extra filtering.
+        if (
+            k is not None
+            and v is not None
+            and layer.layer_id not in self._dump_kv_done_layers
+            and get_bool_env_var("DUMP_KVCACHE", "false")
+        ):
+            dump_tokens = get_int_env_var("DUMP_KVCACHE_TOKENS", 100)
+            layer_id = layer.layer_id
+            saved_so_far = self._dump_saved_tokens.get(layer_id, 0)
+            chunk_idx = self._dump_chunk_idx.get(layer_id, 0)
+            remaining = dump_tokens - saved_so_far
+            if remaining > 0:
+                num_tokens = q.shape[0]
+                tokens_to_save = min(num_tokens, remaining)
+                if str(
+                    getattr(forward_batch.token_to_kv_pool, "device", "cuda")
+                ).startswith("cuda"):
+                    torch.cuda.synchronize()
+                q_dump = (
+                    q[:tokens_to_save]
+                    .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    .contiguous()
+                    .detach()
+                )
+                k_dump = k[:tokens_to_save].contiguous().detach()
+                v_dump = v[:tokens_to_save].contiguous().detach()
+                chunk_seq_lens = []
+                if forward_batch.extend_seq_lens is not None:
+                    remain = tokens_to_save
+                    for slen in forward_batch.extend_seq_lens.tolist():
+                        if remain <= 0:
+                            break
+                        take = min(slen, remain)
+                        chunk_seq_lens.append(take)
+                        remain -= take
+                else:
+                    chunk_seq_lens = [tokens_to_save]
+                chunk_seq_lens_t = torch.tensor(chunk_seq_lens, dtype=torch.int32)
+                tp_size = get_attention_tp_size()
+                tp_rank = get_attention_tp_rank()
+                if tp_size > 1:
+                    attn_tp_group = get_attention_tp_group()
+                    q_dump = attn_tp_group.all_gather(q_dump, dim=1)
+                    k_dump = attn_tp_group.all_gather(k_dump, dim=1)
+                    v_dump = attn_tp_group.all_gather(v_dump, dim=1)
+                if tp_rank == 0:
+                    save_dir = os.environ.get("DUMP_KVCACHE_DIR", ".")
+                    for name, tensor in (("q", q_dump), ("k", k_dump), ("v", v_dump)):
+                        chunk_dir = os.path.join(save_dir, f"layer_{layer_id}", name)
+                        os.makedirs(chunk_dir, exist_ok=True)
+                        torch.save(tensor.cpu(), os.path.join(chunk_dir, f"{chunk_idx}.pt"))
+                    seq_dir = os.path.join(save_dir, f"layer_{layer_id}", "seq_lens")
+                    os.makedirs(seq_dir, exist_ok=True)
+                    torch.save(chunk_seq_lens_t, os.path.join(seq_dir, f"{chunk_idx}.pt"))
+                self._dump_saved_tokens[layer_id] = saved_so_far + tokens_to_save
+                self._dump_chunk_idx[layer_id] = chunk_idx + 1
+                if saved_so_far + tokens_to_save >= dump_tokens:
+                    self._dump_kv_done_layers.add(layer_id)
 
         if k is None and v is None:
             pool = forward_batch.token_to_kv_pool

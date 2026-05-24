@@ -297,16 +297,35 @@ def get_rotation_layer(state: dict, layer_id: int) -> torch.Tensor:
 
 
 def write_hadamard_rotation(
-    output_dir: Path, head_dim: int, num_layers: int
+    output_dir: Path,
+    head_dim: int,
+    num_layers: int,
+    layer_ids: list[int] | None = None,
 ) -> None:
-    """Pure fixed Hadamard rotation (data-free; no dump required)."""
+    """Pure fixed Hadamard rotation (data-free; no dump required).
+
+    When ``layer_ids`` is provided, the rotation file is keyed by those global
+    layer ids (in the order given) instead of ``range(num_layers)``. This is
+    required for hybrid models where the full-attention layers are sparse
+    (e.g. Qwen3.5: layers 3, 7, 11, ...). ``len(layer_ids)`` must equal
+    ``num_layers``.
+    """
     h = build_hadamard(head_dim).float()
     err = (h @ h.T - torch.eye(head_dim)).abs().max().item()
     print(f"Hadamard orthogonality error: {err:.2e}")
     eigvals = torch.ones(head_dim, dtype=torch.float32)
+    if layer_ids is not None:
+        if len(layer_ids) != num_layers:
+            raise ValueError(
+                f"write_hadamard_rotation: --layer-ids has {len(layer_ids)} "
+                f"entries but num_layers={num_layers}"
+            )
+        keys = list(layer_ids)
+    else:
+        keys = list(range(num_layers))
     for target in ("k", "v"):
         result = empty_result("hadamard")
-        for layer_id in range(num_layers):
+        for layer_id in keys:
             add_layer(result, layer_id, h, eigvals)
         path = output_dir / f"{target}_rotation_hadamard.pt"
         torch.save(result, str(path))
@@ -361,26 +380,52 @@ def main() -> None:
         help="Number of layers to emit. Required when --method hadamard and no "
         "--dump-path is given; otherwise inferred from the dump.",
     )
+    parser.add_argument(
+        "--layer-ids",
+        type=str,
+        default=None,
+        help="Comma-separated list of global layer ids to use as keys in the "
+        "rotation file (e.g. '3,7,11,15,19,23,27,31' for Qwen3.5-4B). When "
+        "omitted, hadamard mode emits keys range(num_layers). Required for "
+        "hybrid models where full-attention layers are sparse so the in-server "
+        "OSCAR pool can look up rotations by global id.",
+    )
     parser.add_argument("--ref-k-rotation", type=Path, default=None)
     parser.add_argument("--ref-v-rotation", type=Path, default=None)
     args = parser.parse_args()
+
+    layer_ids = None
+    if args.layer_ids is not None:
+        layer_ids = [int(x) for x in args.layer_ids.split(",") if x.strip()]
+        if not layer_ids:
+            raise ValueError("--layer-ids was provided but parsed to an empty list")
 
     if args.method == "hadamard":
         output_dir = args.output_dir or (args.dump_path if args.dump_path else None)
         if output_dir is None:
             raise ValueError("--output-dir is required when --method hadamard")
         output_dir.mkdir(parents=True, exist_ok=True)
-        if args.num_layers is not None:
+        if layer_ids is not None:
+            num_layers = len(layer_ids)
+            if args.num_layers is not None and args.num_layers != num_layers:
+                raise ValueError(
+                    f"--num-layers={args.num_layers} disagrees with "
+                    f"--layer-ids (len={num_layers})"
+                )
+        elif args.num_layers is not None:
             num_layers = args.num_layers
         elif args.dump_path is not None:
             num_layers = len(layer_dirs(args.dump_path))
         else:
             raise ValueError(
-                "hadamard method needs either --num-layers or --dump-path to know "
-                "how many layers to emit"
+                "hadamard method needs --layer-ids, --num-layers, or --dump-path "
+                "to know how many layers to emit"
             )
-        print(f"Method=hadamard head_dim={args.head_dim} num_layers={num_layers}")
-        write_hadamard_rotation(output_dir, args.head_dim, num_layers)
+        print(
+            f"Method=hadamard head_dim={args.head_dim} num_layers={num_layers} "
+            f"layer_ids={layer_ids}"
+        )
+        write_hadamard_rotation(output_dir, args.head_dim, num_layers, layer_ids)
         return
 
     if args.dump_path is None:

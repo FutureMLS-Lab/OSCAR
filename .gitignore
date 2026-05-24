@@ -10,12 +10,27 @@ rotation/*/MATH/
 rotation/*/MMLU/
 rotation/*/Hadamard/
 rotation/*/qkv_dumps*/
-rotation/*/rotations*/
 rotation/*/_eval_*/
 rotation/*/investigation/
 
 # MiniMax-M2.7 is internal-only for now (per-investigation work-in-progress).
 rotation/MiniMax-M2.7/
+
+# Triton / CUDA JIT caches
+triton_cache/
+deepgemm_cache/
+*.cubin
+*.ptx
+*.llir
+*.ttir
+*.ttgir
+
+# Eval run dirs (smoke tests, wandb run artifacts)
+rotation/*/_*_smoke/
+rotation/*/runs/
+
+# Anonymous mirror dir
+anonymous/
 
 # Python caches
 __pycache__/

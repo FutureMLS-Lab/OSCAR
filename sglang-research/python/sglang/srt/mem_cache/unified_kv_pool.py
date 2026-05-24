@@ -154,6 +154,7 @@ class UnifiedInt2HPKVPool(KVCache):
         kv_cache_quant_group_size: Optional[int] = None,
         scale_dtype: torch.dtype = torch.bfloat16,
         num_hp_prefix_slots: int = 0,
+        rotation_layer_ids: Optional[List[int]] = None,
     ):
         assert dtype == "int2", (
             "UnifiedInt2HPKVPool supports only int2 quant tier; got %s" % dtype
@@ -253,6 +254,14 @@ class UnifiedInt2HPKVPool(KVCache):
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
+        if rotation_layer_ids is not None and len(rotation_layer_ids) != self.layer_num:
+            raise ValueError(
+                f"UnifiedInt2HPKVPool: rotation_layer_ids has "
+                f"{len(rotation_layer_ids)} entries but layer_num={self.layer_num}"
+            )
+        self._rotation_layer_ids = (
+            list(rotation_layer_ids) if rotation_layer_ids is not None else None
+        )
         self._R_k: torch.Tensor = load_oscar_rotations(
             self._oscar_cfg.k_rotation_path,
             layer_num=self.layer_num,
@@ -260,6 +269,7 @@ class UnifiedInt2HPKVPool(KVCache):
             head_dim=self.head_dim,
             device=torch.device(self.device),
             dtype=self.hp_dtype,
+            layer_ids=self._rotation_layer_ids,
         )
         self._R_v: torch.Tensor = load_oscar_rotations(
             self._oscar_cfg.v_rotation_path,
@@ -268,6 +278,7 @@ class UnifiedInt2HPKVPool(KVCache):
             head_dim=self.v_head_dim,
             device=torch.device(self.device),
             dtype=self.hp_dtype,
+            layer_ids=self._rotation_layer_ids,
         )
         logger.info(
             "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
