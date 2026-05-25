@@ -32,7 +32,9 @@ scripts end to end. It works out of the box, and we also provide a rotation zoo
 so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
-- **[Upcoming]** OSCAR is testing minimax-m2.7 and GLM in 200K long horizon Agentic Tasks.  Happy to see OSCAR being used in the wild!
+- **[Upcoming]** OSCAR is testing minimax-m2.7 and GLM in 200K long horizon agentic tasks. Happy to see OSCAR used in the wild!
+- **[2026-05-25]** OSCAR is optimizing kernel performance. Hope to see it run faster in b200, h100!
+- **[2026-05-23]** OSCAR release the [qwen3.5 4B, 35B-A3B, minimax-m2.7 229B preview results](#main-results). You can use OSCAR for qwen3.5, minimax2.7 beta now! refer to branch zhongzhu/hybrid-model and set SGLANG_LLOYD_MAX=1.
 - **[2026-05-18]** Full release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), and [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) are all live — runs out of the box on SGLang.
 
 ## 📖 Table of Contents
