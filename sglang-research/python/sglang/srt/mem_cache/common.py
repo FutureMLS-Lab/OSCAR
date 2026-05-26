@@ -351,30 +351,51 @@ def _mixed_extend_layout_counts(
     hp_prefix_tokens: int,
     hp_recent_tokens: int,
     n_q: int,
+    is_final_chunk: bool = True,
 ) -> tuple[int, int, int, int, int]:
     """Return per-request mixed-KV extend counts.
 
-    The logical layout is ``[HP-prefix][quant-middle][HP-recent]``. Quant
-    middle may end with a partially occupied atomic quant page; we allocate the
-    whole page but write only the live quant slots to ``req_to_token``.
+    Default (final chunk) layout: ``[HP-prefix][quant-middle][HP-recent]``.
+    Non-final chunks collapse to ``[HP-prefix][quant-all]`` and skip
+    HP-recent — chunk N's trailing positions are never the request's final
+    HP-recent window, so allocating HP-recent there only wraps the
+    per-request ring and recycles slots whose K/V is still referenced via
+    ``req_to_token`` at earlier chunk N positions.
     """
-    prefix_keep, recent_keep, _ = _mixed_window_lengths(
-        seq_len, hp_prefix_tokens, hp_recent_tokens
-    )
-    recent_start = seq_len - recent_keep
-    hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
-    quant_count = max(0, recent_start - max(pre_len, prefix_keep))
-    hp_recent_count = max(0, seq_len - max(pre_len, recent_start))
+    if is_final_chunk:
+        prefix_keep, recent_keep, _ = _mixed_window_lengths(
+            seq_len, hp_prefix_tokens, hp_recent_tokens
+        )
+        recent_start = seq_len - recent_keep
+        hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
+        quant_count = max(0, recent_start - max(pre_len, prefix_keep))
+        hp_recent_count = max(0, seq_len - max(pre_len, recent_start))
+    else:
+        prefix_keep = min(seq_len, hp_prefix_tokens)
+        hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
+        quant_count = max(0, seq_len - max(pre_len, prefix_keep))
+        hp_recent_count = 0
     quant_alloc_count = ceil_align(quant_count, n_q)
 
     # Per-request flush counter: count steps until this request's next flush.
     # ``H_0`` is the current HP-recent size after this extend chunk is admitted.
-    # Quant tails remain quant, so they no longer increase ``H_0``.
-    h0_total = (
-        hp_recent_tokens
-        if seq_len >= hp_prefix_tokens + hp_recent_tokens
-        else max(0, seq_len - hp_prefix_tokens)
-    )
+    # For non-final chunks we skip HP-recent entirely (``hp_recent_count=0``),
+    # and for chunked-prefill final chunks the actual HP-recent count is
+    # ``hp_recent_count`` (positions newly admitted in this chunk), NOT the
+    # ``hp_recent_tokens`` target. If we use the target as ``H_0`` while the
+    # actual count is small, ``counter_init`` underestimates how many decode
+    # steps must elapse before the flush kernel's demote range
+    # ``[seq_len - hp_recent - flush_overflow : seq_len - hp_recent]`` falls
+    # entirely inside HP-recent. Early flushes hit the chunk-1 quant region
+    # (valid=0 for all 8 slots → whole-page return). Worse, at the *last*
+    # premature flush before the demote range crosses into HP-recent, the
+    # 8-position window straddles the boundary: 3-5 valid=0 and 3-5 valid=1
+    # → page partially used + partially returned. The used slots get written
+    # to ``req_to_token``; the returned slots go to the free pool. When the
+    # request finishes, ``cache_finished_req`` frees the used slots → same
+    # page added to the free pool TWICE. That is the +N quant-page duplicate
+    # the strict idle leak check trips on.
+    h0_total = hp_recent_count
     counter_init = max(0, (hp_recent_tokens + n_q - 1) - h0_total)
     return (
         hp_prefix_count,
@@ -408,7 +429,12 @@ def _alloc_for_extend_mixed(
     quant_counts: list[int] = []
     quant_alloc_counts: list[int] = []
     flush_counter_inits: list[int] = []
-    for pre_len, seq_len in zip(batch.prefix_lens, batch.seq_lens_cpu.tolist()):
+    seq_lens_cpu_list = batch.seq_lens_cpu.tolist()
+    is_final_chunk_list = [
+        int(seq_lens_cpu_list[i]) >= len(batch.reqs[i].origin_input_ids)
+        for i in range(len(batch.reqs))
+    ]
+    for i, (pre_len, seq_len) in enumerate(zip(batch.prefix_lens, seq_lens_cpu_list)):
         (
             hp_prefix_count,
             hp_recent_count,
@@ -421,6 +447,7 @@ def _alloc_for_extend_mixed(
             int(kv_pool.hp_prefix_tokens),
             hp_recent_target,
             n_q,
+            is_final_chunk=bool(is_final_chunk_list[i]),
         )
 
         hp_prefix_counts.append(hp_prefix_count)
@@ -440,6 +467,27 @@ def _alloc_for_extend_mixed(
     pooled_need = total_quant_alloc + total_hp_prefix_alloc
     if pooled_need > 0:
         evict_from_tree_cache(batch.tree_cache, pooled_need)
+
+    # ``evict_from_tree_cache`` checks total free (quant + HP-prefix). A
+    # single call asking for ``pooled_need`` tokens may free mostly HP-prefix
+    # when leaves happen to be prefix-heavy, leaving the quant tier short.
+    # Loop with a small bound to converge on enough quant pages.
+    if (
+        total_quant_alloc > 0
+        and batch.tree_cache is not None
+        and not batch.tree_cache.is_chunk_cache()
+    ):
+        for _ in range(4):
+            free_quant_slots = (
+                allocator.free_pages.numel() + allocator.release_pages.numel()
+            ) * allocator.N_Q
+            if free_quant_slots >= total_quant_alloc:
+                break
+            result = batch.tree_cache.evict(
+                EvictParams(num_tokens=total_quant_alloc)
+            )
+            if getattr(result, "num_tokens_evicted", 0) == 0:
+                break
 
     quant_alloc = (
         allocator.alloc_quant(total_quant_alloc)
@@ -462,7 +510,7 @@ def _alloc_for_extend_mixed(
     hp_prefix_pt = 0
     hp_recent_pt = 0
     quant_pt = 0
-    for (
+    for i_req, (
         req,
         pre_len,
         hp_prefix_count,
@@ -470,7 +518,7 @@ def _alloc_for_extend_mixed(
         hp_recent_count,
         quant_count,
         quant_alloc_count,
-    ) in zip(
+    ) in enumerate(zip(
         batch.reqs,
         batch.prefix_lens,
         hp_prefix_counts,
@@ -478,7 +526,20 @@ def _alloc_for_extend_mixed(
         hp_recent_counts,
         quant_counts,
         quant_alloc_counts,
-    ):
+    )):
+        # Non-final chunked-prefill chunk: cap insert at the start of the
+        # request-owned tail so cache_unfinished_req / cache_finished_req
+        # don't insert the tail into the radix tree.
+        if not is_final_chunk_list[i_req]:
+            non_final_tail_start = max(
+                0, int(seq_lens_cpu_list[i_req]) - int(kv_pool.hp_recent_tokens)
+            )
+            existing_cutoff = getattr(req, "mixed_kv_quant_slack_cutoff_len", None)
+            req.mixed_kv_quant_slack_cutoff_len = (
+                non_final_tail_start
+                if existing_cutoff is None
+                else min(existing_cutoff, non_final_tail_start)
+            )
         req_parts = []
         req_hp_prefix = None
         req_hp_recent = None
