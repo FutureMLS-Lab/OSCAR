@@ -22,6 +22,10 @@
 
 #define UNUSED GGML_UNUSED
 
+void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_0_ref(x, y, k);
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }
@@ -119,6 +123,159 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 }
 
 //===================================== Dot products =================================
+
+// Lloyd-Max 4-level centroids for N(0,σ): multiply by per-block sigma at runtime.
+static const float Q2_LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+// Decision thresholds (×σ): -0.6745, 0, +0.6745
+#define Q2_0_HAD_SIZE 32
+
+// Full-head OWHT with optional AVX2 acceleration for stages h≥8.
+// Scalar for h=1,2,4 (intra-group shuffles needed); AVX2 for h≥8 (pure add/sub).
+static void q2_0_hadamard_scalar(float * GGML_RESTRICT x, int n) {
+    // Use exactly the same scalar implementation as ortho_hadamard_f32 for correctness check
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h << 1) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) x[i] *= scale;
+}
+
+static void q2_0_hadamard(float * GGML_RESTRICT x, int n) {
+    q2_0_hadamard_scalar(x, n); return;
+    // Scalar butterfly stages for h = 1, 2, 4
+    for (int h = 1; h <= 4; h <<= 1) {
+        for (int i = 0; i < n; i += h << 1) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+#if defined(__AVX2__)
+    // AVX2 butterfly stages for h = 8, 16, 32, 64, ...
+    for (int h = 8; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h << 1) {
+            for (int j = i; j < i + h; j += 8) {
+                __m256 va = _mm256_loadu_ps(x + j);
+                __m256 vb = _mm256_loadu_ps(x + j + h);
+                _mm256_storeu_ps(x + j,     _mm256_add_ps(va, vb));
+                _mm256_storeu_ps(x + j + h, _mm256_sub_ps(va, vb));
+            }
+        }
+    }
+    // AVX2 normalization
+    const float scale = 1.0f / sqrtf((float)n);
+    __m256 vs = _mm256_set1_ps(scale);
+    for (int i = 0; i < n; i += 8) {
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vs));
+    }
+#else
+    // Scalar stages h ≥ 8
+    for (int h = 8; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h << 1) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) x[i] *= scale;
+#endif
+}
+
+void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK2_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    const int nb = n / QK2_0;
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    // Process blocks in groups of (Q2_0_HAD_SIZE/QK2_0) for the full-head OWHT.
+    const int had_nb = (n >= Q2_0_HAD_SIZE) ? (Q2_0_HAD_SIZE / QK2_0) : 1;
+
+    float sumf = 0.0f;
+    float k_buf[Q2_0_HAD_SIZE];
+
+    for (int ig = 0; ig < nb; ig += had_nb) {
+        const int actual_nb = (ig + had_nb <= nb) ? had_nb : (nb - ig);
+
+        // Mean was subtracted before OWHT during quantization; stored in first block's m field.
+        const float mean = GGML_CPU_FP16_TO_FP32(x[ig].m);
+
+        // Decode all blocks in this Hadamard group with Lloyd-Max centroids
+        for (int ib = 0; ib < actual_nb; ib++) {
+            const float sigma = GGML_CPU_FP16_TO_FP32(x[ig + ib].d);
+            float * blk = k_buf + ib * QK2_0;
+#if defined(__AVX__)
+            // 4 elements per _mm_permutevar_ps (AVX VPERMILPS instruction)
+            __m128 vcentroids = _mm_set_ps(Q2_LM_CENTROIDS[3], Q2_LM_CENTROIDS[2],
+                                           Q2_LM_CENTROIDS[1], Q2_LM_CENTROIDS[0]);
+            __m128 vsigma = _mm_set1_ps(sigma);
+            for (int j = 0; j < QK2_0; j += 4) {
+                const uint8_t packed = x[ig + ib].qs[j / 4];
+                __m128i vcodes = _mm_set_epi32((packed >> 6) & 3, (packed >> 4) & 3,
+                                               (packed >> 2) & 3,  packed       & 3);
+                __m128 vv = _mm_permutevar_ps(vcentroids, vcodes);
+                _mm_storeu_ps(blk + j, _mm_mul_ps(vv, vsigma));
+            }
+#else
+            for (int j = 0; j < QK2_0 / 4; j++) {
+                const uint8_t packed = x[ig + ib].qs[j];
+                for (int b = 0; b < 4; b++) {
+                    blk[j*4 + b] = Q2_LM_CENTROIDS[(packed >> (2 * b)) & 0x03] * sigma;
+                }
+            }
+#endif
+        }
+
+        // Undo full-head OWHT (self-inverse) and restore mean
+        q2_0_hadamard(k_buf, actual_nb * QK2_0);
+        for (int j = 0; j < actual_nb * QK2_0; j++) k_buf[j] += mean;
+
+        // Dot product with Q (Q8_0 format)
+        for (int ib = 0; ib < actual_nb; ib++) {
+            const float yd = GGML_CPU_FP16_TO_FP32(y[ig + ib].d);
+            const float * blk = k_buf + ib * QK2_0;
+#if defined(__AVX2__)
+            __m256 vsum = _mm256_setzero_ps();
+            __m256 vyd  = _mm256_set1_ps(yd);
+            for (int j = 0; j < QK2_0; j += 8) {
+                __m256 vk = _mm256_loadu_ps(blk + j);
+                // Load 8 int8 from Q8_0 and convert to float
+                __m128i vi8 = _mm_loadl_epi64((const __m128i *)(y[ig + ib].qs + j));
+                __m256i vi32 = _mm256_cvtepi8_epi32(vi8);
+                __m256 vq = _mm256_cvtepi32_ps(vi32);
+                vsum = _mm256_fmadd_ps(vk, _mm256_mul_ps(vyd, vq), vsum);
+            }
+            // Horizontal sum of vsum
+            __m128 lo = _mm256_castps256_ps128(vsum);
+            __m128 hi = _mm256_extractf128_ps(vsum, 1);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
+            sumf += _mm_cvtss_f32(s4);
+#else
+            float dot = 0.0f;
+            for (int j = 0; j < QK2_0; j++) {
+                dot += blk[j] * (yd * (float)y[ig + ib].qs[j]);
+            }
+            sumf += dot;
+#endif
+        }
+    }
+
+    *s = sumf;
+}
 
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;

@@ -447,6 +447,40 @@ void dequantize_q4_1_t4(device const block_q4_1 * xb, short il, thread type4 & r
 }
 
 template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+    // il selects which half of the 32-element block (0 = first 16, 1 = second 16)
+    // qs[0..3] for il=0, qs[4..7] for il=1; each byte holds 4 packed 2-bit values
+    device const uint8_t * qs = xb->qs + il * 4;
+    const float d = xb->d;
+    const float m = xb->m;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; i++) {  // 4 bytes, each with 4 2-bit values
+        const uint8_t b = qs[i];
+        reg_f[i][0] = m + d * (float)((b     ) & 0x03);
+        reg_f[i][1] = m + d * (float)((b >> 2) & 0x03);
+        reg_f[i][2] = m + d * (float)((b >> 4) & 0x03);
+        reg_f[i][3] = m + d * (float)((b >> 6) & 0x03);
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4>
+void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & reg) {
+    // il in [0..7]: selects which 4-element group within the 32-element block
+    device const uint8_t * qs = xb->qs;
+    const float d = xb->d;
+    const float m = xb->m;
+    const uint8_t b = qs[il];
+    reg[0] = m + d * (float)((b     ) & 0x03);
+    reg[1] = m + d * (float)((b >> 2) & 0x03);
+    reg[2] = m + d * (float)((b >> 4) & 0x03);
+    reg[3] = m + d * (float)((b >> 6) & 0x03);
+}
+
+template <typename type4x4>
 void dequantize_q5_0(device const block_q5_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 3);
     const float d = xb->d;
@@ -3949,6 +3983,11 @@ template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_3")]]   kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_4")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_5")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q1_0,   128, dequantize_q1_0_t4>;
 
+template [[host_name("kernel_mul_mv_ext_q2_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q2_0,    32, dequantize_q2_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q2_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q2_0,    32, dequantize_q2_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q2_0_f32_r1_4")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q2_0,    32, dequantize_q2_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q2_0_f32_r1_5")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q2_0,    32, dequantize_q2_0_t4>;
+
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q4_0,   32, dequantize_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q4_0,   32, dequantize_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q4_0,   32, dequantize_q4_0_t4>;
@@ -6676,6 +6715,14 @@ template [[host_name("kernel_flash_attn_ext_q8_0_dk256_dv256")]] kernel flash_at
 template [[host_name("kernel_flash_attn_ext_q8_0_dk320_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 320, 256>;
 template [[host_name("kernel_flash_attn_ext_q8_0_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 512, 512>;
 template [[host_name("kernel_flash_attn_ext_q8_0_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 576, 512>;
+
+// q2_0 KV cache - common head dimensions (Qwen3-4B uses dk=dv=128)
+template [[host_name("kernel_flash_attn_ext_q2_0_dk32_dv32"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0, 32,  32>;
+template [[host_name("kernel_flash_attn_ext_q2_0_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0, 64,  64>;
+template [[host_name("kernel_flash_attn_ext_q2_0_dk96_dv96"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0, 96,  96>;
+template [[host_name("kernel_flash_attn_ext_q2_0_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_q2_0_dk192_dv192")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0, 192, 192>;
+template [[host_name("kernel_flash_attn_ext_q2_0_dk256_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0, 256, 256>;
 
 #undef FA_TYPES
 #undef FA_TYPES_BF
