@@ -375,7 +375,7 @@ def _fused_flush_quant_kernel(
 
     ``K_CLIP_INDEX`` / ``V_CLIP_INDEX`` of ``-1`` disable in-kernel clip;
     a non-negative value selects the per-row threshold from
-    ``sort(abs(row))[CLIP_INDEX]`` (oscar path). The legacy two-pass
+    ``sort(abs(row))[CLIP_INDEX]`` (coquant path). The legacy two-pass
     ``compute_flush_clip_thresholds_triton`` + threshold-tensor flow is
     replaced by this inline computation.
     """
@@ -541,7 +541,7 @@ def _flush_clip_index(clip_ratio: float, head_dim: int) -> int:
 
 def _flush_elements_per_thread(dtype: torch.dtype) -> int:
     """Elements per thread for a 128-bit vectorized load; bf16 -> 8, fp8 -> 16.
-    Other dtypes raise — the flush kernel is only used in the oscar / hadamard
+    Other dtypes raise — the flush kernel is only used in the coquant / hadamard
     paths where the HP buffer is bf16 (or fp8 on MLA configs).
     """
     if dtype == torch.bfloat16:
@@ -693,6 +693,7 @@ def gpu_flush_int2_apply(
     k_num_scale_groups: int,
     v_num_scale_groups: int,
     num_layers: int,
+    rotation_mode: str = "hadamard",
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
 ) -> None:
@@ -718,8 +719,12 @@ def gpu_flush_int2_apply(
         v_head_dim, v_num_scale_groups
     )
 
-    k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
-    v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
+    if rotation_mode == "coquant":
+        k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
+        v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
+    else:
+        k_clip_index = -1
+        v_clip_index = -1
 
     elements_per_thread = _flush_elements_per_thread(hp_k_sample.dtype)
     block_tok, num_warps = _flush_block_tok_and_num_warps(
@@ -836,6 +841,8 @@ def gpu_flush_int2(
     v_num_scale_groups: int,
     num_layers: int,
     flush_interval: int,
+    # rotation + clip. Defaults preserve legacy behavior.
+    rotation_mode: str = "hadamard",
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -899,6 +906,7 @@ def gpu_flush_int2(
         k_num_scale_groups=k_num_scale_groups,
         v_num_scale_groups=v_num_scale_groups,
         num_layers=num_layers,
+        rotation_mode=rotation_mode,
         k_clip_ratio=k_clip_ratio,
         v_clip_ratio=v_clip_ratio,
     )

@@ -876,6 +876,87 @@ def decode_attention_fwd_quantized(
 
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
+    # ``SGLANG_INT2_BACKEND`` re-routes the stage-1 kernel through an alternate
+    # implementation. Supported: cutedsl (CuTeDSL SIMT), cuda (CUDA wmma),
+    # cuda-wgmma (CUDA wgmma). All three map q-head -> kv-head via
+    # ``cur_kv_head = cur_head // kv_group_num`` so they work for MHA + GQA.
+    backend_env = os.environ.get("SGLANG_INT2_BACKEND", "").lower()
+    if (
+        backend_env in ("cutedsl", "cuda", "cuda-wgmma")
+        and logit_cap == 0.0
+        and xai_temperature_len <= 0
+        and sinks is None
+    ):
+        try:
+            if backend_env == "cutedsl":
+                from sglang.QuantKernel.cutedsl_int2_kv import (
+                    can_use_cutedsl_decode as _can_use,
+                    cutedsl_decode_attention_fwd_int2 as _alt_fn,
+                )
+                _alt_label = "CuteDSL"
+            elif backend_env == "cuda":
+                from sglang.QuantKernel.cutedsl_int2_kv import (
+                    can_use_cuda_decode as _can_use,
+                    cuda_decode_attention_fwd_int2 as _alt_fn,
+                )
+                _alt_label = "CUDA wmma"
+            else:  # cuda-wgmma
+                from sglang.QuantKernel.cutedsl_int2_kv import (
+                    can_use_cuda_decode as _can_use,
+                    cuda_decode_attention_fwd_int2_wgmma as _alt_fn,
+                )
+                _alt_label = "CUDA wgmma"
+
+            if _can_use(
+                q, k_buffer, v_buffer, k_scales_zeros, v_scales_zeros
+            ):
+                if getattr(decode_attention_fwd_quantized,
+                           "_logged_alt_backend", None) != backend_env:
+                    msg = (
+                        f"[INT2 dispatch] using {_alt_label} decode kernel "
+                        f"(q={tuple(q.shape)}, k={tuple(k_buffer.shape)})"
+                    )
+                    logger.info(msg)
+                    print(msg, flush=True)
+                    decode_attention_fwd_quantized._logged_alt_backend = backend_env
+                _alt_fn(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    k_scales_zeros,
+                    v_scales_zeros,
+                    attn_logits,
+                    attn_lse,
+                    kv_indptr,
+                    kv_indices,
+                    num_kv_splits,
+                    max_kv_splits,
+                    sm_scale,
+                )
+                _decode_softmax_reducev_fwd(
+                    attn_logits,
+                    attn_lse,
+                    q,
+                    o,
+                    v_scale=1.0,
+                    v_buffer=o,
+                    kv_indptr=kv_indptr,
+                    num_kv_splits=num_kv_splits,
+                    max_kv_splits=max_kv_splits,
+                    sinks=sinks,
+                    output_lse=output_lse,
+                )
+                return
+        except Exception as e:  # fall back to Triton if anything goes wrong
+            if not getattr(decode_attention_fwd_quantized, "_logged_fallback", False):
+                msg = (
+                    f"[INT2 dispatch] {backend_env} path raised "
+                    f"{type(e).__name__}: {e} — falling back to Triton"
+                )
+                logger.warning(msg)
+                print(msg, flush=True)
+                decode_attention_fwd_quantized._logged_fallback = True
+
     if kv_group_num == 1:
         decode_attention_fwd_normal_quant_int2(
             q,
@@ -2409,6 +2490,16 @@ def decode_attention_fwd_int2_unified(
             "Mixed KV windows do not support sink tokens in Triton decode yet."
         )
 
+    # One-shot trace of arrival — confirms the unified entry is being used.
+    if not getattr(decode_attention_fwd_int2_unified, "_logged_entry", False):
+        print(
+            f"[INT2 unified entry] q={tuple(q.shape)} "
+            f"quant_k={tuple(quant_k_buffer.shape)} "
+            f"backend={os.environ.get('SGLANG_INT2_BACKEND', '')}",
+            flush=True,
+        )
+        decode_attention_fwd_int2_unified._logged_entry = True
+
     total_splits = hp_max_kv_splits + quant_max_kv_splits
     assert attn_logits.shape[2] == total_splits, (
         f"attn_logits split dim ({attn_logits.shape[2]}) must equal hp_max_kv_splits "
@@ -2463,40 +2554,120 @@ def decode_attention_fwd_int2_unified(
             )
 
     if quant_kv_indices.numel() > 0:
-        if kv_group_num == 1:
-            _decode_att_m_fwd_quant_int2(
-                q,
-                quant_k_buffer,
-                quant_v_buffer,
-                quant_k_scales_zeros,
-                quant_v_scales_zeros,
-                quant_logits,
-                quant_lse,
-                quant_kv_indptr,
-                quant_kv_indices,
-                quant_num_kv_splits,
-                quant_max_kv_splits,
-                sm_scale,
-                logit_cap,
-                xai_temperature_len,
-            )
-        else:
-            _decode_grouped_att_m_fwd_quant_int2(
-                q,
-                quant_k_buffer,
-                quant_v_buffer,
-                quant_k_scales_zeros,
-                quant_v_scales_zeros,
-                quant_logits,
-                quant_lse,
-                quant_kv_indptr,
-                quant_kv_indices,
-                quant_num_kv_splits,
-                quant_max_kv_splits,
-                sm_scale,
-                logit_cap,
-                xai_temperature_len,
-            )
+        # ``SGLANG_INT2_BACKEND`` reroutes the int2 portion of the unified
+        # path through an alternate kernel. Supported values:
+        #   cutedsl    — CuTeDSL SIMT kernel
+        #   cuda       — CUDA C++ wmma kernel
+        #   cuda-wgmma — CUDA C++ wgmma kernel
+        # logit_cap / xai_temperature_len must be defaults (none of the
+        # alternate kernels implement them).
+        used_alt = False
+        backend_env = os.environ.get("SGLANG_INT2_BACKEND", "").lower()
+        if (
+            backend_env in ("cutedsl", "cuda", "cuda-wgmma")
+            and logit_cap == 0.0
+            and xai_temperature_len <= 0
+        ):
+            try:
+                if backend_env == "cutedsl":
+                    from sglang.QuantKernel.cutedsl_int2_kv import (
+                        can_use_cutedsl_decode as _can_use,
+                        cutedsl_decode_attention_fwd_int2 as _alt_fn,
+                    )
+                    alt_label = "CuteDSL"
+                elif backend_env == "cuda":
+                    from sglang.QuantKernel.cutedsl_int2_kv import (
+                        can_use_cuda_decode as _can_use,
+                        cuda_decode_attention_fwd_int2 as _alt_fn,
+                    )
+                    alt_label = "CUDA wmma"
+                else:  # cuda-wgmma
+                    from sglang.QuantKernel.cutedsl_int2_kv import (
+                        can_use_cuda_decode as _can_use,
+                        cuda_decode_attention_fwd_int2_wgmma as _alt_fn,
+                    )
+                    alt_label = "CUDA wgmma"
+                if _can_use(
+                    q, quant_k_buffer, quant_v_buffer,
+                    quant_k_scales_zeros, quant_v_scales_zeros,
+                ):
+                    if not getattr(
+                        decode_attention_fwd_int2_unified,
+                        "_logged_alt_backend",
+                        None,
+                    ) == backend_env:
+                        msg = (
+                            f"[INT2 dispatch unified] using {alt_label} "
+                            f"decode kernel (q={tuple(q.shape)}, "
+                            f"k={tuple(quant_k_buffer.shape)})"
+                        )
+                        logger.info(msg)
+                        print(msg, flush=True)
+                        decode_attention_fwd_int2_unified._logged_alt_backend = backend_env
+                    _alt_fn(
+                        q,
+                        quant_k_buffer,
+                        quant_v_buffer,
+                        quant_k_scales_zeros,
+                        quant_v_scales_zeros,
+                        quant_logits,
+                        quant_lse,
+                        quant_kv_indptr,
+                        quant_kv_indices,
+                        quant_num_kv_splits,
+                        quant_max_kv_splits,
+                        sm_scale,
+                    )
+                    used_alt = True
+            except Exception as e:
+                if not getattr(
+                    decode_attention_fwd_int2_unified,
+                    "_logged_fallback",
+                    False,
+                ):
+                    msg = (
+                        f"[INT2 dispatch unified] {backend_env} path raised "
+                        f"{type(e).__name__}: {e} — falling back to Triton"
+                    )
+                    logger.warning(msg)
+                    print(msg, flush=True)
+                    decode_attention_fwd_int2_unified._logged_fallback = True
+
+        if not used_alt:
+            if kv_group_num == 1:
+                _decode_att_m_fwd_quant_int2(
+                    q,
+                    quant_k_buffer,
+                    quant_v_buffer,
+                    quant_k_scales_zeros,
+                    quant_v_scales_zeros,
+                    quant_logits,
+                    quant_lse,
+                    quant_kv_indptr,
+                    quant_kv_indices,
+                    quant_num_kv_splits,
+                    quant_max_kv_splits,
+                    sm_scale,
+                    logit_cap,
+                    xai_temperature_len,
+                )
+            else:
+                _decode_grouped_att_m_fwd_quant_int2(
+                    q,
+                    quant_k_buffer,
+                    quant_v_buffer,
+                    quant_k_scales_zeros,
+                    quant_v_scales_zeros,
+                    quant_logits,
+                    quant_lse,
+                    quant_kv_indptr,
+                    quant_kv_indices,
+                    quant_num_kv_splits,
+                    quant_max_kv_splits,
+                    sm_scale,
+                    logit_cap,
+                    xai_temperature_len,
+                )
 
     _unified_stage2(
         attn_logits,
@@ -2504,4 +2675,5 @@ def decode_attention_fwd_int2_unified(
         o,
         total_splits=total_splits,
     )
+
     return o

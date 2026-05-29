@@ -99,6 +99,15 @@ SERVER_ARGS=(
 if [[ -n "${REASONING_PARSER:-}" ]]; then
     SERVER_ARGS+=(--reasoning-parser "${REASONING_PARSER}")
 fi
+if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+    SERVER_ARGS+=(--disable-cuda-graph --disable-piecewise-cuda-graph --skip-server-warmup)
+fi
+if [[ -n "${WATCHDOG_TIMEOUT:-}" ]]; then
+    SERVER_ARGS+=(--watchdog-timeout "${WATCHDOG_TIMEOUT}")
+fi
+if [[ -n "${TRITON_KV_SPLITS:-}" ]]; then
+    SERVER_ARGS+=(--triton-attention-num-kv-splits "${TRITON_KV_SPLITS}")
+fi
 
 echo "[eval-oscar] model=${MODEL} tp=${TP_SIZE} gpus=${GPUS} rot=${ROT_DIR} out=${RUN_DIR}"
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \

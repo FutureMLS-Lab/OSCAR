@@ -253,6 +253,7 @@ class UnifiedInt2HPKVPool(KVCache):
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
+        self._rotation_mode: str = "oscar"
         self._R_k: torch.Tensor = load_oscar_rotations(
             self._oscar_cfg.k_rotation_path,
             layer_num=self.layer_num,

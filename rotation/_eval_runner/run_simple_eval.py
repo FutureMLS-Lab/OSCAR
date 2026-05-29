@@ -65,8 +65,15 @@ class SglangChatSampler:
 
     def __init__(self, model, base_url, api_key, system_message,
                  temperature, top_p, top_k, max_tokens):
+        import httpx
         from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        # Long read timeout: thinking models generate 20-40k tokens; at 10 tok/s
+        # that takes 2000-4000 s. Default 600 s fires before any response arrives.
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=httpx.Timeout(connect=10.0, read=7200.0, write=30.0, pool=10.0),
+        )
         self.model = model
         self.system_message = system_message
         self.temperature = temperature

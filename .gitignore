@@ -27,3 +27,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+anonymous/
+
+# Internal planning docs that should not be checked in.
+sglang-research/PLAN.md

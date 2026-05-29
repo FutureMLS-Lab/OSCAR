@@ -12,7 +12,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.quantized_kv_prefill import (
     _apply_oscar_rotation,
-    _pool_uses_oscar_rotation,
+    _kv_pool_rotation_mode,
     apply_inverse_v_rotation,
     apply_segmented_hadamard_transform,
     dequantize_prefix_kv,
@@ -122,7 +122,9 @@ def _scatter_mixed_kv_indices_kernel(
         # ``unified_kv_allocator.free``) and the GPU flush kernel
         # (``gpu_flush_int2``) all classify by ``>=``; using ``>`` here would
         # misclassify HP slot id ``HP_OFFSET`` as quant and read OOB from
-        # the quant buffer.
+        # the quant buffer, producing garbage attention output as soon as
+        # the allocator hands page 0 to the HP tier (e.g. batched chunked
+        # prefill where decode-ordered ``alloc_hp`` pops page 0 first).
         is_hp = valid & (slot >= HP_OFFSET)
         is_quant = valid & (slot < HP_OFFSET)  # == valid & ~is_hp; explicit to avoid ~bool dtype quirks
 
@@ -1748,7 +1750,11 @@ class TritonAttnBackend(AttentionBackend):
         # Int2 quantized KV cache path (the only supported quant tier).
         kv_pool = forward_batch.token_to_kv_pool
         if hasattr(kv_pool, "dtype") and kv_pool.dtype == "int2":
-            uses_oscar = _pool_uses_oscar_rotation(kv_pool)
+            grouped_quant_scales = (
+                getattr(kv_pool, "k_num_scale_groups", 1) not in (None, 1)
+                or getattr(kv_pool, "v_num_scale_groups", 1) not in (None, 1)
+            )
+            rotation_mode = _kv_pool_rotation_mode(kv_pool)
 
             q_for_decode = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             mixed_decode_metadata_available = (
@@ -1792,12 +1798,20 @@ class TritonAttnBackend(AttentionBackend):
 
             oscar_layer_idx = layer.layer_id - kv_pool.start_layer
 
-            if uses_oscar:
-                q_for_decode = _apply_oscar_rotation(
-                    q_for_decode, kv_pool._R_k[oscar_layer_idx]
-                )
+            if mixed_decode_enabled:
+                if rotation_mode == "oscar":
+                    q_for_decode = _apply_oscar_rotation(
+                        q_for_decode, kv_pool._R_k[oscar_layer_idx]
+                    )
+                elif rotation_mode != "off":
+                    q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
             else:
-                q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
+                if rotation_mode == "oscar":
+                    q_for_decode = _apply_oscar_rotation(
+                        q_for_decode, kv_pool._R_k[oscar_layer_idx]
+                    )
+                elif rotation_mode != "off":
+                    q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
             if mixed_decode_enabled:
                 bs = q_for_decode.shape[0]
                 self.decode_attention_fwd_int2_unified(
@@ -1846,13 +1860,13 @@ class TritonAttnBackend(AttentionBackend):
                     xai_temperature_len=layer.xai_temperature_len,
                 )
             # int2: V is always rotated, so apply the inverse rotation to the
-            # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
-            # the segmented FWHT (self-inverse with 1/sqrt(N)).
-            if uses_oscar:
+            # output. OSCAR mode uses ``o @ R_v.T``; Hadamard mode re-applies
+            # the segmented FWHT (self-inverse with 1/sqrt(N)); off mode skips.
+            if rotation_mode == "oscar":
                 R_v = kv_pool._R_v[oscar_layer_idx]
                 o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                 o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
-            else:
+            elif rotation_mode != "off":
                 o = apply_segmented_hadamard_transform(o)
         else:
             # Standard attention with dequantized or non-quantized KV cache
@@ -2045,7 +2059,6 @@ def get_num_kv_splits_triton(
     device_core_count,
     MAX_NUM_SEQ: tl.constexpr,
 ):
-    # TODO: this method is tunable, we need more online serving data to tune it
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
     mask_seq = offs_seq < num_seq
 
@@ -2058,21 +2071,36 @@ def get_num_kv_splits_triton(
     max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
     kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
-    # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
-    ext_seq_len = tl.cast(max_seq_len, tl.float32) / 64.0
-    ext_device_core_count = tl.cast(
-        device_core_count * tl.maximum(tl.log2(ext_seq_len), 1.0), tl.int32
-    )
+    # Candidate 2: SM-fill heuristic.
+    #
+    # Prior formula used log2(seq/64)*SMs which inflated the split count at
+    # long sequences and was capped by the (too-low) max_kv_splits default.
+    # Benchmark sweep (B=1..32, S=4096..16384, GQA q=32/kv=8, H100) shows:
+    #   - optimal chunk size ≈ 128*sqrt(batch) tokens
+    #     (128 at B=1, 256 at B=4, 512 at B=32)
+    #   - minimum splits to fill SMs = ceil(2*SMs / CTAs_per_split)
+    # Taking the max of both signals covers occupancy and throughput without
+    # the log2 inflation that inflated the old formula.
     block_h, num_kv_group = 16, num_head // num_kv_head
     if num_kv_group == 1:
         token_grid = num_seq * num_group * num_head
     else:
-        # from triton_ops/decode_attention.py:_decode_grouped_att_m_fwd
+        # matches triton_ops/decode_attention.py:_decode_grouped_att_m_fwd
         block_h = tl.minimum(block_h, num_kv_group)
         token_grid = num_seq * num_group * tl.cdiv(num_head, block_h)
-    max_kv_splits_2 = tl.minimum(
-        tl.cdiv(ext_device_core_count, token_grid), max_kv_splits
+
+    # Splits to fill 2 SM-waves (occupancy signal, seq-len independent).
+    sm_fill_splits = tl.minimum(
+        tl.cdiv(2 * device_core_count, token_grid), max_kv_splits
     )
+    # Splits to keep chunk ≈ 128*sqrt(num_seq*num_group) tokens.
+    # Scales the ideal chunk with batch so large-batch workloads don't
+    # over-split (which wastes stage-2 reduce bandwidth).
+    eff_batch = tl.cast(num_seq * num_group, tl.float32)
+    ideal_chunk = tl.cast(128.0 * tl.sqrt(eff_batch), tl.int32)
+    seq_splits = tl.minimum(tl.cdiv(max_seq_len, ideal_chunk), max_kv_splits)
+
+    max_kv_splits_2 = tl.maximum(sm_fill_splits, seq_splits)
     kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
 
     num_kv_splits = tl.maximum(

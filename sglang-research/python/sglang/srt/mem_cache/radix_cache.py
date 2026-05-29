@@ -931,7 +931,26 @@ class RadixCache(BasePrefixCache):
         flush_overflow = max(1, int(getattr(kvcache, "flush_interval", 1))) - 1
         if hp_recent <= 0 or committed_len <= hp_prefix:
             return 0
-        trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
+
+        if kv_indices is not None and kv_indices.numel() > 0:
+            hp_offset = int(getattr(kvcache, "hp_global_offset", 0))
+            num_hp_prefix_slots = int(getattr(kvcache, "num_hp_prefix_slots", 0))
+            hp_recent_threshold = hp_offset + num_hp_prefix_slots
+            window = kv_indices[: committed_len].to(torch.int64)
+            is_recent = (window >= hp_recent_threshold).to(torch.int32)
+            # Forward cumprod on the NOT-recent mask: stays 1 until the first
+            # HP-recent slot, then drops to 0 permanently.  This handles both
+            # the normal case (HP-recent only at the tail) and the chunked-
+            # prefill case where stale HP-recent IDs appear in the interior
+            # (second+ extend chunk slides the HP-recent window but leaves the
+            # first chunk's ring slot IDs in req_to_token).
+            safe_prefix = torch.cumprod(1 - is_recent, dim=0)
+            trim = committed_len - int(safe_prefix.sum().item())
+        else:
+            if committed_len <= hp_prefix:
+                return 0
+            trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
+
         if self.page_size > 1:
             trim = math.ceil(trim / self.page_size) * self.page_size
         # Clip back if ceil pushed past the available range.

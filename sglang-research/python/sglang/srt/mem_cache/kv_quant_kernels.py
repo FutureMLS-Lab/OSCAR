@@ -2,6 +2,8 @@
 Triton kernels for efficient INT2 KV cache quantization.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -399,6 +401,33 @@ def quantized_set_kv_int2_triton(
     hp_global_offset=None,
 ):
     """Quantize K and V caches to INT2 and write directly to cache buffers."""
+    # ``SGLANG_INT2_BACKEND=cutedsl`` re-routes per-(token,head) packing
+    # through the CuTeDSL kernel when the shape is supported; multi-group
+    # shapes still hit the Triton path below.
+    if os.environ.get("SGLANG_INT2_BACKEND", "").lower() == "cutedsl":
+        try:
+            from sglang.QuantKernel.cutedsl_int2_kv import (
+                can_use_cutedsl_quantize,
+                cutedsl_set_kv_int2,
+            )
+
+            if can_use_cutedsl_quantize(
+                cache_k, k_scales_zeros_buffer
+            ) and can_use_cutedsl_quantize(cache_v, v_scales_zeros_buffer):
+                cutedsl_set_kv_int2(
+                    cache_k,
+                    cache_v,
+                    loc,
+                    k_cache_buffer,
+                    v_cache_buffer,
+                    k_scales_zeros_buffer,
+                    v_scales_zeros_buffer,
+                    hp_global_offset,
+                )
+                return
+        except Exception:  # pragma: no cover - fall back to Triton
+            pass
+
     _launch_quantize_int2(
         cache_k, loc, k_cache_buffer, k_scales_zeros_buffer, hp_global_offset
     )

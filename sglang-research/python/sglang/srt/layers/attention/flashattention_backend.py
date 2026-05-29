@@ -553,7 +553,7 @@ class FlashAttentionBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
     ):
         # Int2 takes a dedicated rotation-aware path below: Q/K/V are
-        # pre-rotated (Hadamard or Oscar) once, and the rotated K/V is then
+        # pre-rotated (Hadamard or OSCAR) once, and the rotated K/V is then
         # written to the pool with ``already_hadamard_transformed=True`` so the
         # pool does not rotate a second time. We therefore skip the eager save
         # here for int2 and defer to the quantized prefill branch.
@@ -689,7 +689,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # (see python/sglang/srt/layers/attention/quantized_kv_prefill.py).
                 # Handles the pure-int2 ``MHATokenToKVPool`` and the mixed
                 # HP+int2 ``UnifiedInt2HPKVPool`` uniformly, and supports
-                # Hadamard / Oscar / off rotation modes.
+                # Hadamard / OSCAR / off rotation modes.
                 #
                 # Prefix is dequantized from the int2 pool; extend is kept in
                 # its higher-precision (bf16/fp16) rotated form to avoid a
@@ -734,7 +734,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                 kv_pool = forward_batch.token_to_kv_pool
                 # Remember the model dtype so we can cast the attention output
-                # back to it (Oscar rotation promotes to hp_dtype, which is
+                # back to it (OSCAR rotation promotes to hp_dtype, which is
                 # often bf16; without this cast a fp16 model would feed bf16
                 # into the downstream o_proj).
                 model_dtype = q.dtype
