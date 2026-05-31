@@ -68,7 +68,36 @@ static inline uint8_t lm_quantize(float v, float inv_sigma) {
 // Full head-vector OWHT size: apply Hadamard to the entire head dimension
 // (128 for Qwen3-4B) so outliers spread across all dims before per-block
 // Lloyd-Max quantization. Falls back to QK2_0=32 if k < HAD_SIZE.
-#define Q2_0_HAD_SIZE 32
+#define Q2_0_HAD_SIZE 128
+
+// OSCAR outlier clip: clamp each rotated head-vector to the clip_ratio percentile
+// of |value| (matches sglang SGLANG_OSCAR_*_CLIP_RATIO; K=0.96, V=0.92). One shared
+// ratio from LLAMA_KV_CLIP_RATIO (0 disables). Applied after OWHT, before quant.
+static int q2_0_cmp_abs_asc(const void * a, const void * b) {
+    const float fa = *(const float *)a;
+    const float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static float q2_0_clip_ratio(void) {
+    static float r = -2.0f;
+    if (r < -1.0f) {
+        const char * e = getenv("LLAMA_KV_CLIP_RATIO");
+        r = e ? (float) atof(e) : 0.0f;
+    }
+    return r;
+}
+
+// When the calibrated OSCAR rotation (R·H·P) is applied in-graph, the quant must
+// NOT re-apply its own Hadamard. Set LLAMA_KV_NO_HADAMARD=1 in that case.
+static int q2_0_skip_hadamard(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+        v = (e && atoi(e)) ? 1 : 0;
+    }
+    return v;
+}
 
 // reference implementation for deterministic creation of model files
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
@@ -96,7 +125,24 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
         mean /= actual_n;
         for (int j = 0; j < actual_n; j++) tmp[j] -= mean;
 
-        ortho_hadamard_f32(tmp, actual_n);  // full-head OWHT on zero-centered values
+        if (!q2_0_skip_hadamard()) ortho_hadamard_f32(tmp, actual_n);  // full-head OWHT on zero-centered values
+
+        // OSCAR outlier clip on the rotated head-vector (before per-block quant).
+        {
+            const float cr = q2_0_clip_ratio();
+            if (cr > 0.0f && cr < 1.0f) {
+                float absv[Q2_0_HAD_SIZE];
+                for (int j = 0; j < actual_n; j++) absv[j] = fabsf(tmp[j]);
+                qsort(absv, actual_n, sizeof(float), q2_0_cmp_abs_asc);
+                int idx = (int)(cr * actual_n);
+                if (idx >= actual_n) idx = actual_n - 1;
+                const float thr = absv[idx];
+                for (int j = 0; j < actual_n; j++) {
+                    if (tmp[j] >  thr) tmp[j] =  thr;
+                    if (tmp[j] < -thr) tmp[j] = -thr;
+                }
+            }
+        }
 
         // Store mean in first block's m field so dequant can restore it.
         y[ig].m = GGML_FP32_TO_FP16(mean);
@@ -492,7 +538,7 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
             }
         }
         // Undo full-head OWHT (self-inverse) and restore mean
-        ortho_hadamard_f32(tmp, actual_n);
+        if (!q2_0_skip_hadamard()) ortho_hadamard_f32(tmp, actual_n);
         for (int j = 0; j < actual_n; j++) tmp[j] += mean;
         memcpy(y + ig * QK2_0, tmp, actual_n * sizeof(float));
     }

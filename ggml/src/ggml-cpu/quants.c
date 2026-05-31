@@ -127,7 +127,7 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 // Lloyd-Max 4-level centroids for N(0,σ): multiply by per-block sigma at runtime.
 static const float Q2_LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
 // Decision thresholds (×σ): -0.6745, 0, +0.6745
-#define Q2_0_HAD_SIZE 32
+#define Q2_0_HAD_SIZE 128
 
 // Full-head OWHT with optional AVX2 acceleration for stages h≥8.
 // Scalar for h=1,2,4 (intra-group shuffles needed); AVX2 for h≥8 (pure add/sub).
@@ -147,7 +147,6 @@ static void q2_0_hadamard_scalar(float * GGML_RESTRICT x, int n) {
 }
 
 static void q2_0_hadamard(float * GGML_RESTRICT x, int n) {
-    q2_0_hadamard_scalar(x, n); return;
     // Scalar butterfly stages for h = 1, 2, 4
     for (int h = 1; h <= 4; h <<= 1) {
         for (int i = 0; i < n; i += h << 1) {
@@ -190,6 +189,17 @@ static void q2_0_hadamard(float * GGML_RESTRICT x, int n) {
     const float scale = 1.0f / sqrtf((float)n);
     for (int i = 0; i < n; i++) x[i] *= scale;
 #endif
+}
+
+// Skip the in-vec_dot OWHT when the calibrated OSCAR rotation is applied in-graph
+// (LLAMA_KV_NO_HADAMARD=1) — matches quantize_row_q2_0_ref's gate.
+static int q2_0_skip_hadamard(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+        v = (e && atoi(e)) ? 1 : 0;
+    }
+    return v;
 }
 
 void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -239,7 +249,7 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
         }
 
         // Undo full-head OWHT (self-inverse) and restore mean
-        q2_0_hadamard(k_buf, actual_nb * QK2_0);
+        if (!q2_0_skip_hadamard()) q2_0_hadamard(k_buf, actual_nb * QK2_0);
         for (int j = 0; j < actual_nb * QK2_0; j++) k_buf[j] += mean;
 
         // Dot product with Q (Q8_0 format)
