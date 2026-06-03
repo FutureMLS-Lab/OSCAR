@@ -1501,6 +1501,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        is_decode: bool = False,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
