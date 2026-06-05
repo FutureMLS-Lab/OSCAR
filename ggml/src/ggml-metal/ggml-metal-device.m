@@ -1221,6 +1221,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
                     break;
+                case GGML_TYPE_Q2_0:
+                    // OSCAR INT2 KV: the Metal q2_0 dequant decodes per block (Lloyd-Max
+                    // levels + replicated group mean). That only matches the CPU reference
+                    // on the calibrated-rotation path where the in-quant Hadamard is
+                    // skipped (LLAMA_KV_NO_HADAMARD). Otherwise the data carries a 128-wide
+                    // OWHT that a per-block kernel cannot undo, so fall back to CPU.
+                    {
+                        const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+                        if (!(e && atoi(e))) {
+                            return false;
+                        }
+                    }
+                    break;
                 case GGML_TYPE_BF16:
                     if (!has_bfloat) {
                         return false;
@@ -1319,6 +1332,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
                         return true;
+                    case GGML_TYPE_Q2_0:
+                        {
+                            // OSCAR INT2 encode on Metal is only correct on the calibrated-
+                            // rotation path (no in-quant Hadamard) and needs full 128-wide
+                            // groups (one per head vector); otherwise fall back to CPU.
+                            const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+                            return (e && atoi(e)) && (op->ne[0] % 128 == 0);
+                        }
                     default:
                         return false;
                 };

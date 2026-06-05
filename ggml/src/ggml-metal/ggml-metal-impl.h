@@ -945,6 +945,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    float    clip_ratio; // q2_0 OSCAR outlier clip percentile (0 disables); unused by other types
 } ggml_metal_kargs_set_rows;
 
 typedef struct {

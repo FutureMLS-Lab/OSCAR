@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -1201,6 +1202,43 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
 
+    // q2_0 (OSCAR INT2 KV) encode needs the full 128-wide group context (mean + clip +
+    // per-block Lloyd-Max), so it uses a dedicated kernel: one threadgroup (32 threads)
+    // per row, looping over the row's 128-wide groups.
+    if (op->type == GGML_TYPE_Q2_0) {
+        float clip_ratio = 0.0f;
+        if (const char * e = getenv("LLAMA_KV_CLIP_RATIO")) {
+            clip_ratio = (float) atof(e);
+        }
+
+        ggml_metal_kargs_set_rows args = {
+            /*.nk0  =*/ nk0,
+            /*.ne01 =*/ ne01,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.nb03 =*/ nb03,
+            /*.ne11 =*/ ne11,
+            /*.ne12 =*/ ne12,
+            /*.nb10 =*/ nb10,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb1  =*/ nb1,
+            /*.nb2  =*/ nb2,
+            /*.nb3  =*/ nb3,
+            /*.clip_ratio =*/ clip_ratio,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32, 1, 1);
+
+        return 1;
+    }
+
     int nth = 32; // SIMD width
 
     while (nth < nk0 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
@@ -1233,6 +1271,7 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.clip_ratio =*/ 0.0f,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2165,7 +2204,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
+        // q2_0 (OSCAR INT2 KV) has no plain mat-vec kernel, so route its decode
+        // (ne11==1) through the mat-mat kernel too (correct; GEMM handles N=1).
+        props_dev->has_simdgroup_mm && ne00 >= 64 &&
+        (ne11 > ne11_mm_min || op->src[0]->type == GGML_TYPE_Q2_0)) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers

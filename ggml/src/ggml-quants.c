@@ -144,9 +144,11 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
             }
         }
 
-        // Store mean in first block's m field so dequant can restore it.
-        y[ig].m = GGML_FP32_TO_FP16(mean);
-        for (int ib = 1; ib < actual_nb; ib++) y[ig + ib].m = GGML_FP32_TO_FP16(0.0f);
+        // Store the group mean in *every* block's m field. The CPU dequant only
+        // reads the first block's m, but a per-block GPU dequant (Metal) cannot
+        // reach the group's first block from an arbitrary block, so replicating
+        // the mean into each block keeps the CPU and GPU decode paths identical.
+        for (int ib = 0; ib < actual_nb; ib++) y[ig + ib].m = GGML_FP32_TO_FP16(mean);
 
         for (int ib = 0; ib < actual_nb; ib++) {
             const float * blk = tmp + ib * QK2_0;

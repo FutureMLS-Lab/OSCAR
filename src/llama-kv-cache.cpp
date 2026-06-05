@@ -1634,7 +1634,12 @@ ggml_tensor * llama_kv_cache::build_input_hp_batch_idxs(ggml_context * ctx, uint
 
 ggml_tensor * llama_kv_cache::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const {
     if (n_hp_total == 0) return nullptr;
-    const uint32_t ns    = n_stream;
+    // Must match the LP mask's stream count. The LP mask (build_attn_inp_*) uses
+    // n_stream = kv_unified ? 1 : ubatch.n_seqs_unq, i.e. the number of unique sequences
+    // *in this ubatch* — not the cache-wide n_stream (= n_seq_max). When the ubatch has
+    // fewer sequences than n_seq_max (np>1 graph reservation / partial batches), using
+    // n_seq_max here gave a different dim1/dim3 and broke the LP+HP ggml_concat.
+    const uint32_t ns    = (n_stream == 1) ? 1 : ubatch.n_seqs_unq;
     const uint32_t n_tps = ubatch.n_tokens / ns;
     auto * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_hp_total, n_tps, 1, ns);
     ggml_set_input(t);
@@ -1674,7 +1679,8 @@ void llama_kv_cache::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
-    const uint32_t ns    = n_stream;
+    // match build_input_hp_kq_mask: stream count = unique sequences in this ubatch
+    const uint32_t ns    = (n_stream == 1) ? 1 : ubatch->n_seqs_unq;
     const uint32_t n_tps = ubatch->n_tokens / ns;
 
     for (uint32_t s = 0; s < ns; ++s) {

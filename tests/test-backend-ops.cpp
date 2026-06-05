@@ -102,6 +102,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
+            // q2_0 (OSCAR INT2 KV) uses a 128-wide mean/rotation group spanning
+            // several 32-element blocks, so it must be quantized at full row
+            // granularity (matching how it is later dequantized by get_rows /
+            // flash-attn, and how the real KV cache encodes each head vector).
+            if (tensor->type == GGML_TYPE_Q2_0 && tensor->ne[0] % blck_size == 0) {
+                blck_size = tensor->ne[0];
+            }
             size_t n_blocks = nels / blck_size;
 
             auto quantize_thread = [&](size_t start, size_t end) {
@@ -7675,6 +7682,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // OSCAR INT2 KV cache type: cols must be a multiple of the 128-wide mean group.
+    // Validates the Metal Lloyd-Max + group-mean dequant against the CPU reference
+    // (run with LLAMA_KV_NO_HADAMARD=1 so both paths skip the in-quant Hadamard).
+    for (int n : {128, 256}) {
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_0, n, 8, 4, 1, 1, v));
+        }
+    }
     for (int b : {1, 7}) {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
@@ -7694,6 +7710,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    // OSCAR INT2 KV cache (q2_0) encode: ne0 must be a multiple of the 128-wide group.
+    // Validates the Metal set_rows q2_0 OSCAR encode vs CPU (run with
+    // LLAMA_KV_NO_HADAMARD=1; add LLAMA_KV_CLIP_RATIO=0.96 to also cover the clip path).
+    for (ggml_type idx_t : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q2_0, idx_t, { 128, 8, 1, 1 }, { 1, 1 }, 4, v));
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q2_0, idx_t, { 256, 6, 1, 1 }, { 1, 1 }, 4, v));
+        }
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -9036,6 +9061,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
+    // OSCAR INT2 KV cache (q2_0): head size 128 = one 128-wide mean group per head
+    // vector. Validates the Metal flash-attn q2_0 decode vs CPU (run with
+    // LLAMA_KV_NO_HADAMARD=1 so both skip the in-quant Hadamard).
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
