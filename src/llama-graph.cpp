@@ -553,6 +553,26 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot_swa) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
+
+    // HP sink+recent buffers, per sub-cache
+    if (hp_k_idxs && hp_k_idxs->buffer) {
+        mctx->get_base()->set_input_hp_k_idxs(hp_k_idxs, ubatch);
+    }
+    if (hp_batch_idxs && hp_batch_idxs->buffer) {
+        mctx->get_base()->set_input_hp_batch_idxs(hp_batch_idxs, ubatch);
+    }
+    if (hp_kq_mask && hp_kq_mask->buffer) {
+        mctx->get_base()->set_input_hp_kq_mask(hp_kq_mask, ubatch, cparams.causal_attn);
+    }
+    if (hp_k_idxs_swa && hp_k_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_hp_k_idxs(hp_k_idxs_swa, ubatch);
+    }
+    if (hp_batch_idxs_swa && hp_batch_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_hp_batch_idxs(hp_batch_idxs_swa, ubatch);
+    }
+    if (hp_kq_mask_swa && hp_kq_mask_swa->buffer) {
+        mctx->get_swa()->set_input_hp_kq_mask(hp_kq_mask_swa, ubatch, cparams.causal_attn);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -2537,13 +2557,81 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // store to HP KV cache (sink+recent tokens only), per sub-cache
+    ggml_tensor * hp_batch_idxs = is_swa ? inp->hp_batch_idxs_swa : inp->hp_batch_idxs;
+    ggml_tensor * hp_k_idxs     = is_swa ? inp->hp_k_idxs_swa     : inp->hp_k_idxs;
+    if (mctx_cur->has_hp() && hp_batch_idxs && k_cur && v_cur) {
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k_hp(ctx0, k_cur, hp_batch_idxs, hp_k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v_hp(ctx0, v_cur, hp_batch_idxs, hp_k_idxs, il));
+    }
+
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur;
+
+    ggml_tensor * hp_kq_mask_f32 = is_swa ? inp->hp_kq_mask_swa  : inp->hp_kq_mask;
+    ggml_tensor * lp_kq_mask_f32 = is_swa ? inp->self_kq_mask_swa : inp->self_kq_mask;
+    if (mctx_cur->has_hp() && hp_kq_mask_f32) {
+        // Exact LP+HP attention via concatenated softmax (mirrors the non-iSWA build_attn):
+        // LP tokens (Q2_0 KV) and HP tokens (sink+recent, F16 KV) are scored separately,
+        // concatenated along the KV dim, joint-softmaxed with a combined mask (LP mask has HP
+        // positions -inf to avoid double-counting), then their weighted value contributions summed.
+        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+
+        const int64_t n_stream = k->ne[3];
+
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                             q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+
+        ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
+        ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+
+        ggml_tensor * kq_lp = ggml_mul_mat(ctx0, k_lp_p, q_perm);
+        ggml_mul_mat_set_prec(kq_lp, GGML_PREC_F32);
+        ggml_tensor * kq_hp = ggml_mul_mat(ctx0, k_hp_p, q_perm);
+        ggml_mul_mat_set_prec(kq_hp, GGML_PREC_F32);
+
+        ggml_tensor * kq_all = ggml_concat(ctx0, kq_lp, kq_hp, 0);
+        ggml_tensor * combined_mask = ggml_concat(ctx0, lp_kq_mask_f32, hp_kq_mask_f32, 0);
+
+        kq_all = ggml_soft_max_ext(ctx0, kq_all, combined_mask, kq_scale, hparams.f_max_alibi_bias);
+        cb(kq_all, "kq_soft_max", il);
+
+        const int64_t n_kv       = k->ne[2];
+        const int64_t n_hp_total = k_hp->ne[2];
+        ggml_tensor * w_lp = ggml_view_4d(ctx0, kq_all, n_kv, kq_all->ne[1], kq_all->ne[2], kq_all->ne[3],
+                                           kq_all->nb[1], kq_all->nb[2], kq_all->nb[3], 0);
+        ggml_tensor * w_hp = ggml_view_4d(ctx0, kq_all, n_hp_total, kq_all->ne[1], kq_all->ne[2], kq_all->ne[3],
+                                           kq_all->nb[1], kq_all->nb[2], kq_all->nb[3],
+                                           n_kv * ggml_type_size(kq_all->type));
+
+        const bool v_lp_trans = v->nb[1] > v->nb[2];
+        ggml_tensor * v_lp_p = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (!v_lp_trans) {
+            if (ggml_is_quantized(v->type)) {
+                v_lp_p = ggml_cast(ctx0, v_lp_p, GGML_TYPE_F32);
+            }
+            v_lp_p = ggml_cont(ctx0, ggml_transpose(ctx0, v_lp_p));
+        }
+        ggml_tensor * vkq_lp = ggml_mul_mat(ctx0, v_lp_p, w_lp);
+
+        ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+        v_hp_p = ggml_cont(ctx0, ggml_transpose(ctx0, v_hp_p));
+        ggml_tensor * w_hp_cont = ggml_cont(ctx0, w_hp);
+        ggml_tensor * vkq_hp = ggml_mul_mat(ctx0, v_hp_p, w_hp_cont);
+
+        ggml_tensor * kqv = ggml_add(ctx0, vkq_lp, vkq_hp);
+        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -2652,6 +2740,24 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+
+    // HP sink+recent buffers, per sub-cache (base + swa)
+    if (mctx_cur->get_base()->has_hp()) {
+        inp->hp_k_idxs     = mctx_cur->get_base()->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs = mctx_cur->get_base()->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask    = mctx_cur->get_base()->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask) {
+            inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
+        }
+    }
+    if (mctx_cur->get_swa()->has_hp()) {
+        inp->hp_k_idxs_swa     = mctx_cur->get_swa()->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs_swa = mctx_cur->get_swa()->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask_swa    = mctx_cur->get_swa()->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask_swa) {
+            inp->hp_kq_mask_swa_cnv = ggml_cast(ctx0, inp->hp_kq_mask_swa, GGML_TYPE_F16);
+        }
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

@@ -402,6 +402,16 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    // HP (high-precision) sink+recent buffer inputs — null when HP disabled (per sub-cache)
+    ggml_tensor * hp_k_idxs          = nullptr;
+    ggml_tensor * hp_batch_idxs      = nullptr;
+    ggml_tensor * hp_kq_mask         = nullptr;
+    ggml_tensor * hp_kq_mask_cnv     = nullptr;
+    ggml_tensor * hp_k_idxs_swa      = nullptr;
+    ggml_tensor * hp_batch_idxs_swa  = nullptr;
+    ggml_tensor * hp_kq_mask_swa     = nullptr;
+    ggml_tensor * hp_kq_mask_swa_cnv = nullptr;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 

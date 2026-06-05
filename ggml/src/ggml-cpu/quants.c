@@ -127,7 +127,7 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 // Lloyd-Max 4-level centroids for N(0,σ): multiply by per-block sigma at runtime.
 static const float Q2_LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
 // Decision thresholds (×σ): -0.6745, 0, +0.6745
-#define Q2_0_HAD_SIZE 128
+#define Q2_0_HAD_SIZE 512  // array cap (max head_dim); runtime width = q2_0_had_size()
 
 // Full-head OWHT with optional AVX2 acceleration for stages h≥8.
 // Scalar for h=1,2,4 (intra-group shuffles needed); AVX2 for h≥8 (pure add/sub).
@@ -147,37 +147,10 @@ static void q2_0_hadamard_scalar(float * GGML_RESTRICT x, int n) {
 }
 
 static void q2_0_hadamard(float * GGML_RESTRICT x, int n) {
-    // Scalar butterfly stages for h = 1, 2, 4
-    for (int h = 1; h <= 4; h <<= 1) {
-        for (int i = 0; i < n; i += h << 1) {
-            for (int j = i; j < i + h; j++) {
-                const float a = x[j], b = x[j + h];
-                x[j]     = a + b;
-                x[j + h] = a - b;
-            }
-        }
-    }
-#if defined(__AVX2__)
-    // AVX2 butterfly stages for h = 8, 16, 32, 64, ...
-    for (int h = 8; h < n; h <<= 1) {
-        for (int i = 0; i < n; i += h << 1) {
-            for (int j = i; j < i + h; j += 8) {
-                __m256 va = _mm256_loadu_ps(x + j);
-                __m256 vb = _mm256_loadu_ps(x + j + h);
-                _mm256_storeu_ps(x + j,     _mm256_add_ps(va, vb));
-                _mm256_storeu_ps(x + j + h, _mm256_sub_ps(va, vb));
-            }
-        }
-    }
-    // AVX2 normalization
-    const float scale = 1.0f / sqrtf((float)n);
-    __m256 vs = _mm256_set1_ps(scale);
-    for (int i = 0; i < n; i += 8) {
-        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vs));
-    }
-#else
-    // Scalar stages h ≥ 8
-    for (int h = 8; h < n; h <<= 1) {
+    // Must be byte-identical to ortho_hadamard_f32 (quant side) so the OWHT round-trip
+    // is exact. The AVX2 butterfly diverged at n=512 (Gemma head_dim) — garbled output;
+    // use the plain scalar transform for correctness across head_dim {128, 256, 512}.
+    for (int h = 1; h < n; h <<= 1) {
         for (int i = 0; i < n; i += h << 1) {
             for (int j = i; j < i + h; j++) {
                 const float a = x[j], b = x[j + h];
@@ -188,7 +161,6 @@ static void q2_0_hadamard(float * GGML_RESTRICT x, int n) {
     }
     const float scale = 1.0f / sqrtf((float)n);
     for (int i = 0; i < n; i++) x[i] *= scale;
-#endif
 }
 
 // Skip the in-vec_dot OWHT when the calibrated OSCAR rotation is applied in-graph
@@ -202,6 +174,18 @@ static int q2_0_skip_hadamard(void) {
     return v;
 }
 
+// Full-head OWHT width = head_dim (128 Qwen3, 256 Gemma) from LLAMA_KV_HAD_SIZE.
+static int q2_0_had_size(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * e = getenv("LLAMA_KV_HAD_SIZE");
+        s = e ? atoi(e) : 128;
+        if (s < QK2_0)         s = QK2_0;
+        if (s > Q2_0_HAD_SIZE) s = Q2_0_HAD_SIZE;
+    }
+    return s;
+}
+
 void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK2_0 == 0);
     assert(nrc == 1);
@@ -211,7 +195,8 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     const block_q8_0 * GGML_RESTRICT y = vy;
 
     // Process blocks in groups of (Q2_0_HAD_SIZE/QK2_0) for the full-head OWHT.
-    const int had_nb = (n >= Q2_0_HAD_SIZE) ? (Q2_0_HAD_SIZE / QK2_0) : 1;
+    const int hs = q2_0_had_size();
+    const int had_nb = (n >= hs) ? (hs / QK2_0) : 1;
 
     float sumf = 0.0f;
     float k_buf[Q2_0_HAD_SIZE];

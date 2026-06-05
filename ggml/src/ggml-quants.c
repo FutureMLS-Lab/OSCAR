@@ -65,10 +65,11 @@ static inline uint8_t lm_quantize(float v, float inv_sigma) {
     return 3;
 }
 
-// Full head-vector OWHT size: apply Hadamard to the entire head dimension
-// (128 for Qwen3-4B) so outliers spread across all dims before per-block
-// Lloyd-Max quantization. Falls back to QK2_0=32 if k < HAD_SIZE.
-#define Q2_0_HAD_SIZE 128
+// Full head-vector OWHT: apply Hadamard over the entire head dimension so outliers
+// spread across all dims before per-block Lloyd-Max quant. Q2_0_HAD_SIZE is the array
+// cap (max supported head_dim); the actual OWHT width is q2_0_had_size() = head_dim at
+// runtime (128 Qwen3, 512 Gemma4) via LLAMA_KV_HAD_SIZE. Falls back to QK2_0=32 if k < width.
+#define Q2_0_HAD_SIZE 512
 
 // OSCAR outlier clip: clamp each rotated head-vector to the clip_ratio percentile
 // of |value| (matches sglang SGLANG_OSCAR_*_CLIP_RATIO; K=0.96, V=0.92). One shared
@@ -99,6 +100,19 @@ static int q2_0_skip_hadamard(void) {
     return v;
 }
 
+// Full-head OWHT width = head_dim (128 Qwen3, 256 Gemma). From LLAMA_KV_HAD_SIZE
+// (default 128), clamped to [QK2_0, Q2_0_HAD_SIZE].
+static int q2_0_had_size(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * e = getenv("LLAMA_KV_HAD_SIZE");
+        s = e ? atoi(e) : 128;
+        if (s < (int) QK2_0)   s = (int) QK2_0;
+        if (s > Q2_0_HAD_SIZE) s = Q2_0_HAD_SIZE;
+    }
+    return s;
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK2_0 == 0);
@@ -106,7 +120,7 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
 
     // Process in groups of (HAD_SIZE/QK2_0) blocks, each group gets a joint OWHT.
     // For k < Q2_0_HAD_SIZE, fall back to per-block (32-dim) OWHT.
-    const int had_n   = (k >= Q2_0_HAD_SIZE) ? Q2_0_HAD_SIZE : QK2_0;
+    const int had_n   = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
     const int had_nb  = had_n / QK2_0;  // blocks per Hadamard group
 
     float tmp[Q2_0_HAD_SIZE];
@@ -516,7 +530,7 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
     assert(k % QK2_0 == 0);
     const int nb = k / QK2_0;
 
-    const int had_n  = (k >= Q2_0_HAD_SIZE) ? Q2_0_HAD_SIZE : QK2_0;
+    const int had_n  = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
     const int had_nb = had_n / QK2_0;
 
     float tmp[Q2_0_HAD_SIZE];
