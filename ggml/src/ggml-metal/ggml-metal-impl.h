@@ -429,6 +429,57 @@ typedef struct {
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
+// OSCAR fused mixed-precision (two-tier KV) flash-decoding kernel args.
+// LP tier = src[1]/src[2]/src[3] (e.g. Q2_0 history), HP tier = src[5]/src[6]/src[7] (F16 sink+recent).
+typedef struct {
+    int32_t  ne01;     // q: n_tok (per stream)
+    int32_t  ne02;     // q: n_head
+    int32_t  ne03;     // q: n_stream
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    // LP tier (K=src1, V=src2, mask=src3)
+    int32_t  ne11;     // LP n_kv
+    int32_t  ne_12_2;  // n_head_kv (K/V same)
+    int32_t  ne_12_3;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne32;     // LP mask ne2
+    int32_t  ne33;     // LP mask ne3
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    // HP tier (K=src5, V=src6, mask=src7)
+    int32_t  neh11;    // HP n_kv
+    int32_t  neh_12_2;
+    int32_t  neh_12_3;
+    uint64_t nbh11;
+    uint64_t nbh12;
+    uint64_t nbh13;
+    uint64_t nbh21;
+    uint64_t nbh22;
+    uint64_t nbh23;
+    int32_t  neh32;    // HP mask ne2
+    int32_t  neh33;    // HP mask ne3
+    uint64_t nbh31;
+    uint64_t nbh32;
+    uint64_t nbh33;
+    // dst dims (permuted FA output: [DV, n_head, n_tok, n_stream])
+    int32_t  ne1;      // dst n_head
+    int32_t  ne2;      // dst n_tok
+    int32_t  ne3;      // dst n_stream
+    float    scale;
+    float    max_bias;
+    float    m0;
+    float    m1;
+    int32_t  n_head_log2;
+    float    logit_softcap;
+} ggml_metal_kargs_flash_attn_mixed;
+
 typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;

@@ -2307,7 +2307,37 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur;
 
-    if (mctx_cur->has_hp() && inp->hp_kq_mask) {
+    // OSCAR fused mixed-precision flash attention: fold the LP (Q2_0 history) and
+    // HP (F16 sink+recent) tiers into one joint online-softmax FA op. Avoids the
+    // explicit-mul_mat path's score materialization and per-step V re-cast.
+    // Gated by LLAMA_KV_FUSED_FA; requires -fa on (F16 masks) and non-transposed V.
+    // decode-only: the fused Metal kernel is specialized for one token per stream.
+    const bool use_fused_fa = (getenv("LLAMA_KV_FUSED_FA") != nullptr) &&
+                              cparams.flash_attn && (v->nb[1] <= v->nb[2]) &&
+                              (q->ne[2] / k->ne[3] == 1);
+
+    if (mctx_cur->has_hp() && inp->hp_kq_mask && use_fused_fa) {
+        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+
+        const int64_t n_stream = k->ne[3];
+
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+
+        // permute(0,2,1,3) into FA layout [head_dim, n_kv, n_head_kv, n_stream]; V stays
+        // native (no transpose/cont) - the fused kernel accumulates V in place.
+        ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
+        ggml_tensor * v_lp_p = ggml_permute(ctx0, v,    0, 2, 1, 3);
+        ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+        ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+
+        cur = ggml_flash_attn_ext_mixed(ctx0, q_perm, k_lp_p, v_lp_p, inp->self_kq_mask_cnv,
+                                        k_hp_p, v_hp_p, inp->hp_kq_mask_cnv,
+                                        kq_scale, hparams.f_max_alibi_bias, 0.0f);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else if (mctx_cur->has_hp() && inp->hp_kq_mask) {
         // Exact LP+HP attention via concatenated softmax (non-FA path):
         //   LP tokens (middle, Q2_0 KV) and HP tokens (sink+recent, F16 KV) are handled
         //   by computing their attention scores separately, concatenating along the KV

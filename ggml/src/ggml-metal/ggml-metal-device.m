@@ -1192,6 +1192,34 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
+            // OSCAR fused mixed-precision (two-tier KV) flash decoding
+            if (((const int32_t *) op->op_params)[4] == 1) {
+                // specialized kernel: head dim 128, LP=Q2_0, HP=F16, F16 masks
+                if (op->src[0]->ne[0] != 128 || op->src[2]->ne[0] != 128) {
+                    return false;
+                }
+                if (op->src[1]->type != GGML_TYPE_Q2_0 || op->src[2]->type != GGML_TYPE_Q2_0) {
+                    return false;
+                }
+                if (!op->src[5] || !op->src[6] ||
+                    op->src[5]->type != GGML_TYPE_F16 || op->src[6]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (op->src[7] && op->src[7]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                {
+                    // OSCAR calibrated-rotation path only (per-block q2_0 decode is exact)
+                    const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+                    if (!(e && atoi(e))) {
+                        return false;
+                    }
+                }
+                return has_simdgroup_reduction;
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&

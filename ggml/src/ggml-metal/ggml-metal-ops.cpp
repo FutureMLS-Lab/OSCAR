@@ -2686,6 +2686,102 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    // OSCAR fused mixed-precision (two-tier KV) flash decoding
+    if (((const int32_t *) op->op_params)[4] == 1) {
+        { static bool once = false; if (!once) { once = true; fprintf(stderr, "[OSCAR] fused INT2 mixed-FA kernel ACTIVE on METAL (q2_0 LP + f16 HP)\n"); } }
+        ggml_tensor * q       = op->src[0];
+        ggml_tensor * k_lp    = op->src[1];
+        ggml_tensor * v_lp    = op->src[2];
+        ggml_tensor * mask_lp = op->src[3];
+        ggml_tensor * k_hp    = op->src[5];
+        ggml_tensor * v_hp    = op->src[6];
+        ggml_tensor * mask_hp = op->src[7];
+
+        GGML_ASSERT(q->type == GGML_TYPE_F32);
+        GGML_ASSERT(k_lp->type == GGML_TYPE_Q2_0 && v_lp->type == GGML_TYPE_Q2_0);
+        GGML_ASSERT(k_hp->type == GGML_TYPE_F16  && v_hp->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask_lp && mask_lp->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask_hp && mask_hp->type == GGML_TYPE_F16);
+        GGML_ASSERT(q->ne[0] == 128 && v_lp->ne[0] == 128);
+
+        float scale, max_bias, logit_softcap;
+        memcpy(&scale,         ((const int32_t *) op->op_params) + 0, sizeof(scale));
+        memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(max_bias));
+        memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(logit_softcap));
+
+        const uint32_t n_head      = q->ne[2];
+        const  int32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
+        const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+        const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+        ggml_metal_kargs_flash_attn_mixed args = {
+            /*.ne01     =*/ (int32_t) q->ne[1],
+            /*.ne02     =*/ (int32_t) q->ne[2],
+            /*.ne03     =*/ (int32_t) q->ne[3],
+            /*.nb01     =*/ q->nb[1],
+            /*.nb02     =*/ q->nb[2],
+            /*.nb03     =*/ q->nb[3],
+            /*.ne11     =*/ (int32_t) k_lp->ne[1],
+            /*.ne_12_2  =*/ (int32_t) k_lp->ne[2],
+            /*.ne_12_3  =*/ (int32_t) k_lp->ne[3],
+            /*.nb11     =*/ k_lp->nb[1],
+            /*.nb12     =*/ k_lp->nb[2],
+            /*.nb13     =*/ k_lp->nb[3],
+            /*.nb21     =*/ v_lp->nb[1],
+            /*.nb22     =*/ v_lp->nb[2],
+            /*.nb23     =*/ v_lp->nb[3],
+            /*.ne32     =*/ (int32_t) mask_lp->ne[2],
+            /*.ne33     =*/ (int32_t) mask_lp->ne[3],
+            /*.nb31     =*/ mask_lp->nb[1],
+            /*.nb32     =*/ mask_lp->nb[2],
+            /*.nb33     =*/ mask_lp->nb[3],
+            /*.neh11    =*/ (int32_t) k_hp->ne[1],
+            /*.neh_12_2 =*/ (int32_t) k_hp->ne[2],
+            /*.neh_12_3 =*/ (int32_t) k_hp->ne[3],
+            /*.nbh11    =*/ k_hp->nb[1],
+            /*.nbh12    =*/ k_hp->nb[2],
+            /*.nbh13    =*/ k_hp->nb[3],
+            /*.nbh21    =*/ v_hp->nb[1],
+            /*.nbh22    =*/ v_hp->nb[2],
+            /*.nbh23    =*/ v_hp->nb[3],
+            /*.neh32    =*/ (int32_t) mask_hp->ne[2],
+            /*.neh33    =*/ (int32_t) mask_hp->ne[3],
+            /*.nbh31    =*/ mask_hp->nb[1],
+            /*.nbh32    =*/ mask_hp->nb[2],
+            /*.nbh33    =*/ mask_hp->nb[3],
+            /*.ne1      =*/ (int32_t) op->ne[1],
+            /*.ne2      =*/ (int32_t) op->ne[2],
+            /*.ne3      =*/ (int32_t) op->ne[3],
+            /*.scale         =*/ scale,
+            /*.max_bias      =*/ max_bias,
+            /*.m0            =*/ m0,
+            /*.m1            =*/ m1,
+            /*.n_head_log2   =*/ n_head_log2,
+            /*.logit_softcap =*/ logit_softcap,
+        };
+
+        auto pipeline = ggml_metal_library_compile_pipeline(lib,
+                "kernel_flash_attn_mixed_q2_0_f16", "kernel_flash_attn_mixed_q2_0_f16", nullptr);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),       1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k_lp),    2);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(v_lp),    3);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask_lp), 4);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k_hp),    5);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(v_hp),    6);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask_hp), 7);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),      8);
+
+        // FA_MIXED_NSG (32) simdgroups per threadgroup, one threadgroup per (query, head, stream)
+        ggml_metal_encoder_dispatch_threadgroups(enc,
+            (int) q->ne[1], (int) q->ne[2], (int) q->ne[3],
+            32*32, 1, 1);
+
+        return 1;
+    }
+
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
