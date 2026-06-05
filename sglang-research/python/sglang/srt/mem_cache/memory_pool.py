@@ -137,21 +137,30 @@ def load_oscar_rotations(
     path: str,
     layer_num: int,
     start_layer: int,
-    head_dim: int,
+    head_dim,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
+):
     """Load per-layer Oscar rotation matrices from ``path``.
 
     The checkpoint schema is the one produced by the offline Oscar pipeline::
 
         {"layers": {layer_id: {"rotation": Tensor[head_dim, head_dim]}, ...}}
 
-    Returns a stacked tensor of shape ``[layer_num, head_dim, head_dim]`` in
-    ``dtype`` on ``device``, indexed by local layer index
-    (``global_layer_id - start_layer``). Raises ``ValueError`` if any layer in
-    ``[start_layer, start_layer + layer_num)`` is missing or has mismatched
-    head_dim.
+    ``head_dim`` may be either a scalar (all layers share one head_dim — the
+    uniform-geometry case) or a per-local-layer list/sequence of length
+    ``layer_num`` (heterogeneous geometry, e.g. gemma4_unified with 256 on
+    sliding layers and 512 on full layers).
+
+    * Scalar ``head_dim``: returns a stacked tensor of shape
+      ``[layer_num, head_dim, head_dim]``.
+    * Per-layer ``head_dim``: returns a Python ``list`` of ``layer_num``
+      tensors, the i-th of shape ``[head_dim[i], head_dim[i]]``. (A single
+      stacked tensor can't hold ragged matrices.)
+
+    Indexed by local layer index (``global_layer_id - start_layer``). Raises
+    ``ValueError`` if any layer in ``[start_layer, start_layer + layer_num)``
+    is missing or has a mismatched head_dim.
     """
     state = torch.load(path, map_location="cpu")
     if "layers" not in state:
@@ -159,29 +168,46 @@ def load_oscar_rotations(
             f"Oscar rotation checkpoint at {path} missing 'layers' key"
         )
     layers = state["layers"]
-    out = torch.empty((layer_num, head_dim, head_dim), dtype=dtype)
+
+    per_layer = not isinstance(head_dim, int)
+    if per_layer:
+        head_dims = list(head_dim)
+        if len(head_dims) != layer_num:
+            raise ValueError(
+                f"per-layer head_dim list len {len(head_dims)} != layer_num {layer_num}"
+            )
+    else:
+        head_dims = [head_dim] * layer_num
+
+    mats = []
     for local in range(layer_num):
         global_lid = start_layer + local
+        hd = head_dims[local]
         if global_lid not in layers and str(global_lid) not in layers:
             raise ValueError(
                 f"Oscar rotation checkpoint at {path} missing layer {global_lid}"
             )
         ldata = layers.get(global_lid, layers.get(str(global_lid)))
         R = ldata["rotation"]
-        if R.shape != (head_dim, head_dim):
+        if R.shape != (hd, hd):
             raise ValueError(
                 f"Oscar rotation layer {global_lid} has shape {tuple(R.shape)}, "
-                f"expected ({head_dim}, {head_dim})"
+                f"expected ({hd}, {hd})"
             )
-        out[local] = R.to(dtype)
+        mats.append(R.to(dtype))
+
     logger.info(
-        "Loaded Oscar rotation from %s for layers [%d, %d) head_dim=%d dtype=%s",
+        "Loaded Oscar rotation from %s for layers [%d, %d) head_dim=%s dtype=%s",
         path,
         start_layer,
         start_layer + layer_num,
-        head_dim,
+        ("per-layer" if per_layer else head_dim),
         dtype,
     )
+
+    if per_layer:
+        return [m.to(device) for m in mats]
+    out = torch.stack(mats, dim=0)
     return out.to(device)
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):

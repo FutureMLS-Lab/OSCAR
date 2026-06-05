@@ -154,6 +154,7 @@ class UnifiedInt2HPKVPool(KVCache):
         kv_cache_quant_group_size: Optional[int] = None,
         scale_dtype: torch.dtype = torch.bfloat16,
         num_hp_prefix_slots: int = 0,
+        layer_groups: Optional[List[dict]] = None,
     ):
         assert dtype == "int2", (
             "UnifiedInt2HPKVPool supports only int2 quant tier; got %s" % dtype
@@ -181,6 +182,46 @@ class UnifiedInt2HPKVPool(KVCache):
         self.hp_prefix_tokens = int(hp_prefix_tokens)
         self.hp_recent_tokens = int(hp_recent_tokens)
         self.kv_cache_quant_group_size = kv_cache_quant_group_size
+
+        # --- Per-layer geometry (two-group / heterogeneous SWA support) ------
+        # Default (layer_groups is None): one uniform group over all layers,
+        # geometry == the scalar head_num/head_dim/v_head_dim above. This is
+        # the path taken by every existing OSCAR model (qwen3, minimax, glm),
+        # so their behavior is unchanged. When ``layer_groups`` is provided
+        # (gemma4_unified: full 1x512 + sliding 8x256), every layer carries its
+        # own (head_num, head_dim, v_head_dim) and the buffers/flush run per
+        # group. ``layer_groups`` entries hold *global* layer ids; we map them
+        # to local [0, layer_num) indices via ``start_layer``.
+        self._layer_groups = layer_groups
+        if layer_groups is None:
+            self._layer_head_num = [head_num] * self.layer_num
+            self._layer_head_dim = [self.head_dim] * self.layer_num
+            self._layer_v_head_dim = [self.v_head_dim] * self.layer_num
+            # local-index lists per group (single group = all layers)
+            self._group_local_layer_ids = [list(range(self.layer_num))]
+        else:
+            self._layer_head_num = [None] * self.layer_num
+            self._layer_head_dim = [None] * self.layer_num
+            self._layer_v_head_dim = [None] * self.layer_num
+            self._group_local_layer_ids = []
+            for g in layer_groups:
+                local_ids = []
+                for gid in g["layer_ids"]:
+                    local = gid - self.start_layer
+                    if not (0 <= local < self.layer_num):
+                        continue
+                    self._layer_head_num[local] = int(g["head_num"])
+                    self._layer_head_dim[local] = int(g["head_dim"])
+                    self._layer_v_head_dim[local] = int(g["v_head_dim"])
+                    local_ids.append(local)
+                self._group_local_layer_ids.append(local_ids)
+            missing = [i for i, h in enumerate(self._layer_head_num) if h is None]
+            if missing:
+                raise ValueError(
+                    f"UnifiedInt2HPKVPool: layer_groups did not cover local "
+                    f"layer indices {missing} (start_layer={self.start_layer}, "
+                    f"layer_num={self.layer_num})"
+                )
 
         self.N_H, self.N_Q = compute_page_geometry(hp_dtype)
         self.hp_recent_ring_size = compute_recent_ring_size(
@@ -223,19 +264,30 @@ class UnifiedInt2HPKVPool(KVCache):
         # ``wait_pending_forward`` inside the flush apply phase.
         self._pending_forward_done = None
 
-        # Grouping for quantization.
+        # Grouping for quantization. The scalar ``*_num_scale_groups`` reflect
+        # the primary (default-group) geometry; per-layer arrays carry the
+        # right grouping for every layer in the two-group case.
         self.k_quant_group_size, self.k_num_scale_groups = self._resolve_quant_grouping(
             self.head_dim, "K"
         )
         self.v_quant_group_size, self.v_num_scale_groups = self._resolve_quant_grouping(
             self.v_head_dim, "V"
         )
-        assert self.head_dim % 4 == 0, (
-            f"head_dim={self.head_dim} must be divisible by 4 for int2 packing"
-        )
-        assert self.v_head_dim % 4 == 0, (
-            f"v_head_dim={self.v_head_dim} must be divisible by 4 for int2 packing"
-        )
+        self._layer_k_num_scale_groups = []
+        self._layer_v_num_scale_groups = []
+        for li in range(self.layer_num):
+            hd = self._layer_head_dim[li]
+            vhd = self._layer_v_head_dim[li]
+            _, k_ng = self._resolve_quant_grouping(hd, "K")
+            _, v_ng = self._resolve_quant_grouping(vhd, "V")
+            self._layer_k_num_scale_groups.append(k_ng)
+            self._layer_v_num_scale_groups.append(v_ng)
+            assert hd % 4 == 0, (
+                f"head_dim={hd} (layer {li}) must be divisible by 4 for int2 packing"
+            )
+            assert vhd % 4 == 0, (
+                f"v_head_dim={vhd} (layer {li}) must be divisible by 4 for int2 packing"
+            )
 
         self._create_arenas()
 
@@ -243,6 +295,15 @@ class UnifiedInt2HPKVPool(KVCache):
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = None
         self.row_dim = self.head_num * self.head_dim  # for store_cache helpers
+        # Per-layer row_dim / same_kv_dim for the HP store helpers.
+        self._layer_row_dim = [
+            self._layer_head_num[li] * self._layer_head_dim[li]
+            for li in range(self.layer_num)
+        ]
+        self._layer_same_kv_dim = [
+            self._layer_head_dim[li] == self._layer_v_head_dim[li]
+            for li in range(self.layer_num)
+        ]
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
         # Oscar rotation + clip. Per-layer orthogonal matrices [head_dim,
@@ -253,19 +314,29 @@ class UnifiedInt2HPKVPool(KVCache):
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
-        self._R_k: torch.Tensor = load_oscar_rotations(
+        # Pass a scalar head_dim for uniform models (returns a stacked
+        # [L,hd,hd] tensor, indexable as ``self._R_k[idx]`` exactly as before)
+        # and a per-layer list for the two-group case (returns a list of
+        # per-layer matrices, also indexable as ``self._R_k[idx]``).
+        k_head_dim_arg = (
+            self._layer_head_dim if self._layer_groups is not None else self.head_dim
+        )
+        v_head_dim_arg = (
+            self._layer_v_head_dim if self._layer_groups is not None else self.v_head_dim
+        )
+        self._R_k = load_oscar_rotations(
             self._oscar_cfg.k_rotation_path,
             layer_num=self.layer_num,
             start_layer=self.start_layer,
-            head_dim=self.head_dim,
+            head_dim=k_head_dim_arg,
             device=torch.device(self.device),
             dtype=self.hp_dtype,
         )
-        self._R_v: torch.Tensor = load_oscar_rotations(
+        self._R_v = load_oscar_rotations(
             self._oscar_cfg.v_rotation_path,
             layer_num=self.layer_num,
             start_layer=self.start_layer,
-            head_dim=self.v_head_dim,
+            head_dim=v_head_dim_arg,
             device=torch.device(self.device),
             dtype=self.hp_dtype,
         )
@@ -282,13 +353,12 @@ class UnifiedInt2HPKVPool(KVCache):
         )
         self._finalize_allocation_log(hp_total_slots)
         hp_itemsize = torch.empty(0, dtype=self.hp_dtype).element_size()
-        hp_bytes = (
-            hp_total_slots
-            * self.layer_num
-            * self.head_num
-            * (self.head_dim + self.v_head_dim)
-            * hp_itemsize
+        per_layer_hp_elems = sum(
+            self._layer_head_num[li]
+            * (self._layer_head_dim[li] + self._layer_v_head_dim[li])
+            for li in range(self.layer_num)
         )
+        hp_bytes = hp_total_slots * per_layer_hp_elems * hp_itemsize
         logger.info(
             "UnifiedInt2HPKVPool: HP arena reserves %.2f GB "
             "(hp_prefix_pool_slots=%d, max_req_slots=%d, recent_ring=%d "
@@ -401,6 +471,7 @@ class UnifiedInt2HPKVPool(KVCache):
             self.num_hp_prefix_slots
             + self.max_req_slots * self.hp_recent_ring_size
         )
+        nq = self.num_quant_pages * self.N_Q
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -409,98 +480,131 @@ class UnifiedInt2HPKVPool(KVCache):
             ):
                 self.k_buffer = [
                     torch.zeros(
-                        (self.num_quant_pages * self.N_Q, self.head_num, self.head_dim // 4),
+                        (nq, self._layer_head_num[li], self._layer_head_dim[li] // 4),
                         dtype=torch.uint8,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for li in range(self.layer_num)
                 ]
                 self.v_buffer = [
                     torch.zeros(
-                        (self.num_quant_pages * self.N_Q, self.head_num, self.v_head_dim // 4),
+                        (nq, self._layer_head_num[li], self._layer_v_head_dim[li] // 4),
                         dtype=torch.uint8,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for li in range(self.layer_num)
                 ]
                 self.k_scales_zeros = [
                     torch.zeros(
-                        (self.num_quant_pages * self.N_Q, self.head_num, 2 * self.k_num_scale_groups),
+                        (nq, self._layer_head_num[li], 2 * self._layer_k_num_scale_groups[li]),
                         dtype=self.scale_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for li in range(self.layer_num)
                 ]
                 self.v_scales_zeros = [
                     torch.zeros(
-                        (self.num_quant_pages * self.N_Q, self.head_num, 2 * self.v_num_scale_groups),
+                        (nq, self._layer_head_num[li], 2 * self._layer_v_num_scale_groups[li]),
                         dtype=self.scale_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for li in range(self.layer_num)
                 ]
                 self.hp_k_buffer = [
                     torch.zeros(
-                        (hp_total_slots, self.head_num, self.head_dim),
+                        (hp_total_slots, self._layer_head_num[li], self._layer_head_dim[li]),
                         dtype=self.hp_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for li in range(self.layer_num)
                 ]
                 self.hp_v_buffer = [
                     torch.zeros(
-                        (hp_total_slots, self.head_num, self.v_head_dim),
+                        (hp_total_slots, self._layer_head_num[li], self._layer_v_head_dim[li]),
                         dtype=self.hp_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for li in range(self.layer_num)
                 ]
 
-        # Cached device pointer arrays for the fused decode-flush kernel. The
-        # flush kernel loops over layers inside the kernel, so it needs
-        # per-layer base pointers as an int64 GPU tensor. Strides are identical
-        # across layers (we enforce that below); the flush kernel reads the
-        # single set at launch time via tl.constexpr.
-        def _base_ptrs(tensors: List[torch.Tensor]) -> torch.Tensor:
+        # Per-group device pointer arrays + strides for the fused decode-flush
+        # kernel. The flush kernel loops over layers inside the kernel and
+        # requires *identical* strides across the layers it spans, so it must
+        # run once per uniform-geometry group. ``self._group_local_layer_ids``
+        # is ``[[0..L)]`` (single group) for uniform models — preserving the
+        # exact previous single-launch behavior — and one entry per geometry
+        # group otherwise.
+        def _base_ptrs(local_ids: List[int], tensors: List[torch.Tensor]) -> torch.Tensor:
             return torch.tensor(
-                [t.data_ptr() for t in tensors],
+                [tensors[i].data_ptr() for i in local_ids],
                 dtype=torch.int64,
                 device=self.device,
             )
 
-        self._flush_hp_k_ptrs = _base_ptrs(self.hp_k_buffer)
-        self._flush_hp_v_ptrs = _base_ptrs(self.hp_v_buffer)
-        self._flush_quant_k_ptrs = _base_ptrs(self.k_buffer)
-        self._flush_quant_v_ptrs = _base_ptrs(self.v_buffer)
-        self._flush_k_sz_ptrs = _base_ptrs(self.k_scales_zeros)
-        self._flush_v_sz_ptrs = _base_ptrs(self.v_scales_zeros)
-
-        # Strides (elements, not bytes) for each kind of buffer. The arenas are
-        # all contiguous, so every layer shares the same strides; assert to be
-        # safe.
         def _strides(t: torch.Tensor) -> tuple:
             return (int(t.stride(0)), int(t.stride(1)), int(t.stride(2)))
 
-        hp_k_stride = _strides(self.hp_k_buffer[0])
-        hp_v_stride = _strides(self.hp_v_buffer[0])
-        q_k_stride = _strides(self.k_buffer[0])
-        q_v_stride = _strides(self.v_buffer[0])
-        k_sz_stride = _strides(self.k_scales_zeros[0])
-        v_sz_stride = _strides(self.v_scales_zeros[0])
-        for l in range(self.layer_num):
-            assert _strides(self.hp_k_buffer[l]) == hp_k_stride
-            assert _strides(self.hp_v_buffer[l]) == hp_v_stride
-            assert _strides(self.k_buffer[l]) == q_k_stride
-            assert _strides(self.v_buffer[l]) == q_v_stride
-            assert _strides(self.k_scales_zeros[l]) == k_sz_stride
-            assert _strides(self.v_scales_zeros[l]) == v_sz_stride
+        self._flush_groups = []
+        for local_ids in self._group_local_layer_ids:
+            l0 = local_ids[0]
+            hp_k_stride = _strides(self.hp_k_buffer[l0])
+            hp_v_stride = _strides(self.hp_v_buffer[l0])
+            q_k_stride = _strides(self.k_buffer[l0])
+            q_v_stride = _strides(self.v_buffer[l0])
+            k_sz_stride = _strides(self.k_scales_zeros[l0])
+            v_sz_stride = _strides(self.v_scales_zeros[l0])
+            for l in local_ids:
+                assert _strides(self.hp_k_buffer[l]) == hp_k_stride
+                assert _strides(self.hp_v_buffer[l]) == hp_v_stride
+                assert _strides(self.k_buffer[l]) == q_k_stride
+                assert _strides(self.v_buffer[l]) == q_v_stride
+                assert _strides(self.k_scales_zeros[l]) == k_sz_stride
+                assert _strides(self.v_scales_zeros[l]) == v_sz_stride
+            self._flush_groups.append(
+                {
+                    "hp_k_ptrs": _base_ptrs(local_ids, self.hp_k_buffer),
+                    "hp_v_ptrs": _base_ptrs(local_ids, self.hp_v_buffer),
+                    "quant_k_ptrs": _base_ptrs(local_ids, self.k_buffer),
+                    "quant_v_ptrs": _base_ptrs(local_ids, self.v_buffer),
+                    "k_sz_ptrs": _base_ptrs(local_ids, self.k_scales_zeros),
+                    "v_sz_ptrs": _base_ptrs(local_ids, self.v_scales_zeros),
+                    "hp_k_stride": hp_k_stride,
+                    "hp_v_stride": hp_v_stride,
+                    "quant_k_stride": q_k_stride,
+                    "quant_v_stride": q_v_stride,
+                    "k_sz_stride": k_sz_stride,
+                    "v_sz_stride": v_sz_stride,
+                    "head_num": self._layer_head_num[l0],
+                    "head_dim": self._layer_head_dim[l0],
+                    "v_head_dim": self._layer_v_head_dim[l0],
+                    "k_num_scale_groups": self._layer_k_num_scale_groups[l0],
+                    "v_num_scale_groups": self._layer_v_num_scale_groups[l0],
+                    "num_layers": len(local_ids),
+                    "k_sample": self.k_buffer[l0],
+                    "v_sample": self.v_buffer[l0],
+                    "hp_k_sample": self.hp_k_buffer[l0],
+                    "hp_v_sample": self.hp_v_buffer[l0],
+                    "k_sz_sample": self.k_scales_zeros[l0],
+                    "v_sz_sample": self.v_scales_zeros[l0],
+                }
+            )
 
-        self._flush_hp_k_stride = hp_k_stride
-        self._flush_hp_v_stride = hp_v_stride
-        self._flush_quant_k_stride = q_k_stride
-        self._flush_quant_v_stride = q_v_stride
-        self._flush_k_sz_stride = k_sz_stride
-        self._flush_v_sz_stride = v_sz_stride
+        # Back-compat single-group flush metadata (used by the existing
+        # common.py flush call for uniform models; the two-group path iterates
+        # ``self._flush_groups`` instead).
+        g0 = self._flush_groups[0]
+        self._flush_hp_k_ptrs = g0["hp_k_ptrs"]
+        self._flush_hp_v_ptrs = g0["hp_v_ptrs"]
+        self._flush_quant_k_ptrs = g0["quant_k_ptrs"]
+        self._flush_quant_v_ptrs = g0["quant_v_ptrs"]
+        self._flush_k_sz_ptrs = g0["k_sz_ptrs"]
+        self._flush_v_sz_ptrs = g0["v_sz_ptrs"]
+        self._flush_hp_k_stride = g0["hp_k_stride"]
+        self._flush_hp_v_stride = g0["hp_v_stride"]
+        self._flush_quant_k_stride = g0["quant_k_stride"]
+        self._flush_quant_v_stride = g0["quant_v_stride"]
+        self._flush_k_sz_stride = g0["k_sz_stride"]
+        self._flush_v_sz_stride = g0["v_sz_stride"]
 
     # -- KVCache interface -------------------------------------------------
 
@@ -515,6 +619,19 @@ class UnifiedInt2HPKVPool(KVCache):
 
     def _layer_index(self, layer_id: int) -> int:
         return layer_id - self.start_layer
+
+    # Per-layer geometry accessors. Equal to the scalar head_num/head_dim/
+    # v_head_dim for uniform models; per-layer for the two-group case. Callers
+    # that previously read ``kv_pool.head_dim`` directly on a per-layer basis
+    # (e.g. dequantize_prefix_kv) must use these.
+    def get_layer_head_num(self, layer_id: int) -> int:
+        return self._layer_head_num[self._layer_index(layer_id)]
+
+    def get_layer_head_dim(self, layer_id: int) -> int:
+        return self._layer_head_dim[self._layer_index(layer_id)]
+
+    def get_layer_v_head_dim(self, layer_id: int) -> int:
+        return self._layer_v_head_dim[self._layer_index(layer_id)]
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         # Triton backend asks for the quant view in the mixed path; HP view is
@@ -614,11 +731,11 @@ class UnifiedInt2HPKVPool(KVCache):
             self.hp_k_buffer[idx],
             self.hp_v_buffer[idx],
             hp_loc,
-            row_dim=self.row_dim,
+            row_dim=self._layer_row_dim[idx],
             store_dtype=self.hp_dtype,
             device_module=self.device_module,
             alt_stream=self.alt_stream,
-            same_kv_dim=self.same_kv_dim,
+            same_kv_dim=self._layer_same_kv_dim[idx],
         )
 
     def _set_quant_kv_buffer_extend(

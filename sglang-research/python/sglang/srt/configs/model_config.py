@@ -155,6 +155,7 @@ class ModelConfig:
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
+                "Gemma4UnifiedForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
@@ -373,7 +374,24 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
-        if self.is_hybrid_swa:
+        # gemma4_unified + OSCAR INT2 mixed-KV: serve the hybrid-SWA model
+        # through the *single* UnifiedInt2HPKVPool with two uniform geometry
+        # groups (full: 1x512, sliding: 8x256) sharing one head-dim-agnostic
+        # allocator, instead of the SWAKVPool. This forgoes only the
+        # sliding-window *memory* optimization; the per-layer sliding-window
+        # attention mask still applies (it comes from layer.sliding_window_size
+        # in the model, independent of the memory pool). Gated on
+        # SGLANG_ENABLE_MIXED_KV_WINDOWS so BF16 / non-OSCAR serving is
+        # byte-for-byte unchanged (keeps is_hybrid_swa -> SWAKVPool).
+        self.unified_two_group_kv = False
+        if (
+            "Gemma4UnifiedForConditionalGeneration" in self.hf_config.architectures
+            and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+        ):
+            self.is_hybrid_swa = False
+            self.unified_two_group_kv = True
+
+        if self.is_hybrid_swa or self.unified_two_group_kv:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
@@ -386,6 +404,7 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         ]
 
     def _derive_context_length(self, context_length: int):
@@ -1462,6 +1481,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1515,6 +1535,7 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "Gemma4UnifiedForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [

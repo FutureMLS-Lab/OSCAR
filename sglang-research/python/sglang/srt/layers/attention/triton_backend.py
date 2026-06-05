@@ -43,6 +43,7 @@ def _count_mixed_hp_lens_kernel(
     req_pool_indices_ptr,   # int64 [bs]
     seq_lens_ptr,           # int32 [bs]
     hp_lens_ptr,            # int32 [bs]
+    start_pos_ptr,          # int32 [bs] or None -- per-req scan start position
     rtt_stride_row,
     HP_OFFSET: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -52,16 +53,25 @@ def _count_mixed_hp_lens_kernel(
     This keeps the req-pool indirection fused with the tier classification so
     ``_build_mixed_kv_indices`` never has to materialize a gathered ``rows``
     tensor or per-token boolean masks. The quant tier length is derived from
-    ``seq_len - hp_len`` on the Python side.
+    ``(seq_len - start) - hp_len`` on the Python side.
+
+    ``start_pos_ptr`` (optional) restricts the scan to token positions
+    ``[start, seq_len)``. It is used by the sliding-window mixed-decode variant
+    to drop out-of-window tokens (both the prefix-sink HP tokens and the
+    out-of-window quant bulk); ``None`` => start at 0 (full context, unchanged
+    behavior for every existing caller / full-attention layer).
     """
     req = tl.program_id(0)
     req_pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
     seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
+    start = tl.zeros((), dtype=tl.int32)
+    if start_pos_ptr:
+        start = tl.load(start_pos_ptr + req).to(tl.int32)
 
     hp_count = tl.zeros((), dtype=tl.int32)
-    num_loops = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_loops = tl.cdiv(seq_len - start, BLOCK_SIZE)
     for i in range(num_loops):
-        offs = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs = start + i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         valid = offs < seq_len
         slot = tl.load(
             req_to_token_ptr + req_pool_idx * rtt_stride_row + offs.to(tl.int64),
@@ -82,34 +92,47 @@ def _scatter_mixed_kv_indices_kernel(
     quant_kv_indptr_ptr,    # int32 [bs + 1]   already cumsum'd
     hp_kv_indices_ptr,      # int64 [*] destination, pre-sized
     quant_kv_indices_ptr,   # int64 [*] destination, pre-sized
+    start_pos_ptr,          # int32 [bs] or None -- per-req scan start position
     rtt_stride_row,
     HP_OFFSET: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Slot-id-classified scatter into hp/quant index buffers, one block per req.
 
-    For each request i we walk ``req_to_token[req_pool_indices[i], 0..seq_len)``
+    For each request i we walk ``req_to_token[req_pool_indices[i], start..seq_len)``
     in ``BLOCK_SIZE`` chunks. Each lane decides whether its slot id is HP
     (``slot >= HP_OFFSET``) or quant, then contributes to within-block exclusive
     prefix sums that act as scatter offsets into the pre-cumsum'd
     ``hp_kv_indptr`` / ``quant_kv_indptr`` tier-local layout. No masked-select,
     no Python bs-loop, and no D2H sync: stride and offset arithmetic is all on
     device with shapes known statically.
+
+    ``start_pos_ptr`` (optional) restricts the scan to ``[start, seq_len)``;
+    ``None`` => start at 0 (full context, unchanged for every existing caller /
+    full-attention layer). The windowed sliding-decode variant passes
+    ``start = max(0, seq_len - window)`` so out-of-window positions (the prefix
+    sink + the out-of-window quant bulk) are never emitted. Because the scan is
+    monotone in position and quant entries are stored in scan order, the emitted
+    quant indices for a sliding layer are exactly the in-window quant bulk in
+    ascending position order.
     """
     req = tl.program_id(0)
     req_pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
     seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
     hp_base = tl.load(hp_kv_indptr_ptr + req).to(tl.int64)
     quant_base = tl.load(quant_kv_indptr_ptr + req).to(tl.int64)
+    start = tl.zeros((), dtype=tl.int32)
+    if start_pos_ptr:
+        start = tl.load(start_pos_ptr + req).to(tl.int32)
 
     # Running counters for the chunked scatter. Triton tracks these as scalar
     # SSA values that accumulate across the Python-side for loop below.
     hp_running = tl.zeros((), dtype=tl.int32)
     quant_running = tl.zeros((), dtype=tl.int32)
 
-    num_loops = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_loops = tl.cdiv(seq_len - start, BLOCK_SIZE)
     for i in range(num_loops):
-        offs = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs = start + i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         valid = offs < seq_len
         slot = tl.load(
             req_to_token_ptr + req_pool_idx * rtt_stride_row + offs.to(tl.int64),
@@ -186,9 +209,27 @@ class ForwardMetadata:
     # launch.
     mixed_attn_logits: Optional[torch.Tensor] = None
     mixed_attn_lse: Optional[torch.Tensor] = None
+    # SWA-geometry mixed scratch (gemma4_unified two-group). The mixed-decode
+    # stage-2 derives the LSE stride via ``// Lv`` from the logits buffer, so
+    # the scratch width must equal the layer's v_head_dim. Sliding layers
+    # (v_head_dim 256) need their own scratch separate from the full-layer
+    # scratch (v_head_dim 512); selected per-layer in forward_decode.
+    mixed_swa_attn_logits: Optional[torch.Tensor] = None
+    mixed_swa_attn_lse: Optional[torch.Tensor] = None
     # Per-tier split counts populated by get_num_kv_splits_triton.
     mixed_hp_num_kv_splits: Optional[torch.Tensor] = None
     mixed_quant_num_kv_splits: Optional[torch.Tensor] = None
+    # Sliding-window mixed-decode indices (gemma4_unified two-group). For
+    # SLIDING layers the quant bulk and HP tier are capped to the last
+    # ``sliding_window`` tokens: the prefix-sink HP tokens and the out-of-window
+    # quant bulk are dropped. Built only when the backend has a sliding window
+    # AND the mixed pool is active; full-attention layers keep the unwindowed
+    # ``mixed_{hp,quant}_kv_*`` above. ``forward_decode`` selects per layer on
+    # ``layer.sliding_window_size``.
+    mixed_swa_hp_kv_indptr: Optional[torch.Tensor] = None
+    mixed_swa_hp_kv_indices: Optional[torch.Tensor] = None
+    mixed_swa_quant_kv_indptr: Optional[torch.Tensor] = None
+    mixed_swa_quant_kv_indices: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -267,12 +308,20 @@ class TritonAttnBackend(AttentionBackend):
             )
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
+        # ``mixed_kv_enabled()`` is True only for ``UnifiedInt2HPKVPool``
+        # (SWAKVPool / MHA pools lack the method), so this gate already
+        # excludes the plain hybrid-SWA path. The unified pool can now span
+        # heterogeneous SWA geometry (gemma4_unified two-group), in which case
+        # ``sliding_window_size`` / ``swa_v_head_dim`` are set on the backend
+        # but the pool is still the unified mixed pool. The mixed-KV decode
+        # reads the full context (there is no windowed mixed-decode variant),
+        # so for the two-group case sliding layers attend over the full
+        # sequence in *decode*; the sliding-window mask still applies in
+        # prefill (extend uses layer.sliding_window_size).
         self.enable_mixed_kv = (
             getattr(model_runner.token_to_kv_pool, "mixed_kv_enabled", None) is not None
             and model_runner.token_to_kv_pool.mixed_kv_enabled()
             and not self.use_mla
-            and self.sliding_window_size is None
-            and self.swa_v_head_dim is None
         )
         self.mixed_hp_prefix_tokens = (
             model_runner.token_to_kv_pool.hp_prefix_tokens
@@ -448,9 +497,18 @@ class TritonAttnBackend(AttentionBackend):
         quant_kv_indptr: torch.Tensor,
         quant_kv_indices: torch.Tensor,
         bs: int,
+        start_pos: Optional[torch.Tensor] = None,
     ):
         """Classify each token's slot id as HP vs quant and scatter into the
         caller-provided per-tier index buffers.
+
+        ``start_pos`` (optional, int32 ``[bs]``): per-request scan start
+        position. When ``None`` the scan covers the full ``[0, seq_len)`` range
+        (every existing caller / full-attention layer -- unchanged). When given
+        (sliding-window mixed-decode variant) the scan covers
+        ``[start_pos, seq_len)`` so out-of-window positions (the prefix-sink HP
+        tokens and the out-of-window quant bulk) are dropped before they reach
+        the per-tier kernels.
 
         Sync-free on the decode hot path. Previously this routine ran a
         ``for i in range(bs)`` Python loop with ``rows[hp_mask[i]]``
@@ -477,6 +535,13 @@ class TritonAttnBackend(AttentionBackend):
         # Cast seq_lens to int32 once; both mixed-KV Triton kernels want
         # int32. Keeps the conversion off the hot path's per-step alloc trail.
         seq_lens_i32 = seq_lens.to(torch.int32)
+        if start_pos is not None:
+            start_pos = start_pos[:bs].to(torch.int32)
+            # Per-request scanned length = seq_len - start (windowed). Clamp at 0
+            # for safety though start is always <= seq_len by construction.
+            scanned_lens_i32 = torch.clamp(seq_lens_i32 - start_pos, min=0)
+        else:
+            scanned_lens_i32 = seq_lens_i32
         hp_lens = torch.empty_like(seq_lens_i32)
         # Count directly from ``req_to_token`` so the hot path no longer
         # materializes a dense gathered ``rows`` tensor or boolean masks.
@@ -485,6 +550,7 @@ class TritonAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens_i32,
             hp_lens,
+            start_pos,
             self.req_to_token.stride(0),
             HP_OFFSET=int(self.mixed_hp_global_offset),
             BLOCK_SIZE=512,
@@ -497,9 +563,10 @@ class TritonAttnBackend(AttentionBackend):
         # ``[0]`` element stays at zero from the buffer's ``torch.zeros``
         # allocation; assigning a Python scalar there would force a sync H2D
         # copy that blocks the CPU on prior decode work, recreating the
-        # ~1.5 ms inter-step bubble.
+        # ~1.5 ms inter-step bubble. The quant length is derived from the
+        # *scanned* (windowed) length minus the HP prefix sum.
         hp_kv_indptr[1 : bs + 1] = torch.cumsum(hp_lens, dim=0)
-        quant_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
+        quant_kv_indptr[1 : bs + 1] = torch.cumsum(scanned_lens_i32, dim=0)
         quant_kv_indptr[1 : bs + 1] -= hp_kv_indptr[1 : bs + 1]
 
         # Single triton launch scatters the tier-classified slot ids directly
@@ -515,6 +582,7 @@ class TritonAttnBackend(AttentionBackend):
             quant_kv_indptr,
             hp_kv_indices,
             quant_kv_indices,
+            start_pos,
             self.req_to_token.stride(0),
             HP_OFFSET=int(self.mixed_hp_global_offset),
             BLOCK_SIZE=512,
@@ -597,22 +665,111 @@ class TritonAttnBackend(AttentionBackend):
             torch.tensor(unified_k_lens, dtype=torch.int32, device=self.device), dim=0
         )
 
-        result = flash_attn_varlen_func(
-            q=q3,
-            k=unified_k,
-            v=unified_v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max(forward_batch.extend_seq_lens_cpu),
-            max_seqlen_k=max(unified_k_lens) if unified_k_lens else 0,
-            softmax_scale=layer.scaling,
-            causal=causal,
-            window_size=(-1, -1),
-            softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
-        )
+        # Sliding-window layers (gemma4_unified two-group): the prefix here is
+        # the *full* dequantized context, so we let flash_attn apply the
+        # sliding-window mask via window_size=(w-1, 0). Full-attention layers
+        # keep the unbounded (-1, -1) window. This makes int2 prefill match the
+        # model's per-layer attention span.
+        if layer.sliding_window_size is not None and layer.sliding_window_size > 0:
+            window_size = (layer.sliding_window_size - 1, 0)
+        else:
+            window_size = (-1, -1)
+
+        head_dim = q3.shape[-1]
+        if head_dim > 256:
+            # FlashAttention (FA2/FA3) caps head_dim at 256; gemma4_unified's
+            # full-attention layers are head_dim 512. Fall back to a per-request
+            # SDPA pass on the already-dequantized dense K/V (handles arbitrary
+            # head_dim, causal + sliding window via an additive mask, and MQA/GQA
+            # via enable_gqa). gemma sets attention logit_cap=0, so SDPA (no
+            # softcap) is equivalent.
+            result = self._sdpa_varlen_prefill(
+                q3,
+                unified_k_parts,
+                unified_v_parts,
+                cu_seqlens_q,
+                forward_batch.extend_seq_lens_cpu,
+                unified_k_lens,
+                layer.scaling,
+                causal,
+                window_size[0] if window_size[0] >= 0 else -1,
+            )
+        else:
+            result = flash_attn_varlen_func(
+                q=q3,
+                k=unified_k,
+                v=unified_v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max(forward_batch.extend_seq_lens_cpu),
+                max_seqlen_k=max(unified_k_lens) if unified_k_lens else 0,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
+            )
         result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
         o.copy_(result.view_as(o))
         return o
+
+    def _sdpa_varlen_prefill(
+        self,
+        q3: torch.Tensor,                  # [total_q, num_q_heads, head_dim]
+        k_parts: list,                     # per-req [k_len_i, num_kv_heads, head_dim]
+        v_parts: list,                     # per-req [k_len_i, num_kv_heads, v_head_dim]
+        cu_seqlens_q: torch.Tensor,        # int32 [bs+1]
+        extend_seq_lens_cpu,               # list[int] per req (query lengths)
+        k_lens: list,                      # list[int] per req (full kv lengths)
+        sm_scale: float,
+        causal: bool,
+        sliding_window: int,               # >=0 window size (w-1 left); -1 disabled
+    ) -> torch.Tensor:
+        """Varlen prefill via per-request SDPA, for head_dim > 256 (FA caps at
+        256). Operates on the already-dequantized dense K/V. Builds an additive
+        mask combining causality + (optional) sliding window. MQA/GQA handled by
+        ``enable_gqa=True``. Returns ``[total_q, num_q_heads, v_head_dim]``.
+        """
+        num_q_heads = q3.shape[1]
+        v_head_dim = v_parts[0].shape[-1] if v_parts else q3.shape[-1]
+        out = q3.new_empty((q3.shape[0], num_q_heads, v_head_dim))
+        q_starts = cu_seqlens_q.tolist()
+        for i, q_len in enumerate(extend_seq_lens_cpu):
+            q_len = int(q_len)
+            if q_len == 0:
+                continue
+            k_len = int(k_lens[i])
+            qs = int(q_starts[i])
+            # [1, H, q_len, hd] / [1, Hkv, k_len, hd]
+            qi = q3[qs : qs + q_len].transpose(0, 1).unsqueeze(0)
+            ki = k_parts[i].transpose(0, 1).unsqueeze(0)
+            vi = v_parts[i].transpose(0, 1).unsqueeze(0)
+            # Query position p (0-based within request) corresponds to absolute
+            # key index (k_len - q_len + p), since the last q_len keys are the
+            # extend tokens and the leading (k_len - q_len) are the prefix.
+            q_abs = torch.arange(
+                k_len - q_len, k_len, device=q3.device
+            ).unsqueeze(1)  # [q_len, 1]
+            k_abs = torch.arange(k_len, device=q3.device).unsqueeze(0)  # [1, k_len]
+            allowed = torch.ones((q_len, k_len), dtype=torch.bool, device=q3.device)
+            if causal:
+                allowed &= k_abs <= q_abs
+            if sliding_window >= 0:
+                # window covers keys [q_abs - sliding_window, q_abs]
+                allowed &= k_abs >= (q_abs - sliding_window)
+            attn_mask = torch.zeros(
+                (q_len, k_len), dtype=qi.dtype, device=q3.device
+            )
+            attn_mask.masked_fill_(~allowed, float("-inf"))
+            oi = torch.nn.functional.scaled_dot_product_attention(
+                qi,
+                ki,
+                vi,
+                attn_mask=attn_mask,
+                scale=sm_scale,
+                enable_gqa=(num_q_heads != ki.shape[1]),
+            )
+            out[qs : qs + q_len] = oi.squeeze(0).transpose(0, 1)
+        return out
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -630,8 +787,14 @@ class TritonAttnBackend(AttentionBackend):
         mixed_quant_kv_indices = None
         mixed_attn_logits = None
         mixed_attn_lse = None
+        mixed_swa_attn_logits = None
+        mixed_swa_attn_lse = None
         mixed_hp_num_kv_splits = None
         mixed_quant_num_kv_splits = None
+        mixed_swa_hp_kv_indptr = None
+        mixed_swa_hp_kv_indices = None
+        mixed_swa_quant_kv_indptr = None
+        mixed_swa_quant_kv_indices = None
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -702,6 +865,19 @@ class TritonAttnBackend(AttentionBackend):
                         dtype=torch.float32,
                         device=self.device,
                     )
+                    # Separate SWA-geometry mixed scratch (sliding layers).
+                    if self.swa_v_head_dim is not None:
+                        mixed_swa_attn_logits = torch.empty(
+                            (bs, self.num_head, total_splits, self.swa_v_head_dim),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        mixed_swa_attn_lse = torch.full(
+                            (bs, self.num_head, total_splits),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
                     mixed_hp_num_kv_splits = torch.full(
                         (bs,), self.max_hp_kv_splits, dtype=torch.int32, device=self.device
                     )
@@ -717,6 +893,56 @@ class TritonAttnBackend(AttentionBackend):
                         mixed_quant_kv_indices,
                         bs,
                     )
+                    # Sliding-window mixed-decode indices (gemma4_unified
+                    # two-group). For SLIDING layers the HP+quant tiers must be
+                    # capped to the last ``sliding_window`` tokens; otherwise a
+                    # sliding layer would (wrongly) attend to the full prior
+                    # context in decode for seq_len > sliding_window. We scan
+                    # only positions [seq_len - window, seq_len): this drops the
+                    # out-of-window quant bulk AND the prefix-sink HP tokens
+                    # (which fall below the window once seq_len-window > sink).
+                    # ``window`` = sliding_window_size + 1 tokens to match the
+                    # validated prefill mask (key >= q_abs - (sliding_window_size)
+                    # in _sdpa_varlen_prefill / flash window_size=(w-1, 0)).
+                    if (
+                        self.sliding_window_size is not None
+                        and self.sliding_window_size > 0
+                    ):
+                        window_tokens = self.sliding_window_size + 1
+                        swa_start_pos = torch.clamp(
+                            forward_batch.seq_lens.to(torch.int32) - window_tokens,
+                            min=0,
+                        )
+                        mixed_swa_hp_kv_indptr = torch.zeros(
+                            (bs + 1,), dtype=torch.int32, device=self.device
+                        )
+                        mixed_swa_quant_kv_indptr = torch.zeros(
+                            (bs + 1,), dtype=torch.int32, device=self.device
+                        )
+                        # Windowed scan emits at most ``window_tokens`` indices
+                        # per request; the full-context buffers are an upper
+                        # bound, so reuse that size to avoid a sync on the
+                        # windowed total.
+                        mixed_swa_hp_kv_indices = torch.empty(
+                            forward_batch.seq_lens_sum,
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        mixed_swa_quant_kv_indices = torch.empty(
+                            forward_batch.seq_lens_sum,
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        self._build_mixed_kv_indices(
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens,
+                            mixed_swa_hp_kv_indptr,
+                            mixed_swa_hp_kv_indices,
+                            mixed_swa_quant_kv_indptr,
+                            mixed_swa_quant_kv_indices,
+                            bs,
+                            start_pos=swa_start_pos,
+                        )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -893,8 +1119,14 @@ class TritonAttnBackend(AttentionBackend):
             mixed_quant_kv_indices=mixed_quant_kv_indices,
             mixed_attn_logits=mixed_attn_logits,
             mixed_attn_lse=mixed_attn_lse,
+            mixed_swa_attn_logits=mixed_swa_attn_logits,
+            mixed_swa_attn_lse=mixed_swa_attn_lse,
             mixed_hp_num_kv_splits=mixed_hp_num_kv_splits,
             mixed_quant_num_kv_splits=mixed_quant_num_kv_splits,
+            mixed_swa_hp_kv_indptr=mixed_swa_hp_kv_indptr,
+            mixed_swa_hp_kv_indices=mixed_swa_hp_kv_indices,
+            mixed_swa_quant_kv_indptr=mixed_swa_quant_kv_indptr,
+            mixed_swa_quant_kv_indices=mixed_swa_quant_kv_indices,
         )
 
     def init_cuda_graph_state(
@@ -1036,6 +1268,8 @@ class TritonAttnBackend(AttentionBackend):
         mixed_quant_kv_indices = None
         mixed_attn_logits = None
         mixed_attn_lse = None
+        mixed_swa_attn_logits = None
+        mixed_swa_attn_lse = None
         mixed_hp_num_kv_splits = None
         mixed_quant_num_kv_splits = None
 
@@ -1208,6 +1442,8 @@ class TritonAttnBackend(AttentionBackend):
             mixed_quant_kv_indices=mixed_quant_kv_indices,
             mixed_attn_logits=mixed_attn_logits,
             mixed_attn_lse=mixed_attn_lse,
+            mixed_swa_attn_logits=mixed_swa_attn_logits,
+            mixed_swa_attn_lse=mixed_swa_attn_lse,
             mixed_hp_num_kv_splits=mixed_hp_num_kv_splits,
             mixed_quant_num_kv_splits=mixed_quant_num_kv_splits,
         )
@@ -1430,12 +1666,23 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets = None
 
         kv_pool = forward_batch.token_to_kv_pool
+        # Mixed two-group pool (gemma4_unified): sliding-window layers also
+        # store int2 KV, so they must take the int2 dense prefill path too.
+        # The sliding-window mask is then applied by flash_attn's window_size
+        # (see ``_forward_extend_quantized_dense``); the full prefix is
+        # dequantized and flash masks out-of-window keys. For non-mixed int2
+        # pools (uniform full-attention models) the original ``sliding_window
+        # < 0`` gate is unchanged (those never have sliding layers).
+        mixed_pool_active = (
+            getattr(kv_pool, "mixed_kv_enabled", None) is not None
+            and kv_pool.mixed_kv_enabled()
+        )
         use_quantized_dense_prefill = (
             hasattr(kv_pool, "dtype")
             and kv_pool.dtype == "int2"
-            and sliding_window_size < 0
+            and (sliding_window_size < 0 or mixed_pool_active)
             and self.forward_metadata.custom_mask is None
-            and window_kv_offsets is None
+            and (window_kv_offsets is None or mixed_pool_active)
         )
         pre_rotated_q = None
         pre_rotated_k = None
@@ -1460,6 +1707,67 @@ class TritonAttnBackend(AttentionBackend):
                     v.contiguous(),
                 )
             )
+
+        # OSCAR calibration dump: capture post-norm/post-RoPE Q/K/V for this chunk
+        # (prefill only, enabled via DUMP_KVCACHE=1). Per-layer shapes are preserved,
+        # so heterogeneous head_dim (sliding 256 / full 512) is handled naturally.
+        # Ported from the legacy dump fork so calibration can run in this (eval) fork.
+        if (
+            k is not None
+            and v is not None
+            and get_bool_env_var("DUMP_KVCACHE", "false")
+        ):
+            import os
+
+            if not hasattr(self, "_dump_saved_tokens"):
+                self._dump_saved_tokens = {}
+                self._dump_chunk_idx = {}
+                self._dump_kv_done_layers = set()
+            dump_layer_id = layer.layer_id
+            if dump_layer_id not in self._dump_kv_done_layers:
+                dump_tokens = get_int_env_var("DUMP_KVCACHE_TOKENS", 100)
+                saved_so_far = self._dump_saved_tokens.get(dump_layer_id, 0)
+                chunk_idx = self._dump_chunk_idx.get(dump_layer_id, 0)
+                remaining = dump_tokens - saved_so_far
+                if remaining > 0:
+                    if get_attention_tp_size() > 1:
+                        raise RuntimeError(
+                            "DUMP_KVCACHE supports TP=1 only (gemma4_unified dump)"
+                        )
+                    tokens_to_save = min(q.shape[0], remaining)
+                    torch.cuda.synchronize()
+                    q_dump = (
+                        q[:tokens_to_save]
+                        .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                        .contiguous()
+                        .detach()
+                    )
+                    k_dump = k[:tokens_to_save].contiguous().detach()
+                    v_dump = v[:tokens_to_save].contiguous().detach()
+                    chunk_seq_lens = []
+                    if forward_batch.extend_seq_lens is not None:
+                        remain = tokens_to_save
+                        for slen in forward_batch.extend_seq_lens.tolist():
+                            if remain <= 0:
+                                break
+                            take = min(slen, remain)
+                            chunk_seq_lens.append(take)
+                            remain -= take
+                    else:
+                        chunk_seq_lens = [tokens_to_save]
+                    chunk_seq_lens_t = torch.tensor(chunk_seq_lens, dtype=torch.int32)
+                    save_dir = os.environ.get("DUMP_KVCACHE_DIR", ".")
+                    for _name, _tensor in [("q", q_dump), ("k", k_dump), ("v", v_dump)]:
+                        chunk_dir = os.path.join(save_dir, f"layer_{dump_layer_id}", _name)
+                        os.makedirs(chunk_dir, exist_ok=True)
+                        torch.save(_tensor.cpu(), os.path.join(chunk_dir, f"{chunk_idx}.pt"))
+                    seq_dir = os.path.join(save_dir, f"layer_{dump_layer_id}", "seq_lens")
+                    os.makedirs(seq_dir, exist_ok=True)
+                    torch.save(chunk_seq_lens_t, os.path.join(seq_dir, f"{chunk_idx}.pt"))
+                    self._dump_saved_tokens[dump_layer_id] = saved_so_far + tokens_to_save
+                    self._dump_chunk_idx[dump_layer_id] = chunk_idx + 1
+                    if saved_so_far + tokens_to_save >= dump_tokens:
+                        self._dump_kv_done_layers.add(dump_layer_id)
 
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache and k is not None and v is not None:
@@ -1800,6 +2108,52 @@ class TritonAttnBackend(AttentionBackend):
                 q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
             if mixed_decode_enabled:
                 bs = q_for_decode.shape[0]
+                # Select the mixed scratch whose width matches this layer's
+                # v_head_dim. The unified stage-2 derives the LSE stride via
+                # ``// Lv`` from the logits buffer, so the scratch width MUST
+                # equal v_head_dim. Sliding layers (gemma4_unified two-group)
+                # use the SWA-sized scratch; full layers use the default one.
+                is_sliding_layer = (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > 0
+                )
+                if (
+                    self.forward_metadata.mixed_swa_attn_logits is not None
+                    and self.swa_v_head_dim is not None
+                    and layer.v_head_dim == self.swa_v_head_dim
+                ):
+                    mixed_logits = self.forward_metadata.mixed_swa_attn_logits[:bs]
+                    mixed_lse = self.forward_metadata.mixed_swa_attn_lse[:bs]
+                else:
+                    mixed_logits = self.forward_metadata.mixed_attn_logits[:bs]
+                    mixed_lse = self.forward_metadata.mixed_attn_lse[:bs]
+                # Sliding layers attend only to the last ``sliding_window``
+                # tokens in decode -- use the windowed HP+quant indices built in
+                # init_forward_metadata (drops the prefix-sink HP tokens and the
+                # out-of-window quant bulk). Full-attention layers (and any model
+                # without a sliding window) keep the full-context indices. The
+                # quant split count (sized from full seq_len) is a safe upper
+                # bound for the smaller windowed quant length: the int2 stage-1
+                # early-exits on empty splits.
+                if (
+                    is_sliding_layer
+                    and self.forward_metadata.mixed_swa_quant_kv_indptr is not None
+                ):
+                    decode_hp_kv_indptr = self.forward_metadata.mixed_swa_hp_kv_indptr
+                    decode_hp_kv_indices = self.forward_metadata.mixed_swa_hp_kv_indices
+                    decode_quant_kv_indptr = (
+                        self.forward_metadata.mixed_swa_quant_kv_indptr
+                    )
+                    decode_quant_kv_indices = (
+                        self.forward_metadata.mixed_swa_quant_kv_indices
+                    )
+                else:
+                    decode_hp_kv_indptr = self.forward_metadata.mixed_hp_kv_indptr
+                    decode_hp_kv_indices = self.forward_metadata.mixed_hp_kv_indices
+                    decode_quant_kv_indptr = self.forward_metadata.mixed_quant_kv_indptr
+                    decode_quant_kv_indices = (
+                        self.forward_metadata.mixed_quant_kv_indices
+                    )
                 self.decode_attention_fwd_int2_unified(
                     q_for_decode,
                     kv_pool.get_hp_key_buffer(layer.layer_id),
@@ -1809,12 +2163,12 @@ class TritonAttnBackend(AttentionBackend):
                     kv_pool.get_key_scales_zeros(layer.layer_id),
                     kv_pool.get_value_scales_zeros(layer.layer_id),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.forward_metadata.mixed_hp_kv_indptr,
-                    self.forward_metadata.mixed_hp_kv_indices,
-                    self.forward_metadata.mixed_quant_kv_indptr,
-                    self.forward_metadata.mixed_quant_kv_indices,
-                    self.forward_metadata.mixed_attn_logits[:bs],
-                    self.forward_metadata.mixed_attn_lse[:bs],
+                    decode_hp_kv_indptr,
+                    decode_hp_kv_indices,
+                    decode_quant_kv_indptr,
+                    decode_quant_kv_indices,
+                    mixed_logits,
+                    mixed_lse,
                     self.forward_metadata.mixed_hp_num_kv_splits[:bs],
                     self.forward_metadata.mixed_quant_num_kv_splits[:bs],
                     self.max_hp_kv_splits,

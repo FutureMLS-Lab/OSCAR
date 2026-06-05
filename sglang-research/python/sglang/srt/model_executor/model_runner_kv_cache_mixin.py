@@ -577,6 +577,42 @@ class ModelRunnerKVCacheMixin:
                         self.req_to_token_pool.size,
                         hp_prefix_pool,
                     )
+                    # Heterogeneous-SWA two-group geometry (gemma4_unified):
+                    # one UnifiedInt2HPKVPool storing buffers as TWO uniform
+                    # groups (full: 1x512 over the full-attention layers;
+                    # sliding: 8x256 over the rest), sharing one head-dim-
+                    # agnostic allocator. ``layer_groups`` holds global layer
+                    # ids; the pool maps them to local indices. None for every
+                    # other (uniform) OSCAR model -> unchanged single-group path.
+                    layer_groups = None
+                    if getattr(self.model_config, "unified_two_group_kv", False):
+                        tp = get_attention_tp_size()
+                        full_ids = list(self.model_config.full_attention_layer_ids)
+                        swa_ids = list(self.model_config.swa_attention_layer_ids)
+                        layer_groups = [
+                            {
+                                "head_num": self.model_config.get_num_kv_heads(tp),
+                                "head_dim": self.model_config.head_dim,
+                                "v_head_dim": self.model_config.v_head_dim,
+                                "layer_ids": full_ids,
+                            },
+                            {
+                                "head_num": self.model_config.get_swa_num_kv_heads(tp),
+                                "head_dim": self.model_config.swa_head_dim,
+                                "v_head_dim": self.model_config.swa_v_head_dim,
+                                "layer_ids": swa_ids,
+                            },
+                        ]
+                        logger.info(
+                            "Unified two-group KV (gemma4_unified): full=%d layers "
+                            "(%dx%d), sliding=%d layers (%dx%d)",
+                            len(full_ids),
+                            self.model_config.get_num_kv_heads(tp),
+                            self.model_config.head_dim,
+                            len(swa_ids),
+                            self.model_config.get_swa_num_kv_heads(tp),
+                            self.model_config.swa_head_dim,
+                        )
                     self.token_to_kv_pool = UnifiedInt2HPKVPool(
                         num_quant_pages=num_quant_pages,
                         num_hp_prefix_slots=hp_prefix_pool,
@@ -600,6 +636,7 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.kv_cache_quant_group_size
                         ),
                         scale_dtype=scale_dtype,
+                        layer_groups=layer_groups,
                     )
                 else:
                     # For int2 KV cache, scale/zero dtype is configurable via

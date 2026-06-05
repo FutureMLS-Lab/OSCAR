@@ -695,12 +695,18 @@ def gpu_flush_int2_apply(
     num_layers: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    apply_remap: bool = True,
 ) -> None:
     """Apply phase: run fused quant + remap kernels using a prepared plan.
 
     Must be issued *after* the schedule-stream wait on the previous forward —
     the remap kernel writes ``req_to_token`` at positions the previous
     forward's attention is concurrently reading.
+
+    ``apply_remap`` lets a multi-group caller (heterogeneous SWA geometry) run
+    the quant kernel once per uniform-geometry group while issuing the
+    geometry-independent ``req_to_token`` remap exactly once (on the final
+    group). Defaults to True so single-group callers are unchanged.
     """
     bs = plan.bs
     flush_interval = plan.flush_interval
@@ -784,18 +790,19 @@ def gpu_flush_int2_apply(
         num_stages=1,
     )
 
-    rtt_stride_row = int(req_to_token.stride(0))
-    _flush_remap_kernel[(bs, flush_interval)](
-        req_pool_indices,
-        plan.flush_pos,
-        plan.dst_quant_slots,
-        plan.valid_mask,
-        req_to_token,
-        rtt_stride_row,
-        FLUSH_INTERVAL=int(flush_interval),
-        num_warps=1,
-        num_stages=1,
-    )
+    if apply_remap:
+        rtt_stride_row = int(req_to_token.stride(0))
+        _flush_remap_kernel[(bs, flush_interval)](
+            req_pool_indices,
+            plan.flush_pos,
+            plan.dst_quant_slots,
+            plan.valid_mask,
+            req_to_token,
+            rtt_stride_row,
+            FLUSH_INTERVAL=int(flush_interval),
+            num_warps=1,
+            num_stages=1,
+        )
 
 
 def gpu_flush_int2(
