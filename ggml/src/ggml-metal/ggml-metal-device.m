@@ -1194,9 +1194,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_FLASH_ATTN_EXT:
             // OSCAR fused mixed-precision (two-tier KV) flash decoding
             if (((const int32_t *) op->op_params)[4] == 1) {
-                // specialized kernel: head dim 128, LP=Q2_0, HP=F16, F16 masks
-                if (op->src[0]->ne[0] != 128 || op->src[2]->ne[0] != 128) {
-                    return false;
+                // specialized kernel: head dim 128 (Qwen) or 256 (Gemma), LP=Q2_0, HP=F16, F16 masks
+                {
+                    const int64_t D = op->src[0]->ne[0];
+                    if ((D != 128 && D != 256 && D != 512) || op->src[2]->ne[0] != D) {
+                        return false;
+                    }
                 }
                 if (op->src[1]->type != GGML_TYPE_Q2_0 || op->src[2]->type != GGML_TYPE_Q2_0) {
                     return false;

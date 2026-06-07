@@ -2702,7 +2702,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         GGML_ASSERT(k_hp->type == GGML_TYPE_F16  && v_hp->type == GGML_TYPE_F16);
         GGML_ASSERT(mask_lp && mask_lp->type == GGML_TYPE_F16);
         GGML_ASSERT(mask_hp && mask_hp->type == GGML_TYPE_F16);
-        GGML_ASSERT(q->ne[0] == 128 && v_lp->ne[0] == 128);
+        const int64_t D = q->ne[0]; // head dim (128: Qwen; 256: Gemma SWA; 512: Gemma global)
+        GGML_ASSERT((D == 128 || D == 256 || D == 512) && v_lp->ne[0] == D);
 
         float scale, max_bias, logit_softcap;
         memcpy(&scale,         ((const int32_t *) op->op_params) + 0, sizeof(scale));
@@ -2760,8 +2761,67 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_compile_pipeline(lib,
-                "kernel_flash_attn_mixed_q2_0_f16", "kernel_flash_attn_mixed_q2_0_f16", nullptr);
+        // Decode (1 token/stream) uses the per-query kernel (NSG splits KV for latency
+        // hiding). Prefill (many tokens) uses the Q-tiling kernel: TQ queries per
+        // threadgroup, one simdgroup (NSG=1), K/V dequantized once and reused across
+        // the TQ queries -> amortizes the q2_0 dequant + memory traffic over the tile.
+        const int64_t n_tok = q->ne[1];
+
+        // Tiled simdgroup-matmul prefill kernel (dual-source, like f16 FA) — DEFAULT for
+        // prefill (~f16 parity). nsg=4 for d512 to fit the 32KB threadgroup-memory budget;
+        // nsg=8 otherwise. Set LLAMA_KV_PF_NOMM to fall back to the per-query kernel.
+        if (n_tok > 1 && getenv("LLAMA_KV_PF_NOMM") == nullptr) {
+            const char * kname = (D == 512) ? "kernel_flash_attn_mixed_mm_q2_0_f16_d512"
+                               : (D == 256) ? "kernel_flash_attn_mixed_mm_q2_0_f16_d256"
+                                            : "kernel_flash_attn_mixed_mm_q2_0_f16_d128";
+            const int nsg = (D == 512) ? 4 : 8;
+            const int nqptg = 8;
+            const int ncpsg = 64;
+            // matches FATTN_SMEM in the regular FA path (is_q=1: q2_0 dequant scratch)
+            const size_t smem = GGML_PAD((size_t)(nqptg*(D + 2*GGML_PAD((int)D, 64) + 2*(2*ncpsg)) + 16*32*nsg)*(sizeof(float)/2), 16);
+
+            auto pipeline = ggml_metal_library_compile_pipeline(lib, kname, kname, nullptr);
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),       1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k_lp),    2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(v_lp),    3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask_lp), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k_hp),    5);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(v_hp),    6);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask_hp), 7);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),      8);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc,
+                (int)((n_tok + nqptg - 1)/nqptg), (int) q->ne[2], (int) q->ne[3],
+                nsg*32, 1, 1);
+
+            return 1;
+        }
+
+        // The Q-tiling prefill kernel (NSG=1) loses the KV-split latency hiding that the
+        // per-query kernel gets from NSG>1, so it is opt-in for now (LLAMA_KV_PF_TILED).
+        const bool prefill = n_tok > 1 && (getenv("LLAMA_KV_PF_TILED") != nullptr);
+
+        const char * kname;
+        int nsg;
+        int gx;
+        if (prefill) {
+            const int TQ = (D == 128) ? 8 : 4; // must match the kernel instantiations below
+            kname = (D == 512) ? "kernel_flash_attn_mixed_pf_q2_0_f16_d512"
+                  : (D == 256) ? "kernel_flash_attn_mixed_pf_q2_0_f16_d256"
+                               : "kernel_flash_attn_mixed_pf_q2_0_f16_d128";
+            nsg = 1;
+            gx  = (int)((n_tok + TQ - 1)/TQ);
+        } else {
+            kname = (D == 512) ? "kernel_flash_attn_mixed_q2_0_f16_d512"
+                  : (D == 256) ? "kernel_flash_attn_mixed_q2_0_f16_d256"
+                               : "kernel_flash_attn_mixed_q2_0_f16_d128";
+            nsg = (D == 512) ? 8 : (D == 256) ? 16 : 32; // keep threadgroup mem ~16KB
+            gx  = (int) n_tok;
+        }
+        auto pipeline = ggml_metal_library_compile_pipeline(lib, kname, kname, nullptr);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
@@ -2774,10 +2834,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask_hp), 7);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),      8);
 
-        // FA_MIXED_NSG (32) simdgroups per threadgroup, one threadgroup per (query, head, stream)
         ggml_metal_encoder_dispatch_threadgroups(enc,
-            (int) q->ne[1], (int) q->ne[2], (int) q->ne[3],
-            32*32, 1, 1);
+            gx, (int) q->ne[2], (int) q->ne[3],
+            nsg*32, 1, 1);
 
         return 1;
     }

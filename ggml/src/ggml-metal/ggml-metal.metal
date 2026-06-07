@@ -7369,12 +7369,13 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512")]] kernel flas
 // Reading both tiers into the same (M, S, O) accumulators is mathematically the
 // joint softmax, but fused: no materialized scores and no V re-cast.
 // =============================================================================
-// NSG simdgroups per threadgroup split the KV range (flash-decoding split) to hide
-// memory latency and improve occupancy; their partials are combined in threadgroup
-// memory at the end (log-sum-exp merge).
-#define FA_MIXED_NSG 32
-
-kernel void kernel_flash_attn_mixed_q2_0_f16(
+// Templated on head dim D (DK==DV) and NSG (simdgroups per threadgroup). NSG simdgroups
+// split the KV range (flash-decoding split) to hide memory latency / improve occupancy;
+// their partials are combined in threadgroup memory at the end (log-sum-exp merge).
+// Each lane owns NF = D/128 float4s of the head dim (1 for D=128, 2 for D=256). NSG is
+// chosen so threadgroup memory (NSG*32*NF float4) stays ~16KB: D128->NSG32, D256->NSG16.
+template<short D, short NSG>
+kernel void kernel_flash_attn_mixed(
         constant ggml_metal_kargs_flash_attn_mixed & args,
         device const char * q,
         device const char * k_lp,
@@ -7387,13 +7388,12 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short DK = 128;
-    const short DV = 128;
-    constexpr short NSG = FA_MIXED_NSG;
+    constexpr short NF = D/128; // float4s per lane along the head dim (32 lanes * 4 * NF == D)
+    constexpr short DV = D;
 
     threadgroup float  tg_M[NSG];
     threadgroup float  tg_S[NSG];
-    threadgroup float4 tg_acc[NSG*32]; // per-simdgroup unnormalized accumulator (128 = 32 float4)
+    threadgroup float4 tg_acc[NSG*32*NF]; // per-simdgroup unnormalized accumulator
 
     const ushort iq1 = tgpig[0]; // query (token within stream)
     const ushort iq2 = tgpig[1]; // head
@@ -7403,9 +7403,11 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
     const short ikv2 = iq2/(args.ne02/args.ne_12_2);
     const short ikv3 = iq3/(args.ne03/args.ne_12_3);
 
-    // each lane handles one float4 of the head dim (DK/4 == 32 == simd width)
     device const float4 * q4 = (device const float4 *)(q + iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03);
-    const float4 lq = q4[tiisg];
+    float4 lq[NF];
+    for (short f = 0; f < NF; ++f) {
+        lq[f] = q4[tiisg + f*32];
+    }
 
     // ALiBi slope
     float slope = 1.0f;
@@ -7424,7 +7426,10 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
 
     float  M = -FLT_MAX/2;
     float  S = 0.0f;
-    float4 O = float4(0.0f); // unnormalized accumulator for this simdgroup's KV slice
+    float4 O[NF];
+    for (short f = 0; f < NF; ++f) {
+        O[f] = float4(0.0f);
+    }
 
     // ---- LP tier: Q2_0 (each simdgroup strides its slice of the KV) ----
     {
@@ -7438,10 +7443,16 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
                 continue;
             }
 
-            float4 kf;
-            dequantize_q2_0_t4((device const block_q2_0 *)(kb + ic*args.nb11) + tiisg/8, tiisg%8, kf);
+            device const block_q2_0 * kblk = (device const block_q2_0 *)(kb + ic*args.nb11);
+            float acc = 0.0f;
+            for (short f = 0; f < NF; ++f) {
+                const short i = tiisg + f*32;
+                float4 kf;
+                dequantize_q2_0_t4(kblk + i/8, i%8, kf);
+                acc += dot(lq[f], kf);
+            }
 
-            float s = simd_sum(dot(lq, kf))*sc;
+            float s = simd_sum(acc)*sc;
             if (args.logit_softcap != 0.0f) {
                 s = args.logit_softcap*precise::tanh(s);
             }
@@ -7452,11 +7463,14 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
             const float ms = exp(Mold - M);
             const float vs = exp(s    - M);
             S = S*ms + vs;
-            O *= ms;
 
-            float4 vf;
-            dequantize_q2_0_t4((device const block_q2_0 *)(vb + ic*args.nb21) + tiisg/8, tiisg%8, vf);
-            O += vs*vf;
+            device const block_q2_0 * vblk = (device const block_q2_0 *)(vb + ic*args.nb21);
+            for (short f = 0; f < NF; ++f) {
+                const short i = tiisg + f*32;
+                float4 vf;
+                dequantize_q2_0_t4(vblk + i/8, i%8, vf);
+                O[f] = O[f]*ms + vs*vf;
+            }
         }
     }
 
@@ -7472,10 +7486,15 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
                 continue;
             }
 
-            float4 kf;
-            dequantize_f16_t4((device const half4 *)(kb + ic*args.nbh11) + tiisg, 0, kf);
+            device const half4 * krow = (device const half4 *)(kb + ic*args.nbh11);
+            float acc = 0.0f;
+            for (short f = 0; f < NF; ++f) {
+                float4 kf;
+                dequantize_f16_t4(krow + tiisg + f*32, 0, kf);
+                acc += dot(lq[f], kf);
+            }
 
-            float s = simd_sum(dot(lq, kf))*sc;
+            float s = simd_sum(acc)*sc;
             if (args.logit_softcap != 0.0f) {
                 s = args.logit_softcap*precise::tanh(s);
             }
@@ -7486,11 +7505,13 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
             const float ms = exp(Mold - M);
             const float vs = exp(s    - M);
             S = S*ms + vs;
-            O *= ms;
 
-            float4 vf;
-            dequantize_f16_t4((device const half4 *)(vb + ic*args.nbh21) + tiisg, 0, vf);
-            O += vs*vf;
+            device const half4 * vrow = (device const half4 *)(vb + ic*args.nbh21);
+            for (short f = 0; f < NF; ++f) {
+                float4 vf;
+                dequantize_f16_t4(vrow + tiisg + f*32, 0, vf);
+                O[f] = O[f]*ms + vs*vf;
+            }
         }
     }
 
@@ -7499,7 +7520,9 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
         tg_M[sgitg] = M;
         tg_S[sgitg] = S;
     }
-    tg_acc[sgitg*32 + tiisg] = O;
+    for (short f = 0; f < NF; ++f) {
+        tg_acc[sgitg*(32*NF) + f*32 + tiisg] = O[f];
+    }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -7511,22 +7534,689 @@ kernel void kernel_flash_attn_mixed_q2_0_f16(
         }
 
         float  Ssum = 0.0f;
-        float4 acc  = float4(0.0f);
+        float4 acc[NF];
+        for (short f = 0; f < NF; ++f) {
+            acc[f] = float4(0.0f);
+        }
         FOR_UNROLL (short g = 0; g < NSG; ++g) {
             const float w = exp(tg_M[g] - Mg);
             Ssum += tg_S[g]*w;
-            acc  += tg_acc[g*32 + tiisg]*w;
+            for (short f = 0; f < NF; ++f) {
+                acc[f] += tg_acc[g*(32*NF) + f*32 + tiisg]*w;
+            }
         }
 
         const float S_inv = Ssum > 0.0f ? 1.0f/Ssum : 0.0f;
-        acc *= S_inv;
 
         // write in flash_attn_ext permuted output layout: [DV, n_head, n_tok, n_stream]
         const uint64_t row = (uint64_t)iq3*args.ne2*args.ne1 + (uint64_t)iq1*args.ne1 + iq2;
         device float4 * dst4 = (device float4 *)(dst + row*DV*sizeof(float));
-        dst4[tiisg] = acc;
+        for (short f = 0; f < NF; ++f) {
+            dst4[tiisg + f*32] = acc[f]*S_inv;
+        }
     }
 }
+
+typedef decltype(kernel_flash_attn_mixed<128, 32>) flash_attn_mixed_t;
+template [[host_name("kernel_flash_attn_mixed_q2_0_f16_d128")]] kernel flash_attn_mixed_t kernel_flash_attn_mixed<128, 32>;
+template [[host_name("kernel_flash_attn_mixed_q2_0_f16_d256")]] kernel flash_attn_mixed_t kernel_flash_attn_mixed<256, 16>;
+template [[host_name("kernel_flash_attn_mixed_q2_0_f16_d512")]] kernel flash_attn_mixed_t kernel_flash_attn_mixed<512,  8>; // Gemma 4 global (full-attn) layers
+
+// ---------------------------------------------------------------------------
+// OSCAR fused mixed-precision PREFILL kernel (Q-tiling, register-resident).
+//
+// Why a separate kernel from the decode one: the standard tiled simdgroup-matmul
+// FA needs to stage Q + O + dequant scratch for the whole head dim in threadgroup
+// memory. For D=512 (Gemma 4) that is ~36 KB, over the 32 KB Metal limit on this
+// device. So instead of staging the head dim in shared memory, we keep Q and the
+// O accumulator in registers (distributed across the simdgroup lanes, NF float4
+// per lane) and process TQ query rows per threadgroup with ONE simdgroup (NSG=1,
+// no cross-simdgroup merge needed because prefill already has many threadgroups:
+// ceil(n_tok/TQ) * n_head). The key speedup vs the per-query decode kernel is K/V
+// reuse: each KV position is dequantized ONCE and reused by all TQ queries in the
+// tile, so the (expensive) q2_0 dequant + memory traffic is amortized TQ-fold.
+// Causality is handled entirely through the per-query mask rows.
+template<short D, short TQ>
+kernel void kernel_flash_attn_mixed_pf(
+        constant ggml_metal_kargs_flash_attn_mixed & args,
+        device const char * q,
+        device const char * k_lp,
+        device const char * v_lp,
+        device const char * mask_lp,
+        device const char * k_hp,
+        device const char * v_hp,
+        device const char * mask_hp,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    constexpr short NF = D/128; // float4s per lane along the head dim (32 lanes * 4 * NF == D)
+    constexpr short DV = D;
+
+    const int    iq1_0 = (int) tgpig[0]*TQ; // first query (token within stream) of this tile
+    const ushort iq2   = tgpig[1];          // head
+    const ushort iq3   = tgpig[2];          // stream
+
+    // GQA broadcast: map query head -> KV head (LP and HP share KV-head layout)
+    const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+    const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+    // number of valid queries in this tile (tail tile may be partial)
+    const short nq = (short) min((int) TQ, args.ne01 - iq1_0);
+
+    // load TQ queries into registers (NF float4 per lane per query)
+    float4 lq[TQ][NF];
+    for (short t = 0; t < TQ; ++t) {
+        if (t < nq) {
+            device const float4 * q4 = (device const float4 *)(q + (iq1_0 + t)*args.nb01 + iq2*args.nb02 + iq3*args.nb03);
+            for (short f = 0; f < NF; ++f) {
+                lq[t][f] = q4[tiisg + f*32];
+            }
+        } else {
+            for (short f = 0; f < NF; ++f) {
+                lq[t][f] = float4(0.0f);
+            }
+        }
+    }
+
+    // ALiBi slope
+    float slope = 1.0f;
+    if (args.max_bias > 0.0f) {
+        const short h = iq2;
+        const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+        const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+        slope = pow(base, exph);
+    }
+
+    // effective scale (matches CPU: scale is pre-divided by softcap when softcapping)
+    float sc = args.scale;
+    if (args.logit_softcap != 0.0f) {
+        sc = args.scale/args.logit_softcap;
+    }
+
+    float  M[TQ];
+    float  S[TQ];
+    float4 O[TQ][NF];
+    for (short t = 0; t < TQ; ++t) {
+        M[t] = -FLT_MAX/2;
+        S[t] = 0.0f;
+        for (short f = 0; f < NF; ++f) {
+            O[t][f] = float4(0.0f);
+        }
+    }
+
+    const short lt = nq - 1; // last valid query in the tile (highest position -> widest causal range)
+
+    // ---- LP tier: Q2_0 (K/V dequantized once per position, reused by all TQ queries) ----
+    {
+        device const char * kb = k_lp + ikv2*args.nb12 + ikv3*args.nb13;
+        device const char * vb = v_lp + ikv2*args.nb22 + ikv3*args.nb23;
+        device const half * pm[TQ];
+        for (short t = 0; t < TQ; ++t) {
+            const short tt = t < nq ? t : lt;
+            pm[t] = (device const half *)(mask_lp + (iq1_0 + tt)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        }
+
+        for (int ic = 0; ic < args.ne11; ++ic) {
+            // causal: if the widest-range query in the tile doesn't attend here, none do
+            if ((float) pm[lt][ic] <= -MAXHALF) {
+                continue;
+            }
+
+            device const block_q2_0 * kblk = (device const block_q2_0 *)(kb + ic*args.nb11);
+            device const block_q2_0 * vblk = (device const block_q2_0 *)(vb + ic*args.nb21);
+            float4 kf[NF];
+            float4 vf[NF];
+            for (short f = 0; f < NF; ++f) {
+                const short i = tiisg + f*32;
+                dequantize_q2_0_t4(kblk + i/8, i%8, kf[f]);
+                dequantize_q2_0_t4(vblk + i/8, i%8, vf[f]);
+            }
+
+            for (short t = 0; t < nq; ++t) {
+                const float mv = (float) pm[t][ic];
+                if (mv <= -MAXHALF) {
+                    continue;
+                }
+                float acc = 0.0f;
+                for (short f = 0; f < NF; ++f) {
+                    acc += dot(lq[t][f], kf[f]);
+                }
+                float s = simd_sum(acc)*sc;
+                if (args.logit_softcap != 0.0f) {
+                    s = args.logit_softcap*precise::tanh(s);
+                }
+                s += slope*mv;
+
+                const float Mold = M[t];
+                M[t] = max(M[t], s);
+                const float ms = exp(Mold - M[t]);
+                const float vs = exp(s    - M[t]);
+                S[t] = S[t]*ms + vs;
+                for (short f = 0; f < NF; ++f) {
+                    O[t][f] = O[t][f]*ms + vs*vf[f];
+                }
+            }
+        }
+    }
+
+    // ---- HP tier: F16 ----
+    {
+        device const char * kb = k_hp + ikv2*args.nbh12 + ikv3*args.nbh13;
+        device const char * vb = v_hp + ikv2*args.nbh22 + ikv3*args.nbh23;
+        device const half * pm[TQ];
+        for (short t = 0; t < TQ; ++t) {
+            const short tt = t < nq ? t : lt;
+            pm[t] = (device const half *)(mask_hp + (iq1_0 + tt)*args.nbh31 + (iq2%args.neh32)*args.nbh32 + (iq3%args.neh33)*args.nbh33);
+        }
+
+        for (int ic = 0; ic < args.neh11; ++ic) {
+            if ((float) pm[lt][ic] <= -MAXHALF) {
+                continue;
+            }
+
+            device const half4 * krow = (device const half4 *)(kb + ic*args.nbh11);
+            device const half4 * vrow = (device const half4 *)(vb + ic*args.nbh21);
+            float4 kf[NF];
+            float4 vf[NF];
+            for (short f = 0; f < NF; ++f) {
+                dequantize_f16_t4(krow + tiisg + f*32, 0, kf[f]);
+                dequantize_f16_t4(vrow + tiisg + f*32, 0, vf[f]);
+            }
+
+            for (short t = 0; t < nq; ++t) {
+                const float mv = (float) pm[t][ic];
+                if (mv <= -MAXHALF) {
+                    continue;
+                }
+                float acc = 0.0f;
+                for (short f = 0; f < NF; ++f) {
+                    acc += dot(lq[t][f], kf[f]);
+                }
+                float s = simd_sum(acc)*sc;
+                if (args.logit_softcap != 0.0f) {
+                    s = args.logit_softcap*precise::tanh(s);
+                }
+                s += slope*mv;
+
+                const float Mold = M[t];
+                M[t] = max(M[t], s);
+                const float ms = exp(Mold - M[t]);
+                const float vs = exp(s    - M[t]);
+                S[t] = S[t]*ms + vs;
+                for (short f = 0; f < NF; ++f) {
+                    O[t][f] = O[t][f]*ms + vs*vf[f];
+                }
+            }
+        }
+    }
+
+    // write results: permuted FA output layout [DV, n_head, n_tok, n_stream]
+    for (short t = 0; t < nq; ++t) {
+        const float S_inv = S[t] > 0.0f ? 1.0f/S[t] : 0.0f;
+        const uint64_t row = (uint64_t)iq3*args.ne2*args.ne1 + (uint64_t)(iq1_0 + t)*args.ne1 + iq2;
+        device float4 * dst4 = (device float4 *)(dst + row*DV*sizeof(float));
+        for (short f = 0; f < NF; ++f) {
+            dst4[tiisg + f*32] = O[t][f]*S_inv;
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_mixed_pf<128, 8>) flash_attn_mixed_pf_t;
+template [[host_name("kernel_flash_attn_mixed_pf_q2_0_f16_d128")]] kernel flash_attn_mixed_pf_t kernel_flash_attn_mixed_pf<128, 8>;
+template [[host_name("kernel_flash_attn_mixed_pf_q2_0_f16_d256")]] kernel flash_attn_mixed_pf_t kernel_flash_attn_mixed_pf<256, 4>;
+template [[host_name("kernel_flash_attn_mixed_pf_q2_0_f16_d512")]] kernel flash_attn_mixed_pf_t kernel_flash_attn_mixed_pf<512, 4>; // Gemma 4
+
+// ---------------------------------------------------------------------------
+// OSCAR fused mixed-precision PREFILL kernel (tiled simdgroup-matmul, dual source).
+//
+// This mirrors the proven kernel_flash_attn_ext_impl tiled FA (8x8 simdgroup matmul,
+// Q rows x C cache columns per threadgroup, K/V staged in threadgroup memory) but runs
+// the KV loop TWICE over a shared online-softmax state: first the LP tier (q2_0,
+// dequantized into shared memory) then the HP tier (f16, read directly). The shared
+// M/S/O accumulators make the two-tier merge exact in a single pass.
+//
+// Simplifications vs the upstream kernel (kept correct, drop the optional machinery):
+//   - no sinks, no kvpad/pad buffer, no precomputed blk skip-list
+//   - instead, OOB columns of the last partial KV block are masked to -inf inline, and
+//     fully-masked (all -inf) blocks are skipped inline (this recovers the causal-triangle
+//     skipping that makes prefill ~O(n^2/2) instead of O(n^2), matching f16 FA work).
+// Types are fixed to the FA_TYPES set: q/k/v shared = half, scores+O accum = float.
+//
+// One pass over a single KV source. Updates M[], S[] (registers) and so (threadgroup O).
+template<short D, short NSG,
+         typename KD4X4, short NL_K, void (*DEQ_K)(device const KD4X4 *, short, thread half4x4 &),
+         typename VD4X4, short NL_V, void (*DEQ_V)(device const VD4X4 *, short, thread half4x4 &)>
+void mm_mixed_pass(
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        int      ne11,
+        int      ne01,
+        uint64_t nb11,
+        uint64_t nb21,
+        uint64_t nb31,
+        uint64_t nb32,
+        uint64_t nb33,
+        int      ne32,
+        int      ne33,
+        int      ns10,
+        int      ns20,
+        float    scale,
+        float    logit_softcap,
+        float    slope,
+        threadgroup half * shmem_f16,
+        thread float (&M)[8/NSG],
+        thread float (&S)[8/NSG],
+        ushort iq1b, ushort iq2, ushort iq3, ushort tiisg, ushort sgitg) {
+    constexpr short Q  = 8;
+    constexpr short C  = 64;
+    constexpr short DK = D;
+    constexpr short DV = D;
+    constexpr short KV = 8;
+    constexpr short DK8  = DK/8;
+    constexpr short DK16 = DK/16;
+    constexpr short DV4  = DV/4;
+    constexpr short DV16 = DV/16;
+    constexpr short PV   = PAD2(DV, 64);
+    constexpr short PV4  = PV/4;
+    constexpr short PV8  = PV/8;
+    constexpr short NW   = N_SIMDWIDTH;
+    constexpr short NQ   = Q/NSG;
+    constexpr short SH   = 2*C;
+    constexpr short TS   = 2*SH;
+    constexpr short T    = DK + 2*PV;
+    const bool has_scap = (logit_softcap != 0.0f);
+
+    threadgroup half    * sq    = (threadgroup half    *) (shmem_f16 + 0*T);
+    threadgroup float   * so    = (threadgroup float   *) (shmem_f16 + 0*T + Q*DK);
+    threadgroup float4  * so4   = (threadgroup float4  *) (shmem_f16 + 0*T + Q*DK);
+    threadgroup float   * ss    = (threadgroup float   *) (shmem_f16 + Q*T);
+    threadgroup float2  * ss2   = (threadgroup float2  *) (shmem_f16 + Q*T);
+    threadgroup half    * sk    = (threadgroup half    *) (shmem_f16 + sgitg*(4*16*KV) + Q*T + Q*TS);
+    threadgroup half4x4 * sk4x4 = (threadgroup half4x4 *) (shmem_f16 + sgitg*(4*16*KV) + Q*T + Q*TS);
+    threadgroup half    * sv    = (threadgroup half    *) (shmem_f16 + sgitg*(4*16*KV) + Q*T + Q*TS);
+    threadgroup half4x4 * sv4x4 = (threadgroup half4x4 *) (shmem_f16 + sgitg*(4*16*KV) + Q*T + Q*TS);
+    threadgroup half2   * sm2   = (threadgroup half2   *) (shmem_f16 + Q*T + 2*C);
+
+    device const half2 * pm2[NQ];
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1b + j)*nb31 + (iq2%ne32)*nb32 + (iq3%ne33)*nb33);
+    }
+
+    for (int ic0 = 0; ; ++ic0) {
+        const int ic = ic0*C;
+        if (ic >= ne11) {
+            break;
+        }
+
+        // read the mask block into shared mem; bound OOB columns (>= ne11) and OOB rows to -inf
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+            half2 mm = (iq1b + j) < ne01 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+            const int c0 = ic + 2*tiisg;
+            if (c0 + 0 >= ne11) mm[0] = -MAXHALF;
+            if (c0 + 1 >= ne11) mm[1] = -MAXHALF;
+            sm2[j*SH + tiisg] = mm;
+            pm2[jj] += NW;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // skip fully-masked (all -inf) blocks -> causal-triangle + fully-excluded blocks
+        {
+            half2 smax2(-MAXHALF/2, -MAXHALF/2);
+            FOR_UNROLL (short j = 0; j < Q; ++j) {
+                smax2 = max(smax2, sm2[j*SH + tiisg]);
+            }
+            smax2 = simd_max(smax2);
+            if (max(smax2[0], smax2[1]) <= -MAXHALF/2) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                continue;
+            }
+        }
+
+        // Q*K^T
+        if (is_same<KD4X4, half4x4>::value) {
+            // direct read (HP F16)
+            device const half * pk = (device const half *) (k + ic*nb11);
+            threadgroup const half * pq = sq;
+            threadgroup       float * ps = ss;
+
+            pk += sgitg*(8*ns10);
+            ps += sgitg*(8*1);
+
+            static_assert((C/8) % NSG == 0, "");
+            constexpr short NC = (C/8)/NSG;
+
+            FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>((float) 0.0f);
+
+                #pragma unroll (MIN(DK8/2, 4*NSG))
+                for (short i = 0; i < DK8/2; ++i) {
+                    simdgroup_half8x8 mk[2];
+                    simdgroup_half8x8 mq[2];
+
+                    simdgroup_barrier(mem_flags::mem_none);
+
+                    simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+                    simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+
+                    simdgroup_load(mk[0], pk + 0*8 + 16*i, ns10, 0, true);
+                    simdgroup_load(mk[1], pk + 1*8 + 16*i, ns10, 0, true);
+
+                    simdgroup_barrier(mem_flags::mem_none);
+
+                    simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
+                    simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+                }
+
+                simdgroup_store(mqk, ps, SH, 0, false);
+
+                pk += 8*(NSG*ns10);
+                ps += 8*(NSG);
+            }
+        } else {
+            // quantized (LP Q2_0): dequantize into shared mem, then matmul
+            for (short ccc = 0; ccc < (C/8)/NSG; ++ccc) {
+                const short cc = ccc*NSG + sgitg;
+
+                const short tx = tiisg%4;
+                const short ty = tiisg/4;
+
+                simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>((float) 0.0f);
+
+                for (short ii = 0; ii < DK16; ii += 4) {
+                    device const KD4X4 * pk4x4 = (device const KD4X4 *) (k + ((ic + 8*cc + ty)*nb11));
+
+                    {
+                        half4x4 tmp;
+                        DEQ_K(pk4x4 + (ii + tx)/NL_K, (ii + tx)%NL_K, tmp);
+                        sk4x4[4*ty + tx] = tmp;
+                    }
+
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                    FOR_UNROLL (short k1 = 0; k1 < 4; ++k1) {
+                        simdgroup_half8x8 mk;
+                        simdgroup_half8x8 mq;
+
+                        simdgroup_load(mk, sk + 16*k1 + 0*8, 4*16, 0, true); // transpose
+                        simdgroup_load(mq, sq + (2*(ii + k1) + 0)*8, DK);
+                        simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+
+                        simdgroup_load(mk, sk + 16*k1 + 1*8, 4*16, 0, true); // transpose
+                        simdgroup_load(mq, sq + (2*(ii + k1) + 1)*8, DK);
+                        simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                    }
+                }
+
+                simdgroup_store(mqk, ss + 8*cc, SH, 0, false);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // online softmax
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+
+            const float m = M[jj];
+
+            float2 s2 = ss2[j*SH/2 + tiisg]*scale;
+            if (has_scap) {
+                s2 = logit_softcap*precise::tanh(s2);
+            }
+            s2 += float2(sm2[j*SH + tiisg])*slope;
+
+            M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
+
+            const float  ms  = exp(m  - M[jj]);
+            const float2 vs2 = exp(s2 - M[jj]);
+
+            S[jj] = S[jj]*ms + simd_sum(vs2[0] + vs2[1]);
+
+            ss2[j*SH/2 + tiisg] = vs2;
+
+            if (DV4 % NW == 0) {
+                FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+                    const short i = ii*NW + tiisg;
+                    so4[j*PV4 + i] *= ms;
+                }
+            } else {
+                for (short i = tiisg; i < DV4; i += NW) {
+                    so4[j*PV4 + i] *= ms;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O = O + P*V
+        if (is_same<VD4X4, half4x4>::value) {
+            static_assert(PV8 % NSG == 0, "");
+            constexpr short NO = PV8/NSG;
+
+            simdgroup_float8x8 lo[NO];
+            {
+                auto sot = so + 8*sgitg;
+                FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                    simdgroup_load(lo[ii], sot, PV, 0, false);
+                    sot += 8*NSG;
+                }
+            }
+            {
+                device const half * pv = (device const half *) (v + ic*nb21);
+                pv += 8*sgitg;
+
+                if (DV <= 64) {
+                    FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                        simdgroup_float8x8 vs;
+                        simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+
+                        FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
+                            simdgroup_half8x8 mv[2];
+                            simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, ns20, 0, false);
+                            simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, ns20, 0, false);
+                            simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
+                        }
+                        pv += 8*ns20;
+                    }
+                } else {
+                    constexpr short NC = (C/8)/2;
+                    FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                        simdgroup_float8x8 vs[2];
+                        simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
+                        simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+
+                        FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
+                            simdgroup_half8x8 mv[4];
+                            simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*ns20, ns20, 0, false);
+                            simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*ns20, ns20, 0, false);
+                            simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*ns20, ns20, 0, false);
+                            simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*ns20, ns20, 0, false);
+                            simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                        }
+                        pv += 2*8*ns20;
+                    }
+                }
+            }
+            {
+                auto sot = so + 8*sgitg;
+                FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                    simdgroup_store(lo[ii], sot, PV, 0, false);
+                    sot += 8*NSG;
+                }
+            }
+        } else {
+            // quantized V (LP Q2_0)
+            const short tx = tiisg%4;
+            const short ty = tiisg/4;
+
+            for (short cc = 0; cc < C/8; ++cc) {
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+
+                for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
+                    device const VD4X4 * pv4x4 = (device const VD4X4 *) (v + ((ic + 8*cc + ty)*nb21));
+
+                    {
+                        half4x4 tmp;
+                        DEQ_V(pv4x4 + (ii + tx)/NL_V, (ii + tx)%NL_V, tmp);
+                        sv4x4[4*ty + tx] = tmp;
+                    }
+
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                    FOR_UNROLL (short k1 = 0; k1 < 4; ++k1) {
+                        simdgroup_half8x8  mv[2];
+                        simdgroup_float8x8 lo[2];
+
+                        simdgroup_load(mv[0], sv + 16*k1 + 0*8, 4*16, 0, false);
+                        simdgroup_load(mv[1], sv + 16*k1 + 1*8, 4*16, 0, false);
+                        simdgroup_load(lo[0], so + 8*(2*(ii + k1) + 0), PV, 0, false);
+                        simdgroup_load(lo[1], so + 8*(2*(ii + k1) + 1), PV, 0, false);
+
+                        simdgroup_multiply_accumulate(lo[0], vs, mv[0], lo[0]);
+                        simdgroup_multiply_accumulate(lo[1], vs, mv[1], lo[1]);
+
+                        simdgroup_store(lo[0], so + 8*(2*(ii + k1) + 0), PV, 0, false);
+                        simdgroup_store(lo[1], so + 8*(2*(ii + k1) + 1), PV, 0, false);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template<short D, short NSG>
+kernel void kernel_flash_attn_mixed_mm(
+        constant ggml_metal_kargs_flash_attn_mixed & args,
+        device const char * q,
+        device const char * k_lp,
+        device const char * v_lp,
+        device const char * mask_lp,
+        device const char * k_hp,
+        device const char * v_hp,
+        device const char * mask_hp,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short Q  = 8;
+    constexpr short C  = 64;
+    constexpr short DK = D;
+    constexpr short DV = D;
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+    constexpr short PV  = PAD2(DV, 64);
+    constexpr short PV4 = PV/4;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NQ  = Q/NSG;
+    constexpr short SH  = 2*C;
+    constexpr short T   = DK + 2*PV;
+
+    const ushort iq3 = tgpig[2];
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0]*Q; // first query of the Q-block
+
+    threadgroup half4  * sq4 = (threadgroup half4  *) (shmem_f16 + 0*T);
+    threadgroup float4 * so4 = (threadgroup float4 *) (shmem_f16 + 0*T + Q*DK);
+
+    // load Q into shared mem
+    {
+        device const char * qb = q + iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+            device const float4 * q4 = (device const float4 *)(qb + j*args.nb01);
+            for (short i = tiisg; i < DK4; i += NW) {
+                sq4[j*DK4 + i] = (iq1 + j < args.ne01) ? (half4) q4[i] : half4(0.0f);
+            }
+        }
+    }
+
+    // zero O and the score scratch
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        for (short i = tiisg; i < DV4; i += NW) {
+            so4[j*PV4 + i] = float4(0.0f);
+        }
+        threadgroup float * ss = (threadgroup float *) (shmem_f16 + Q*T);
+        for (short i = tiisg; i < SH; i += NW) {
+            ss[j*SH + i] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float M[NQ];
+    float S[NQ];
+    for (short jj = 0; jj < NQ; ++jj) { M[jj] = -FLT_MAX/2; S[jj] = 0.0f; }
+
+    // ALiBi slope
+    float slope = 1.0f;
+    if (args.max_bias > 0.0f) {
+        const short h = iq2;
+        const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+        const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+        slope = pow(base, exph);
+    }
+
+    // effective scale (pre-divide by softcap when softcapping; matches CPU + decode kernel)
+    float sc = args.scale;
+    if (args.logit_softcap != 0.0f) {
+        sc = args.scale/args.logit_softcap;
+    }
+
+    // GQA broadcast: query head -> KV head
+    const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+    const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+    // ---- LP tier: Q2_0 ----
+    {
+        device const char * kb = k_lp + ikv2*args.nb12 + ikv3*args.nb13;
+        device const char * vb = v_lp + ikv2*args.nb22 + ikv3*args.nb23;
+        mm_mixed_pass<D, NSG, block_q2_0, 2, dequantize_q2_0, block_q2_0, 2, dequantize_q2_0>(
+            kb, vb, mask_lp, args.ne11, args.ne01, args.nb11, args.nb21, args.nb31, args.nb32, args.nb33,
+            args.ne32, args.ne33, (int)(args.nb11/2), (int)(args.nb21/2), sc, args.logit_softcap, slope,
+            shmem_f16, M, S, iq1, iq2, iq3, tiisg, sgitg);
+    }
+
+    // ---- HP tier: F16 ----
+    {
+        device const char * kb = k_hp + ikv2*args.nbh12 + ikv3*args.nbh13;
+        device const char * vb = v_hp + ikv2*args.nbh22 + ikv3*args.nbh23;
+        mm_mixed_pass<D, NSG, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16>(
+            kb, vb, mask_hp, args.neh11, args.ne01, args.nbh11, args.nbh21, args.nbh31, args.nbh32, args.nbh33,
+            args.neh32, args.neh33, (int)(args.nbh11/2), (int)(args.nbh21/2), sc, args.logit_softcap, slope,
+            shmem_f16, M, S, iq1, iq2, iq3, tiisg, sgitg);
+    }
+
+    // write results (permuted FA output layout [DV, n_head, n_tok, n_stream])
+    for (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        if (iq1 + j >= args.ne01) {
+            break;
+        }
+        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
+        const float S_inv = S[jj] == 0.0f ? 0.0f : 1.0f/S[jj];
+        for (short i = tiisg; i < DV4; i += NW) {
+            dst4[i] = so4[j*PV4 + i]*S_inv;
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_mixed_mm<128, 8>) flash_attn_mixed_mm_t;
+template [[host_name("kernel_flash_attn_mixed_mm_q2_0_f16_d128")]] kernel flash_attn_mixed_mm_t kernel_flash_attn_mixed_mm<128, 8>;
+template [[host_name("kernel_flash_attn_mixed_mm_q2_0_f16_d256")]] kernel flash_attn_mixed_mm_t kernel_flash_attn_mixed_mm<256, 8>;
+template [[host_name("kernel_flash_attn_mixed_mm_q2_0_f16_d512")]] kernel flash_attn_mixed_mm_t kernel_flash_attn_mixed_mm<512, 4>; // Gemma 4 (nsg=4 fits 32KB)
 
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];

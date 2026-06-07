@@ -234,6 +234,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
+        { static bool once = false; if (!once) { once = true; fprintf(stderr, "[OSCAR] KV cache dtype: K=%s V=%s (n_embd_k_gqa=%d, kv_size=%d)\n", ggml_type_name(type_k), ggml_type_name(type_v), (int) n_embd_k_gqa, (int) kv_size); fflush(stderr); } }
+
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
