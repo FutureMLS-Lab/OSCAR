@@ -34,7 +34,7 @@ sys.path.insert(0, str(SE_DIR.parent))
 
 def _build_argparser():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", required=True, choices=["gpqa"],
+    p.add_argument("--task", required=True, choices=["gpqa", "humaneval"],
                    help="simple-evals task; only gpqa wired up for now")
     p.add_argument("--model", required=True, help="HF model id served by sglang")
     p.add_argument("--base-url", required=True, help="OpenAI-compatible endpoint")
@@ -65,12 +65,12 @@ class SglangChatSampler:
 
     def __init__(self, model, base_url, api_key, system_message,
                  temperature, top_p, top_k, max_tokens):
-        from openai import OpenAI
         import httpx
+        from openai import OpenAI
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key,
-            timeout=httpx.Timeout(connect=10.0, read=7200.0, write=30.0, pool=10.0),
+            timeout=httpx.Timeout(connect=30, read=7200, write=30, pool=30),
             max_retries=0,
         )
         self.model = model
@@ -144,9 +144,9 @@ def main():
     from simple_evals import common as _se_common
     _orig_map = _se_common.map_with_progress
     def _patched_map(f, xs, num_threads=None, pbar=True):
-        if num_threads is None:
-            num_threads = args.num_threads
-        return _orig_map(f, xs, num_threads=num_threads, pbar=pbar)
+        # Force args.num_threads ALWAYS (HumanEval hardcodes num_threads=3).
+        # This INT2 server is fastest single-stream, so honor --num-threads 1.
+        return _orig_map(f, xs, num_threads=args.num_threads, pbar=pbar)
     _se_common.map_with_progress = _patched_map
 
     # Monkey-patch ANSWER_PATTERN_MULTICHOICE back to the permissive `\s*`
@@ -195,6 +195,14 @@ def main():
         evaluator = GPQAEval(
             n_repeats=args.n_repeats, variant=args.variant,
             num_examples=args.num_examples,
+        )
+    elif args.task == "humaneval":
+        from simple_evals.humaneval_eval import HumanEval
+        # pass@1, single sample/task (this server is single-stream); base HumanEval (164)
+        evaluator = HumanEval(
+            num_examples=args.num_examples,
+            num_samples_per_task=1,
+            ks_passes=[1],
         )
     else:
         raise ValueError(f"task {args.task} not wired up yet")

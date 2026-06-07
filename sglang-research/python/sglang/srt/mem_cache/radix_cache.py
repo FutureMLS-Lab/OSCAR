@@ -567,86 +567,27 @@ class RadixCache(BasePrefixCache):
             req.cache_protected_len = protected_len
 
         if self._mixed_kv_enabled:
-            if not is_insert:
-                # Retracted: don't insert (would pollute tree on a retract /
-                # eviction race). Just free the tail and release the lock.
-                self.token_to_kv_pool_allocator.free(
-                    self._with_mixed_quant_slack(req, kv_indices[protected_len:])
-                )
-                self.dec_lock_ref(req.last_node)
-                return
-
-            # Natural finish. The inc-before-dec lock ordering is critical:
-            # the new nodes must have a live locker through the tail-free
-            # path or a concurrent retract eviction would race.
-            keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-            keys = page_align_keys(keys, self.page_size)
-            values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-
-            mixed_trim = self._mixed_kv_tail_to_drop(len(keys), values)
-            if mixed_trim > 0:
-                insert_keys = keys[: len(keys) - mixed_trim]
-                insert_values = values[: len(insert_keys)]
-            else:
-                insert_keys = keys
-                insert_values = values
-
-            insert_limit = self._mixed_kv_slack_insert_limit(req, len(insert_keys))
-            if insert_limit < len(insert_keys):
-                insert_keys = insert_keys[:insert_limit]
-                insert_values = insert_values[:insert_limit]
-
-            insert_radix_key = RadixKey(
-                insert_keys, req.extra_key, is_bigram=self.is_eagle
-            )
-            priority = getattr(req, "priority", 0) or 0
-            result = self.insert(
-                InsertParams(
-                    key=insert_radix_key, value=insert_values, priority=priority
-                )
-            )
-            new_prefix_len = result.prefix_len
-
-            # Free our-own duplicates already in the tree.
+            # Mixed-KV: the radix tree is populated ONLY by
+            # ``cache_unfinished_req`` (called once after each request's
+            # prefill via the scheduler output-processor mixin).
+            # ``cache_finished_req`` deliberately returns early for both
+            # is_insert=True (natural finish) and is_insert=False (retract):
+            # finished/retracted requests just free their tail slots and
+            # ``dec_lock_ref`` — they do NOT extend the tree.
+            #
+            # The naive "insert + bypass-cap re-match + inc_lock_ref(new)
+            # → dec_lock_ref(old)" pattern is unsafe under mixed-KV +
+            # retract: the new leaf has ``lock_ref=0`` immediately and
+            # gets evicted under concurrent retract memory pressure,
+            # freeing slot ids that other live requests' ``req_to_token``
+            # mappings still reference → corrupted reads → gibberish
+            # (~0.5% rate at this batch size, confirmed against the
+            # mixed-pool reference implementation which has the same
+            # early-return).
             self.token_to_kv_pool_allocator.free(
-                kv_indices[protected_len:new_prefix_len]
+                self._with_mixed_quant_slack(req, kv_indices[protected_len:])
             )
-
-            # Bypass-cap re-match: pick up sibling-extended coverage past
-            # our insert depth.
-            match_len = len(keys)
-            slack_limit = self._mixed_kv_slack_insert_limit(req, match_len)
-            if slack_limit < match_len:
-                match_len = slack_limit
-            match_key = keys[:match_len]
-            full_radix_key = RadixKey(
-                match_key, req.extra_key, is_bigram=self.is_eagle
-            )
-            match_result = self.match_prefix(
-                MatchPrefixParams(key=full_radix_key, bypass_mixed_kv_cap=True)
-            )
-            new_last_node = match_result.last_device_node
-            full_match_len = len(match_result.device_indices)
-
-            # Pin new path BEFORE releasing the old.
-            self.inc_lock_ref(new_last_node)
             self.dec_lock_ref(req.last_node)
-
-            if full_match_len > protected_len:
-                extra_free_start = max(
-                    protected_len, new_prefix_len, len(insert_keys)
-                )
-                if extra_free_start < full_match_len:
-                    self.token_to_kv_pool_allocator.free(
-                        kv_indices[extra_free_start:full_match_len]
-                    )
-
-            # Free the request-owned tail (HP-recent + slack).
-            tail_start = max(len(insert_keys), full_match_len)
-            self.token_to_kv_pool_allocator.free(
-                self._with_mixed_quant_slack(req, kv_indices[tail_start:])
-            )
-            self.dec_lock_ref(new_last_node)
             return
 
         # Maybe convert to bigram keys for EAGLE
@@ -661,7 +602,7 @@ class RadixCache(BasePrefixCache):
         # is shortened, covers the HP-recent tail, the live slots in any
         # unaligned quant tail page, and that page's owned slack slots in one
         # call.
-        mixed_trim = self._mixed_kv_tail_to_drop(len(keys), values)
+        mixed_trim = self._mixed_kv_tail_to_drop(len(keys))
         if mixed_trim > 0:
             keys = keys[: len(keys) - mixed_trim]
             values = values[: len(keys)]
@@ -729,7 +670,7 @@ class RadixCache(BasePrefixCache):
         # still owns those HP slots (they stay addressable via the
         # ``torch.cat`` branch below that rebuilds ``req.prefix_indices``),
         # so we must not free them here. See :meth:`_mixed_kv_tail_to_drop`.
-        mixed_trim = self._mixed_kv_tail_to_drop(len(keys), values)
+        mixed_trim = self._mixed_kv_tail_to_drop(len(keys))
         if mixed_trim > 0:
             insert_keys = keys[: len(keys) - mixed_trim]
             insert_values = values[: len(insert_keys)]
@@ -765,9 +706,23 @@ class RadixCache(BasePrefixCache):
         # ``[cache_protected_len, new_prefix_len)`` were covered by the
         # tree before our insert, and our kv_indices there are our-own
         # allocations from extend).
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[protected_len:new_prefix_len]
-        )
+        #
+        # CRITICAL: Clamp by ``_mixed_kv_slack_insert_limit``. If
+        # ``new_prefix_len`` overlaps a request-owned partial quant page
+        # (whose remaining slots are tracked in
+        # ``req.mixed_kv_quant_slack_indices`` and freed later by
+        # ``_with_mixed_quant_slack``), freeing slots there now would put
+        # the page into ``free_pages`` while the request still owns the
+        # rest of it via slack. The next ``alloc_quant`` would re-issue
+        # the page to another request → multiple requests writing to the
+        # same physical slots, and on their finish, the same page gets
+        # added to ``free_pages`` twice. Restricting the free to the
+        # slack-cutoff range keeps partial-page ownership intact.
+        free_end = self._mixed_kv_slack_insert_limit(req, new_prefix_len)
+        if free_end > protected_len:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[protected_len:free_end]
+            )
 
         # For mixed-KV we match as deeply as it is safe to share. That is
         # usually the FULL (untrimmed) key so ``cache_protected_len`` never
@@ -815,9 +770,16 @@ class RadixCache(BasePrefixCache):
             # originals must be reclaimed to avoid a leak.
             insert_len = len(insert_keys)
             extra_free_start = max(protected_len, new_prefix_len, insert_len)
-            if extra_free_start < full_match_len:
+            # Same partial-page clamp as the dup-free above: the free
+            # range must not cross the slack boundary, or it will
+            # release slots in a page the request still owns via
+            # ``mixed_kv_quant_slack_indices``.
+            extra_free_end = self._mixed_kv_slack_insert_limit(
+                req, full_match_len
+            )
+            if extra_free_start < extra_free_end:
                 self.token_to_kv_pool_allocator.free(
-                    kv_indices[extra_free_start:full_match_len]
+                    kv_indices[extra_free_start:extra_free_end]
                 )
 
             self.req_to_token_pool.write(
@@ -952,13 +914,11 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _mixed_kv_tail_to_drop(
-        self, committed_len: int, kv_indices: Optional[torch.Tensor] = None
-    ) -> int:
+    def _mixed_kv_tail_to_drop(self, committed_len: int) -> int:
         # HP-recent slot ids are per-request and must not enter the tree.
-        # Count the contiguous HP-recent suffix of ``kv_indices`` (the layout
-        # invariant guarantees HP-recent is the trailing region) and round
-        # up to ``page_size`` so the residual is page-aligned.
+        # Trim a fixed ``hp_recent + flush_overflow`` window from the
+        # tail (page-aligned, ceil'd), which fully covers the worst-case
+        # HP-recent span at any time.
         allocator = self.token_to_kv_pool_allocator
         if allocator is None:
             return 0
@@ -969,26 +929,14 @@ class RadixCache(BasePrefixCache):
         hp_prefix = int(getattr(kvcache, "hp_prefix_tokens", 0))
         hp_recent = int(getattr(kvcache, "hp_recent_tokens", 0))
         flush_overflow = max(1, int(getattr(kvcache, "flush_interval", 1))) - 1
-        if hp_recent <= 0:
+        if hp_recent <= 0 or committed_len <= hp_prefix:
             return 0
-
-        if kv_indices is not None and kv_indices.numel() > 0:
-            hp_offset = int(getattr(kvcache, "hp_global_offset", 0))
-            num_hp_prefix_slots = int(getattr(kvcache, "num_hp_prefix_slots", 0))
-            hp_recent_threshold = hp_offset + num_hp_prefix_slots
-            window = kv_indices[: committed_len].to(torch.int64)
-            is_recent = (window >= hp_recent_threshold).to(torch.int32)
-            # Reverse cumprod: trim = length of leading 1s in the flipped mask.
-            rev = is_recent.flip(0)
-            trim = int(torch.cumprod(rev, dim=0).sum().item())
-        else:
-            if committed_len <= hp_prefix:
-                return 0
-            trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
-
+        trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
         if self.page_size > 1:
             trim = math.ceil(trim / self.page_size) * self.page_size
-        return max(0, min(trim, committed_len))
+        # Clip back if ceil pushed past the available range.
+        trim = min(trim, committed_len - hp_prefix)
+        return trim
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
