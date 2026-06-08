@@ -29,6 +29,7 @@ so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
 - **[Upcoming]** OSCAR is testing minimax-m2.7, GLM-5.1, Qwen3.7 and more models in long horizon agentic tasks (1M+ token context). Happy to se·e OSCAR used in the wild!
+- **[2026-06-08]** OSCAR INT2 KV cache now supports **Gemma 4 12B** (`google/gemma-4-12B-it`, `gemma4_unified`) on **SGLang** — OSCAR's first **hybrid-SWA / dual-head-dim** model (sliding 8×256 + full-attention 1×512 layers, all INT2). INT2 matches BF16 on GPQA-Diamond (62.63%). See [`rotation/gemma-4-12B-it/`](rotation/gemma-4-12B-it/).
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/zhongzhu/llama.cpp/tree/oscar) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
 
   <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 Local Run Video</b>
@@ -280,6 +281,7 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
 | `rotation/qwen3-32B/` | `Qwen/Qwen3-32B` | 2-4 | 4 | |
 | `rotation/MiniMax-M2.7/` | `MiniMaxAI/MiniMax-M2.7` | 4 | 4 | FP8 weights, `--reasoning-parser minimax-append-think` |
 | `rotation/GLM-4.7/` | `zai-org/GLM-4.7-FP8` | 8 | 8 | FP8 weights, 92 layers |
+| `rotation/gemma-4-12B-it/` | `google/gemma-4-12B-it` | 1 | 1 | `gemma4_unified` hybrid-SWA, dual head_dim (sliding 8×256 / full 1×512), all INT2; needs transformers ≥5.5; INT2 ≈ BF16 on GPQA (62.63%); optional vision via `--enable-multimodal` |
 
 ## How the rotation is fit (spectral covariance)
 
