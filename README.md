@@ -31,12 +31,13 @@ so users can download calibrated rotations directly instead of recomputing them.
 - **[Upcoming]** OSCAR is testing minimax-m2.7, GLM-5.1, Qwen3.7 and more models in long horizon agentic tasks (1M+ token context). Happy to se·e OSCAR used in the wild!
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
 
-  <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 Local Run Video</b>
-  <img width="960" height="502" alt="Screen Recording 2026-06-07 at 21 01 42 - 2x" src="https://github.com/user-attachments/assets/29022df7-2ece-449f-9961-db00653d7590" />
+  <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 KV Local Run Video</b>
+  <img width="960" height="502" alt="Screen Recording 2026-06-08 at 00 47 11 - 2x" src="https://github.com/user-attachments/assets/72f7c51d-fb43-42b7-ac2b-1b5baaf256c5" />
+
 
 - **[2026-06-05]** OSCAR now runs its INT2 KV cache through a fused mixed-precision Flash-Attention kernel on Apple Metal in the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp), making long-context decode up to ~15× faster (near-BF16) at ~7× less KV memory. Try to RUN QWEN-3-32B with LONG CONTEXT in your LOCAL MAC!
   <details>
-  <summary><b>MacBook M5 Max Qwen3-32B OSCAR INT2 Local Run Screenshot</b></summary>
+  <summary><b>MacBook M5 Max Qwen3-32B OSCAR INT2 KV Local Run Screenshot</b></summary>
   <img width="1003" height="654" alt="Screenshot 2026-06-05 at 09 57 31" src="https://github.com/user-attachments/assets/8ea1ccf9-c2f0-4f3e-8232-7f0b2dbdd144" />
   </details>
 - **[2026-06-04]** OSCAR now supports **Gemma 4 12B** with **SGLang INT2 KV cache** on the [`zhongzhu/gemma4-12b`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/gemma4-12b) branch.
