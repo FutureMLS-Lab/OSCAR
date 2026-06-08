@@ -27,3 +27,17 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Build output (CMake / Gradle) -- e.g. /build, examples/llama.android/build
+build/
+
+# clangd / compiler index cache -- e.g. /.cache, build/.cache
+.cache/
+
+# Node / frontend deps & build artifacts (tools/ui)
+node_modules/
+.svelte-kit/
+.vite-temp/
+
+# Android / Gradle caches (examples/llama.android)
+.gradle/
