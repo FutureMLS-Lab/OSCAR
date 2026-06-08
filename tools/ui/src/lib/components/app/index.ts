@@ -1,5 +1,6 @@
 export * from './actions';
 export * from './badges';
+export * from './brand';
 export * from './chat';
 export * from './content';
 export * from './dialogs';

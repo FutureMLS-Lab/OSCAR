@@ -3,7 +3,7 @@
 	import { page } from '$app/state';
 	import { Trash2, Pencil, X } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
-	import { DialogConfirmation } from '$lib/components/app';
+	import { DialogConfirmation, OscarBrand } from '$lib/components/app';
 	import SidebarNavigationActions from './SidebarNavigationActions.svelte';
 	import SidebarNavigationConversationItem from './SidebarNavigationConversationItem.svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
@@ -20,7 +20,6 @@
 	} from '$lib/stores/conversations.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
 	import { getPreviewText } from '$lib/utils';
-	import { APP_NAME } from '$lib/constants';
 
 	const sidebar = Sidebar.useSidebar();
 
@@ -174,9 +173,7 @@
 		<Sidebar.Header class="gap-4 bg-sidebar/50 p-3 backdrop-blur-lg md:pt-4 md:pb-2">
 			<div class="flex items-center justify-between">
 				<a href={ROUTES.START} onclick={handleMobileSidebarItemClick}>
-					<h1 class="inline-flex items-center gap-1 px-2 text-xl font-semibold">
-						{APP_NAME}
-					</h1>
+					<OscarBrand class="px-2" logoClass="h-12 w-12" />
 				</a>
 
 				<Button

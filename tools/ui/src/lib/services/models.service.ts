@@ -139,6 +139,15 @@ export class ModelsService {
 			tags: []
 		};
 
+		const fileName = modelId.split(/[\\/]/).pop()?.toLowerCase();
+
+		if (fileName === 'gemma-4-12b-it-rot-kv.gguf') {
+			return {
+				...result,
+				modelName: 'GEMMA 12B OSCAR 2BIT KV'
+			};
+		}
+
 		// 1. Extract colon-separated quantization (e.g. `model:Q4_K_M`)
 		const colonIdx = modelId.indexOf(MODEL_ID_QUANTIZATION_SEPARATOR);
 		let modelPath: string;
