@@ -26,6 +26,13 @@ from typing import Any, Optional, Union
 
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    register_customized_processor,
+)
+from sglang.srt.multimodal.processors.gemma4_unified_processing import (
+    Gemma4UnifiedProcessor,
+)
+
 
 class Gemma4UnifiedTextConfig(PretrainedConfig):
     model_type = "gemma4_unified_text"
@@ -120,14 +127,52 @@ class Gemma4UnifiedTextConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
+class Gemma4UnifiedVisionConfig(PretrainedConfig):
+    """Encoder-free vision config (gemma4_unified_vision).
+
+    Carries the geometry the vision embedder needs: ``model_patch_size`` (48),
+    ``mm_embed_dim`` (3840), ``mm_posemb_size`` (1120), ``output_proj_dims`` (3840).
+    """
+
+    model_type = "gemma4_unified_vision"
+
+    def __init__(
+        self,
+        model_patch_size: int = 48,
+        patch_size: int = 16,
+        pooling_kernel_size: int = 3,
+        mm_embed_dim: int = 3840,
+        mm_posemb_size: int = 1120,
+        output_proj_dims: int = 3840,
+        num_soft_tokens: int = 280,
+        rms_norm_eps: float = 1e-6,
+        initializer_range: float = 0.02,
+        **kwargs,
+    ):
+        self.model_patch_size = model_patch_size
+        self.patch_size = patch_size
+        self.pooling_kernel_size = pooling_kernel_size
+        self.mm_embed_dim = mm_embed_dim
+        self.mm_posemb_size = mm_posemb_size
+        self.output_proj_dims = output_proj_dims
+        self.num_soft_tokens = num_soft_tokens
+        self.rms_norm_eps = rms_norm_eps
+        self.initializer_range = initializer_range
+        super().__init__(**kwargs)
+
+
+@register_customized_processor(Gemma4UnifiedProcessor)
 class Gemma4UnifiedConfig(PretrainedConfig):
     model_type = "gemma4_unified"
-    sub_configs = {"text_config": Gemma4UnifiedTextConfig}
+    sub_configs = {
+        "text_config": Gemma4UnifiedTextConfig,
+        "vision_config": Gemma4UnifiedVisionConfig,
+    }
 
     def __init__(
         self,
         text_config: Optional[Union[dict, Gemma4UnifiedTextConfig]] = None,
-        vision_config: Optional[dict] = None,
+        vision_config: Optional[Union[dict, Gemma4UnifiedVisionConfig]] = None,
         audio_config: Optional[dict] = None,
         boi_token_id: int = 255999,
         eoi_token_id: int = 258882,
@@ -143,7 +188,10 @@ class Gemma4UnifiedConfig(PretrainedConfig):
         elif isinstance(text_config, dict):
             text_config = Gemma4UnifiedTextConfig(**text_config)
         self.text_config = text_config
-        # Vision/audio towers are not built for text-only serving; keep raw.
+        # Expose a structured vision config (encoder-free embedder reads geometry off
+        # it); keep audio raw (audio modality not served).
+        if isinstance(vision_config, dict):
+            vision_config = Gemma4UnifiedVisionConfig(**vision_config)
         self.vision_config = vision_config
         self.audio_config = audio_config
 
@@ -161,4 +209,8 @@ class Gemma4UnifiedConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["Gemma4UnifiedConfig", "Gemma4UnifiedTextConfig"]
+__all__ = [
+    "Gemma4UnifiedConfig",
+    "Gemma4UnifiedTextConfig",
+    "Gemma4UnifiedVisionConfig",
+]

@@ -1331,6 +1331,9 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
+    # gemma4_unified is multimodal only when --enable-multimodal is set; when off it
+    # stays in mm_disabled_models above and is served text-only (INT2 OSCAR path).
+    "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
