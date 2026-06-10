@@ -28,7 +28,7 @@ scripts end to end. It works out of the box, and we also provide a rotation zoo
 so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
-- **[Upcoming]** OSCAR is testing minimax-m2.7, GLM-5.1, Qwen3.7 and more models in long horizon agentic tasks (1M+ token context). Happy to se·e OSCAR used in the wild!
+- **[Upcoming]** OSCAR is testing minimax-m2.7, GLM-5.1, Qwen3.7 and more models in long horizon agentic tasks (1M+ token context). Happy to see OSCAR used in the wild!
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
 
   <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 KV Local Run Video</b>
