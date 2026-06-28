@@ -23,19 +23,16 @@ OSCAR captures Q/K/V activations on a small calibration set, estimates **attenti
   <img src="materials/OSCAR_pipeline.png" alt="OSCAR pipeline" width="720"/>
 </p>
 
-OSCAR is built directly into the open-source SGLang framework: clone the repo,
-set up the single environment, and run the dump, rotation, and evaluation
-scripts end to end. It works out of the box, and we also provide a rotation zoo
-so users can download calibrated rotations directly instead of recomputing them.
+OSCAR is built directly into the open-source SGLang framework (main branch), llama.cpp (zhongzhu/llamacpp branch). We also provide a rotation zoo so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
-- **[Upcoming]** OSCAR is testing minimax-m2.7, GLM-5.1, Qwen3.7 and more models in long horizon agentic tasks (1M+ token context). Happy to se·e OSCAR used in the wild!
+- **[Upcoming]** OSCAR is testing MiniMax 3, GLM 5.2 and more models in long horizon agentic tasks (1M+ token context). Happy to see OSCAR used in the wild!
+- **[2026-06-26]** OSCAR is PRing into **vLLM** too, bringing INT2 KV cache support to another high-throughput serving stack.
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
-
-  <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 KV Local Run Video</b>
+  <details>
+  <summary> <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 KV Local Run Video</b></summary>
   <img width="960" height="502" alt="Screen Recording 2026-06-08 at 00 47 11 - 2x" src="https://github.com/user-attachments/assets/72f7c51d-fb43-42b7-ac2b-1b5baaf256c5" />
-
-
+  </details>
 - **[2026-06-05]** OSCAR now runs its INT2 KV cache through a fused mixed-precision Flash-Attention kernel on Apple Metal in the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp), making long-context decode up to ~15× faster (near-BF16) at ~7× less KV memory. Try to RUN QWEN-3-32B with LONG CONTEXT in your LOCAL MAC!
   <details>
   <summary><b>MacBook M5 Max Qwen3-32B OSCAR INT2 KV Local Run Screenshot</b></summary>
@@ -51,10 +48,12 @@ so users can download calibrated rotations directly instead of recomputing them.
 - [Layout](#layout)
 - [Setup](#setup)
 - [Quick start (Qwen3-8B example)](#quick-start-qwen3-8b-example)
+- [Model support](#model-support)
 - [All configured models](#all-configured-models)
 - [How the rotation is fit (spectral covariance)](#how-the-rotation-is-fit-spectral-covariance)
 - [Serving with the rotation](#serving-with-the-rotation)
 - [Calibration knobs](#calibration-knobs)
+- [Troubleshooting](#troubleshooting)
 - [Citation](#citation)
 - [License & acknowledgements](#license--acknowledgements)
 
@@ -201,11 +200,14 @@ rotation/
         _eval_gpqa_oscar/   eval results from this rotation
         _eval_lcb_v6_128k/  ...
 
-sglang-research/            submodule — INT2 KV eval
-sglang-dump-qkv/            vendored older sglang-fork — QKV dump (loaded via shim)
+sglang-research/            vendored sglang fork — INT2 KV eval
+sglang-dump-qkv/            vendored older sglang fork — QKV dump (loaded via shim)
+third_party/simple_evals/   git submodule — eval harness (needs git clone --recursive)
 ```
 
 ## Setup
+
+OSCAR vendors a snapshot of the upstream SGLang `main` fork (~May 2026; `torch==2.9.1`, `transformers==5.3.0`, `flashinfer==0.6.7.post3`). Both `sglang-research/` (INT2 eval) and `sglang-dump-qkv/` (QKV dump) ship in the repo — no separate SGLang install is needed.
 
 ### Requirements
 
@@ -273,15 +275,34 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
   bash rotation/qwen3-8B/eval_gpqa.sh
 ```
 
+## Model support
+
+Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int2` (full-attention INT2 path); other rows point to feature branches.
+
+| Model | Backend / branch | Status |
+|---|---|---|
+| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B | SGLang `main` | ✅ supported (paper results) |
+| GLM-4.7-FP8 (358B) | SGLang `main` | ✅ supported (paper results) |
+| MiniMax-M2.7 | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview |
+| Qwen3.5 (4B, 35B-A3B) | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview (hybrid linear-attn) |
+| GLM-5.1 | SGLang `zhongzhu/glm-mla` | 🧪 experimental (MLA latent) |
+| Qwen3-VL (4B, 8B) | SGLang `zhongzhu/VL` | 🧪 preview |
+| Qwen3-32B, Qwen3-4B-Thinking, Gemma-4-12B | llama.cpp `zhongzhu/llamacpp` + [GGUF](https://huggingface.co/Zhongzhu) | ✅ supported (Mac / Metal) |
+
+> INT2 on `main` targets **full-attention** models. MLA models (GLM-5.1 / DeepSeek-style) and hybrid linear-attention models (Qwen3.5 GatedDeltaNet) are not on `main` yet — use the branches above.
+
 ## All configured models
+
+Calibration-pipeline folders included on this branch (`rotation/<model>/`):
 
 | Folder | HF model | TP (dump) | TP (eval) | Notes |
 |---|---|---|---|---|
 | `rotation/qwen3-4B-thinking-2507/` | `Qwen/Qwen3-4B-Thinking-2507` | 1 | 1 | thinking model |
 | `rotation/qwen3-8B/` | `Qwen/Qwen3-8B` | 1 | 1 | |
 | `rotation/qwen3-32B/` | `Qwen/Qwen3-32B` | 2-4 | 4 | |
-| `rotation/MiniMax-M2.7/` | `MiniMaxAI/MiniMax-M2.7` | 4 | 4 | FP8 weights, `--reasoning-parser minimax-append-think` |
 | `rotation/GLM-4.7/` | `zai-org/GLM-4.7-FP8` | 8 | 8 | FP8 weights, 92 layers |
+
+> MiniMax-M2.7 / Qwen3.5 calibration scripts live on `zhongzhu/hybrid-model`; pre-fit rotations for several models are available on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
 ## How the rotation is fit (spectral covariance)
 
@@ -327,6 +348,17 @@ python -m sglang.launch_server \
 
 Sink (`PREFIX_TOKENS`) and recent window (`RECENT_TOKENS`) stay in BF16; the rest of the cache is INT2-quantized into 128-element groups along head-dim.
 
+### Skip calibration — use a pre-fit rotation from RotationZoo
+
+To serve without running phases 1–2, download a calibrated rotation from the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) and point the env vars at it:
+
+```bash
+huggingface-cli download Zhongzhu/OSCAR-RotationZoo --include "Qwen3-8B/*" --local-dir rotzoo
+ROT=$(ls -1d rotzoo/Qwen3-8B/seq*_prompt*_group128 | tail -1)
+export SGLANG_OSCAR_K_ROTATION_PATH=$ROT/k_rotation_qqt_r_h_pbr.pt
+export SGLANG_OSCAR_V_ROTATION_PATH=$ROT/v_rotation_sst_r_h_pbr.pt
+```
+
 ## Calibration knobs
 
 Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
@@ -340,6 +372,13 @@ Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
 | `TP_SIZE` | per-model | Tensor parallel size for dump |
 | `GPU` | per-model | CUDA_VISIBLE_DEVICES |
 | `HF_HOME` | `/shared/huggingface` | HF cache (set to `$HOME/.cache/huggingface` on a fresh machine) |
+
+## Troubleshooting
+
+- **Garbled / mixed-language output in long-context agent sessions.** Update to the latest `main`. Older checkouts (before the mixed-KV slot-accounting fix) could free KV slots still referenced by other in-flight requests under concurrency, corrupting reads.
+- **`--kv-cache-dtype int2` only supports full-attention models.** MLA models (GLM-5.1 / DeepSeek-style) and hybrid linear-attention models (Qwen3.5 GatedDeltaNet) are not supported on `main` yet — see [Model support](#model-support).
+- **Hybrid / preview models (Qwen3.5, MiniMax-M2.7).** Use the `zhongzhu/hybrid-model` branch with `SGLANG_LLOYD_MAX=1`.
+- **Running locally on a Mac.** Use the `zhongzhu/llamacpp` branch or the pre-built `*-rot-kv.gguf` files on Hugging Face.
 
 ## Citation
 
