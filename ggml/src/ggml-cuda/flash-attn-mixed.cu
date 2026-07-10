@@ -2,6 +2,20 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+// local decode helper for debug dump (mirrors ggml_cpu/quants.c::dequantize_row_q2_0)
+static void dbg_dequantize_q2_0(const block_q2_0 * x, float * y, int64_t k) {
+    constexpr float c[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+    for (int64_t i = 0; i < k; i += QK2_0) {
+        const float d = __half2float(x[i/QK2_0].d);
+        const float m = __half2float(x[i/QK2_0].m);
+        for (int j = 0; j < QK2_0; ++j) {
+            const int by = j/4, sub = j%4;
+            const int code = (x[i/QK2_0].qs[by] >> (2*sub)) & 0x03;
+            y[i+j] = m + d*c[code];
+        }
+    }
+}
+
 // OSCAR two-tier mixed-precision fused flash-attention (INT2-LP history + F16-HP
 // sink/recent) ported from the CPU reference in ggml-cpu/ops.cpp
 // (ggml_compute_forward_flash_attn_ext_mixed).
@@ -119,16 +133,20 @@ __global__ void flash_attn_ext_mixed_kernel(
         const char * vd = (const char *) v_lp + (ic * nbv1 + iv2 * nbv2 + iv3 * nbv3);
         if (s > M) { M = s; ms = expf(Mold - M); for (int j = 0; j < slice; ++j) v_acc[j] *= ms; }
         else       { vs = expf(s - M); }
-        // dequantize v_lp (q2_0) slice and MAD: value = m + d * centroid
-        // (set-rows replicates the group mean into every block's m field)
+        // dequantize v_lp (q2_0) slice and MAD: value = m + d * centroid[code].
+        // V row layout: 8 contiguous q2_0 blocks (12B each) cover DV=256; the KV-row
+        // stride is nbv1=96. So dim j is in block (j/32) at offset (j/32)*sizeof(block_q2_0)
+        // from row base vd. Matches VEC dequantize_V_q2_0 (ib=j/32, x[ib] contiguous).
+        // (set-rows replicates the group mean into every block's m field.)
         for (int j = 0; j < slice; ++j) {
-            const int g = (j0 + j) / 32;
-            const int z = (j0 + j) % 32;
-            const float mean = __half2float(((const block_q2_0 *) vd)[g].m);
-            const float d = __half2float(((const block_q2_0 *) vd)[g].d);
-            const int  by  = z / 4;
+            const int  dim  = j0 + j;
+            const block_q2_0 * vb = (const block_q2_0 *)(vd + (int64_t)(dim / 32) * sizeof(block_q2_0));
+            const float mean = __half2float(vb->m);
+            const float d    = __half2float(vb->d);
+            const int  z  = dim % 32;
+            const int  by = z / 4;
             const int  sub = z % 4;
-            const int  code = ((((const block_q2_0 *) vd)[g].qs[by]) >> (2 * sub)) & 0x03;
+            const int  code = (vb->qs[by] >> (2 * sub)) & 0x03;
             constexpr float cc[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
             v_acc[j] += vs * (mean + d * cc[code]);
         }
@@ -195,19 +213,104 @@ void ggml_cuda_flash_attn_ext_mixed(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t n_kv = nek1;
     const int64_t n_hp = nekh1;
 
-    static bool dbg_once = false;
-    if (!dbg_once) {
-        dbg_once = true;
-        fprintf(stderr, "[MIXED-DBG] q=%d k_lp=%d v_lp=%d k_hp=%d v_hp=%d DK=%ld DV=%ld n_kv=%ld n_hp=%ld N=%ld nh=%ld nseq=%ld nbq0=%zu nbk0=%zu\n",
-                (int)q->type, (int)k_lp->type, (int)v_lp->type, (int)k_hp->type, (int)v_hp->type,
-                (long)DK, (long)DV, (long)n_kv, (long)n_hp, (long)N, (long)n_head, (long)nseq,
-                q->nb[0], k_lp->nb[0]);
-    }
-
     const int rk2 = neq2 / nek2, rk3 = neq3 / nek3;
     const int rv2 = neq2 / nev2, rv3 = neq3 / nev3;
     const int rk2h = neq2 / nekh2, rk3h = neq3 / nekh3;
     const int rv2h = neq2 / nevh2, rv3h = neq3 / nevh3;
+
+    static int dbg_call = 0;
+    static bool dbg_done = false;
+    if (!dbg_done && dbg_call++ >= 30) {
+        // only proceed once a real (populated) row exists: check k_lp[1] block0 d != 0
+        float probe_d = 0;
+        {
+            block_q2_0 b;
+            cudaMemcpy(&b, (const char *)k_lp->data + (int64_t)1*nbk1, sizeof(block_q2_0), cudaMemcpyDeviceToHost);
+            probe_d = __half2float(b.d);
+        }
+        if (probe_d <= 0.0f) {
+            // not populated yet; skip this dump, keep polling on later calls (no early return)
+        } else {
+        dbg_done = true;
+        fprintf(stderr, "[MIXED-DBG] q=%d k_lp=%d v_lp=%d k_hp=%d v_hp=%d DK=%ld DV=%ld n_kv=%ld n_hp=%ld N=%ld nh=%ld nseq=%ld nbq0=%zu nbk0=%zu nbk1=%zu nbk2=%zu nbk3=%zu nbv1=%zu nbv2=%zu nbv3=%zu nek2=%ld nev2=%ld rk2=%d rv2=%d\n",
+                (int)q->type, (int)k_lp->type, (int)v_lp->type, (int)k_hp->type, (int)v_hp->type,
+                (long)DK, (long)DV, (long)n_kv, (long)n_hp, (long)N, (long)n_head, (long)nseq,
+                q->nb[0], k_lp->nb[0], k_lp->nb[1], k_lp->nb[2], k_lp->nb[3],
+                v_lp->nb[1], v_lp->nb[2], v_lp->nb[3],
+                (long)nek2, (long)nev2, rk2, rv2);
+        // Dump KV rows ic=1 and ic=n_kv-1 (raw bytes + decoded) + Q for head 0, iq1=1.
+        {
+            const int ics[2] = {1, (int)n_kv - 1};
+            for (int w=0; w<2; ++w) {
+                const int ic = ics[w];
+                const size_t rowb = (size_t)DK / 32 * sizeof(block_q2_0);
+                const char * krow = (const char *)k_lp->data + (int64_t)ic*nbk1 + 0*nbk2 + 0*nbk3;
+                const char * vrow = (const char *)v_lp->data + (int64_t)ic*nbv1 + 0*nbv2 + 0*nbv3;
+                std::vector<uint8_t> kb(rowb), vb(rowb);
+                cudaMemcpy(kb.data(), krow, rowb, cudaMemcpyDeviceToHost);
+                cudaMemcpy(vb.data(), vrow, rowb, cudaMemcpyDeviceToHost);
+                std::vector<float> kf(DK), vf(DV);
+                dbg_dequantize_q2_0((const block_q2_0*)kb.data(), kf.data(), DK);
+                dbg_dequantize_q2_0((const block_q2_0*)vb.data(), vf.data(), DV);
+                fprintf(stderr, "[MIXED-DBG] ic=%d k raw[0..11]:", ic);
+                for (int i=0;i<12;i++) fprintf(stderr, " %02x", kb[i]);
+                {
+                    const block_q2_0 * b0 = (const block_q2_0*)kb.data();
+                    fprintf(stderr, " | d=%.4f m=%.4f", __half2float(b0->d), __half2float(b0->m));
+                }
+                fprintf(stderr, " | k decoded[0..7]:");
+                for (int i=0;i<8;i++) fprintf(stderr, " %.4f", kf[i]);
+                fprintf(stderr, "\n[MIXED-DBG] ic=%d v raw[0..11]:", ic);
+                for (int i=0;i<12;i++) fprintf(stderr, " %02x", vb[i]);
+                {
+                    const block_q2_0 * b0 = (const block_q2_0*)vb.data();
+                    fprintf(stderr, " | d=%.4f m=%.4f", __half2float(b0->d), __half2float(b0->m));
+                }
+                fprintf(stderr, " | v decoded[0..7]:");
+                for (int i=0;i<8;i++) fprintf(stderr, " %.4f", vf[i]);
+                fprintf(stderr, "\n");
+            }
+            const float * pq = (const float *)((const char *)q->data + (int64_t)1*nbq1 + 0*nbq2 + 0*nbq3);
+            fprintf(stderr, "[MIXED-DBG] Q[1] first16:");
+            for (int i=0;i<16;i++) fprintf(stderr, " %.4f", pq[i]);
+            fprintf(stderr, "\n"); fflush(stderr);
+            // Recompute full LP attention on CPU (KQ dot via q2_0 decode, masked) for head 0, iq1=1
+            if (mask_lp != nullptr) {
+                const int head = 0;
+                std::vector<float> allK(n_kv*DK), allV(n_kv*DV);
+                for (int64_t ic=0; ic<n_kv; ++ic) {
+                    const char * krow = (const char *)k_lp->data + ic*nbk1 + (int64_t)head*nbk2;
+                    const char * vrow = (const char *)v_lp->data + ic*nbv1 + (int64_t)head*nbv2;
+                    std::vector<uint8_t> kb((size_t)DK/32*sizeof(block_q2_0)), vb((size_t)DV/32*sizeof(block_q2_0));
+                    cudaMemcpy(kb.data(), krow, kb.size(), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(vb.data(), vrow, vb.size(), cudaMemcpyDeviceToHost);
+                    dbg_dequantize_q2_0((const block_q2_0*)kb.data(), allK.data()+ic*DK, DK);
+                    dbg_dequantize_q2_0((const block_q2_0*)vb.data(), allV.data()+ic*DV, DV);
+                }
+                const ggml_fp16_t * mp = (const ggml_fp16_t *)((const char *)mask_lp->data + (int64_t)1*mask_lp->nb[1] + (int64_t)(head%(int64_t)mask_lp->ne[2])*mask_lp->nb[2]);
+                std::vector<float> dots(n_kv);
+                float mx = -1e30f;
+                for (int64_t ic=0; ic<n_kv; ++ic) {
+                    float d=0; for (int i=0;i<DK;i++) d += pq[i]*allK[ic*DK+i];
+                    dots[ic] = d*scale + __half2float(mp[ic]);
+                    if (dots[ic] > mx) mx = dots[ic];
+                }
+                float sum=0; for (int64_t ic=0; ic<n_kv; ++ic) sum += expf(dots[ic]-mx);
+                std::vector<float> out(DV, 0);
+                for (int64_t ic=0; ic<n_kv; ++ic) { float w = expf(dots[ic]-mx)/sum; for (int i=0;i<DV;i++) out[i]+=w*allV[ic*DV+i]; }
+                fprintf(stderr, "[MIXED-DBG] CPU-LP out[0..7]:");
+                for (int i=0;i<8;i++) fprintf(stderr, " %.4f", out[i]);
+                fprintf(stderr, "\n"); fflush(stderr);
+                const float * ko = (const float *)((const char *)dst->data + ((int64_t)0*n_head*N + (int64_t)1*N + head)*DV);
+                fprintf(stderr, "[MIXED-DBG] KERNEL dst(iq1=1,h=0)[0..7]:");
+                for (int i=0;i<8;i++) fprintf(stderr, " %.4f", ko[i]);
+                fprintf(stderr, "\n"); fflush(stderr);
+            } else {
+                fprintf(stderr, "[MIXED-DBG] mask_lp is NULL\n"); fflush(stderr);
+            }
+        }
+        }
+    }
 
     // pick thread count: DV must be divisible by T
     int T = (DV >= 256) ? 256 : (DV >= 128) ? 128 : (DV >= 64) ? 64 : 32;
