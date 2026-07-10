@@ -160,3 +160,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local model/rotation assets (large binaries)
+assets/
