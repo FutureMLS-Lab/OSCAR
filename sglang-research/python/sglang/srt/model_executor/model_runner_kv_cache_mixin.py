@@ -364,6 +364,34 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+        elif self.use_mla_backend and is_nsa_model and (
+            envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
+            or envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get()
+        ):
+            # MLA / NSA INT2 fake-quant pool for OSCAR latent KV experiments.
+            # Activated by either rotation_path (eval) or dump_dir (calibration).
+            from sglang.srt.mem_cache.mla_int2_kv_pool import NSAInt2HPKVPool
+
+            self.token_to_kv_pool = NSAInt2HPKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                dump_c_kv_dir=envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                dump_max_tokens_per_layer=envs.SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS.get(),
+                lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                hp_subspace_path=envs.SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH.get(),
+            )
         elif self.use_mla_backend and is_nsa_model:
             nsa_pool_kwargs = dict(
                 size=self.max_total_num_tokens,
@@ -403,6 +431,32 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                )
+            elif (
+                envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
+                or envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get()
+            ):
+                # Plain-MLA (non-NSA, e.g. DeepSeek-V2) INT2 fake-quant pool for
+                # OSCAR latent KV experiments. Same activation as the NSA branch.
+                from sglang.srt.mem_cache.mla_int2_kv_pool import MLAInt2HPKVPool
+
+                self.token_to_kv_pool = MLAInt2HPKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                    group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                    dump_c_kv_dir=envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                    dump_max_tokens_per_layer=envs.SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS.get(),
+                    lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                    hp_subspace_path=envs.SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH.get(),
                 )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(

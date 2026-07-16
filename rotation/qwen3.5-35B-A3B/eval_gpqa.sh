@@ -23,9 +23,9 @@ export NAME="${NAME:-gpqa_qwen35_35b_a3b}"
 export SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
 
 if [[ "${MODE}" == "hadamard" || "${MODE}" == "calibrated" ]]; then
-    ROT_BASE="${SCRIPT_DIR}/rotations/${MODE}"
-    export SGLANG_OSCAR_K_ROTATION_PATH="${ROT_BASE}/k_rotation.pt"
-    export SGLANG_OSCAR_V_ROTATION_PATH="${ROT_BASE}/v_rotation.pt"
+    export ROT_DIR="${SCRIPT_DIR}/rotations/${MODE}"
+    export K_ROT_FILENAME="k_rotation.pt"
+    export V_ROT_FILENAME="v_rotation.pt"
     export SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP}"
     export SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP}"
     export SGLANG_OSCAR_ABSORB_V_ROTATION=1

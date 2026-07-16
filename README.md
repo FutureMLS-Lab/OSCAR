@@ -54,13 +54,25 @@ so users can download calibrated rotations directly instead of recomputing them.
 <details>
 <summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
 
-Qwen3.5
-| Model | Mode | GPQA (198) | Δ vs BF16 |
-|-------|------|------------|-----------|
-| Qwen3.5-4B | baseline | **75.25%** | — |
-| Qwen3.5-4B | OSCAR | **74.75%** | −0.50 pp |
-| Qwen3.5-35B-A3B | baseline | **80.30%** | — |
-| Qwen3.5-35B-A3B | OSCAR | **82.32%** | +2.02 pp |
+Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std over 3 seeds (35B-A3B AIME: 8 seeds, N=30 is high-variance). OSCAR quantizer per model best: 4B uniform, 35B-A3B Lloyd-Max.
+
+**Qwen3.5-4B**
+| Benchmark | BF16 | OSCAR | Δ vs BF16 |
+|---|:---:|:---:|:---:|
+| GPQA-Diamond | 76.9 ± 1.3 | **75.8 ± 1.6** | −1.2 |
+| HumanEval | 81.7 ± 1.8 | **83.9 ± 1.0** | +2.2 |
+| AIME 2025 | 47.8 ± 3.1 | **46.7 ± 0.0** | −1.1 |
+| MATH500 | 89.5 ± 0.6 | **88.0 ± 0.6** | −1.5 |
+
+**Qwen3.5-35B-A3B**
+| Benchmark | BF16 | OSCAR | Δ vs BF16 |
+|---|:---:|:---:|:---:|
+| GPQA-Diamond | 83.3 ± 1.8 | **84.0 ± 1.3** | +0.7 |
+| HumanEval | 83.9 ± 0.6 | **86.6 ± 1.8** | +2.6 |
+| AIME 2025 † | 66.7 ± 5.3 | **62.1 ± 4.7** | −4.6 |
+| MATH500 | 92.8 ± 0.2 | **91.7 ± 0.4** | −1.1 |
+
+<sub>† AIME N=30 is high-variance; measured over 8 seeds. The −4.6 gap is not statistically significant (Welch t=1.72). At 3 seeds it read −6.7, inflated by a favorable BF16 draw.</sub>
 
 MiniMax2.7
 | Benchmark | BF16 | OSCAR (LM_RATIO=1.16) | Δ |

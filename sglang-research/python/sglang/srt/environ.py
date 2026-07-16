@@ -223,6 +223,16 @@ class Envs:
     # orthogonal matrices loaded from K/V rotation checkpoints.
     SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")
     SGLANG_OSCAR_V_ROTATION_PATH = EnvStr("")
+    # MLA / NSA latent KV INT2 fake-quant (GLM-5.1-FP8, DeepSeek-V2 style).
+    SGLANG_OSCAR_MLA_KV_ROTATION_PATH = EnvStr("")
+    SGLANG_OSCAR_MLA_KV_DUMP_DIR = EnvStr("")
+    SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
+    SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
+    # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
+    # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
+    # latent directions (from the kv_b_proj Hessian). Their projection is kept in
+    # BF16; only the residual is rotated + INT2-quantized. Beats plain Hadamard.
+    SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH = EnvStr("")
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
