@@ -157,6 +157,9 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                # MiniMax-M3 ships a VL wrapper config but we serve it text-only
+                # (the sglang model def builds only the language model).
+                "MiniMaxM3SparseForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models

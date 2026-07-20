@@ -793,6 +793,7 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
             num_layers=kv_pool.layer_num,
             k_clip_ratio=kv_pool._k_clip_ratio,
             v_clip_ratio=kv_pool._v_clip_ratio,
+            lloyd_max=getattr(kv_pool, "_lloyd_max", False),
         )
 
     if batch.model_config.is_encoder_decoder:

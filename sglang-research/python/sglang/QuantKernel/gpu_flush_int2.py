@@ -169,6 +169,7 @@ def _fused_flush_quant_body(
     BLOCK_TOK: tl.constexpr,
     CLIP_INDEX: tl.constexpr,
     BSEARCH_ITERS: tl.constexpr,
+    LLOYD_MAX: tl.constexpr,
 ):
     """Quantize ``BLOCK_TOK`` (src_hp_slot, head) HP rows into int2 at the
     matching ``dst_quant_slot``s.
@@ -225,23 +226,15 @@ def _fused_flush_quant_body(
             thr[:, None],
         )
 
-    grouped = tl.reshape(acc, (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE))
-    val_min = tl.min(grouped, axis=2)  # [BLOCK_TOK, NUM_GROUPS]
-    val_max = tl.max(grouped, axis=2)
-    scale = tl.maximum(val_max - val_min, 1e-8) / 3.0
-    zero = tl.math.div_rn(-val_min, scale)
-
-    # Quartered split via reshape + permute + split×2. Matches the layout
-    # produced by ``_pretransformed_grouped_int2_set_kv_kernel`` (the
-    # non-fused reference): byte ``i`` packs values at positions
+    # Quartered split of fp32 ``acc`` -> per-lane values (shared by both the
+    # uniform and Lloyd-Max paths). Matches the layout produced by
+    # ``_pretransformed_grouped_int2_set_kv_kernel`` (the non-fused
+    # reference): byte ``i`` packs values at positions
     # ``i, BQ+i, 2*BQ+i, 3*BQ+i``.
     #
     # We split fp32 ``acc`` (not the post-quant uint8 tile): empirically the
     # uint8-permute-reshape-split chain produced wrong q2 lanes on this
-    # Triton/sm90 build, while the fp32 chain matches the bit-level
-    # reference. Per-position scale/zero come from broadcasting the per-
-    # group ``scale``/``zero`` to ``HEAD_DIM`` and feeding them through
-    # the same reshape+permute+split pipeline.
+    # Triton/sm90 build, while the fp32 chain matches the bit-level reference.
     acc_r = tl.reshape(acc, (BLOCK_TOK, 4, BLOCK_QUARTER))
     acc_p = tl.permute(acc_r, (0, 2, 1))
     acc_s = tl.reshape(acc_p, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
@@ -249,33 +242,78 @@ def _fused_flush_quant_body(
     vals0, vals2 = tl.split(a_even)
     vals1, vals3 = tl.split(a_odd)
 
-    scale_3d = tl.broadcast_to(
-        scale[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
-    )
-    zero_3d = tl.broadcast_to(
-        zero[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
-    )
-    scale_flat = tl.reshape(scale_3d, (BLOCK_TOK, HEAD_DIM))
-    zero_flat = tl.reshape(zero_3d, (BLOCK_TOK, HEAD_DIM))
+    if LLOYD_MAX:
+        # Approximate Lloyd-Max INT2, bit-identical to the single-scale set
+        # kernel (``_pretransformed_int2_set_kv_clip_single_kernel`` LM
+        # branch): bucketize standardized ``z`` against LM levels and store
+        # uniform-equivalent (scale, zero) so the legacy ``(q - zero) * scale``
+        # dequant reconstructs at LM-aligned magnitudes (LM_RATIO=1.16 matches
+        # the CLIP=0.96 uniform-asym dynamic range). LM is single-scale: the
+        # launcher requires NUM_GROUPS == 1 so per-row stats == per-group.
+        row_mean = tl.sum(acc, axis=1) / HEAD_DIM
+        row_diff = acc - row_mean[:, None]
+        row_var = tl.sum(row_diff * row_diff, axis=1) / HEAD_DIM
+        row_std = tl.sqrt(row_var + 1e-8)
+        LM_M0: tl.constexpr = -0.9810652732849121
+        LM_M1: tl.constexpr = 0.0
+        LM_M2: tl.constexpr = 0.9810652732849121
+        zl0 = (vals0 - row_mean[:, None]) / row_std[:, None]
+        zl1 = (vals1 - row_mean[:, None]) / row_std[:, None]
+        zl2 = (vals2 - row_mean[:, None]) / row_std[:, None]
+        zl3 = (vals3 - row_mean[:, None]) / row_std[:, None]
+        q0 = ((zl0 >= LM_M0).to(tl.uint8) + (zl0 >= LM_M1).to(tl.uint8)
+              + (zl0 >= LM_M2).to(tl.uint8))
+        q1 = ((zl1 >= LM_M0).to(tl.uint8) + (zl1 >= LM_M1).to(tl.uint8)
+              + (zl1 >= LM_M2).to(tl.uint8))
+        q2 = ((zl2 >= LM_M0).to(tl.uint8) + (zl2 >= LM_M1).to(tl.uint8)
+              + (zl2 >= LM_M2).to(tl.uint8))
+        q3 = ((zl3 >= LM_M0).to(tl.uint8) + (zl3 >= LM_M1).to(tl.uint8)
+              + (zl3 >= LM_M2).to(tl.uint8))
+        LM_C0_EFF: tl.constexpr = -1.5095585584640503
+        LM_C3_EFF: tl.constexpr = 1.5095585584640503
+        LM_SPAN: tl.constexpr = LM_C3_EFF - LM_C0_EFF
+        LM_RATIO: tl.constexpr = 1.16
+        uniform_scale = (LM_SPAN / 3.0) * LM_RATIO * row_std
+        uniform_zero = (-LM_C0_EFF) / (LM_SPAN / 3.0) - row_mean / uniform_scale
+        scale = uniform_scale[:, None]  # [BLOCK_TOK, NUM_GROUPS(==1)]
+        zero = uniform_zero[:, None]
+    else:
+        grouped = tl.reshape(acc, (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE))
+        val_min = tl.min(grouped, axis=2)  # [BLOCK_TOK, NUM_GROUPS]
+        val_max = tl.max(grouped, axis=2)
+        scale = tl.maximum(val_max - val_min, 1e-8) / 3.0
+        zero = tl.math.div_rn(-val_min, scale)
 
-    sr = tl.reshape(scale_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
-    sp = tl.permute(sr, (0, 2, 1))
-    ss = tl.reshape(sp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
-    s_even, s_odd = tl.split(ss)
-    s0, s2 = tl.split(s_even)
-    s1, s3 = tl.split(s_odd)
+        # Per-position scale/zero via broadcasting the per-group scale/zero to
+        # HEAD_DIM and feeding them through the same reshape+permute+split.
+        scale_3d = tl.broadcast_to(
+            scale[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
+        )
+        zero_3d = tl.broadcast_to(
+            zero[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
+        )
+        scale_flat = tl.reshape(scale_3d, (BLOCK_TOK, HEAD_DIM))
+        zero_flat = tl.reshape(zero_3d, (BLOCK_TOK, HEAD_DIM))
 
-    zr = tl.reshape(zero_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
-    zp = tl.permute(zr, (0, 2, 1))
-    zs = tl.reshape(zp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
-    z_even, z_odd = tl.split(zs)
-    z0, z2 = tl.split(z_even)
-    z1, z3 = tl.split(z_odd)
+        sr = tl.reshape(scale_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
+        sp = tl.permute(sr, (0, 2, 1))
+        ss = tl.reshape(sp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
+        s_even, s_odd = tl.split(ss)
+        s0, s2 = tl.split(s_even)
+        s1, s3 = tl.split(s_odd)
 
-    q0 = (tl.math.div_rn(vals0, s0) + z0 + 0.5).to(tl.uint8)
-    q1 = (tl.math.div_rn(vals1, s1) + z1 + 0.5).to(tl.uint8)
-    q2 = (tl.math.div_rn(vals2, s2) + z2 + 0.5).to(tl.uint8)
-    q3 = (tl.math.div_rn(vals3, s3) + z3 + 0.5).to(tl.uint8)
+        zr = tl.reshape(zero_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
+        zp = tl.permute(zr, (0, 2, 1))
+        zs = tl.reshape(zp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
+        z_even, z_odd = tl.split(zs)
+        z0, z2 = tl.split(z_even)
+        z1, z3 = tl.split(z_odd)
+
+        q0 = (tl.math.div_rn(vals0, s0) + z0 + 0.5).to(tl.uint8)
+        q1 = (tl.math.div_rn(vals1, s1) + z1 + 0.5).to(tl.uint8)
+        q2 = (tl.math.div_rn(vals2, s2) + z2 + 0.5).to(tl.uint8)
+        q3 = (tl.math.div_rn(vals3, s3) + z3 + 0.5).to(tl.uint8)
+
     packed = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6)
 
     dim_offs_q = tl.arange(0, BLOCK_QUARTER)
@@ -359,6 +397,8 @@ def _fused_flush_quant_kernel(
     V_CLIP_INDEX: tl.constexpr,
     K_BSEARCH_ITERS: tl.constexpr,
     V_BSEARCH_ITERS: tl.constexpr,
+    K_LLOYD_MAX: tl.constexpr,
+    V_LLOYD_MAX: tl.constexpr,
 ):
     """Grid: ``(cdiv(num_flush_tokens, BLOCK_TOK), num_heads, num_layers)``.
 
@@ -435,6 +475,7 @@ def _fused_flush_quant_kernel(
         BLOCK_TOK,
         K_CLIP_INDEX,
         K_BSEARCH_ITERS,
+        K_LLOYD_MAX,
     )
     # V side
     hp_v_base = tl.load(hp_v_ptrs_ptr + layer).to(
@@ -470,6 +511,7 @@ def _fused_flush_quant_kernel(
         BLOCK_TOK,
         V_CLIP_INDEX,
         V_BSEARCH_ITERS,
+        V_LLOYD_MAX,
     )
 
 
@@ -695,6 +737,7 @@ def gpu_flush_int2_apply(
     num_layers: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    lloyd_max: bool = False,
 ) -> None:
     """Apply phase: run fused quant + remap kernels using a prepared plan.
 
@@ -717,6 +760,16 @@ def gpu_flush_int2_apply(
     v_block_quarter, v_num_groups, v_group_size = _resolve_kv_quant_config(
         v_head_dim, v_num_scale_groups
     )
+
+    # Lloyd-Max is single-scale (per-row stats); it mirrors the single-scale
+    # set kernel, which only supports NUM_GROUPS == 1. Guard so a grouped
+    # config can't silently mis-quantize under LM.
+    if lloyd_max and (k_num_groups != 1 or v_num_groups != 1):
+        raise ValueError(
+            f"lloyd_max requires a single scale group (k_num_groups="
+            f"{k_num_groups}, v_num_groups={v_num_groups}); set "
+            f"kv-cache-quant-group-size == head_dim"
+        )
 
     k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
     v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
@@ -780,6 +833,8 @@ def gpu_flush_int2_apply(
         V_CLIP_INDEX=v_clip_index,
         K_BSEARCH_ITERS=(int(head_dim).bit_length() - 1) if head_dim >= 64 else 0,
         V_BSEARCH_ITERS=(int(v_head_dim).bit_length() - 1) if v_head_dim >= 64 else 0,
+        K_LLOYD_MAX=bool(lloyd_max),
+        V_LLOYD_MAX=bool(lloyd_max),
         num_warps=num_warps,
         num_stages=1,
     )
@@ -838,6 +893,7 @@ def gpu_flush_int2(
     flush_interval: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    lloyd_max: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run plan -> fused quant -> remap for one decode flush step.
 
@@ -901,6 +957,7 @@ def gpu_flush_int2(
         num_layers=num_layers,
         k_clip_ratio=k_clip_ratio,
         v_clip_ratio=v_clip_ratio,
+        lloyd_max=lloyd_max,
     )
 
     return plan.returned_slot_ids, plan.valid_mask
