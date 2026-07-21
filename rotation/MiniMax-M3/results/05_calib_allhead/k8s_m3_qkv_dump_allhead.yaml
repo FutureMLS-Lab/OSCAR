@@ -1,0 +1,210 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: m3-dumpah-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: m3-dumpah-multinode, role: head}
+  ports:
+  - {name: dist, port: 41191, targetPort: 41191}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3-dumpah-head
+  namespace: charlie
+  labels: {app: m3-dumpah-multinode, role: head}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels: {app: m3-dumpah-multinode, role: head}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      nodeSelector: {node-pool: compute, node-group: nccl}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: [research-common-h100-014.cloud.together.ai, research-common-h100-064.cloud.together.ai, research-common-h100-092.cloud.together.ai, research-common-h100-099.cloud.together.ai, research-common-h100-117.cloud.together.ai]
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      containers:
+      - name: serve-dump
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        workingDir: /home/charlie/CoQuant/.RUD/m3oscar
+        env:
+        - {name: HOME, value: /home/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: HF_DATASETS_CACHE, value: /shared/huggingface}
+        - {name: TRANSFORMERS_CACHE, value: /shared/huggingface}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: TRANSFORMERS_OFFLINE, value: "1"}
+        - {name: NCCL_SOCKET_IFNAME, value: bond0}
+        - {name: NCCL_IB_HCA, value: ^mlx5_0}
+        - {name: NCCL_NET, value: IB}
+        - {name: NCCL_IB_DISABLE, value: "0"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: expandable_segments:True}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        resources:
+          limits: {nvidia.com/gpu: "8", memory: 400Gi, cpu: "32"}
+          requests: {nvidia.com/gpu: "8", memory: 200Gi, cpu: "16"}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home-charlie, mountPath: /home/charlie}
+        command:
+        - /bin/bash
+        - -lc
+        - |
+          set -euo pipefail
+          export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices | paste -sd,)
+          WORKTREE=/home/charlie/CoQuant/.RUD/m3oscar/work/CoQuant
+          RUN_DIR=/home/charlie/CoQuant/.RUD/m3oscar/investigation/05_calib_allhead
+          export DUMP_M3_QKV_DIR=${WORKTREE}/rotation/MiniMax-M3/GPQA/calib_allhead/qkv_dumps_perrank
+          mkdir -p "${RUN_DIR}" "${DUMP_M3_QKV_DIR}"
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
+          export PATH="${CONDA_PREFIX}/bin:${PATH}"
+          export PYTHONPATH="${WORKTREE}/rotation/_triton_per_rank:${WORKTREE}/sglang-research/python:${PYTHONPATH:-}"
+          export TRITON_CACHE_DIR=/tmp/triton_cache_head OSCAR_TRITON_PER_RANK_BASE=/tmp/oscar_triton_head
+          mkdir -p "${TRITON_CACHE_DIR}" "${OSCAR_TRITON_PER_RANK_BASE}"
+          LOG=${RUN_DIR}/server.log; : > "${LOG}"
+          MY_IP=$(hostname -I | awk '{print $1}'); echo "[head] IP=${MY_IP} dump_dir=${DUMP_M3_QKV_DIR}"
+
+          CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+            python -m sglang.launch_server \
+              --model-path MiniMaxAI/MiniMax-M3 --dtype bfloat16 \
+              --tensor-parallel-size 16 --nnodes 2 --node-rank 0 \
+              --dist-init-addr "${MY_IP}:41191" \
+              --prefill-attention-backend fa3 --decode-attention-backend triton \
+              --disable-cuda-graph --context-length 40960 \
+              --mem-fraction-static 0.85 --max-running-requests 16 \
+              --skip-server-warmup --watchdog-timeout 1800 \
+              --host 0.0.0.0 --port 31191 --trust-remote-code \
+              >> "${LOG}" 2>&1 &
+          SERVER_PID=$!
+          for _ in $(seq 1 720); do
+            curl -s "http://127.0.0.1:31191/health" >/dev/null 2>&1 && { echo "[head] ready"; break; }
+            kill -0 "${SERVER_PID}" 2>/dev/null || { echo "[head] server died"; tail -120 "${LOG}"; exit 1; }
+            sleep 5
+          done
+          curl -s "http://127.0.0.1:31191/health" >/dev/null 2>&1 || { echo "[head] not ready"; tail -120 "${LOG}"; exit 1; }
+
+          echo "[head] sending 198 GPQA prompts (max_tokens=1) to trigger dump"
+          python ${WORKTREE}/rotation/_eval_runner/dump_gpqa_prompts.py \
+            --model MiniMaxAI/MiniMax-M3 --base-url "http://127.0.0.1:31191/v1" \
+            --num-prompts 45 --num-threads 16 \
+            --temperature 0.6 --top-p 0.95 --top-k 40 --max-tokens 1 \
+            2>&1 | tee "${RUN_DIR}/dump_runner.log"
+          echo "[head] dump done. layer_3 k chunks:"; ls "${DUMP_M3_QKV_DIR}/layer_3/rank_0/k" 2>/dev/null | head
+          kill -KILL "${SERVER_PID}" 2>/dev/null || true; pkill -KILL -P "${SERVER_PID}" 2>/dev/null || true
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3-dumpah-worker
+  namespace: charlie
+  labels: {app: m3-dumpah-multinode, role: worker}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels: {app: m3-dumpah-multinode, role: worker}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      nodeSelector: {node-pool: compute, node-group: nccl}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: [research-common-h100-014.cloud.together.ai, research-common-h100-064.cloud.together.ai, research-common-h100-092.cloud.together.ai, research-common-h100-099.cloud.together.ai, research-common-h100-117.cloud.together.ai]
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - {key: app, operator: In, values: [m3-dumpah-multinode]}
+            topologyKey: kubernetes.io/hostname
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      containers:
+      - name: worker
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        workingDir: /home/charlie/CoQuant/.RUD/m3oscar
+        env:
+        - {name: HOME, value: /home/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: HF_DATASETS_CACHE, value: /shared/huggingface}
+        - {name: TRANSFORMERS_CACHE, value: /shared/huggingface}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: TRANSFORMERS_OFFLINE, value: "1"}
+        - {name: NCCL_SOCKET_IFNAME, value: bond0}
+        - {name: NCCL_IB_HCA, value: ^mlx5_0}
+        - {name: NCCL_NET, value: IB}
+        - {name: NCCL_IB_DISABLE, value: "0"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: expandable_segments:True}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        resources:
+          limits: {nvidia.com/gpu: "8", memory: 400Gi, cpu: "32"}
+          requests: {nvidia.com/gpu: "8", memory: 200Gi, cpu: "16"}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home-charlie, mountPath: /home/charlie}
+        command:
+        - /bin/bash
+        - -lc
+        - |
+          set -euo pipefail
+          export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices | paste -sd,)
+          WORKTREE=/home/charlie/CoQuant/.RUD/m3oscar/work/CoQuant
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
+          export PATH="${CONDA_PREFIX}/bin:${PATH}"
+          export PYTHONPATH="${WORKTREE}/rotation/_triton_per_rank:${WORKTREE}/sglang-research/python:${PYTHONPATH:-}"
+          export DUMP_M3_QKV_DIR=${WORKTREE}/rotation/MiniMax-M3/GPQA/calib_allhead/qkv_dumps_perrank
+          export TRITON_CACHE_DIR=/tmp/triton_cache_worker OSCAR_TRITON_PER_RANK_BASE=/tmp/oscar_triton_worker
+          mkdir -p "${TRITON_CACHE_DIR}" "${OSCAR_TRITON_PER_RANK_BASE}" "${DUMP_M3_QKV_DIR}"
+          for i in $(seq 1 180); do
+            MASTER_IP=$(getent hosts m3-dumpah-master | awk '{print $1}' || true)
+            [[ -n "$MASTER_IP" ]] && { echo "[worker] master=${MASTER_IP}"; break; }
+            echo "[worker] waiting DNS..."; sleep 5
+          done
+          [[ -z "$MASTER_IP" ]] && { echo "[worker] no master"; exit 1; } || true
+          CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+            python -m sglang.launch_server \
+              --model-path MiniMaxAI/MiniMax-M3 --dtype bfloat16 \
+              --tensor-parallel-size 16 --nnodes 2 --node-rank 1 \
+              --dist-init-addr "${MASTER_IP}:41191" \
+              --prefill-attention-backend fa3 --decode-attention-backend triton \
+              --disable-cuda-graph --context-length 40960 \
+              --mem-fraction-static 0.85 --max-running-requests 16 \
+              --skip-server-warmup --watchdog-timeout 1800 \
+              --host 0.0.0.0 --port 31192 --trust-remote-code \
+              2>&1 | tee /tmp/worker_server.log
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}

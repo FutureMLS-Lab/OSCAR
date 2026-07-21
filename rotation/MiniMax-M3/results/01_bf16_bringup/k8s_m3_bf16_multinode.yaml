@@ -1,0 +1,343 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: m3-bf16-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: m3-bf16-multinode
+    role: head
+  ports:
+  - name: dist
+    port: 41183
+    targetPort: 41183
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3-bf16-head
+  namespace: charlie
+  labels:
+    app: m3-bf16-multinode
+    role: head
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: m3-bf16-multinode
+        role: head
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      nodeSelector:
+        node-pool: compute
+        node-group: nccl
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-014.cloud.together.ai
+                - research-common-h100-064.cloud.together.ai
+                - research-common-h100-092.cloud.together.ai
+                - research-common-h100-099.cloud.together.ai
+                - research-common-h100-117.cloud.together.ai
+      tolerations:
+      - key: node-group
+        operator: Equal
+        value: nccl
+        effect: NoSchedule
+      containers:
+      - name: serve-eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        workingDir: /home/charlie/CoQuant/.RUD/m3oscar
+        env:
+        - name: HOME
+          value: /home/charlie
+        - name: HF_HOME
+          value: /shared/huggingface
+        - name: HF_DATASETS_CACHE
+          value: /shared/huggingface
+        - name: TRANSFORMERS_CACHE
+          value: /shared/huggingface
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+        - name: NCCL_SOCKET_IFNAME
+          value: bond0
+        - name: NCCL_IB_HCA
+          value: ^mlx5_0
+        - name: NCCL_NET
+          value: IB
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+            memory: 400Gi
+            cpu: "32"
+          requests:
+            nvidia.com/gpu: "8"
+            memory: 200Gi
+            cpu: "16"
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        command:
+        - /bin/bash
+        - -lc
+        - |
+          set -euo pipefail
+          export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices | paste -sd,)
+          WORKTREE=/home/charlie/CoQuant/.RUD/m3oscar/work/CoQuant
+          RUN_DIR=/home/charlie/CoQuant/.RUD/m3oscar/investigation/01_bf16_bringup
+          mkdir -p "${RUN_DIR}"
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh
+          conda activate oscar
+          export PATH="${CONDA_PREFIX}/bin:${PATH}"
+          export PYTHONPATH="${WORKTREE}/rotation/_triton_per_rank:${WORKTREE}/sglang-research/python:${PYTHONPATH:-}"
+
+          export TRITON_CACHE_DIR=/tmp/triton_cache_head
+          export OSCAR_TRITON_PER_RANK_BASE=/tmp/oscar_triton_head
+          mkdir -p "${TRITON_CACHE_DIR}" "${OSCAR_TRITON_PER_RANK_BASE}"
+
+          LOG_SERVER=${RUN_DIR}/server.log
+          : > "${LOG_SERVER}"
+          MY_IP=$(hostname -I | awk '{print $1}')
+          echo "[head] my IP=${MY_IP}"
+
+          CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+            python -m sglang.launch_server \
+              --model-path MiniMaxAI/MiniMax-M3 \
+              --dtype bfloat16 \
+              --tensor-parallel-size 16 \
+              --nnodes 2 \
+              --node-rank 0 \
+              --dist-init-addr "${MY_IP}:41183" \
+              --kv-cache-dtype auto \
+              --prefill-attention-backend fa3 \
+              --decode-attention-backend triton \
+              --context-length 40960 \
+              --mem-fraction-static 0.85 \
+              --max-running-requests 16 \
+              --enable-cache-report \
+              --skip-server-warmup \
+              --watchdog-timeout 1800 \
+              --host 0.0.0.0 \
+              --port 31183 \
+              --trust-remote-code \
+              >> "${LOG_SERVER}" 2>&1 &
+          SERVER_PID=$!
+
+          for _ in $(seq 1 720); do
+            if curl -s "http://127.0.0.1:31183/health" >/dev/null 2>&1; then
+              echo "[head] server ready"; break
+            fi
+            if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+              echo "[head] server died"; tail -120 "${LOG_SERVER}"; exit 1
+            fi
+            sleep 5
+          done
+          if ! curl -s "http://127.0.0.1:31183/health" >/dev/null 2>&1; then
+            echo "[head] server not ready after 60 min"; tail -120 "${LOG_SERVER}"; exit 1
+          fi
+
+          echo "[head] === sanity generation (coherence check) ==="
+          curl -s http://127.0.0.1:31183/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"MiniMaxAI/MiniMax-M3","messages":[{"role":"user","content":"Reply with exactly one word: the capital of France."}],"max_tokens":32,"temperature":0}' \
+            | tee "${RUN_DIR}/sanity.json"; echo
+
+          RUNNER="${WORKTREE}/rotation/_eval_runner/run_simple_eval.py"
+          python "${RUNNER}" \
+            --task gpqa \
+            --model MiniMaxAI/MiniMax-M3 \
+            --base-url "http://127.0.0.1:31183/v1" \
+            --max-tokens 32768 \
+            --temperature 1.0 --top-p 0.95 --top-k 40 \
+            --n-repeats 1 --num-threads 16 \
+            --output-dir "${RUN_DIR}" \
+            2>&1 | tee "${RUN_DIR}/runner.log"
+          echo "[head] done. score:"
+          grep -iE "gpqa/score|score" "${RUN_DIR}/eval.log" 2>/dev/null | tail -5 || \
+            python -c "import json;d=json.load(open('${RUN_DIR}/metrics.json'));print('score=%.4f'%d['score'])" 2>/dev/null || true
+
+          kill -KILL "${SERVER_PID}" 2>/dev/null || true
+          pkill -KILL -P "${SERVER_PID}" 2>/dev/null || true
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3-bf16-worker
+  namespace: charlie
+  labels:
+    app: m3-bf16-multinode
+    role: worker
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: m3-bf16-multinode
+        role: worker
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      nodeSelector:
+        node-pool: compute
+        node-group: nccl
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-014.cloud.together.ai
+                - research-common-h100-064.cloud.together.ai
+                - research-common-h100-092.cloud.together.ai
+                - research-common-h100-099.cloud.together.ai
+                - research-common-h100-117.cloud.together.ai
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - m3-bf16-multinode
+            topologyKey: kubernetes.io/hostname
+      tolerations:
+      - key: node-group
+        operator: Equal
+        value: nccl
+        effect: NoSchedule
+      containers:
+      - name: worker
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        workingDir: /home/charlie/CoQuant/.RUD/m3oscar
+        env:
+        - name: HOME
+          value: /home/charlie
+        - name: HF_HOME
+          value: /shared/huggingface
+        - name: HF_DATASETS_CACHE
+          value: /shared/huggingface
+        - name: TRANSFORMERS_CACHE
+          value: /shared/huggingface
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+        - name: NCCL_SOCKET_IFNAME
+          value: bond0
+        - name: NCCL_IB_HCA
+          value: ^mlx5_0
+        - name: NCCL_NET
+          value: IB
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+            memory: 400Gi
+            cpu: "32"
+          requests:
+            nvidia.com/gpu: "8"
+            memory: 200Gi
+            cpu: "16"
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        command:
+        - /bin/bash
+        - -lc
+        - |
+          set -euo pipefail
+          export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices | paste -sd,)
+          WORKTREE=/home/charlie/CoQuant/.RUD/m3oscar/work/CoQuant
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh
+          conda activate oscar
+          export PATH="${CONDA_PREFIX}/bin:${PATH}"
+          export PYTHONPATH="${WORKTREE}/rotation/_triton_per_rank:${WORKTREE}/sglang-research/python:${PYTHONPATH:-}"
+          export TRITON_CACHE_DIR=/tmp/triton_cache_worker
+          export OSCAR_TRITON_PER_RANK_BASE=/tmp/oscar_triton_worker
+          mkdir -p "${TRITON_CACHE_DIR}" "${OSCAR_TRITON_PER_RANK_BASE}"
+
+          for i in $(seq 1 180); do
+            MASTER_IP=$(getent hosts m3-bf16-master | awk '{print $1}' || true)
+            if [[ -n "$MASTER_IP" ]]; then echo "[worker] master IP=${MASTER_IP}"; break; fi
+            echo "[worker] waiting for m3-bf16-master DNS..."; sleep 5
+          done
+          if [[ -z "$MASTER_IP" ]]; then echo "[worker] no master after 15 min"; exit 1; fi
+
+          CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+            python -m sglang.launch_server \
+              --model-path MiniMaxAI/MiniMax-M3 \
+              --dtype bfloat16 \
+              --tensor-parallel-size 16 \
+              --nnodes 2 \
+              --node-rank 1 \
+              --dist-init-addr "${MASTER_IP}:41183" \
+              --kv-cache-dtype auto \
+              --prefill-attention-backend fa3 \
+              --decode-attention-backend triton \
+              --context-length 40960 \
+              --mem-fraction-static 0.85 \
+              --max-running-requests 16 \
+              --skip-server-warmup \
+              --watchdog-timeout 1800 \
+              --host 0.0.0.0 \
+              --port 31184 \
+              --trust-remote-code \
+              2>&1 | tee /tmp/worker_server.log
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
