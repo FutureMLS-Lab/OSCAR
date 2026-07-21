@@ -74,7 +74,7 @@ class SglangChatSampler:
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key,
-            timeout=httpx.Timeout(connect=30, read=21600, write=30, pool=30),
+            timeout=httpx.Timeout(connect=30, read=28800, write=30, pool=30),
             max_retries=0,
         )
         self.model = model

@@ -1,0 +1,7 @@
+
+=== 6 layers, α=1.0; lower total=better ===
+method             total  dB_none   dB_had  bits/elem
+none           0.0844744    +0.00    +0.03      2.000
+hadamard        0.083891    -0.03    +0.00      2.000
+had+hp64       0.0589918    -1.56    -1.53      4.000 <== beats hadamard
+had+hp128      0.0446625    -2.77    -2.74      6.000 <== beats hadamard

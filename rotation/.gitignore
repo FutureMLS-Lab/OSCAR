@@ -6,3 +6,10 @@ triton_cache/
 triton_cache_head/
 __pycache__/
 bench_matrix/**/lmeval/
+eval.log
+GLM-5.1-FP8/
+qwen3-32B/rotations/
+bench_bf16_vs_int2/
+investigation/*/upproj_rotations/
+investigation/*/hp128_subspace/
+investigation/*/qkv_dumps*/
