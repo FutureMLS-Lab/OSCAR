@@ -90,6 +90,12 @@ case "${LEG}" in
   int2_radixoff) # single-delta: radix cache OFF, cuda graphs stay ON (deployable config)
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" ) ;;
+  int2_lm_g) # deployable config + Lloyd-Max (zero extra bits)
+    ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 ) ;;
+  int2_lm_g_r512) # + recent 512 (~+3% bits at BFCL median ctx)
+    ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
   int2_lm)
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --disable-cuda-graph )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 ) ;;
