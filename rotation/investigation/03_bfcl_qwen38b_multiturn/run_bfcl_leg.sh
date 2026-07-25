@@ -96,6 +96,15 @@ case "${LEG}" in
   int2_lm_g_r512) # + recent 512 (~+3% bits at BFCL median ctx)
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
+  int2_best_noclip) # winner config, clip disabled (zero-bit; retrieval outliers stay exact)
+    ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 SGLANG_OSCAR_K_CLIP_RATIO=0 SGLANG_OSCAR_V_CLIP_RATIO=0 ) ;;
+  int2_best_g64) # winner config, group 64 (+0.5 bpe scale overhead; precision probe)
+    ARGS=( "${SERVER_ARGS[@]}" --kv-cache-dtype int2 --kv-cache-quant-group-size 64 --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
+  int2_best_g256) # winner config, group 256 (-0.25 bpe)
+    ARGS=( "${SERVER_ARGS[@]}" --kv-cache-dtype int2 --kv-cache-quant-group-size 256 --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
   int2_lm)
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --disable-cuda-graph )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 ) ;;
