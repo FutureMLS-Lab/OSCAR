@@ -19,6 +19,13 @@ case "${LEG}" in
     ROT=${ZOO}/Qwen3-32B/seq16000_prompt69_group128
     BFCL_MODEL="Qwen/Qwen3-32B-FC"
     SERVED_NAME="Qwen/Qwen3-32B" ;;
+  q354b_*) # Qwen3.5-4B legs (hybrid attention; local calibrated rotations)
+    TP=${TP:-1}
+    MODEL=/shared/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots
+    ROT=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/qwen3.5-4B/rotations/calibrated
+    K_ROT_FILE=k_rotation.pt; V_ROT_FILE=v_rotation.pt
+    BFCL_MODEL="Qwen/Qwen3.5-4B-FC"
+    SERVED_NAME="Qwen/Qwen3.5-4B" ;;
   *)
     TP=${TP:-2}
     MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots
@@ -62,7 +69,7 @@ done
 MEMFRAC=0.85; MAXRUN=128
 case "${LEG}" in
   int2_hp2048) MEMFRAC=0.70; MAXRUN=16 ;;  # HP-prefix pool = prefix_tokens x max_running in BF16
-  int2_*|q332_int2_*) MEMFRAC=0.75 ;;             # INT2 pool sizing leaves ~0GB for cuda-graph capture at 0.85 (reporter also used 0.75)
+  int2_*|q332_int2_*|q354b_int2_*) MEMFRAC=0.75 ;;             # INT2 pool sizing leaves ~0GB for cuda-graph capture at 0.85 (reporter also used 0.75)
 esac
 SERVER_ARGS=(
   --model-path "${MODEL}" --served-model-name ${SERVED_NAME}
@@ -84,8 +91,8 @@ ENV_INT2=(
   SGLANG_MIXED_KV_HP_DTYPE=bfloat16
   SGLANG_MIXED_KV_SCALE_DTYPE=float32
   SGLANG_OSCAR_ABSORB_V_ROTATION=1
-  SGLANG_OSCAR_K_ROTATION_PATH=${ROT}/k_rotation_qqt_r_h_pbr.pt
-  SGLANG_OSCAR_V_ROTATION_PATH=${ROT}/v_rotation_sst_r_h_pbr.pt
+  SGLANG_OSCAR_K_ROTATION_PATH=${ROT}/${K_ROT_FILE:-k_rotation_qqt_r_h_pbr.pt}
+  SGLANG_OSCAR_V_ROTATION_PATH=${ROT}/${V_ROT_FILE:-v_rotation_sst_r_h_pbr.pt}
   SGLANG_OSCAR_K_CLIP_RATIO=0.96
   SGLANG_OSCAR_V_CLIP_RATIO=0.92
   SGLANG_LLOYD_MAX=0
@@ -125,11 +132,14 @@ case "${LEG}" in
   int2_hp2048)
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --disable-cuda-graph )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_MIXED_KV_PREFIX_TOKENS=2048 SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS=65536 ) ;;
-  q332_bf16)
+  q332_bf16|q354b_bf16)
     ARGS=( "${SERVER_ARGS[@]}" --cuda-graph-max-bs 16 )
     ENVV=( "${ENV_COMMON[@]}" ) ;;
-  q332_int2_best) # winner recipe on 32B: radix OFF + graphs ON + LM + recent512
+  q332_int2_best) # winner recipe: radix OFF + graphs ON + LM + recent512
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
+  q354b_int2_best) # winner recipe; Qwen3.5 head_dim=256 -> LM needs group==head_dim
+    ARGS=( "${SERVER_ARGS[@]}" --kv-cache-dtype int2 --kv-cache-quant-group-size 256 --disable-radix-cache --cuda-graph-max-bs 16 )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
   *) echo "unknown LEG=${LEG}"; exit 1 ;;
 esac
