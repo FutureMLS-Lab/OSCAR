@@ -11,12 +11,24 @@ set -euo pipefail
 LEG=${LEG:?set LEG}
 RUN_TAG=${RUN_TAG:-run0}
 PORT=${PORT:-31500}
-TP=${TP:-2}
-MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots
+ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo
+case "${LEG}" in
+  q332_*)  # Qwen3-32B legs
+    TP=${TP:-4}
+    MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-32B/snapshots
+    ROT=${ZOO}/Qwen3-32B/seq16000_prompt69_group128
+    BFCL_MODEL="Qwen/Qwen3-32B-FC"
+    SERVED_NAME="Qwen/Qwen3-32B" ;;
+  *)
+    TP=${TP:-2}
+    MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots
+    ROT=${ZOO}/Qwen3-8B/seq20000_prompt83_group128
+    BFCL_MODEL="Qwen/Qwen3-8B-FC"
+    SERVED_NAME="Qwen/Qwen3-8B" ;;
+esac
 MODEL=$(ls -d ${MODEL}/*/ | head -1)
 
 INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn
-ROT=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
 SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
 BFCL_SRC=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/gorilla/berkeley-function-call-leaderboard
 OUT=${INV}/legs/${LEG}/${RUN_TAG}
@@ -28,6 +40,8 @@ rm -f /tmp/*file_baton* 2>/dev/null || true
 
 source /home/charlie/miniconda3/etc/profile.d/conda.sh
 conda activate oscar
+export TRITON_CACHE_DIR=/tmp/triton_cache_${LEG}   # pod-local: weka-shared ~/.triton races across pods
+mkdir -p "${TRITON_CACHE_DIR}" 
 export PYTHONPATH=${SGL}/python:${PYTHONPATH:-}
 export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices 2>/dev/null | paste -sd, || echo 0,1)
 
@@ -48,10 +62,10 @@ done
 MEMFRAC=0.85; MAXRUN=128
 case "${LEG}" in
   int2_hp2048) MEMFRAC=0.70; MAXRUN=16 ;;  # HP-prefix pool = prefix_tokens x max_running in BF16
-  int2_*)      MEMFRAC=0.75 ;;             # INT2 pool sizing leaves ~0GB for cuda-graph capture at 0.85 (reporter also used 0.75)
+  int2_*|q332_int2_*) MEMFRAC=0.75 ;;             # INT2 pool sizing leaves ~0GB for cuda-graph capture at 0.85 (reporter also used 0.75)
 esac
 SERVER_ARGS=(
-  --model-path "${MODEL}" --served-model-name Qwen/Qwen3-8B
+  --model-path "${MODEL}" --served-model-name ${SERVED_NAME}
   --tensor-parallel-size ${TP}
   --prefill-attention-backend fa3 --decode-attention-backend triton
   --mem-fraction-static ${MEMFRAC} --max-running-requests ${MAXRUN}
@@ -111,6 +125,12 @@ case "${LEG}" in
   int2_hp2048)
     ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --disable-cuda-graph )
     ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_MIXED_KV_PREFIX_TOKENS=2048 SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS=65536 ) ;;
+  q332_bf16)
+    ARGS=( "${SERVER_ARGS[@]}" --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" ) ;;
+  q332_int2_best) # winner recipe on 32B: radix OFF + graphs ON + LM + recent512
+    ARGS=( "${SERVER_ARGS[@]}" "${INT2_ARGS[@]}" --disable-radix-cache --cuda-graph-max-bs 16 )
+    ENVV=( "${ENV_COMMON[@]}" "${ENV_INT2[@]}" SGLANG_LLOYD_MAX=1 SGLANG_MIXED_KV_RECENT_TOKENS=512 ) ;;
   *) echo "unknown LEG=${LEG}"; exit 1 ;;
 esac
 
@@ -135,14 +155,14 @@ mkdir -p "${BFCL_PROJECT_ROOT}"
 export LOCAL_SERVER_ENDPOINT=127.0.0.1
 export LOCAL_SERVER_PORT=${PORT}
 cd "${BFCL_SRC}"
-bfcl generate --model Qwen/Qwen3-8B-FC --test-category multi_turn \
+bfcl generate --model "${BFCL_MODEL}" --test-category multi_turn \
   --num-threads ${BFCL_THREADS:-16} --skip-server-setup --allow-overwrite \
   > "${OUT}/generate.log" 2>&1
 # a dead server mid-generation leaves "Error during inference" entries and a completed-looking run
 curl -s http://127.0.0.1:${PORT}/health >/dev/null 2>&1 || { echo "SERVER_DEAD_AFTER_GENERATE"; exit 1; }
 nerr=$(grep -hc "Error during inference" "${BFCL_PROJECT_ROOT}"/result/*/multi_turn/*.json 2>/dev/null | awk '{s+=$1} END{print s+0}')
 [ "${nerr}" -gt 40 ] && { echo "TOO_MANY_INFERENCE_ERRORS ${nerr}"; exit 1; }
-bfcl evaluate --model Qwen/Qwen3-8B-FC --test-category multi_turn \
+bfcl evaluate --model "${BFCL_MODEL}" --test-category multi_turn \
   > "${OUT}/evaluate.log" 2>&1 || true
 cp -r "${BFCL_PROJECT_ROOT}/score" "${OUT}/" 2>/dev/null || true
 tail -30 "${OUT}/evaluate.log" | tee "${OUT}/summary.txt"
