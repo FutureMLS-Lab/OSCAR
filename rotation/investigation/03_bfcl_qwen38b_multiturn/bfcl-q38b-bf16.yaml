@@ -77,7 +77,7 @@ spec:
         - /bin/bash
         - -lc
         - |
-          bash /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/run_bfcl_leg.sh
+          bash /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/03_bfcl_qwen38b_multiturn/run_bfcl_leg.sh
       volumes:
       - name: shared
         persistentVolumeClaim:

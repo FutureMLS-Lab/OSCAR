@@ -1,9 +1,9 @@
 #!/bin/bash
 # 4-arm bisect for Qwen3-30B-A3B INT2 corruption.
 set -euo pipefail
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix
-RADIX=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/04_radix_mixedkv_regression
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix
+RADIX=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/04_radix_mixedkv_regression
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
 MODEL=$(ls -d /shared/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/*/ | head -1)
 PORT=31608
 OUT=$INV/out_final; mkdir -p "$OUT"
@@ -16,8 +16,8 @@ export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices 2>/dev/null |
 OSCAR_ENV=(SGLANG_ENABLE_MIXED_KV_WINDOWS=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
   SGLANG_MIXED_KV_HP_MAX_SPLITS=8 SGLANG_MIXED_KV_PREFIX_TOKENS=64 SGLANG_MIXED_KV_RECENT_TOKENS=256
   SGLANG_MIXED_KV_HP_DTYPE=bfloat16 SGLANG_MIXED_KV_SCALE_DTYPE=float32
-  SGLANG_OSCAR_K_ROTATION_PATH=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt15_group128/rotations/k_rotation_qqt_r_h_pbr.pt
-  SGLANG_OSCAR_V_ROTATION_PATH=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt15_group128/rotations/v_rotation_sst_r_h_pbr.pt
+  SGLANG_OSCAR_K_ROTATION_PATH=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt15_group128/rotations/k_rotation_qqt_r_h_pbr.pt
+  SGLANG_OSCAR_V_ROTATION_PATH=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt15_group128/rotations/v_rotation_sst_r_h_pbr.pt
   SGLANG_OSCAR_K_CLIP_RATIO=0.96 SGLANG_OSCAR_V_CLIP_RATIO=0.92 SGLANG_LLOYD_MAX=0)
 
 run_arm () { # name, extra_env..., -- extra_args...

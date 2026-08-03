@@ -1,7 +1,7 @@
 #!/bin/bash
 # Discrimination test: can the harness tell a known-good rotation from a known-bad one?
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 INV=$W/rotation/investigation/05_qwen3moe_absorb_fix
 ZOO=$W/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
 OUT=$INV/ppl_out; mkdir -p $OUT

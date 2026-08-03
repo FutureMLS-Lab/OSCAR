@@ -1,6 +1,6 @@
 """Generation coherence: shared vs per-head rotation under INT2 fake-quant."""
 import argparse, glob, json, sys, torch
-sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix")
+sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix")
 import fq_common as FQ
 from transformers import AutoModelForCausalLM, AutoTokenizer
 

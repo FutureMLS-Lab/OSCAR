@@ -6,7 +6,7 @@ window, so the bf16 recent span is exact.
 """
 import argparse, json, math, sys, time
 import torch
-sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix")
+sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix")
 import fq_common as FQ
 
 AP = argparse.ArgumentParser()

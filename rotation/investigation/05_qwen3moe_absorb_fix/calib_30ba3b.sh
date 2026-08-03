@@ -1,7 +1,7 @@
 #!/bin/bash
 # Calibrate OSCAR rotations for Qwen3-30B-A3B: TP=1 dump (no rank merge) + qqt/sst fit.
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
 export PYTHONPATH=$W/sglang-dump-qkv/python:${PYTHONPATH:-}
 export TRITON_CACHE_DIR=/tmp/triton_calib; mkdir -p $TRITON_CACHE_DIR

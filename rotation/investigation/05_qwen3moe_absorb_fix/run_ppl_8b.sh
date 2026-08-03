@@ -2,7 +2,7 @@
 # Harness validation on Qwen3-8B: bf16 vs Zoo-shared INT2 fake-quant.
 # Known target from the serving path: INT2+OSCAR = +2.8-3.7% PPL over bf16.
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 INV=$W/rotation/investigation/05_qwen3moe_absorb_fix
 ZOO=$W/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
 OUT=$INV/ppl_out; mkdir -p $OUT

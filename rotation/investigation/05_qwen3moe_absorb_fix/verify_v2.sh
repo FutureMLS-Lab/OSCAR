@@ -1,9 +1,9 @@
 #!/bin/bash
 # 4-arm bisect for Qwen3-30B-A3B INT2 corruption.
 set -euo pipefail
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix
-RADIX=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/04_radix_mixedkv_regression
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix
+RADIX=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/04_radix_mixedkv_regression
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
 MODEL=$(ls -d /shared/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/*/ | head -1)
 PORT=31602
 OUT=$INV/out_v2; mkdir -p "$OUT"

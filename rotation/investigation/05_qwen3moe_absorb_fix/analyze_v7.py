@@ -1,7 +1,7 @@
 import torch, sys
-sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research/python")
+sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research/python")
 from sglang.srt.mem_cache.kv_quant_kernels import _groupwise_dequantize_int2_torch
-O = "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix/out_v7"
+O = "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix/out_v7"
 
 for arm in ("had", "zoo"):
     d = torch.load(f"{O}/dump_{arm}/dbg_step0_pre.pt", map_location="cpu", weights_only=False)

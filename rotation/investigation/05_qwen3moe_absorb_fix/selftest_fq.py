@@ -1,11 +1,11 @@
 """Prove the fake-quant hook actually fires and changes logits."""
 import sys, torch
-sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix")
+sys.path.insert(0, "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix")
 import fq_common as FQ
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import glob
 M = glob.glob("/shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/")[0]
-ZOO = "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128"
+ZOO = "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128"
 tok = AutoTokenizer.from_pretrained(M, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(M, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True).eval()
 FQ.install(model)

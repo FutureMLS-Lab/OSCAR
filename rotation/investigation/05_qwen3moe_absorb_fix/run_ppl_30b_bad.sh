@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 INV=$W/rotation/investigation/05_qwen3moe_absorb_fix
 FAKE=$W/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt15_group128/rotations
 OUT=$INV/ppl_out; mkdir -p $OUT

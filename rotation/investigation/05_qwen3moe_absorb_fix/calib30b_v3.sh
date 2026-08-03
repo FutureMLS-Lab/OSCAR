@@ -1,7 +1,7 @@
 #!/bin/bash
 # 30B-A3B calibration, TP=2 (weights 30GB/GPU leaves real KV room), then merge rank shards and fit.
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 INV=$W/rotation/investigation/05_qwen3moe_absorb_fix
 source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
 export PYTHONPATH=$W/sglang-dump-qkv/python:${PYTHONPATH:-}

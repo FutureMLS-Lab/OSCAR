@@ -1,7 +1,7 @@
 #!/bin/bash
 # 30B-A3B: fit per-head rotations, then PPL across bf16 / pipeline-shared / per-head / per-head+LM.
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 INV=$W/rotation/investigation/05_qwen3moe_absorb_fix
 CAL=$W/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt117_group128
 OUT=$INV/ppl_out; mkdir -p $OUT

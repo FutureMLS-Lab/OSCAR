@@ -36,7 +36,7 @@ spec:
         - |
           set -uo pipefail
           source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
-          I=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/01_glm52_int2_mla_kernel
+          I=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/01_glm52_int2_mla_kernel
           for ctx in 2048 8192; do
             echo "===== ctx=$ctx ====="
             python $I/glm52_mla_int2_proto.py --ctx $ctx 2>&1

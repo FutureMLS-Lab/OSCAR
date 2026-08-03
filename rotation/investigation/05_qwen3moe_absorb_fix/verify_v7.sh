@@ -1,8 +1,8 @@
 #!/bin/bash
 # Dump decode-step tensors for offline numerics (H rotation on 8B, layer 0).
 set -euo pipefail
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
 MODEL=$(ls -d /shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/ | head -1)
 PORT=31607
 OUT=$INV/out_v7; mkdir -p "$OUT"
@@ -36,5 +36,5 @@ PY
   kill -KILL $SP 2>/dev/null || true; pkill -KILL -P $SP 2>/dev/null || true; sleep 5
 }
 run_arm had $INV/rotations/hadamard_36L.pt
-run_arm zoo /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/k_rotation_qqt_r_h_pbr.pt
+run_arm zoo /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/k_rotation_qqt_r_h_pbr.pt
 echo V7_DONE

@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 INV=$W/rotation/investigation/05_qwen3moe_absorb_fix
 CAL=$W/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt117_group128/rotations
 ZOO=$W/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128

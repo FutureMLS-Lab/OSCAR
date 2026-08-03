@@ -1,9 +1,9 @@
 #!/bin/bash
 # Isolate the serving knob that flips 8B INT2 between clean and broken.
 set -euo pipefail
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
-ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
+ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
 MODEL=$(ls -d /shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/ | head -1)
 PORT=31618
 OUT=$INV/out_v15; mkdir -p "$OUT"

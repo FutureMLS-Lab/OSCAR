@@ -1,8 +1,8 @@
 #!/bin/bash
 # BF16 control for the tiny/mid/long probe (is tiny degeneracy real or a thinking-model artifact?)
 set -euo pipefail
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
 PORT=31616
 OUT=$INV/out_v13; mkdir -p "$OUT"
 rm -rf /dev/shm/nccl* /dev/shm/torch_* 2>/dev/null || true

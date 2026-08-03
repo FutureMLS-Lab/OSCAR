@@ -187,7 +187,7 @@ def fake_quant_ref(x, group=GROUP):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", default="/shared/glm52_fp8_c_kv_dump")
-    ap.add_argument("--rot", default="/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/GLM-5.2-FP8/GPQA/_rcov_phblock/rotations")
+    ap.add_argument("--rot", default="/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/GLM-5.2-FP8/GPQA/_rcov_phblock/rotations")
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--heads", type=int, default=64)

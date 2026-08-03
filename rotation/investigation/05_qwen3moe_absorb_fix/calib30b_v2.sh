@@ -1,7 +1,7 @@
 #!/bin/bash
 # Proper 30B-A3B calibration dump: modest max-running-requests so alloc_req_slots holds.
 set -euo pipefail
-W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant
+W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
 export PYTHONPATH=$W/sglang-dump-qkv/python:${PYTHONPATH:-}
 export TRITON_CACHE_DIR=/tmp/triton_calib2; mkdir -p $TRITON_CACHE_DIR

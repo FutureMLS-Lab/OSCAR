@@ -11,7 +11,7 @@ set -euo pipefail
 LEG=${LEG:?set LEG}
 RUN_TAG=${RUN_TAG:-run0}
 PORT=${PORT:-31500}
-ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo
+ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo
 case "${LEG}" in
   q332_*)  # Qwen3-32B legs
     TP=${TP:-4}
@@ -22,7 +22,7 @@ case "${LEG}" in
   q354b_*) # Qwen3.5-4B legs (hybrid attention; local calibrated rotations)
     TP=${TP:-1}
     MODEL=/shared/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots
-    ROT=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/qwen3.5-4B/rotations/calibrated
+    ROT=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/qwen3.5-4B/rotations/calibrated
     K_ROT_FILE=k_rotation.pt; V_ROT_FILE=v_rotation.pt
     BFCL_MODEL="Qwen/Qwen3.5-4B-FC"
     SERVED_NAME="Qwen/Qwen3.5-4B" ;;
@@ -35,8 +35,8 @@ case "${LEG}" in
 esac
 MODEL=$(ls -d ${MODEL}/*/ | head -1)
 
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/03_bfcl_qwen38b_multiturn
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
 BFCL_SRC=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/gorilla/berkeley-function-call-leaderboard
 OUT=${INV}/legs/${LEG}/${RUN_TAG}
 mkdir -p "${OUT}"

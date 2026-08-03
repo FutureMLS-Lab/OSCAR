@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
-INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix
-RADIX=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/04_radix_mixedkv_regression
-SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research
-ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
+INV=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/05_qwen3moe_absorb_fix
+RADIX=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/investigation/04_radix_mixedkv_regression
+SGL=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/sglang-research
+ZOO=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128
 MODEL=$(ls -d /shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/ | head -1)
 PORT=31606
 OUT=$INV/out_v6; mkdir -p "$OUT"
@@ -32,6 +32,6 @@ run_arm () {
   kill -TERM $SP 2>/dev/null || true; sleep 5; kill -KILL $SP 2>/dev/null || true; pkill -KILL -P $SP 2>/dev/null || true
   sleep 8
 }
-run_arm kZoo_vHad /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/k_rotation_qqt_r_h_pbr.pt $INV/rotations/hadamard_36L.pt
-run_arm kHad_vZoo $INV/rotations/hadamard_36L.pt /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/v_rotation_sst_r_h_pbr.pt
+run_arm kZoo_vHad /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/k_rotation_qqt_r_h_pbr.pt $INV/rotations/hadamard_36L.pt
+run_arm kHad_vZoo $INV/rotations/hadamard_36L.pt /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/v_rotation_sst_r_h_pbr.pt
 echo V6_DONE
