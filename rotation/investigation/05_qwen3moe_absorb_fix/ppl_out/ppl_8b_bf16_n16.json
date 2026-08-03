@@ -1,0 +1,9 @@
+{
+ "tag": "8b_bf16_n16",
+ "mode": "bf16",
+ "ppl": 8.807529108686744,
+ "tokens": 28672,
+ "quantized_rows": 0,
+ "lloyd_max": false,
+ "k_rot": null
+}

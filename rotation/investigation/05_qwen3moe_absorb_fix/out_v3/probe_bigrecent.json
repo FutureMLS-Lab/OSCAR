@@ -1,0 +1,118 @@
+{
+ "divergent_seed": {
+  "degen": 0.304,
+  "len": 4158,
+  "boxed": true
+ },
+ "divergent": [
+  {
+   "degen": 0.234,
+   "len": 4135,
+   "boxed": false
+  },
+  {
+   "degen": 0.168,
+   "len": 4843,
+   "boxed": false
+  },
+  {
+   "degen": 0.224,
+   "len": 4769,
+   "boxed": false
+  },
+  {
+   "degen": 0.032,
+   "len": 7996,
+   "boxed": false
+  }
+ ],
+ "divergent_recheck": {
+  "degen": 0.228,
+  "len": 2198,
+  "boxed": false
+ },
+ "seq_cold": {
+  "degen": 0.278,
+  "len": 3298,
+  "boxed": false
+ },
+ "seq_hit": {
+  "degen": 0.27,
+  "len": 2237,
+  "boxed": false
+ },
+ "concurrent": [
+  {
+   "degen": 0.235,
+   "len": 4897,
+   "boxed": false
+  },
+  {
+   "degen": 0.32,
+   "len": 3277,
+   "boxed": false
+  },
+  {
+   "degen": 0.126,
+   "len": 4885,
+   "boxed": false
+  },
+  {
+   "degen": 0.092,
+   "len": 5476,
+   "boxed": false
+  },
+  {
+   "degen": 0.244,
+   "len": 3910,
+   "boxed": false
+  }
+ ],
+ "multiturn": [
+  {
+   "t1": 0.078,
+   "t2": 0.159,
+   "t3": 0.027,
+   "boxed": [
+    false,
+    false,
+    false
+   ],
+   "lens": [
+    2808,
+    1361,
+    2411
+   ]
+  },
+  {
+   "t1": 0.234,
+   "t2": 0.507,
+   "t3": 0.037,
+   "boxed": [
+    false,
+    false,
+    false
+   ],
+   "lens": [
+    1780,
+    1036,
+    3337
+   ]
+  },
+  {
+   "t1": 0.08,
+   "t2": 0.122,
+   "t3": 0.03,
+   "boxed": [
+    false,
+    false,
+    false
+   ],
+   "lens": [
+    3676,
+    1374,
+    3076
+   ]
+  }
+ ]
+}

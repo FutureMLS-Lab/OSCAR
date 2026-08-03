@@ -1,0 +1,20 @@
+{
+ "bf16": {
+  "alpha": 0.646,
+  "boxed": false,
+  "quantized_rows": 0,
+  "head": "<think> Okay, let's see. The user wants me to compute the sum of the first 40 positive integers and then subtract 20. Hmm, first, "
+ },
+ "shared": {
+  "alpha": 0.624,
+  "boxed": false,
+  "quantized_rows": 386294400,
+  "head": "<think> Okay, let's see. The user wants me to compute the sum of the first 40 positive integers and then subtract 20. Hmm, okay. L"
+ },
+ "perhead": {
+  "alpha": 0.662,
+  "boxed": false,
+  "quantized_rows": 386294400,
+  "head": "<think> Okay, let's see. The user wants me to compute the sum of the first 40 positive integers and then subtract 20. Hmm, first, "
+ }
+}

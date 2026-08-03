@@ -1,0 +1,9 @@
+{
+ "tag": "30b_hadamard",
+ "mode": "quant",
+ "ppl": 9.078858281416519,
+ "tokens": 17920,
+ "quantized_rows": 9584640,
+ "lloyd_max": false,
+ "k_rot": "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix/rotations/hadamard_48L.pt"
+}

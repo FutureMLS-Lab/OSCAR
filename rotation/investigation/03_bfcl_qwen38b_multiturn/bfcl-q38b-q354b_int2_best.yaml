@@ -1,11 +1,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: bfcl-q38b-__LEGDASH__
+  name: bfcl-q38b-q354b-int2-best
   namespace: charlie
   labels:
     app: bfcl-q38b
-    leg: __LEGDASH__
+    leg: q354b-int2-best
 spec:
   backoffLimit: 8
   ttlSecondsAfterFinished: 172800
@@ -13,7 +13,7 @@ spec:
     metadata:
       labels:
         app: bfcl-q38b
-        leg: __LEGDASH__
+        leg: q354b-int2-best
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
@@ -58,15 +58,15 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: LEG
-          value: "__LEG__"
+          value: "q354b_int2_best"
         - name: RUN_TAG
-          value: "__RUNTAG__"
+          value: "run0"
         resources:
           limits:
-            nvidia.com/gpu: "2"
+            nvidia.com/gpu: "1"
           requests:
-            nvidia.com/gpu: "2"
-            memory: 96Gi
+            nvidia.com/gpu: "1"
+            memory: 48Gi
             cpu: "12"
         volumeMounts:
         - name: shared

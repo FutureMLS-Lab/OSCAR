@@ -1,11 +1,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: bfcl-q38b-__LEGDASH__
+  name: bfcl-q38b-int2-best-g256
   namespace: charlie
   labels:
     app: bfcl-q38b
-    leg: __LEGDASH__
+    leg: int2-best-g256
 spec:
   backoffLimit: 8
   ttlSecondsAfterFinished: 172800
@@ -13,7 +13,7 @@ spec:
     metadata:
       labels:
         app: bfcl-q38b
-        leg: __LEGDASH__
+        leg: int2-best-g256
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
@@ -43,7 +43,6 @@ spec:
                 - research-common-h100-055.cloud.together.ai
                 - research-common-h100-096.cloud.together.ai
                 - research-common-h100-116.cloud.together.ai
-                - research-common-h100-066.cloud.together.ai
       containers:
       - name: bfcl
         image: nvcr.io/nvidia/pytorch:24.12-py3
@@ -58,9 +57,9 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: LEG
-          value: "__LEG__"
+          value: "int2_best_g256"
         - name: RUN_TAG
-          value: "__RUNTAG__"
+          value: "run0"
         resources:
           limits:
             nvidia.com/gpu: "2"
