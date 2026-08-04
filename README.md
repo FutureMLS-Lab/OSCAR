@@ -7,17 +7,13 @@
 ### Offline Spectral Covariance-Aware Rotation for 2-bit KV Cache Quantization
 
 <p align="center">
-  <a href="https://arxiv.org/pdf/2605.17757">
-    <img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?logo=arxiv&logoColor=white" alt="Paper"/>
-  </a>
-  &nbsp;
-  <a href="https://oscar-quantize.github.io/">
-    <img src="https://img.shields.io/badge/Website-oscar--quantize-1f77b4?logo=googlechrome&logoColor=white" alt="Website"/>
-  </a>
-  &nbsp;
-  <a href="https://huggingface.co/Zhongzhu/OSCAR-RotationZoo">
-    <img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-RotationZoo-FFD21E" alt="HuggingFace RotationZoo"/>
-  </a>
+  <a href="https://arxiv.org/pdf/2605.17757"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?logo=arxiv&logoColor=white" alt="Paper"/></a>
+  <a href="https://oscar-quantize.github.io/"><img src="https://img.shields.io/badge/Website-oscar--quantize-1f77b4?logo=googlechrome&logoColor=white" alt="Website"/></a>
+  <a href="https://huggingface.co/Zhongzhu/OSCAR-RotationZoo"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-RotationZoo-FFD21E" alt="HuggingFace RotationZoo"/></a>
+  <br/>
+  <a href="https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Qwen3-32B-INT2-KV"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20GGUF%20Qwen3--32B-INT2%20KV-FFD21E" alt="GGUF Qwen3-32B INT2 KV"/></a>
+  <a href="https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20GGUF%20Gemma--4--12B--it-INT2%20KV-FFD21E" alt="GGUF Gemma 4 12B it INT2 KV"/></a>
+  <a href="https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Qwen3-4B-Thinking-2507-INT2-KV"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20GGUF%20Qwen3--4B--Thinking--2507-INT2%20KV-FFD21E" alt="GGUF Qwen3-4B Thinking 2507 INT2 KV"/></a>
 </p>
 
 OSCAR captures Q/K/V activations on a small calibration set, estimates **attention-aware K/V covariance structures** offline, and derives per-layer rotations + clipping thresholds that align KV quantization with the directions attention actually consumes. The result is **INT2 storage for the bulk of the KV cache** plus a small BF16 sink + recent window — ~7× compression of the KV-cache memory footprint vs BF16, with single-digit pp accuracy drop on GPQA for the dense reasoning models we validated.
@@ -32,11 +28,22 @@ scripts end to end. It works out of the box, and we also provide a rotation zoo
 so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
-- **[Upcoming]** OSCAR is testing minimax-m2.7 and GLM in 200K long horizon agentic tasks. Happy to see OSCAR used in the wild!
-- **[2026-05-29]** OSCAR is validating in zhongzhu/llama.cpp branch
-- **[2026-05-25]** OSCAR is optimizing kernel performance. Hope to see it run faster in b200, h100!
+- **[Upcoming]** OSCAR is testing minimax-m2.7, GLM-5.1, Qwen3.7 and more models in long horizon agentic tasks (1M+ token context). Happy to se·e OSCAR used in the wild!
+- **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
+
+  <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 KV Local Run Video</b>
+  <img width="960" height="502" alt="Screen Recording 2026-06-08 at 00 47 11 - 2x" src="https://github.com/user-attachments/assets/72f7c51d-fb43-42b7-ac2b-1b5baaf256c5" />
+
+
+- **[2026-06-05]** OSCAR now runs its INT2 KV cache through a fused mixed-precision Flash-Attention kernel on Apple Metal in the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp), making long-context decode up to ~15× faster (near-BF16) at ~7× less KV memory. Try to RUN QWEN-3-32B with LONG CONTEXT in your LOCAL MAC!
+  <details>
+  <summary><b>MacBook M5 Max Qwen3-32B OSCAR INT2 KV Local Run Screenshot</b></summary>
+  <img width="1003" height="654" alt="Screenshot 2026-06-05 at 09 57 31" src="https://github.com/user-attachments/assets/8ea1ccf9-c2f0-4f3e-8232-7f0b2dbdd144" />
+  </details>
+- **[2026-06-04]** OSCAR now supports **Gemma 4 12B** with **SGLang INT2 KV cache** on the [`zhongzhu/gemma4-12b`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/gemma4-12b) branch.
+- **[2026-05-31]** OSCAR is now runnable on the zhongzhu/llamacpp branch of **llama.cpp**. Feedback and suggestions are very welcome!
 - **[2026-05-23]** OSCAR release the [qwen3.5 4B, 35B-A3B, minimax-m2.7 229B preview results](#main-results). You can use OSCAR for qwen3.5, minimax2.7 beta now! refer to branch zhongzhu/hybrid-model and set SGLANG_LLOYD_MAX=1.
-- **[2026-05-18]** Full release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), and [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) are all live — runs out of the box on SGLang.
+- **[2026-05-18]** Full release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), and [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) are all live — runs out of the box on **SGLang**.
 
 ## 📖 Table of Contents
 - [Main results](#main-results)
@@ -286,6 +293,16 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
 | `rotation/qwen3-32B/` | `Qwen/Qwen3-32B` | 2-4 | 4 | |
 | `rotation/MiniMax-M2.7/` | `MiniMaxAI/MiniMax-M2.7` | 4 | 4 | FP8 weights, `--reasoning-parser minimax-append-think` |
 | `rotation/GLM-4.7/` | `zai-org/GLM-4.7-FP8` | 8 | 8 | FP8 weights, 92 layers |
+| `rotation/gemma-4-12B-it/` | `google/gemma-4-12B-it` | 1 | 1 | `gemma4_unified` hybrid-SWA, dual head_dim (sliding 8×256 / full 1×512), all INT2; needs transformers ≥5.5; INT2 ≈ BF16 on GPQA (62.63%); optional vision via `--enable-multimodal` |
+
+### Per-model GPQA: BF16 vs OSCAR INT2
+
+Single-seed GPQA-Diamond (198) — full-precision baseline vs OSCAR INT2 KV cache, with the calibration tag used.
+
+| Model | Calibration | GPQA (BF16) | GPQA (OSCAR INT2) |
+|---|---|---|---|
+| `Qwen/Qwen3-4B-Thinking-2507` | `seq20000_prompt83_group128` | 67.27 | 67.17 |
+| `google/gemma-4-12B-it` | `seq30000_prompt134_group128` | 62.63 | 62.63 |
 
 ## How the rotation is fit (spectral covariance)
 

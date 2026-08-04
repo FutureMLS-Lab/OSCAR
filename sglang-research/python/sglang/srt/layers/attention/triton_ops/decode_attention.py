@@ -1402,6 +1402,18 @@ def _fwd_grouped_kernel_stage1_quant_int2(
     split_kv_id = tl.program_id(2)
     GROUPED: tl.constexpr = GROUP_SIZE < L
     FAST: tl.constexpr = (BLOCK_D // 4) >= GROUP_SIZE
+    # Hoisted out of the per-block KV loop: all loop-invariant (depend only on
+    # the BLOCK_D/GROUP_SIZE constexprs). Defining them inside the loop made
+    # newer Triton raise "constexpr cannot be reassigned" on the 2nd iteration.
+    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
+    grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
+    grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
+    grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
+    grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -1520,7 +1532,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 # path. Otherwise (group spans multiple quarters), fall back
                 # to the per-element load.
                 if FAST:
-                    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
                     offs_grp_k = tl.arange(0, NUM_GROUPS_QUARTER)
                     offs_grp_k_q1 = (BLOCK_D // 4) // GROUP_SIZE + offs_grp_k
                     offs_grp_k_q2 = 2 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_k
@@ -1606,10 +1617,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     # entirely within a single group, so just load 1 (scale,
                     # zero) per (quarter, token) and broadcast across all dims.
                     offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-                    grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
-                    grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
-                    grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
-                    grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
                     k_scale_q0_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0,
                                            mask=offs_n < split_kv_end, other=1.0)
                     k_zero_q0_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0 + 1,
@@ -1728,7 +1735,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             # Load V scales and zeros for dequantization
             if GROUPED:
                 if FAST:
-                    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
                     offs_grp_v = tl.arange(0, NUM_GROUPS_QUARTER)
                     offs_grp_v_q1 = (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
                     offs_grp_v_q2 = 2 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
@@ -1811,10 +1817,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 else:
                     # Fallback: group spans multiple quarters.
                     offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
-                    v_grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
                     v_scale_q0_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0,
                                            mask=offs_n < split_kv_end, other=1.0)
                     v_zero_q0_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0 + 1,

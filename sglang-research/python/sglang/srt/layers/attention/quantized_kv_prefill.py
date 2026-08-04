@@ -306,15 +306,25 @@ def dequantize_prefix_kv(
     ``dequantize_kv_int2_triton`` internally.
     """
     device = prefix_indices.device
+    # Per-layer geometry (two-group / heterogeneous SWA). Falls back to the
+    # scalar pool geometry for uniform pools / pools without the accessors.
+    if hasattr(kv_pool, "get_layer_head_dim"):
+        l_head_num = kv_pool.get_layer_head_num(layer_id)
+        l_head_dim = kv_pool.get_layer_head_dim(layer_id)
+        l_v_head_dim = kv_pool.get_layer_v_head_dim(layer_id)
+    else:
+        l_head_num = kv_pool.head_num
+        l_head_dim = kv_pool.head_dim
+        l_v_head_dim = kv_pool.v_head_dim
     if prefix_indices.numel() == 0:
         return (
             torch.empty(
-                (0, kv_pool.head_num, kv_pool.head_dim),
+                (0, l_head_num, l_head_dim),
                 dtype=model_dtype,
                 device=device,
             ),
             torch.empty(
-                (0, kv_pool.head_num, kv_pool.v_head_dim),
+                (0, l_head_num, l_v_head_dim),
                 dtype=model_dtype,
                 device=device,
             ),
@@ -335,7 +345,7 @@ def dequantize_prefix_kv(
                 kv_pool.get_key_scales_zeros(layer_id),
                 kv_pool.get_hp_key_buffer(layer_id),
                 kv_pool.hp_global_offset,
-                kv_pool.head_dim,
+                l_head_dim,
                 model_dtype,
             ),
             _mixed_prefix_dequantize_tensor(
@@ -344,7 +354,7 @@ def dequantize_prefix_kv(
                 kv_pool.get_value_scales_zeros(layer_id),
                 kv_pool.get_hp_value_buffer(layer_id),
                 kv_pool.hp_global_offset,
-                kv_pool.v_head_dim,
+                l_v_head_dim,
                 model_dtype,
             ),
         )
@@ -357,8 +367,8 @@ def dequantize_prefix_kv(
         f"Unsupported quantized KV dtype: {kv_pool.dtype}"
     )
     return (
-        dequantize_kv_int2_triton(raw_k, scales_k, kv_pool.head_dim, model_dtype),
-        dequantize_kv_int2_triton(raw_v, scales_v, kv_pool.v_head_dim, model_dtype),
+        dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype),
+        dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype),
     )
 
 

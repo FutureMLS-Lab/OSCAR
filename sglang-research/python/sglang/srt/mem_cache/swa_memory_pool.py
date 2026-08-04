@@ -160,6 +160,7 @@ class SWAKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        is_decode: bool = False,
     ):
 
         layer_id = layer.layer_id
@@ -179,6 +180,7 @@ class SWAKVPool(KVCache):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                is_decode=is_decode,
             )
         else:
             self.full_kv_pool.set_kv_buffer(
@@ -189,6 +191,7 @@ class SWAKVPool(KVCache):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                is_decode=is_decode,
             )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

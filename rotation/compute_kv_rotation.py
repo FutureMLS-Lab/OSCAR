@@ -468,19 +468,30 @@ def main() -> None:
     }
     for layer_dir in dirs:
         layer_id = int(layer_dir.name.split("_", 1)[1])
+        # Per-layer head_dim — heterogeneous for gemma4_unified (sliding=256,
+        # full=512). Infer cheaply from one dumped K chunk (head_dim is constant
+        # within a layer) and build a matching Hadamard so each layer gets a
+        # correctly-sized rotation.
+        _k_chunks = sorted((layer_dir / "k").glob("*.pt"), key=lambda p: int(p.stem))
+        layer_head_dim = torch.load(
+            str(_k_chunks[0]), map_location="cpu"
+        ).shape[-1]
+        layer_hadamard = build_hadamard(layer_head_dim)
         errors = []
         for target, hessian in METHOD_TARGETS[args.method]:
-            rotation, eigvals = HESSIAN_FNS[hessian](layer_dir, args.chunk_id, args.head_dim)
+            rotation, eigvals = HESSIAN_FNS[hessian](
+                layer_dir, args.chunk_id, layer_head_dim
+            )
             loaded_rotation = compose_rotation(
-                rotation, eigvals, hadamard, args.composition
+                rotation, eigvals, layer_hadamard, args.composition
             )
             err = (
                 loaded_rotation @ loaded_rotation.T
-                - torch.eye(args.head_dim, dtype=torch.float64)
+                - torch.eye(layer_head_dim, dtype=torch.float64)
             ).abs().max().item()
             errors.append(f"{target.upper()}({hessian})={err:.1e}")
             add_layer(results[(target, hessian)], layer_id, loaded_rotation, eigvals)
-        print(f"  Layer {layer_id:>2}: {', '.join(errors)}")
+        print(f"  Layer {layer_id:>2} (hd={layer_head_dim}): {', '.join(errors)}")
 
     for (target, hessian), result in results.items():
         path = output_dir / f"{target}_rotation_{hessian}_{args.composition}.pt"
