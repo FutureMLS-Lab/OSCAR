@@ -119,6 +119,17 @@ def compute_recent_ring_size(hp_recent_tokens: int, n_q: int) -> int:
     return int(hp_recent_tokens) + int(n_q) - 1
 
 
+def _rotate_heads(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+    """Apply an Oscar rotation to ``x`` of shape ``[tokens, heads, head_dim]``.
+
+    ``R`` is either ``[hd, hd]`` (V1, one rotation shared by every KV head) or
+    ``[heads, hd, hd]`` (V2, one per KV head).
+    """
+    if R.dim() == 2:
+        return x @ R
+    return torch.einsum("thd,hde->the", x, R)
+
+
 class UnifiedInt2HPKVPool(KVCache):
     """Unified HP + int2 MHA KV cache.
 
@@ -703,11 +714,11 @@ class UnifiedInt2HPKVPool(KVCache):
         loaded in ``__init__``.
         """
         idx = self._layer_index(layer_id)
-        k_hp = cache_k.to(self.hp_dtype) @ self._R_k[idx]
+        k_hp = _rotate_heads(cache_k.to(self.hp_dtype), self._R_k[idx])
         if v_rotation_absorbed:
             v_hp = cache_v.to(self.hp_dtype)
         else:
-            v_hp = cache_v.to(self.hp_dtype) @ self._R_v[idx]
+            v_hp = _rotate_heads(cache_v.to(self.hp_dtype), self._R_v[idx])
         return k_hp, v_hp
 
     def _prepare_hp_kv_tensors(

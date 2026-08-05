@@ -2179,8 +2179,17 @@ class TritonAttnBackend(AttentionBackend):
             oscar_layer_idx = layer.layer_id - kv_pool.start_layer
 
             if uses_oscar:
+                # q is [bs, q_heads, hd]; a per-head rotation is indexed by KV
+                # head, so under GQA each KV head's matrix serves
+                # ``kv_group_num`` consecutive query heads.
+                R_k_dec = kv_pool._R_k[oscar_layer_idx]
+                q_kv_group = (
+                    q_for_decode.shape[1] // R_k_dec.shape[0]
+                    if R_k_dec.dim() == 3
+                    else 1
+                )
                 q_for_decode = _apply_oscar_rotation(
-                    q_for_decode, kv_pool._R_k[oscar_layer_idx]
+                    q_for_decode, R_k_dec, q_kv_group
                 )
             else:
                 q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
@@ -2283,7 +2292,17 @@ class TritonAttnBackend(AttentionBackend):
             if uses_oscar:
                 R_v = kv_pool._R_v[oscar_layer_idx]
                 o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
+                if R_v.dim() == 2:
+                    o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
+                else:
+                    Rv_h = R_v.repeat_interleave(
+                        max(1, o3.shape[1] // R_v.shape[0]), dim=0
+                    )
+                    o3.copy_(
+                        torch.einsum("thd,hed->the", o3.to(R_v.dtype), Rv_h).to(
+                            o3.dtype
+                        )
+                    )
             else:
                 o = apply_segmented_hadamard_transform(o)
         else:

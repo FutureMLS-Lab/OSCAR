@@ -589,6 +589,7 @@ def _kv_oscar_rotate_k_clip_single_kernel(
     v_input_stride_token,
     v_input_stride_head,
     v_input_stride_dim,
+    R_stride_head,
     R_stride_in,
     R_stride_out,
     k_cache_stride_loc,
@@ -650,7 +651,14 @@ def _kv_oscar_rotate_k_clip_single_kernel(
 
     r_in = tl.arange(0, HEAD_DIM)
     r_out = tl.arange(0, HEAD_DIM)
-    R_offs = r_in[:, None] * R_stride_in + r_out[None, :] * R_stride_out
+    # ``R_stride_head`` is 0 for a shared (V1) rotation, so every head reads the
+    # same matrix with no branch; for a per-head (V2) rotation it is R.stride(0)
+    # and each program loads its own head's matrix.
+    R_offs = (
+        head_idx * R_stride_head
+        + r_in[:, None] * R_stride_in
+        + r_out[None, :] * R_stride_out
+    )
     R_tile = tl.load(R_ptr + R_offs)
 
     k_rows = tl.dot(k_tile, R_tile, out_dtype=tl.float32)
@@ -843,10 +851,20 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
     assert _is_power_of_two(head_dim), (
         f"oscar rotate+clip int2 kernel requires power-of-two head_dim, got {head_dim}"
     )
-    assert R_k.shape == (head_dim, head_dim), (
-        f"R_k must be [head_dim, head_dim]={head_dim}x{head_dim}, "
-        f"got {tuple(R_k.shape)}"
-    )
+    if R_k.dim() == 3:
+        assert R_k.shape == (num_heads, head_dim, head_dim), (
+            f"per-head R_k must be [num_heads, head_dim, head_dim]="
+            f"{num_heads}x{head_dim}x{head_dim}, got {tuple(R_k.shape)}"
+        )
+        r_stride_head, r_stride_in, r_stride_out = R_k.stride()
+    else:
+        assert R_k.shape == (head_dim, head_dim), (
+            f"R_k must be [head_dim, head_dim]={head_dim}x{head_dim} or "
+            f"[num_heads, head_dim, head_dim], got {tuple(R_k.shape)}"
+        )
+        # zero head stride => every head reads the one shared matrix
+        r_stride_head = 0
+        r_stride_in, r_stride_out = R_k.stride()
     assert R_k.dtype == cache_k_unrotated.dtype, (
         f"R_k dtype ({R_k.dtype}) must match input dtype "
         f"({cache_k_unrotated.dtype})"
@@ -885,8 +903,9 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
         cache_v_rotated.stride(0),
         cache_v_rotated.stride(1),
         cache_v_rotated.stride(2),
-        R_k.stride(0),
-        R_k.stride(1),
+        r_stride_head,
+        r_stride_in,
+        r_stride_out,
         k_cache_buffer.stride(0),
         k_cache_buffer.stride(1),
         k_cache_buffer.stride(2),

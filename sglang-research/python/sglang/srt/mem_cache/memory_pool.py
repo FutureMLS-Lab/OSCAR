@@ -211,20 +211,31 @@ def load_oscar_rotations(
             )
         ldata = layers.get(global_lid, layers.get(str(global_lid)))
         R = ldata["rotation"]
-        if R.shape != (hd, hd):
+        # V2 checkpoints carry a leading KV-head axis: [num_kv_heads, hd, hd].
+        # V1 stays [hd, hd]. Both are accepted; the head axis is detected here
+        # and preserved all the way to the kernels, which broadcast a shared
+        # rotation with a zero head stride.
+        if R.dim() == 3:
+            if R.shape[1:] != (hd, hd):
+                raise ValueError(
+                    f"Oscar per-head rotation layer {global_lid} has shape "
+                    f"{tuple(R.shape)}, expected (num_kv_heads, {hd}, {hd})"
+                )
+        elif R.shape != (hd, hd):
             raise ValueError(
                 f"Oscar rotation layer {global_lid} has shape {tuple(R.shape)}, "
-                f"expected ({hd}, {hd})"
+                f"expected ({hd}, {hd}) or (num_kv_heads, {hd}, {hd})"
             )
         mats.append(R.to(dtype))
 
     logger.info(
-        "Loaded Oscar rotation from %s for layers %s head_dim=%s dtype=%s",
+        "Loaded Oscar rotation from %s for layers %s head_dim=%s dtype=%s%s",
         path,
         global_layer_ids if layer_ids is not None
         else f"[{start_layer}, {start_layer + layer_num})",
         ("per-layer" if per_layer else head_dim),
         dtype,
+        (" [per-head: %d kv heads]" % mats[0].shape[0]) if mats[0].dim() == 3 else "",
     )
 
     if per_layer:
