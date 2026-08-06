@@ -145,6 +145,8 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
 
     if isinstance(R, (list, tuple)):
         return [_slice(m) for m in R]
+    if R.dim() == 3:                          # [H, hd, hd] one layer
+        return _slice(R)
     if R.dim() == 4:                          # [L, H, hd, hd]
         total = R.shape[1]
         if total != local_head_num:
