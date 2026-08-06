@@ -1,0 +1,206 @@
+# GLM-5.2 OSCAR multibench (Job C): 2-node TP=16, INT2 latent pure Rcov·P·Hblock
+# (rotation from Job A's _rcov_phblock/rotations, group128, Lloyd-Max), then
+# GPQA/HumanEval/AIME25/MATH500 x 3 seeds via glm_multibench.sh. Needs Job A done.
+apiVersion: v1
+kind: Service
+metadata: {name: glm52smk-master, namespace: charlie}
+spec: {type: ClusterIP, clusterIP: None, selector: {app: glm52-smoke, role: head}, ports: [{name: dist, port: 41191, targetPort: 41191}]}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: glm52smk-head, namespace: charlie, labels: {app: glm52-smoke, role: head}}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata: {labels: {app: glm52-smoke, role: head}}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: {matchExpressions: [{key: app, operator: In, values: [glm52-smoke]}]}
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        workingDir: /home/charlie/CoQuant/.RUD/hybridmodel-testing
+        env:
+        - {name: HOME, value: /home/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+        - {name: TRANSFORMERS_CACHE, value: /shared/huggingface}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}}
+        - {name: NCCL_SOCKET_IFNAME, value: bond0}
+        - {name: NCCL_IB_HCA, value: "^mlx5_0"}
+        - {name: NCCL_NET, value: IB}
+        - {name: NCCL_IB_DISABLE, value: "0"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: CUDA_VISIBLE_DEVICES, value: "0,1,2,3,4,5,6,7"}
+        resources: {limits: {nvidia.com/gpu: "8", memory: 200Gi, cpu: "32"}, requests: {nvidia.com/gpu: "8", memory: 100Gi, cpu: "16"}}
+        volumeMounts: [{name: shared, mountPath: /shared}, {name: home-charlie, mountPath: /home/charlie}]
+        command:
+        - /bin/bash
+        - -lc
+        - |
+          set -uo pipefail
+          rm -f /dev/shm/nccl* /dev/shm/torch_* /dev/shm/sglang* 2>/dev/null || true
+          export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+          W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
+          OUT=$W/rotation/investigation/06_postmerge_smoke/glm52; mkdir -p "$OUT"
+          ROT=$W/rotation/GLM-5.2-FP8/GPQA/_rcov_phblock/rotations
+          [ -d "$ROT" ] || { echo "MISSING rotation $ROT — run Job A (dump+fit) first"; exit 1; }
+          ( cd $W && git fetch -q oscar zhongzhu/hybrid-model && git merge --ff-only FETCH_HEAD 2>&1 | tail -1 )
+          echo "[smoke] ARM=glm52  HEAD=$(cd $W && git log --oneline -1)"
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
+          export PATH="${CONDA_PREFIX}/bin:${PATH}"
+          export PYTHONPATH="$W/rotation/_triton_per_rank:$W/sglang-research/python:${PYTHONPATH:-}"
+          export TRITON_CACHE_DIR=/tmp/tc_h SGLANG_DG_CACHE_DIR=/tmp/dg_h SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 OSCAR_TRITON_PER_RANK_BASE=/tmp/otr_h
+          mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR" "$OSCAR_TRITON_PER_RANK_BASE"
+          LOG=$OUT/server.log; : > "$LOG"; MY_IP=$(hostname -I|awk '{print $1}')
+          SGLANG_OSCAR_MLA_KV_ROTATION_PATH="$ROT" SGLANG_OSCAR_MLA_KV_GROUP_SIZE=128 SGLANG_LLOYD_MAX=1 \
+            CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" python -m sglang.launch_server \
+            --model-path zai-org/GLM-5.2-FP8 --tensor-parallel-size 16 --ep-size 16 \
+            --moe-a2a-backend deepep --deepep-mode normal --nnodes 2 --node-rank 0 \
+            --dist-init-addr "${MY_IP}:41191" --kv-cache-dtype auto \
+            --prefill-attention-backend triton --decode-attention-backend triton \
+            --mem-fraction-static 0.85 --max-running-requests 64 --disable-cuda-graph \
+            --skip-server-warmup --watchdog-timeout 1800 --host 0.0.0.0 --port 31191 --trust-remote-code >> "$LOG" 2>&1 &
+          SP=$!
+          for _ in $(seq 1 720); do curl -s http://127.0.0.1:31191/health >/dev/null 2>&1 && { echo ready; break; }; kill -0 $SP 2>/dev/null || { echo died; tail -100 "$LOG"; exit 1; }; sleep 5; done
+          curl -s http://127.0.0.1:31191/health >/dev/null 2>&1 || { echo "not ready"; tail -100 "$LOG"; exit 1; }
+          python3 - 31191 "$OUT" glm52 <<'PY'
+          import collections, json, re, sys, urllib.request
+          port, out, arm = sys.argv[1], sys.argv[2], sys.argv[3]
+          filler = " ".join("note %d says %d." % (i, i % 7) for i in range(600))   # ~2.5k tok -> real quant tier
+          prompts = [("short", "What is 3+4? Reply briefly."),
+                     ("long",  filler + " Now: compute the sum of the first 40 positive integers, then subtract 20. Put the final answer in \\boxed{}.")]
+
+
+          def judge(t):
+              """Detect the failure modes INT2 KV actually produces: digit/symbol soup and
+              repetition loops. A letter-ratio threshold cannot do this -- markdown-heavy
+              but perfectly coherent replies ('**Analyze the Request:**') score as low as
+              garbage, which failed Qwen3.5-4B once already."""
+              if t.startswith("<FAILED") or len(t) < 60:
+                  return False, {"reason": "no usable response"}
+              body = t.replace("<think>", " ").replace("</think>", " ")
+              words = re.findall(r"[A-Za-z][A-Za-z']*", body)
+              nw = len(words)
+              mean_len = (sum(map(len, words)) / nw) if nw else 0.0
+              alnum = [c for c in body if c.isalnum()]
+              digit_frac = (sum(c.isdigit() for c in alnum) / len(alnum)) if alnum else 1.0
+              # repetition loop: does one word-5gram dominate?
+              low = [w.lower() for w in words]
+              grams = collections.Counter(tuple(low[i:i + 5]) for i in range(max(0, nw - 4)))
+              top_gram = (grams.most_common(1)[0][1] / max(1, nw - 4)) if grams else 0.0
+              m = {"words": nw, "mean_word_len": round(mean_len, 2),
+                   "digit_frac": round(digit_frac, 3), "top_5gram_frac": round(top_gram, 3)}
+              checks = {"enough_words": nw >= 25,          # real prose, not a stub
+                        "wordlike": 2.2 <= mean_len <= 9.0,  # not char soup, not glued tokens
+                        "not_digit_soup": digit_frac < 0.55,
+                        "no_repeat_loop": top_gram < 0.06}
+              m["failed_checks"] = [k for k, v in checks.items() if not v]
+              return all(checks.values()), m
+
+
+          res = {}
+          for tag, content in prompts:
+              body = json.dumps({"model": "m", "messages": [{"role": "user", "content": content}],
+                                 "max_tokens": 400, "temperature": 0.6, "top_p": 0.95, "top_k": 20}).encode()
+              req = urllib.request.Request("http://127.0.0.1:%s/v1/chat/completions" % port,
+                                           data=body, headers={"Content-Type": "application/json"})
+              try:
+                  t = json.load(urllib.request.urlopen(req, timeout=600))["choices"][0]["message"]["content"] or ""
+              except Exception as e:
+                  t = "<FAILED %s>" % e
+              ok, m = judge(t)
+              res[tag] = dict(coherent=ok, len=len(t), text=t, **m)
+              print("[smoke] %-10s %-5s coherent=%s len=%d words=%s wl=%s dig=%s rep=%s %s | %s" % (
+                  arm, tag, ok, len(t), m.get("words"), m.get("mean_word_len"), m.get("digit_frac"),
+                  m.get("top_5gram_frac"), ("BAD:" + ",".join(m.get("failed_checks", []))) if not ok else "",
+                  t[:100].replace("\n", " ")), flush=True)
+          json.dump(res, open("%s/smoke.json" % out, "w"), indent=1)
+          ok = all(r["coherent"] for r in res.values())
+          print("[smoke] %s VERDICT=%s (coherent prose, no digit soup, no repetition loop, both prompts)" % (
+              arm, "PASS" if ok else "FAIL"))
+          PY
+          if grep -q '"coherent": false' "$OUT/smoke.json" 2>/dev/null; then
+            echo "[smoke] glm52 server-side traceback:"; grep -nE "Traceback|Error:|error:" "$LOG" | tail -8; tail -25 "$LOG"; fi
+          kill -KILL $SP 2>/dev/null || true; pkill -KILL -P $SP 2>/dev/null || true; exit 0
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}, {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: glm52smk-worker, namespace: charlie, labels: {app: glm52-smoke, role: worker}}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata: {labels: {app: glm52-smoke, role: worker}}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: {matchExpressions: [{key: app, operator: In, values: [glm52-smoke]}]}
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        workingDir: /home/charlie/CoQuant/.RUD/hybridmodel-testing
+        env:
+        - {name: HOME, value: /home/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}}
+        - {name: NCCL_SOCKET_IFNAME, value: bond0}
+        - {name: NCCL_IB_HCA, value: "^mlx5_0"}
+        - {name: NCCL_NET, value: IB}
+        - {name: NCCL_IB_DISABLE, value: "0"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: CUDA_VISIBLE_DEVICES, value: "0,1,2,3,4,5,6,7"}
+        - {name: SGLANG_OSCAR_MLA_KV_ROTATION_PATH, value: /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar/rotation/GLM-5.2-FP8/GPQA/_rcov_phblock/rotations}
+        - {name: SGLANG_OSCAR_MLA_KV_GROUP_SIZE, value: "128"}
+        - {name: SGLANG_LLOYD_MAX, value: "1"}
+        resources: {limits: {nvidia.com/gpu: "8", memory: 200Gi, cpu: "32"}, requests: {nvidia.com/gpu: "8", memory: 100Gi, cpu: "16"}}
+        volumeMounts: [{name: shared, mountPath: /shared}, {name: home-charlie, mountPath: /home/charlie}]
+        command:
+        - /bin/bash
+        - -lc
+        - |
+          set -uo pipefail
+          rm -f /dev/shm/nccl* /dev/shm/torch_* /dev/shm/sglang* 2>/dev/null || true
+          export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+          W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh; conda activate oscar
+          export PATH="${CONDA_PREFIX}/bin:${PATH}"
+          export PYTHONPATH="$W/rotation/_triton_per_rank:$W/sglang-research/python:${PYTHONPATH:-}"
+          export TRITON_CACHE_DIR=/tmp/tc_w SGLANG_DG_CACHE_DIR=/tmp/dg_w SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 OSCAR_TRITON_PER_RANK_BASE=/tmp/otr_w
+          mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR" "$OSCAR_TRITON_PER_RANK_BASE"
+          for i in $(seq 1 180); do MASTER_IP=$(getent hosts glm52smk-master | awk '{print $1}' || true); [ -n "$MASTER_IP" ] && break; sleep 5; done
+          [ -z "${MASTER_IP:-}" ] && { echo "no master"; exit 1; }
+          SGLANG_OSCAR_MLA_KV_ROTATION_PATH="$SGLANG_OSCAR_MLA_KV_ROTATION_PATH" SGLANG_OSCAR_MLA_KV_GROUP_SIZE=128 SGLANG_LLOYD_MAX=1 \
+            CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" python -m sglang.launch_server \
+            --model-path zai-org/GLM-5.2-FP8 --tensor-parallel-size 16 --ep-size 16 \
+            --moe-a2a-backend deepep --deepep-mode normal --nnodes 2 --node-rank 1 \
+            --dist-init-addr "${MASTER_IP}:41191" --kv-cache-dtype auto \
+            --prefill-attention-backend triton --decode-attention-backend triton \
+            --mem-fraction-static 0.85 --max-running-requests 64 --disable-cuda-graph \
+            --skip-server-warmup --watchdog-timeout 1800 --host 0.0.0.0 --port 31192 --trust-remote-code 2>&1 | tee /tmp/worker.log
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}, {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}]
