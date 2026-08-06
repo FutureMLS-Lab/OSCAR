@@ -43,4 +43,14 @@ print("ok 5: rotation outputs are contiguous (view-safe)")
 # 6) shared path unchanged (V1 regression)
 assert torch.allclose(_apply_oscar_rotation(x, Rs), (x @ Rs), atol=1e-6)
 print("ok 6: V1 shared path bit-unchanged")
+# 7) TP sharding: a rank owning 2 of 4 KV heads must get its own slice
+from sglang.srt.mem_cache.unified_kv_pool import _shard_rotation_heads
+R4 = torch.stack([torch.full((D, D), float(h)) for h in range(4)])     # [4,D,D]
+for rank, expect in ((0, [0.0, 1.0]), (1, [2.0, 3.0])):
+    sl = _shard_rotation_heads(R4, local_head_num=2, tp_rank=rank)
+    assert sl.shape == (2, D, D) and [float(sl[i][0, 0]) for i in (0, 1)] == expect, (rank, sl.shape)
+assert _shard_rotation_heads(Rs, 2, 1) is Rs, "shared rotation must pass through"
+stacked = R4.unsqueeze(0).repeat(3, 1, 1, 1)                           # [L,H,D,D]
+assert _shard_rotation_heads(stacked, 2, 1).shape == (3, 2, D, D)
+print("ok 7: per-head rotations are sharded by TP rank (shared passes through)")
 print("ALL PASS")

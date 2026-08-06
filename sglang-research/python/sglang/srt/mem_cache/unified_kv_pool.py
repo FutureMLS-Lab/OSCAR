@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.kv_quant_kernels import _get_num_scale_groups
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     OscarRotationConfig,
@@ -117,6 +118,44 @@ def compute_recent_ring_size(hp_recent_tokens: int, n_q: int) -> int:
     # Max HP-recent occupancy between flushes is hp_recent + (N_Q - 1); the
     # ring reuses slots after the oldest N_Q have been demoted to quant.
     return int(hp_recent_tokens) + int(n_q) - 1
+
+
+def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
+    """Slice a per-head rotation down to the KV heads this rank owns.
+
+    A V2 checkpoint stores every KV head of the model, but under tensor
+    parallelism each rank holds only ``local_head_num`` consecutive heads.
+    Shared (2D) rotations are TP-invariant and pass through untouched.
+    Accepts either a stacked ``[L, H, hd, hd]`` tensor or a per-layer list.
+    """
+
+    def _slice(m):
+        if m.dim() != 3:                      # [hd, hd] shared -> unchanged
+            return m
+        total = m.shape[0]
+        if total == local_head_num:
+            return m
+        if total % local_head_num != 0:
+            raise ValueError(
+                f"per-head rotation has {total} KV heads, which is not a "
+                f"multiple of this rank's {local_head_num}"
+            )
+        beg = tp_rank * local_head_num
+        return m[beg : beg + local_head_num].contiguous()
+
+    if isinstance(R, (list, tuple)):
+        return [_slice(m) for m in R]
+    if R.dim() == 4:                          # [L, H, hd, hd]
+        total = R.shape[1]
+        if total != local_head_num:
+            if total % local_head_num != 0:
+                raise ValueError(
+                    f"per-head rotation has {total} KV heads, not a multiple "
+                    f"of this rank's {local_head_num}"
+                )
+            beg = tp_rank * local_head_num
+            R = R[:, beg : beg + local_head_num].contiguous()
+    return R
 
 
 def _rotate_heads(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
@@ -364,6 +403,10 @@ class UnifiedInt2HPKVPool(KVCache):
             dtype=self.hp_dtype,
             layer_ids=self._rotation_layer_ids,
         )
+        # Per-head rotations ship every KV head; keep only this rank's slice.
+        _tp_rank = get_attention_tp_rank()
+        self._R_k = _shard_rotation_heads(self._R_k, self.head_num, _tp_rank)
+        self._R_v = _shard_rotation_heads(self._R_v, self.head_num, _tp_rank)
         logger.info(
             "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
             self._k_clip_ratio,
