@@ -127,7 +127,10 @@ def _rotate_heads(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     """
     if R.dim() == 2:
         return x @ R
-    return torch.einsum("thd,hde->the", x, R)
+    # ``.contiguous()`` is load-bearing: einsum can hand back a non-contiguous
+    # result, and the downstream store path does ``k.view(-1, row_dim)``, which
+    # raises "view size is not compatible with input tensor's size and stride".
+    return torch.einsum("thd,hde->the", x, R).contiguous()
 
 
 class UnifiedInt2HPKVPool(KVCache):

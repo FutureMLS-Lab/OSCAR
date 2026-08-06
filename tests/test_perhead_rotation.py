@@ -33,7 +33,14 @@ inv = torch.einsum("thd,hed->the", rot, Rp)     # same expression the decode inv
 assert torch.allclose(inv, x, atol=1e-5), (inv - x).abs().max()
 print("ok 4: per-head rotate -> inverse round trip is identity")
 
-# 5) shared path unchanged (V1 regression)
+# 5) outputs must be CONTIGUOUS -- the store path does k.view(-1, row_dim) and
+#    a non-contiguous rotation result makes CUDA-graph capture fail
+assert _rotate_heads(x, Rp).is_contiguous(), "per-head rotate must be contiguous"
+assert _rotate_heads(x, Rs).is_contiguous(), "shared rotate must be contiguous"
+assert _apply_oscar_rotation(q, Rp, G).is_contiguous()
+print("ok 5: rotation outputs are contiguous (view-safe)")
+
+# 6) shared path unchanged (V1 regression)
 assert torch.allclose(_apply_oscar_rotation(x, Rs), (x @ Rs), atol=1e-6)
-print("ok 5: V1 shared path bit-unchanged")
+print("ok 6: V1 shared path bit-unchanged")
 print("ALL PASS")
