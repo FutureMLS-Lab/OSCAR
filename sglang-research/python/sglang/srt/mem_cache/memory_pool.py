@@ -1273,6 +1273,25 @@ class MHATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.v_scales_zeros[layer_id - self.start_layer]
 
+    # gemma4's per-layer geometry accessors need the same sparse->local
+    # translation as the buffer getters above; without it a hybrid model
+    # (Qwen3.5: full-attn layers 3, 7, 11, ...) indexes the per-layer lists
+    # with a global id and raises IndexError from dequantize_prefix_kv.
+    def get_layer_head_num(self, layer_id: int) -> int:
+        return self.full_kv_pool.get_layer_head_num(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_layer_head_dim(self, layer_id: int) -> int:
+        return self.full_kv_pool.get_layer_head_dim(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_layer_v_head_dim(self, layer_id: int) -> int:
+        return self.full_kv_pool.get_layer_v_head_dim(
+            self._transfer_full_attention_id(layer_id)
+        )
+
     def get_raw_kv_buffer(self, layer_id: int):
         """
         Get raw quantized KV buffer with scales/zeros for efficient dequantization.
