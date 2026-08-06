@@ -127,6 +127,13 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
     parallelism each rank holds only ``local_head_num`` consecutive heads.
     Shared (2D) rotations are TP-invariant and pass through untouched.
     Accepts either a stacked ``[L, H, hd, hd]`` tensor or a per-layer list.
+
+    A bare 3D tensor is deliberately left alone: ``[L, hd, hd]`` (V1 stacked
+    per-layer shared rotations, what this pool actually holds for V1) and
+    ``[H, hd, hd]`` (one layer's per-head rotations) are indistinguishable by
+    shape. Slicing it as heads mistakes the layer axis for a head axis and
+    breaks every V1 model, so per-head sharding only happens where the head
+    axis is unambiguous: a per-layer list, or a 4D ``[L, H, hd, hd]``.
     """
 
     def _slice(m):
@@ -145,8 +152,6 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
 
     if isinstance(R, (list, tuple)):
         return [_slice(m) for m in R]
-    if R.dim() == 3:                          # [H, hd, hd] one layer
-        return _slice(R)
     if R.dim() == 4:                          # [L, H, hd, hd]
         total = R.shape[1]
         if total != local_head_num:

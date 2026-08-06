@@ -46,11 +46,19 @@ print("ok 6: V1 shared path bit-unchanged")
 # 7) TP sharding: a rank owning 2 of 4 KV heads must get its own slice
 from sglang.srt.mem_cache.unified_kv_pool import _shard_rotation_heads
 R4 = torch.stack([torch.full((D, D), float(h)) for h in range(4)])     # [4,D,D]
+# per-layer list: each entry is one layer's [H,D,D] -> head axis unambiguous
 for rank, expect in ((0, [0.0, 1.0]), (1, [2.0, 3.0])):
-    sl = _shard_rotation_heads(R4, local_head_num=2, tp_rank=rank)
+    sl = _shard_rotation_heads([R4, R4], local_head_num=2, tp_rank=rank)[0]
     assert sl.shape == (2, D, D) and [float(sl[i][0, 0]) for i in (0, 1)] == expect, (rank, sl.shape)
-assert _shard_rotation_heads(Rs, 2, 1) is Rs, "shared rotation must pass through"
-stacked = R4.unsqueeze(0).repeat(3, 1, 1, 1)                           # [L,H,D,D]
+# 4D [L,H,D,D] -> head axis unambiguous
+stacked = R4.unsqueeze(0).repeat(3, 1, 1, 1)
 assert _shard_rotation_heads(stacked, 2, 1).shape == (3, 2, D, D)
+assert _shard_rotation_heads(Rs, 2, 1) is Rs, "shared rotation must pass through"
+# A bare 3D tensor is ambiguous: V1 holds [L,D,D] stacked per-layer shared
+# rotations, which look exactly like one layer's [H,D,D]. It must pass through
+# untouched -- slicing it as heads broke every V1 model (Qwen3-8B: 36 layers,
+# 8 kv heads -> "36 KV heads is not a multiple of this rank's 8").
+v1_stacked = torch.stack([torch.full((D, D), float(l)) for l in range(36)])
+assert _shard_rotation_heads(v1_stacked, 8, 0) is v1_stacked, "V1 [L,hd,hd] must pass through"
 print("ok 7: per-head rotations are sharded by TP rank (shared passes through)")
 print("ALL PASS")
