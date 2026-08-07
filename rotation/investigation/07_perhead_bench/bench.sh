@@ -9,7 +9,10 @@ set -uo pipefail
 : "${ARM:?ARM=bf16|shared|perhead}"; : "${BENCH:?BENCH required}"
 W=/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/oscar
 git config --global --add safe.directory "$W" 2>/dev/null || true
-( cd $W && git fetch -q oscar zhongzhu/hybrid-model && git merge --ff-only FETCH_HEAD 2>&1 | tail -1 )
+# Deliberately no git fetch/merge here: every arm shares one weka worktree, and
+# 12 pods merging into it concurrently race on index.lock and can be importing
+# sglang while another pod rewrites the files. Update the worktree once, before
+# launching, and let the pods read it.
 echo "[bench] ARM=$ARM BENCH=$BENCH HEAD=$(cd $W && git log --oneline -1)"
 
 MODEL=$(ls -d /shared/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/*/ | head -1)
