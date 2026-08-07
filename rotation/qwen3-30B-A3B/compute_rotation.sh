@@ -8,7 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATASET="${DATASET:-GPQA}"
 if [[ -z "${CALIB_DIR:-}" ]]; then
-  CALIB_DIR="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/*/ 2>/dev/null | head -1 | sed 's:/$::')"
+  # earlier calibrations were written under the lower-case sibling dir;
+  # look there too so an existing dump is not silently ignored
+  CALIB_DIR="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/*/ "${SCRIPT_DIR}/../qwen3-30b-a3b/${DATASET}"/*/ 2>/dev/null | head -1 | sed 's:/$::')"
 fi
 DUMP_PATH="${DUMP_PATH:-${CALIB_DIR}/qkv_dumps/gpqa}" \
 OUTPUT_DIR="${OUTPUT_DIR:-${CALIB_DIR}/rotations}" \

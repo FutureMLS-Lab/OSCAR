@@ -8,7 +8,7 @@ export PYTHONPATH="${REPO_ROOT}/sglang-research/python:${PYTHONPATH:-}"
 
 DATASET="${DATASET:-GPQA}"
 if [[ -z "${CAL:-}" ]]; then
-  CAL="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/*/rotations 2>/dev/null | head -1)"
+  CAL="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/*/rotations "${SCRIPT_DIR}/../qwen3-30b-a3b/${DATASET}"/*/rotations 2>/dev/null | head -1)"
 fi
 K_ROT="${K_ROT:-${CAL}/k_perhead.pt}"
 V_ROT="${V_ROT:-${CAL}/v_perhead.pt}"

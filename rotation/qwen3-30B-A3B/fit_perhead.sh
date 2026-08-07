@@ -7,7 +7,9 @@ FIT="${SCRIPT_DIR}/../investigation/05_qwen3moe_absorb_fix/fit_perhead.py"
 
 DATASET="${DATASET:-GPQA}"
 if [[ -z "${CALIB_DIR:-}" ]]; then
-  CALIB_DIR="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/*/ 2>/dev/null | head -1 | sed 's:/$::')"
+  # earlier calibrations were written under the lower-case sibling dir;
+  # look there too so an existing dump is not silently ignored
+  CALIB_DIR="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/*/ "${SCRIPT_DIR}/../qwen3-30b-a3b/${DATASET}"/*/ 2>/dev/null | head -1 | sed 's:/$::')"
 fi
 DUMP="${DUMP:-${CALIB_DIR}/qkv_dumps/gpqa}"
 OUT="${OUT:-${CALIB_DIR}/rotations}"
