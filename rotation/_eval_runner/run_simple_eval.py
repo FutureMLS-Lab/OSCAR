@@ -206,7 +206,10 @@ def main():
             num_examples=args.num_examples,
         )
     elif args.task == "humaneval":
-        from simple_evals.humaneval_eval import HumanEval
+        # Local subclass: upstream's find_code falls back to the whole response
+        # when the model emits no ```python fence, which a thinking model does
+        # not, scoring ~0.15 regardless of the model. See humaneval_eval.py.
+        from humaneval_eval import HumanEval
         # pass@1, single sample/task (this server is single-stream); base HumanEval (164)
         evaluator = HumanEval(
             num_examples=args.num_examples,
