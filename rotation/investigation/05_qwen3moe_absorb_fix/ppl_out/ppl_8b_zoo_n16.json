@@ -1,9 +1,0 @@
-{
- "tag": "8b_zoo_n16",
- "mode": "quant",
- "ppl": 8.753866336096287,
- "tokens": 28672,
- "quantized_rows": 23003136,
- "lloyd_max": false,
- "k_rot": "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128/k_rotation_qqt_r_h_pbr.pt"
-}

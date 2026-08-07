@@ -1,9 +1,0 @@
-{
- "tag": "30b_bf16",
- "mode": "bf16",
- "ppl": 7.173041088224886,
- "tokens": 17920,
- "quantized_rows": 0,
- "lloyd_max": false,
- "k_rot": null
-}

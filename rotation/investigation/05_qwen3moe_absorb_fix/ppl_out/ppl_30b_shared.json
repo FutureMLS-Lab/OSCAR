@@ -1,9 +1,0 @@
-{
- "tag": "30b_shared",
- "mode": "quant",
- "ppl": 8.360996628493696,
- "tokens": 17920,
- "quantized_rows": 9584640,
- "lloyd_max": false,
- "k_rot": "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/qwen3-30b-a3b/GPQA/seq30000_prompt117_group128/rotations/k_rotation_qqt_r_h_pbr.pt"
-}

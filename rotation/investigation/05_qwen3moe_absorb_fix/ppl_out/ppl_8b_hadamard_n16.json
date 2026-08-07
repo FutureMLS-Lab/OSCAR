@@ -1,9 +1,0 @@
-{
- "tag": "8b_hadamard_n16",
- "mode": "quant",
- "ppl": 9.70585727285047,
- "tokens": 28672,
- "quantized_rows": 23003136,
- "lloyd_max": false,
- "k_rot": "/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/05_qwen3moe_absorb_fix/rotations/hadamard_36L.pt"
-}
