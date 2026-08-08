@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-latent-calibration-client-v1
+  namespace: charlie
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 10800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: TASK, value: calibration}
+            - {name: CALIBRATION_TOKENS, value: "4096"}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: BLOCKS, value: /shared/oscar-int3-rubin-simulate/multimodel/kimi-k3/calibration/wikitext2_train_8192.pt}
+          command: ["/bin/bash", "/shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant/rotation/kimi_k3_latent/run_quality_client.sh"]
+          resources:
+            requests: {cpu: "4", memory: 8Gi}
+            limits: {cpu: "16", memory: 32Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}

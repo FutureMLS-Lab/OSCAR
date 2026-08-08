@@ -1,0 +1,126 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-latent-two-layer-smoke-v3
+  namespace: charlie
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+        topology.csi.weka.io/accessible: "true"
+      containers:
+        - name: smoke
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie/flashinfer}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+            - {name: TRITON_CACHE_DIR, value: /tmp/charlie/triton}
+            - {name: SGLANG_KIMI_TWO_LAYER_SMOKE, value: "1"}
+            - {name: SGLANG_KIMI_LATENT_LAYER_IDS, value: "1"}
+            - {name: SGLANG_KIMI_LATENT_OSCAR_CLIP_RATIO, value: "0.96"}
+            - {name: SGLANG_KIMI_LATENT_Q_QDQ, value: "1"}
+            - {name: SGLANG_KIMI_LATENT_P_QDQ, value: "1"}
+            - {name: SGLANG_KIMI_LATENT_CONTROL_FILE, value: /tmp/charlie/kimi-smoke/mode}
+            - {name: SGLANG_KIMI_LATENT_CODEBOOK_DIR, value: /tmp/charlie/kimi-smoke}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate
+              SOURCE=${ROOT}/source/multimodel/CoQuant
+              RUNTIME=/tmp/charlie/kimi-two-layer-runtime
+              ART=/tmp/charlie/kimi-smoke
+              mkdir -p "$RUNTIME/python" "$ART"
+              cp -a /sgl-workspace/sglang/python/sglang "$RUNTIME/python/"
+              python3 "${SOURCE}/rotation/kimi_k3_latent/patch_stock_runtime.py" \
+                "$RUNTIME/python"
+              export PYTHONPATH="$RUNTIME/python"
+              python3 - <<'PY'
+              from pathlib import Path
+              import torch
+              root=Path('/tmp/charlie/kimi-smoke')
+              codebook=torch.tensor(
+                  [-2.0, -1.0, -0.5, -0.125, 0.125, 0.5, 1.0, 2.0],
+                  dtype=torch.float32,
+              )
+              state={
+                  'format':'kimi_mla_latent_lutb_int3_e4m3',
+                  'format_version':1,
+                  'method':'lloyd_max',
+                  'oscar':False,
+                  'clip_ratio':0.0,
+                  'latent_dim':512,
+                  'layers':{1:{'layer_id':1,'codebook':codebook}},
+              }
+              torch.save(state,root/'latent_lloyd_max.pt')
+              (root/'mode').write_text('offline_lm_qp\n')
+              PY
+              LOG=$ART/server.log
+              CUDA_VISIBLE_DEVICES=0,1,2,3 \
+                python3 -m sglang.launch_server \
+                  --model-path moonshotai/Kimi-K3 \
+                  --trust-remote-code \
+                  --load-format dummy \
+                  --tp-size 4 --ep-size 4 \
+                  --attention-backend triton \
+                  --decode-attention-backend triton \
+                  --linear-attn-backend triton \
+                  --context-length 4096 \
+                  --max-total-tokens 4096 \
+                  --max-running-requests 1 \
+                  --chunked-prefill-size 256 \
+                  --mem-fraction-static 0.75 \
+                  --disable-radix-cache \
+                  --disable-cuda-graph \
+                  --disable-piecewise-cuda-graph \
+                  --skip-server-warmup \
+                  --host 127.0.0.1 --port 30631 \
+                  --dist-init-addr 127.0.0.1:40631 \
+                  >"$LOG" 2>&1 &
+              PID=$!
+              trap 'kill -TERM "$PID" 2>/dev/null || true' EXIT
+              for _ in $(seq 1 600); do
+                curl -fsS http://127.0.0.1:30631/health >/dev/null 2>&1 && break
+                kill -0 "$PID" 2>/dev/null || {
+                  python3 - "$LOG" <<'PY'
+              from pathlib import Path
+              import sys
+              print('\n'.join(Path(sys.argv[1]).read_text().splitlines()[-200:]))
+              PY
+                  exit 1
+                }
+                sleep 5
+              done
+              curl -fsS http://127.0.0.1:30631/health >/dev/null
+              curl -fsS http://127.0.0.1:30631/generate \
+                -H 'Content-Type: application/json' \
+                -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":2}}' \
+                >"$ART/generation.json"
+              python3 - <<'PY'
+              import json
+              from pathlib import Path
+              value=json.load(open('/tmp/charlie/kimi-smoke/generation.json'))
+              assert 'text' in value or 'output_ids' in value or 'meta_info' in value
+              log=Path('/tmp/charlie/kimi-smoke/server.log').read_text()
+              assert 'Kimi latent control switched to offline_lm_qp' in log
+              print('KIMI_TWO_LAYER_LATENT_K3V3_SMOKE_OK')
+              PY
+          resources:
+            requests: {nvidia.com/gpu: "4", cpu: "32", memory: 192Gi}
+            limits: {nvidia.com/gpu: "4", cpu: "64", memory: 512Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 128Gi}}
