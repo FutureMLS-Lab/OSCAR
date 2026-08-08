@@ -3,7 +3,7 @@
 # Writes format_version 2 checkpoints: rotation is [num_kv_heads, hd, hd].
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-FIT="${SCRIPT_DIR}/../investigation/05_qwen3moe_absorb_fix/fit_perhead.py"
+FIT="${SCRIPT_DIR}/../fit_perhead_rotation.py"
 
 DATASET="${DATASET:-GPQA}"
 if [[ -z "${CALIB_DIR:-}" ]]; then
