@@ -18,7 +18,6 @@ import json
 import os
 from typing import List, Optional, Union
 
-import torch
 from transformers import AutoTokenizer
 
 from sglang.srt.multimodal.processors.gemma4_unified_image_processing import (

@@ -10,7 +10,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 # sglang-research's attention/triton_backend.py, so the dump runs natively
 # without the stale fork's model definitions. Override SGLANG_DUMP_DIR to
 # point at a different sglang checkout.
-SGLANG_DUMP_DIR="${SGLANG_DUMP_DIR:-/home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/sglang-research}"
+SGLANG_DUMP_DIR="${SGLANG_DUMP_DIR:-${REPO_ROOT}/sglang-research}"
 if [[ ! -d "${SGLANG_DUMP_DIR}" ]]; then
     SGLANG_DUMP_DIR="${REPO_ROOT}/sglang-research"
 fi
