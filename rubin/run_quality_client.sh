@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/shared/oscar-int3-rubin-simulate}"
-SOURCE="${SOURCE:-${ROOT}/source/multimodel/CoQuant}"
-BASE="${BASE:-${ROOT}/multimodel/kimi-k3}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${SOURCE:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+BASE="${BASE:-${TMPDIR:-/tmp}/rubin-kimi-k3}"
 BASE_URL="${BASE_URL:-http://kimi-k3-latent-head:30000}"
 MODEL="${MODEL:-moonshotai/Kimi-K3}"
-BLOCKS="${BLOCKS:-/shared/CoQuant/kimi3-official-2bit/wikitext2_test_8192.pt}"
+BLOCKS="${BLOCKS:?BLOCKS must point to a tokenized WikiText-2 block file}"
 TASK="${TASK:?TASK is required}"
 MODE="${MODE:-calibration}"
 
@@ -72,7 +72,7 @@ PY
     ;;
   kl_teacher)
     mkdir -p "${BASE}/kl_8k/bf16"
-    python3 "${SOURCE}/rotation/kimi_k3_latent/wikitext2_kl_tail.py" \
+    python3 "${SOURCE}/rubin/wikitext2_kl_tail.py" \
       --base-url "${BASE_URL}" \
       --model moonshotai/Kimi-K3-native \
       --blocks-path "${BLOCKS}" \
@@ -84,7 +84,7 @@ PY
     [[ "${MODE}" == offline_lm_qp || "${MODE}" == oscar_offline_lm_qp ]]
     verify_mode
     mkdir -p "${BASE}/ppl/${MODE}"
-    python3 "${SOURCE}/rotation/wikitext2_ppl.py" \
+    python3 "${SOURCE}/rubin/wikitext2_ppl.py" \
       --base-url "${BASE_URL}" \
       --model "Kimi-K3-${MODE}" \
       --tokenizer-path "${MODEL}" \
@@ -102,7 +102,7 @@ PY
     done
     test -s "${BASE}/kl_8k/bf16/reference.json"
     mkdir -p "${BASE}/kl_8k/${MODE}"
-    python3 "${SOURCE}/rotation/kimi_k3_latent/wikitext2_kl_tail.py" \
+    python3 "${SOURCE}/rubin/wikitext2_kl_tail.py" \
       --base-url "${BASE_URL}" \
       --model "Kimi-K3-${MODE}" \
       --blocks-path "${BLOCKS}" \
@@ -119,7 +119,7 @@ PY
     NUM_SHARDS="${NUM_SHARDS:-4}"
     RUN_DIR="${BASE}/gpqa/${MODE}/seed${SEED}/shard${SHARD_INDEX}"
     mkdir -p "${RUN_DIR}"
-    python3 "${SOURCE}/rotation/_eval_runner/run_simple_eval.py" \
+    python3 "${SOURCE}/rubin/run_simple_eval.py" \
       --task gpqa \
       --model "${MODEL}" \
       --base-url "${BASE_URL}/v1" \
