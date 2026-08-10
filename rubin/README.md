@@ -36,6 +36,12 @@ Neither command is a hardware prediction. A concrete speedup requires Rubin
 measurements of LUT-B tile throughput, achieved HBM bandwidth, and collector
 reuse in a fused attention kernel.
 
+The calculator models ordinary MHA/GQA caches, where separate K and V tensors
+are shared by `q_heads / kv_heads` query heads. Do not transfer its GQA4
+`4 / 128` row occupancy to MLA: an MLA latent is shared by all local query
+heads. Tensor/context parallelism determines how many of those heads can be
+packed by one GPU.
+
 Compile the SM107 LUT-B probes with a CUDA 13.4 toolchain:
 
 ```bash
