@@ -20,6 +20,8 @@ Rebuild the H100, B200, and Rubin roofline projection:
 python3 rubin/rubin_k3v3_roofline.py --compare-hardware
 ```
 
+The default contexts are 8K, 32K, and 1M tokens.
+
 NVIDIA publishes 17.5 PFLOP/s as Rubin's dense FP8/FP6 specification, but
 does not publish the full-tile throughput of `decompress::lut::b`. The default
 uses 17.5 PFLOP/s only as a sensitivity endpoint. Compare it with a hypothetical

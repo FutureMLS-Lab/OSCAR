@@ -136,7 +136,9 @@ def project(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--contexts", type=int, nargs="+", default=[8192, 32768])
+    parser.add_argument(
+        "--contexts", type=int, nargs="+", default=[8192, 32768, 1048576]
+    )
     parser.add_argument("--layers", type=int, default=36)
     parser.add_argument("--q-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=8)
