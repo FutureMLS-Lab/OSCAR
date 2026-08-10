@@ -2608,9 +2608,9 @@ class ServerArgs:
             self.page_size = 1
 
     def _unified_mixed_kv_active(self) -> bool:
-        """Return True when --kv-cache-dtype int2 + the SGLANG_ENABLE_MIXED_KV_*
+        """Return True when --kv-cache-dtype int2/int1 + the SGLANG_ENABLE_MIXED_KV_*
         environment variables would route ModelRunner through the unified
-        HP+int2 KV pool. Mirrors the gates in
+        HP+quant KV pool. Mirrors the gates in
         ``model_runner_kv_cache_mixin._init_pools`` and
         ``pool_configurator._attention_supports_mixed_kv``.
         """
@@ -2618,7 +2618,7 @@ class ServerArgs:
 
         if not envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get():
             return False
-        if self.kv_cache_dtype != "int2":
+        if self.kv_cache_dtype not in ("int2", "int1", "pq_k_int2v"):
             return False
         ab = self.attention_backend
         pab = self.prefill_attention_backend or ab
@@ -4178,8 +4178,10 @@ class ServerArgs:
                 "bfloat16",
                 "fp4_e2m1",
                 "int2",
+                "int1",
+                "pq_k_int2v",
             ],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "int2" uses the Triton quantized KV cache path.',
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "int2" uses the Triton quantized KV cache path. "int1" extends int2 to 1-bit packing (8 values/byte). "pq_k_int2v" uses Product-Quantized K (1.0 bpe) with INT2 V, or PQ V when SGLANG_PQ_V_CODEBOOK is configured.',
         )
         parser.add_argument(
             "--kv-cache-quant-group-size",
@@ -6491,29 +6493,29 @@ class ServerArgs:
         if self.kv_cache_quant_group_size is not None:
             if self.kv_cache_quant_group_size <= 0:
                 raise ValueError("--kv-cache-quant-group-size must be positive")
-            if self.kv_cache_dtype != "int2":
+            if self.kv_cache_dtype not in ("int2", "int1", "pq_k_int2v"):
                 raise ValueError(
                     "--kv-cache-quant-group-size is only supported with "
-                    "--kv-cache-dtype int2"
+                    "--kv-cache-dtype int2, int1, or pq_k_int2v"
                 )
             if self.model_path.lower() not in ["none", "dummy"] and getattr(
                 self.get_model_config(), "is_hybrid_swa", False
             ):
                 raise ValueError(
                     "--kv-cache-quant-group-size is only supported for the "
-                    "full-attention int2 KV cache path (Triton backend, or "
+                    "full-attention int2/int1 KV cache path (Triton backend, or "
                     "hybrid FA3-prefill + Triton-decode) and is not "
                     "supported with hybrid SWA models"
                 )
 
-        # int2 has no FA3 decode reader path; it lives only in the Triton
-        # backend. FA3 prefill is supported via HybridAttnBackend
+        # int2/int1 have no FA3 decode reader path; they live only in the
+        # Triton backend. FA3 prefill is supported via HybridAttnBackend
         # (--prefill-attention-backend fa3 --decode-attention-backend
-        # triton), but sending decode to FA3 with int2 would crash in
+        # triton), but sending decode to FA3 with int2/int1 would crash in
         # forward_decode (``q.to("int2")``). Reject the unsupported
         # combinations up front so we fail at startup with a clear message
         # rather than a cryptic TypeError mid-forward.
-        if self.kv_cache_dtype == "int2":
+        if self.kv_cache_dtype in ("int2", "int1", "pq_k_int2v"):
             bad_backend = None
             if (
                 self.attention_backend not in (None, "triton")
@@ -6530,9 +6532,10 @@ class ServerArgs:
                 )
             if bad_backend is not None:
                 raise ValueError(
-                    "--kv-cache-dtype int2 requires the Triton decode path. "
-                    f"Got {bad_backend}. Use either `--attention-backend "
-                    "triton` or `--prefill-attention-backend fa3 "
+                    f"--kv-cache-dtype {self.kv_cache_dtype} requires the "
+                    f"Triton decode path. Got {bad_backend}. Use either "
+                    "`--attention-backend triton` or "
+                    "`--prefill-attention-backend fa3 "
                     "--decode-attention-backend triton`."
                 )
 

@@ -768,10 +768,16 @@ class KVCache(abc.ABC):
         self.device = device
         if model_dtype is not None:
             self.model_dtype = model_dtype
-        elif dtype == "int2":
+        elif dtype in ("int2", "int1", "pq_k_int2v"):
             raise ValueError(f"model_dtype is required for {dtype} kv cache")
 
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, "int2"):
+        if dtype in (
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+            "int2",
+            "int1",
+            "pq_k_int2v",
+        ):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -893,10 +899,11 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
         self.kv_cache_quant_group_size = kv_cache_quant_group_size
-        # Scale/zero dtype for int2-packed scales. fp32 preserves the historical
-        # default; bf16/fp16 are opt-in via env. Unused for non-int2 dtypes.
+        # Scale/zero dtype for int2/int1-packed scales. fp32 preserves the
+        # historical default; bf16/fp16 are opt-in via env. Unused for other
+        # dtypes.
         self.scale_dtype = scale_dtype if scale_dtype is not None else torch.float32
-        if self.dtype == "int2":
+        if self.dtype in ("int2", "int1", "pq_k_int2v"):
             self.k_quant_group_size, self.k_num_scale_groups = (
                 self._resolve_quant_grouping(self.head_dim, "K")
             )
@@ -1013,10 +1020,10 @@ class MHATokenToKVPool(KVCache):
                 if self.dtype == "int2":
                     assert (
                         self.head_dim % 4 == 0
-                    ), f"head_dim: {self.head_dim}, kv cache dtype: int2"
+                    ), f"head_dim: {self.head_dim}, kv cache dtype: {self.dtype}"
                     assert (
                         self.v_head_dim % 4 == 0
-                    ), f"v_head_dim: {self.v_head_dim}, kv cache dtype: int2"
+                    ), f"v_head_dim: {self.v_head_dim}, kv cache dtype: {self.dtype}"
                     self.k_buffer = [
                         torch.zeros(
                             (self.size + self.page_size, self.head_num, self.head_dim // 4),

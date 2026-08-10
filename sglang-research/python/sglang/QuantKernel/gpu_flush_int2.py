@@ -44,10 +44,10 @@ class FlushPlan:
     """
 
     returned_slot_ids: torch.Tensor  # int64 [bs * flush_interval]
-    src_hp_slot: torch.Tensor        # int64 [bs * flush_interval]
-    flush_pos: torch.Tensor          # int32 [bs * flush_interval]
-    valid_mask: torch.Tensor         # int8  [bs * flush_interval]
-    dst_quant_slots: torch.Tensor    # int64 [bs * flush_interval] (carried through)
+    src_hp_slot: torch.Tensor  # int64 [bs * flush_interval]
+    flush_pos: torch.Tensor  # int32 [bs * flush_interval]
+    valid_mask: torch.Tensor  # int8  [bs * flush_interval]
+    dst_quant_slots: torch.Tensor  # int64 [bs * flush_interval] (carried through)
     bs: int
     flush_interval: int
 
@@ -59,16 +59,16 @@ class FlushPlan:
 
 @triton.jit
 def _flush_plan_kernel(
-    seq_lens_ptr,               # int32 [bs]
-    prefix_lens_ptr,            # int32 [bs]
-    req_pool_indices_ptr,       # int64 [bs]
-    dst_quant_slot_ptr,         # int64 [bs * FLUSH_INTERVAL]  pre-allocated
-    req_to_token_ptr,           # int32 [num_req_slots, max_ctx]
-    flush_mask_ptr,             # int8  [bs] -- 1 if request flushes this step
-    src_hp_slot_out_ptr,        # int64 [bs, FLUSH_INTERVAL]   src hp slot or -1
-    returned_slot_ids_ptr,      # int64 [bs, FLUSH_INTERVAL]   hp slot or dst_quant_slot
-    flush_pos_out_ptr,          # int32 [bs, FLUSH_INTERVAL]   flush_pos or -1
-    valid_mask_out_ptr,         # int8  [bs, FLUSH_INTERVAL]   1 if flushed else 0
+    seq_lens_ptr,  # int32 [bs]
+    prefix_lens_ptr,  # int32 [bs]
+    req_pool_indices_ptr,  # int64 [bs]
+    dst_quant_slot_ptr,  # int64 [bs * FLUSH_INTERVAL]  pre-allocated
+    req_to_token_ptr,  # int32 [num_req_slots, max_ctx]
+    flush_mask_ptr,  # int8  [bs] -- 1 if request flushes this step
+    src_hp_slot_out_ptr,  # int64 [bs, FLUSH_INTERVAL]   src hp slot or -1
+    returned_slot_ids_ptr,  # int64 [bs, FLUSH_INTERVAL]   hp slot or dst_quant_slot
+    flush_pos_out_ptr,  # int32 [bs, FLUSH_INTERVAL]   flush_pos or -1
+    valid_mask_out_ptr,  # int8  [bs, FLUSH_INTERVAL]   1 if flushed else 0
     max_ctx,
     rtt_stride_row,
     HP_PREFIX_TOKENS: tl.constexpr,
@@ -146,13 +146,13 @@ def _flush_plan_kernel(
 
 @triton.jit
 def _fused_flush_quant_body(
-    hp_base,                     # pointer to hp_dtype arena for one (layer, K|V)
-    quant_base,                  # pointer to uint8 arena (int2 packed view)
-    sz_base,                     # pointer to scale_dtype arena
-    src_hp_slot,                 # int64 [BLOCK_TOK]
-    dst_quant_slot,              # int64 [BLOCK_TOK]
-    active,                      # int1  [BLOCK_TOK]  per-row valid mask
-    head_idx,                    # int64 scalar
+    hp_base,  # pointer to hp_dtype arena for one (layer, K|V)
+    quant_base,  # pointer to uint8 arena (int2 packed view)
+    sz_base,  # pointer to scale_dtype arena
+    src_hp_slot,  # int64 [BLOCK_TOK]
+    dst_quant_slot,  # int64 [BLOCK_TOK]
+    active,  # int1  [BLOCK_TOK]  per-row valid mask
+    head_idx,  # int64 scalar
     HP_STRIDE_LOC: tl.constexpr,
     HP_STRIDE_HEAD: tl.constexpr,
     HP_STRIDE_DIM: tl.constexpr,
@@ -209,9 +209,7 @@ def _fused_flush_quant_body(
             thr_hi = tl.max(abs_acc, axis=1)
             for _ in tl.static_range(BSEARCH_ITERS):
                 thr_mid = (thr_lo + thr_hi) * 0.5
-                cnt_above = tl.sum(
-                    (abs_acc > thr_mid[:, None]).to(tl.int32), axis=1
-                )
+                cnt_above = tl.sum((abs_acc > thr_mid[:, None]).to(tl.int32), axis=1)
                 too_many = cnt_above > target_above
                 thr_lo = tl.where(too_many, thr_mid, thr_lo)
                 thr_hi = tl.where(too_many, thr_hi, thr_mid)
@@ -249,12 +247,8 @@ def _fused_flush_quant_body(
     vals0, vals2 = tl.split(a_even)
     vals1, vals3 = tl.split(a_odd)
 
-    scale_3d = tl.broadcast_to(
-        scale[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
-    )
-    zero_3d = tl.broadcast_to(
-        zero[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
-    )
+    scale_3d = tl.broadcast_to(scale[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE))
+    zero_3d = tl.broadcast_to(zero[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE))
     scale_flat = tl.reshape(scale_3d, (BLOCK_TOK, HEAD_DIM))
     zero_flat = tl.reshape(zero_3d, (BLOCK_TOK, HEAD_DIM))
 
@@ -287,9 +281,7 @@ def _fused_flush_quant_body(
     tl.store(quant_base + cache_offset, packed, mask=active[:, None])
 
     group_ids = tl.arange(0, NUM_GROUPS)
-    sz_offset_base = (
-        dst_quant_slot[:, None] * SZ_STRIDE_LOC + head_idx * SZ_STRIDE_HEAD
-    )
+    sz_offset_base = dst_quant_slot[:, None] * SZ_STRIDE_LOC + head_idx * SZ_STRIDE_HEAD
     tl.store(
         sz_base + sz_offset_base + (group_ids[None, :] * 2) * SZ_STRIDE_DIM,
         scale,
@@ -321,9 +313,9 @@ def _fused_flush_quant_kernel(
     k_sz_sample_ptr,
     v_sz_sample_ptr,
     # Flush plan (flat view of [bs, FLUSH_INTERVAL])
-    src_hp_slot_ptr,             # int64 [num_flush_tokens]  clamped >= 0
-    dst_quant_slot_ptr,          # int64 [num_flush_tokens]
-    valid_mask_ptr,              # int8  [num_flush_tokens]
+    src_hp_slot_ptr,  # int64 [num_flush_tokens]  clamped >= 0
+    dst_quant_slot_ptr,  # int64 [num_flush_tokens]
+    valid_mask_ptr,  # int8  [num_flush_tokens]
     num_flush_tokens,
     num_heads,
     num_layers,
@@ -480,11 +472,11 @@ def _fused_flush_quant_kernel(
 
 @triton.jit
 def _flush_remap_kernel(
-    req_pool_indices_ptr,       # int64 [bs]
-    flush_pos_ptr,              # int32 [bs * FLUSH_INTERVAL]
-    dst_quant_slot_ptr,         # int64 [bs * FLUSH_INTERVAL]
-    valid_mask_ptr,             # int8  [bs * FLUSH_INTERVAL]
-    req_to_token_ptr,           # int32 [num_req_slots, max_ctx]
+    req_pool_indices_ptr,  # int64 [bs]
+    flush_pos_ptr,  # int32 [bs * FLUSH_INTERVAL]
+    dst_quant_slot_ptr,  # int64 [bs * FLUSH_INTERVAL]
+    valid_mask_ptr,  # int8  [bs * FLUSH_INTERVAL]
+    req_to_token_ptr,  # int32 [num_req_slots, max_ctx]
     rtt_stride_row,
     FLUSH_INTERVAL: tl.constexpr,
 ):
@@ -574,22 +566,25 @@ def _flush_block_tok_and_num_warps(
     if block_tok > fi_pow2:
         block_tok = fi_pow2
     total_elems = block_tok * head_dim
-    assert total_elems % (32 * elements_per_thread) == 0, (
-        f"BLOCK_TOK={block_tok} head_dim={head_dim} "
-        f"epp={elements_per_thread}: tile doesn't divide cleanly into "
-        "128-bit/thread loads"
+    # Small test/debug intervals (notably K=1 with head_dim=64) contain fewer
+    # than one warp's worth of 128-bit vectors. They are still valid Triton
+    # tiles; launch one warp and let inactive lanes idle instead of rejecting
+    # the configuration. Production shapes remain exactly vector-balanced.
+    vectors_per_warp = 32 * elements_per_thread
+    num_warps = triton.next_power_of_2(
+        max(1, triton.cdiv(total_elems, vectors_per_warp))
     )
-    num_warps = total_elems // (32 * elements_per_thread)
     return block_tok, num_warps
+
 
 def gpu_flush_int2_plan(
     *,
-    seq_lens: torch.Tensor,                   # int32 [bs]
-    prefix_lens: torch.Tensor,                # int32 [bs]
-    req_pool_indices: torch.Tensor,           # int64 [bs]
-    dst_quant_slots: torch.Tensor,            # int64 [bs * flush_interval]
-    req_to_token: torch.Tensor,               # int32 [num_req_slots, max_ctx]
-    flush_mask: torch.Tensor,                 # bool [bs] -- per-request gate
+    seq_lens: torch.Tensor,  # int32 [bs]
+    prefix_lens: torch.Tensor,  # int32 [bs]
+    req_pool_indices: torch.Tensor,  # int64 [bs]
+    dst_quant_slots: torch.Tensor,  # int64 [bs * flush_interval]
+    req_to_token: torch.Tensor,  # int32 [num_req_slots, max_ctx]
+    flush_mask: torch.Tensor,  # bool [bs] -- per-request gate
     hp_prefix_tokens: int,
     hp_recent_tokens: int,
     hp_global_offset: int,
@@ -623,7 +618,9 @@ def gpu_flush_int2_plan(
 
     device = seq_lens.device
     total_flush_slots = bs * flush_interval
-    returned_slot_ids = torch.empty((total_flush_slots,), dtype=torch.int64, device=device)
+    returned_slot_ids = torch.empty(
+        (total_flush_slots,), dtype=torch.int64, device=device
+    )
     src_hp_slot = torch.empty((total_flush_slots,), dtype=torch.int64, device=device)
     flush_pos = torch.empty((total_flush_slots,), dtype=torch.int32, device=device)
     valid_mask = torch.empty((total_flush_slots,), dtype=torch.int8, device=device)
@@ -665,8 +662,8 @@ def gpu_flush_int2_plan(
 def gpu_flush_int2_apply(
     plan: FlushPlan,
     *,
-    req_pool_indices: torch.Tensor,           # int64 [bs]
-    req_to_token: torch.Tensor,               # int32 [num_req_slots, max_ctx]
+    req_pool_indices: torch.Tensor,  # int64 [bs]
+    req_to_token: torch.Tensor,  # int32 [num_req_slots, max_ctx]
     # Pool-held metadata (built once at pool construction):
     hp_k_ptrs: torch.Tensor,
     hp_v_ptrs: torch.Tensor,
@@ -800,19 +797,19 @@ def gpu_flush_int2_apply(
 
 def gpu_flush_int2(
     *,
-    seq_lens: torch.Tensor,                   # int32 [bs]
-    prefix_lens: torch.Tensor,                # int32 [bs]
-    req_pool_indices: torch.Tensor,           # int64 [bs]
-    dst_quant_slots: torch.Tensor,            # int64 [bs * flush_interval]
-    req_to_token: torch.Tensor,               # int32 [num_req_slots, max_ctx]
-    flush_mask: torch.Tensor,                 # bool [bs] -- per-request gate
+    seq_lens: torch.Tensor,  # int32 [bs]
+    prefix_lens: torch.Tensor,  # int32 [bs]
+    req_pool_indices: torch.Tensor,  # int64 [bs]
+    dst_quant_slots: torch.Tensor,  # int64 [bs * flush_interval]
+    req_to_token: torch.Tensor,  # int32 [num_req_slots, max_ctx]
+    flush_mask: torch.Tensor,  # bool [bs] -- per-request gate
     # Pool-held metadata (built once at pool construction):
-    hp_k_ptrs: torch.Tensor,                  # int64 [num_layers]
-    hp_v_ptrs: torch.Tensor,                  # int64 [num_layers]
-    quant_k_ptrs: torch.Tensor,               # int64 [num_layers]
-    quant_v_ptrs: torch.Tensor,               # int64 [num_layers]
-    k_sz_ptrs: torch.Tensor,                  # int64 [num_layers]
-    v_sz_ptrs: torch.Tensor,                  # int64 [num_layers]
+    hp_k_ptrs: torch.Tensor,  # int64 [num_layers]
+    hp_v_ptrs: torch.Tensor,  # int64 [num_layers]
+    quant_k_ptrs: torch.Tensor,  # int64 [num_layers]
+    quant_v_ptrs: torch.Tensor,  # int64 [num_layers]
+    k_sz_ptrs: torch.Tensor,  # int64 [num_layers]
+    v_sz_ptrs: torch.Tensor,  # int64 [num_layers]
     hp_k_sample: torch.Tensor,
     hp_v_sample: torch.Tensor,
     quant_k_sample: torch.Tensor,
@@ -904,3 +901,122 @@ def gpu_flush_int2(
     )
 
     return plan.returned_slot_ids, plan.valid_mask
+
+
+def gpu_flush_pqk_int2v_apply(
+    plan: "FlushPlan",
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    kv_pool,  # UnifiedInt2HPKVPool with pq_k_int2v dtype
+) -> None:
+    """Apply phase for PQ K + INT2 LM V flush.
+
+    K: gather HP K, PQ-encode → k_buffer codes.
+    V: gather HP V, INT2 LM-encode → v_buffer + v_scales_zeros.
+    Remap: same _flush_remap_kernel as INT2.
+    """
+    from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
+        _launch_grouped_clip_int2,
+        _launch_single_clip_int2,
+    )
+    from sglang.QuantKernel.oscar_rotation_pq_k_kv import pq_encode_k
+    from sglang.srt.mem_cache.kv_quant_kernels import _get_num_scale_groups
+
+    bs = plan.bs
+    flush_interval = plan.flush_interval
+
+    safe_src = plan.src_hp_slot.clamp(min=0)  # [bs * flush_interval]
+    valid = plan.valid_mask.bool()  # [bs * flush_interval]
+    dst = plan.dst_quant_slots  # [bs * flush_interval] int32
+
+    valid_dst = dst[valid]  # [n_valid]
+
+    for layer_idx in range(kv_pool.layer_num):
+        layer_id = kv_pool.start_layer + layer_idx
+        # --- K: PQ encode ---
+        hp_k = kv_pool.hp_k_buffer[layer_idx]  # [hp_slots, heads, head_dim]
+        gathered_k = hp_k[safe_src][valid]  # [n_valid, heads, head_dim]
+        k_fp16 = (
+            gathered_k
+            if gathered_k.dtype == torch.float16
+            else gathered_k.to(torch.float16)
+        )
+        pq_encode_k(
+            k_fp16,
+            valid_dst,
+            kv_pool.k_buffer[layer_idx],
+            kv_pool.get_pq_codebook(layer_id),
+            kv_pool.get_pq_cb_norms(layer_id),
+        )
+        # RVQ stage-2: encode the residual (k - PQ(k)) into k_buffer2 (reuses pq kernels).
+        if getattr(kv_pool, "_is_rvq", False):
+            from sglang.QuantKernel.oscar_rotation_pq_k_kv import pq_decode_k
+
+            n_valid = k_fp16.shape[0]
+            head_dim_k = k_fp16.shape[-1]
+            recon1 = pq_decode_k(
+                kv_pool.k_buffer[layer_idx][valid_dst],
+                kv_pool.get_pq_codebook(layer_id),
+                n_valid,
+                head_dim_k,
+            ).to(k_fp16.dtype)
+            resid = (k_fp16 - recon1).contiguous()
+            pq_encode_k(
+                resid,
+                valid_dst,
+                kv_pool.k_buffer2[layer_idx],
+                kv_pool.get_rvq_cb2(layer_id),
+                kv_pool.get_rvq_cb2_norms(layer_id),
+            )
+
+        # --- V: PQ encode (if SGLANG_PQ_V_CODEBOOK set) else INT2 LM encode ---
+        hp_v = kv_pool.hp_v_buffer[layer_idx]  # [hp_slots, heads, v_head_dim]
+        gathered_v = hp_v[safe_src][valid]  # [n_valid, heads, v_head_dim]
+        v_float = gathered_v.to(kv_pool.hp_dtype)
+        if getattr(kv_pool, "_pq_v", False):
+            vcb = kv_pool.get_pq_v_codebook(layer_id)
+            n_sub_v = vcb.shape[0]
+            pq_encode_k(
+                v_float.to(torch.float16),
+                valid_dst,
+                kv_pool.v_buffer[layer_idx][
+                    ..., :n_sub_v
+                ],  # store codes in first n_sub bytes
+                vcb,
+                kv_pool.get_pq_v_cb_norms(layer_id),
+            )
+            continue
+        n_groups_v = _get_num_scale_groups(kv_pool.v_scales_zeros[layer_idx])
+        if n_groups_v == 1:
+            _launch_single_clip_int2(
+                v_float,
+                valid_dst,
+                kv_pool.v_buffer[layer_idx],
+                kv_pool.v_scales_zeros[layer_idx],
+                kv_pool._v_clip_ratio,
+                hp_global_offset=None,
+                lloyd_max=kv_pool._lloyd_max,
+            )
+        else:
+            _launch_grouped_clip_int2(
+                v_float,
+                valid_dst,
+                kv_pool.v_buffer[layer_idx],
+                kv_pool.v_scales_zeros[layer_idx],
+                kv_pool._v_clip_ratio,
+                hp_global_offset=None,
+            )
+
+    rtt_stride_row = int(req_to_token.stride(0))
+    _flush_remap_kernel[(bs, flush_interval)](
+        req_pool_indices,
+        plan.flush_pos,
+        plan.dst_quant_slots,
+        plan.valid_mask,
+        req_to_token,
+        rtt_stride_row,
+        FLUSH_INTERVAL=int(flush_interval),
+        num_warps=1,
+        num_stages=1,
+    )

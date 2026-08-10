@@ -51,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.utils import maybe_absorb_oscar_v_rotation_into_qkv
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.utils import get_exception_traceback
@@ -194,6 +195,9 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        # OSCAR: K QQT-rotation is applied pool-side by layer_id; V SST-rotation is
+        # folded into qkv_proj at load (maybe_absorb_oscar_v_rotation_into_qkv).
+        self.attn.oscar_v_rotation_absorbed = False
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -677,6 +681,10 @@ class LlamaForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+        maybe_absorb_oscar_v_rotation_into_qkv(
+            self.model, quant_config=self.quant_config, model_label="Llama"
+        )
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

@@ -121,16 +121,14 @@ def prepare_quantized_extend_qkv(
     """
     need_v_inverse = False
     kv_dtype = kv_pool.dtype
-    if kv_dtype != "int2":
+    if kv_dtype not in ("int2", "int1", "pq_k_int2v"):
         return q, k, v, need_v_inverse
 
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_k = kv_pool._R_k[layer_idx]
         R_v = kv_pool._R_v[layer_idx]
-        v_rotation_absorbed = bool(
-            getattr(layer, "oscar_v_rotation_absorbed", False)
-        )
+        v_rotation_absorbed = bool(getattr(layer, "oscar_v_rotation_absorbed", False))
         if not q_already_hadamard_transformed:
             q = _apply_oscar_rotation(q, R_k)
         if not kv_already_hadamard_transformed:
@@ -176,6 +174,7 @@ def _mixed_prefix_dequant_kernel(
     HP_OFFSET: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    INT1: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -184,9 +183,13 @@ def _mixed_prefix_dequant_kernel(
 
     slot = tl.load(prefix_indices_ptr + token_idx)
     is_hp = slot >= HP_OFFSET
-    quarter_dim = head_dim // 4
 
-    byte_offsets = offs % quarter_dim
+    pack_bits: tl.constexpr = 1 if INT1 else 2
+    pack_factor: tl.constexpr = 8 if INT1 else 4
+    byte_dim: tl.constexpr = head_dim // pack_factor
+    byte_mask: tl.constexpr = (1 << pack_bits) - 1
+
+    byte_offsets = offs % byte_dim
     packed = tl.load(
         quant_ptr
         + slot * quant_stride_token
@@ -195,8 +198,8 @@ def _mixed_prefix_dequant_kernel(
         mask=(~is_hp) & dim_mask,
         other=0,
     )
-    shift = (offs // quarter_dim) * 2
-    q = ((packed >> shift) & 0x03).to(tl.float32)
+    shift = (offs // byte_dim) * pack_bits
+    q = ((packed >> shift) & byte_mask).to(tl.float32)
 
     group_ids = offs // GROUP_SIZE
     scale = tl.load(
@@ -235,6 +238,171 @@ def _mixed_prefix_dequant_kernel(
         out_val,
         mask=(token_idx < num_tokens) & (head_idx < num_heads) & dim_mask,
     )
+
+
+@triton.jit
+def _mixed_prefix_pq_dequant_kernel(
+    prefix_indices_ptr,
+    codes_ptr,
+    codebook_ptr,
+    codes2_ptr,
+    codebook2_ptr,
+    hp_ptr,
+    out_ptr,
+    num_tokens,
+    num_heads,
+    codes_stride_token: tl.constexpr,
+    codes_stride_head: tl.constexpr,
+    codes_stride_sub: tl.constexpr,
+    codes2_stride_token: tl.constexpr,
+    codes2_stride_head: tl.constexpr,
+    codes2_stride_sub: tl.constexpr,
+    hp_stride_token: tl.constexpr,
+    hp_stride_head: tl.constexpr,
+    hp_stride_dim: tl.constexpr,
+    out_stride_token: tl.constexpr,
+    out_stride_head: tl.constexpr,
+    out_stride_dim: tl.constexpr,
+    HP_OFFSET: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    SUB_DIM: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
+    N_CENTROIDS2: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    HAS_STAGE2: tl.constexpr,
+):
+    """Decode a mixed HP/PQ prefix without data-dependent Python masks."""
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_DIM)
+    dim_mask = offs < HEAD_DIM
+
+    slot = tl.load(prefix_indices_ptr + token_idx).to(tl.int64)
+    is_hp = slot >= HP_OFFSET
+    quant_slot = tl.where(is_hp, 0, slot)
+    hp_slot = tl.where(is_hp, slot - HP_OFFSET, 0)
+
+    sub_idx = offs // SUB_DIM
+    sub_off = offs % SUB_DIM
+    code = tl.load(
+        codes_ptr
+        + quant_slot * codes_stride_token
+        + head_idx * codes_stride_head
+        + sub_idx * codes_stride_sub,
+        mask=(~is_hp) & dim_mask,
+        other=0,
+    ).to(tl.int64)
+    quant_val = tl.load(
+        codebook_ptr + (sub_idx * N_CENTROIDS + code) * SUB_DIM + sub_off,
+        mask=(~is_hp) & dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if HAS_STAGE2:
+        code2 = tl.load(
+            codes2_ptr
+            + quant_slot * codes2_stride_token
+            + head_idx * codes2_stride_head
+            + sub_idx * codes2_stride_sub,
+            mask=(~is_hp) & dim_mask,
+            other=0,
+        ).to(tl.int64)
+        quant_val += tl.load(
+            codebook2_ptr + (sub_idx * N_CENTROIDS2 + code2) * SUB_DIM + sub_off,
+            mask=(~is_hp) & dim_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    hp_val = tl.load(
+        hp_ptr
+        + hp_slot * hp_stride_token
+        + head_idx * hp_stride_head
+        + offs * hp_stride_dim,
+        mask=is_hp & dim_mask,
+        other=0.0,
+    )
+    out_val = tl.where(is_hp, hp_val, quant_val)
+    tl.store(
+        out_ptr
+        + token_idx * out_stride_token
+        + head_idx * out_stride_head
+        + offs * out_stride_dim,
+        out_val,
+        mask=(token_idx < num_tokens) & (head_idx < num_heads) & dim_mask,
+    )
+
+
+def _mixed_prefix_dequantize_pq_tensor(
+    prefix_indices: torch.Tensor,
+    codes: torch.Tensor,
+    codebook: torch.Tensor,
+    hp: torch.Tensor,
+    hp_offset: int,
+    model_dtype: torch.dtype,
+    codes2: Optional[torch.Tensor] = None,
+    codebook2: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    num_tokens = prefix_indices.shape[0]
+    num_heads = codes.shape[1]
+    n_sub, n_centroids, sub_dim = codebook.shape
+    head_dim = n_sub * sub_dim
+    out = torch.empty(
+        (num_tokens, num_heads, head_dim),
+        dtype=model_dtype,
+        device=prefix_indices.device,
+    )
+    if num_tokens == 0:
+        return out
+
+    has_stage2 = codes2 is not None
+    if has_stage2:
+        assert codebook2 is not None
+        assert codebook2.shape[0] == n_sub
+        assert codebook2.shape[2] == sub_dim
+        codes2_arg = codes2
+        codebook2_arg = codebook2
+        n_centroids2 = int(codebook2.shape[1])
+    else:
+        # Triton still requires pointer arguments even when the constexpr
+        # branch is disabled.
+        codes2_arg = codes
+        codebook2_arg = codebook
+        n_centroids2 = n_centroids
+
+    grid = (num_tokens, num_heads)
+    _mixed_prefix_pq_dequant_kernel[grid](
+        prefix_indices,
+        codes,
+        codebook,
+        codes2_arg,
+        codebook2_arg,
+        hp,
+        out,
+        num_tokens,
+        num_heads,
+        codes.stride(0),
+        codes.stride(1),
+        codes.stride(2),
+        codes2_arg.stride(0),
+        codes2_arg.stride(1),
+        codes2_arg.stride(2),
+        hp.stride(0),
+        hp.stride(1),
+        hp.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        HP_OFFSET=int(hp_offset),
+        HEAD_DIM=head_dim,
+        SUB_DIM=sub_dim,
+        N_CENTROIDS=n_centroids,
+        N_CENTROIDS2=n_centroids2,
+        BLOCK_DIM=triton.next_power_of_2(head_dim),
+        HAS_STAGE2=has_stage2,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
 
 
 def _mixed_prefix_dequantize_tensor(
@@ -282,6 +450,7 @@ def _mixed_prefix_dequantize_tensor(
         HP_OFFSET=int(hp_offset),
         GROUP_SIZE=group_size,
         BLOCK_DIM=triton.next_power_of_2(head_dim),
+        INT1=(quantized.shape[-1] == head_dim // 8),
         num_warps=4,
         num_stages=1,
     )
@@ -325,9 +494,44 @@ def dequantize_prefix_kv(
         getattr(kv_pool, "mixed_kv_enabled", None) is not None
         and kv_pool.mixed_kv_enabled()
     ):
-        assert kv_pool.dtype == "int2", (
-            f"Unsupported quantized KV dtype: {kv_pool.dtype}"
-        )
+        assert kv_pool.dtype in (
+            "int2",
+            "int1",
+            "pq_k_int2v",
+        ), f"Unsupported quantized KV dtype: {kv_pool.dtype}"
+        if kv_pool.dtype == "pq_k_int2v":
+            hp_off = kv_pool.hp_global_offset
+            out_k = _mixed_prefix_dequantize_pq_tensor(
+                prefix_indices,
+                kv_pool.get_raw_key_buffer(layer_id),
+                kv_pool.get_pq_codebook(layer_id),
+                kv_pool.get_hp_key_buffer(layer_id),
+                hp_off,
+                model_dtype,
+                codes2=kv_pool.get_raw_key_buffer2(layer_id),
+                codebook2=kv_pool.get_rvq_cb2(layer_id),
+            )
+            vcb = kv_pool.get_pq_v_codebook(layer_id)
+            if vcb is not None:
+                out_v = _mixed_prefix_dequantize_pq_tensor(
+                    prefix_indices,
+                    kv_pool.get_raw_value_buffer(layer_id),
+                    vcb,
+                    kv_pool.get_hp_value_buffer(layer_id),
+                    hp_off,
+                    model_dtype,
+                )
+            else:
+                out_v = _mixed_prefix_dequantize_tensor(
+                    prefix_indices,
+                    kv_pool.get_raw_value_buffer(layer_id),
+                    kv_pool.get_value_scales_zeros(layer_id),
+                    kv_pool.get_hp_value_buffer(layer_id),
+                    hp_off,
+                    kv_pool.v_head_dim,
+                    model_dtype,
+                )
+            return out_k, out_v
         return (
             _mixed_prefix_dequantize_tensor(
                 prefix_indices,
@@ -351,11 +555,37 @@ def dequantize_prefix_kv(
 
     raw_k = kv_pool.get_raw_key_buffer(layer_id)[prefix_indices]
     raw_v = kv_pool.get_raw_value_buffer(layer_id)[prefix_indices]
-    scales_k = kv_pool.get_key_scales_zeros(layer_id)[prefix_indices]
     scales_v = kv_pool.get_value_scales_zeros(layer_id)[prefix_indices]
-    assert kv_pool.dtype == "int2", (
-        f"Unsupported quantized KV dtype: {kv_pool.dtype}"
-    )
+    assert kv_pool.dtype in (
+        "int2",
+        "int1",
+        "pq_k_int2v",
+    ), f"Unsupported quantized KV dtype: {kv_pool.dtype}"
+    if kv_pool.dtype == "pq_k_int2v":
+        from sglang.QuantKernel.oscar_rotation_pq_k_kv import pq_decode_k
+
+        n = int(raw_k.shape[0])
+        _cb = kv_pool.get_pq_codebook(layer_id)
+        head_dim_k = int(_cb.shape[0]) * int(_cb.shape[2])
+        k_out = pq_decode_k(raw_k, _cb, n, head_dim_k)
+        # RVQ: add stage-2 residual reconstruction (None for plain PQ K).
+        _cb2 = kv_pool.get_rvq_cb2(layer_id)
+        if _cb2 is not None:
+            raw_k2 = kv_pool.get_raw_key_buffer2(layer_id)[prefix_indices]
+            k_out = k_out + pq_decode_k(raw_k2, _cb2, n, head_dim_k)
+        k_out = k_out.to(model_dtype)
+        _vcb = kv_pool.get_pq_v_codebook(layer_id)
+        if _vcb is not None:
+            n_sub_v = int(_vcb.shape[0])
+            v_out = pq_decode_k(raw_v[..., :n_sub_v], _vcb, n, kv_pool.v_head_dim).to(
+                model_dtype
+            )
+        else:
+            v_out = dequantize_kv_int2_triton(
+                raw_v, scales_v, kv_pool.v_head_dim, model_dtype
+            )
+        return k_out, v_out
+    scales_k = kv_pool.get_key_scales_zeros(layer_id)[prefix_indices]
     return (
         dequantize_kv_int2_triton(raw_k, scales_k, kv_pool.head_dim, model_dtype),
         dequantize_kv_int2_triton(raw_v, scales_v, kv_pool.v_head_dim, model_dtype),
@@ -375,12 +605,18 @@ def apply_inverse_v_rotation(
     ``result`` must have shape ``[..., v_head_dim]``; callers should reshape
     beforehand if their output is stored flattened.
     """
-    if not need_v_inverse or kv_pool.dtype != "int2":
+    if not need_v_inverse:
         return result
+    # Oscar rotation: V is stored in R_v-rotated space regardless of whether
+    # the rotation was absorbed into qkv_proj or applied explicitly at store
+    # time.  Always apply R_v^T to recover the original space.
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_v = kv_pool._R_v[layer_idx]
         return (result.to(R_v.dtype) @ R_v.T).contiguous()
+    # Hadamard rotation (non-Oscar pools) only applies to scalar int2/int1.
+    if kv_pool.dtype not in ("int2", "int1"):
+        return result
     return _apply_segmented_hadamard_transform(result)
 
 
@@ -416,6 +652,7 @@ def _cpu_int_list(values) -> Optional[list[int]]:
             return None
         return [int(v) for v in values.tolist()]
     return [int(v) for v in values]
+
 
 def build_prefix_indices_from_req_to_token(
     req_to_token: torch.Tensor,

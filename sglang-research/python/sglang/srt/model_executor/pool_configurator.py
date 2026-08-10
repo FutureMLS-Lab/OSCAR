@@ -105,22 +105,31 @@ def _get_int_kv_bytes_per_head_pair(
     group_size: Optional[int],
     scale_dtype_bytes: int = 4,
 ) -> int:
-    """Bytes per *quant-token* per head-pair for the int2 KV cache.
+    """Bytes per *quant-token* per head-pair for the int2/int1 KV cache.
 
     Used by both the non-mixed path and the mixed path: the scheduler's
     ``max_total_num_tokens`` is denominated in quant tokens (= slot ids on the
-    int2 tier), and the mixed allocator's ``size`` = ``(num_pages - 1) * N_Q``
-    is also in quant tokens, so the leak check
+    int2/int1 tier), and the mixed allocator's ``size`` =
+    ``(num_pages - 1) * N_Q`` is also in quant tokens, so the leak check
     ``size - available - evictable - protected`` closes in a single unit.
     """
-    assert kv_cache_dtype == "int2", (
-        f"Only int2 quant KV is supported, got {kv_cache_dtype}"
-    )
-    pack_factor = 4
+    if kv_cache_dtype == "int2":
+        k_pack_factor = 4
+        v_pack_factor = 4
+    elif kv_cache_dtype == "int1":
+        k_pack_factor = 8
+        v_pack_factor = 8
+    elif kv_cache_dtype == "pq_k_int2v":
+        k_pack_factor = 8  # N_SUB=16 codes = 16 bytes for head_dim=128
+        v_pack_factor = 4  # INT2 V
+    else:
+        raise AssertionError(
+            f"Only int2/int1/pq_k_int2v quant KV is supported, got {kv_cache_dtype}"
+        )
     k_groups = _resolve_quant_group_count(k_head_dim, group_size)
     v_groups = _resolve_quant_group_count(v_head_dim, group_size)
-    packed_k_bytes = k_head_dim // pack_factor
-    packed_v_bytes = v_head_dim // pack_factor
+    packed_k_bytes = k_head_dim // k_pack_factor
+    packed_v_bytes = v_head_dim // v_pack_factor
     # Interleaved (scale, zero) per group in ``scale_dtype``.
     scales_zeros_bytes = 2 * scale_dtype_bytes * (k_groups + v_groups)
     return packed_k_bytes + packed_v_bytes + scales_zeros_bytes
@@ -227,7 +236,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # ``(head_dim + v_head_dim) * hp_dtype_bytes`` (== 1 HP token worth).
         # Plus the scales/zeros arena sized for every page's quant view.
         enable_mixed_kv = (
-            kv_cache_dtype == "int2"
+            kv_cache_dtype in ("int2", "int1", "pq_k_int2v")
             and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
             and _attention_supports_mixed_kv(mr.server_args)
             and not mr.is_hybrid_swa
@@ -235,7 +244,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             and mr.server_args.speculative_algorithm is None
         )
 
-        if kv_cache_dtype == "int2":
+        if kv_cache_dtype in ("int2", "int1", "pq_k_int2v"):
             scale_dtype = resolve_scale_dtype(envs.SGLANG_MIXED_KV_SCALE_DTYPE.get())
             scale_bytes = torch.empty(0, dtype=scale_dtype).element_size()
         else:
@@ -252,7 +261,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 model_config.v_head_dim, kv_quant_group_size
             )
             # max_total_num_tokens is denominated in *quant tokens* (slot ids
-            # on the int2 tier). This matches the unified allocator's
+            # on the int2/int1 tier). This matches the unified allocator's
             # scheduler-facing ``size = (num_pages - 1) * N_Q``.
             bytes_per_head = _get_unified_mixed_kv_bytes_per_quant_token(
                 model_config.head_dim,
@@ -264,7 +273,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 n_q,
             )
             kv_size = None
-        elif kv_cache_dtype == "int2":
+        elif kv_cache_dtype in ("int2", "int1", "pq_k_int2v"):
             bytes_per_head = _get_int_kv_bytes_per_head_pair(
                 model_config.head_dim,
                 model_config.v_head_dim,
@@ -360,16 +369,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if (
-            kv_cache_dtype == "int2"
+            kv_cache_dtype in ("int2", "int1", "pq_k_int2v")
             and kv_quant_group_size is not None
         ):
             raise ValueError(
                 "--kv-cache-quant-group-size is only supported for the "
-                "full-attention Triton int2 KV cache path and is not supported "
-                "with hybrid SWA models"
+                "full-attention Triton int2/int1/PQ KV cache path and is not "
+                "supported with hybrid SWA models"
             )
 
-        if kv_cache_dtype == "int2":
+        if kv_cache_dtype in ("int2", "int1", "pq_k_int2v"):
             full_per_token = model_config.get_num_kv_heads(tp_size) * (
                 _get_int_kv_bytes_per_head_pair(
                     model_config.head_dim,
