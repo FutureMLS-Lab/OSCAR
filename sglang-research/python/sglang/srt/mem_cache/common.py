@@ -17,6 +17,11 @@ from sglang.QuantKernel.gpu_flush_int2 import (
     gpu_flush_int2,
     gpu_flush_int2_apply,
     gpu_flush_int2_plan,
+    gpu_flush_pqk_int2v_apply,
+)
+from sglang.QuantKernel.gpu_flush_int1 import (
+    gpu_flush_int1_apply,
+    gpu_flush_int1_plan,
 )
 
 if TYPE_CHECKING:
@@ -732,7 +737,7 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
     # ``allocator.free``, whose ``torch.unique`` host-syncs only against this
     # short pre-wait prefix instead of the previous forward. See
     # plan-for-a-fix-starry-russell.md.
-    plan = gpu_flush_int2_plan(
+    plan_kwargs = dict(
         seq_lens=seq_lens_int32,
         prefix_lens=prefix_lens_gpu,
         req_pool_indices=req_pool_indices_int64,
@@ -744,6 +749,12 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         hp_global_offset=kv_pool.hp_global_offset,
         flush_interval=flush_interval,
     )
+    use_int1_flush = getattr(kv_pool, "dtype", None) == "int1"
+    use_pqk_flush = getattr(kv_pool, "dtype", None) == "pq_k_int2v"
+    if use_int1_flush:
+        plan = gpu_flush_int1_plan(**plan_kwargs)
+    else:
+        plan = gpu_flush_int2_plan(**plan_kwargs)
 
     if plan is not None:
         # Free everything returned by the kernel in one call: flushed HP
@@ -763,8 +774,7 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         wait_pending_forward()
 
     if plan is not None:
-        gpu_flush_int2_apply(
-            plan,
+        apply_kwargs = dict(
             req_pool_indices=req_pool_indices_int64,
             req_to_token=batch.req_to_token_pool.req_to_token,
             hp_k_ptrs=kv_pool._flush_hp_k_ptrs,
@@ -794,6 +804,19 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
             k_clip_ratio=kv_pool._k_clip_ratio,
             v_clip_ratio=kv_pool._v_clip_ratio,
         )
+        if use_pqk_flush:
+            gpu_flush_pqk_int2v_apply(
+                plan,
+                req_pool_indices=req_pool_indices_int64,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                kv_pool=kv_pool,
+            )
+        elif use_int1_flush:
+            gpu_flush_int1_apply(
+                plan, lloyd_max=getattr(kv_pool, "_lloyd_max", False), **apply_kwargs
+            )
+        else:
+            gpu_flush_int2_apply(plan, **apply_kwargs)
 
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens

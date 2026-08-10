@@ -236,6 +236,19 @@ class Envs:
     # the default uniform min-max. Applies only to single-scale pretransformed
     # clip kernels (num_groups == 1). Requires oscar rotation + clip enabled.
     SGLANG_LLOYD_MAX = EnvBool(False)
+    # Path to a PQ K codebook .pt file for the pq_k_int2v KV dtype.
+    # Expected keys: codebooks ([N_SUB, N_CENTS, SUB_DIM] list), n_sub, sub_dim, n_centroids.
+    SGLANG_PQ_K_CODEBOOK = EnvStr("")
+    # Optional per-layer PQ V codebook. When set with pq_k_int2v, V is stored
+    # as one uint8 centroid index per sub-vector instead of INT2 values.
+    SGLANG_PQ_V_CODEBOOK = EnvStr("")
+    # PQ decode kernel tuning. Zero selects the shape-dependent default.
+    # -1 = auto (ADC for graph batch <4), 0 = reconstruct K, 1 = ADC.
+    SGLANG_PQ_USE_ADC = EnvInt(-1)
+    SGLANG_PQ_BLOCK_N = EnvInt(0)
+    SGLANG_PQ_BLOCK_H = EnvInt(0)
+    SGLANG_PQ_NUM_WARPS = EnvInt(0)
+    SGLANG_PQ_NUM_STAGES = EnvInt(0)
     SGLANG_MIXED_KV_HP_MAX_SPLITS = EnvInt(8)
     HADAMARD_ORDER = EnvInt(16)
 

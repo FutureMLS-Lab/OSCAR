@@ -2014,7 +2014,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "int2":
+        elif self.server_args.kv_cache_dtype in ("int2", "int1", "pq_k_int2v"):
             self.kv_cache_dtype = self.server_args.kv_cache_dtype
         else:
             raise ValueError(

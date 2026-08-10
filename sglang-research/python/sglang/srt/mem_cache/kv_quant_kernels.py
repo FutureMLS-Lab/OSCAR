@@ -1,6 +1,8 @@
 """
-Triton kernels for efficient INT2 KV cache quantization.
+Triton kernels for efficient INT2/INT1 KV cache quantization.
 """
+
+from typing import Optional
 
 import torch
 import triton
@@ -575,6 +577,377 @@ def dequantize_kv_int2_triton(
         output.stride(2),
         GROUP_SIZE=group_size,
         NUM_GROUPS_QUARTER=num_groups // 4,
+        num_warps=1,
+        num_stages=1,
+    )
+    return output
+
+
+# ---------------------------------------------------------------------------
+# INT1 helpers
+# ---------------------------------------------------------------------------
+# INT1 packs 8 quant values per byte (1-bit slots). Slot i sits in bits [i, i+1).
+# Storage shape is ``[cache_size, num_heads, head_dim // 8]`` uint8. Per-group
+# scale/zero layout is identical to INT2 (interleaved scale/zero pairs).
+# Bit ``i`` of byte ``b`` corresponds to original head_dim position
+# ``i * (head_dim // 8) + b`` (so the 8 lanes in one byte are stride-1 sub-
+# samples of the head_dim row, the same convention as INT2's "quartered split"
+# but one level deeper).
+
+
+@triton.jit
+def _dequantize_kv_int1_kernel(
+    quantized_ptr, scales_zeros_ptr, output_ptr,
+    cache_size, num_heads, head_dim,
+    quant_stride_cache, quant_stride_head, quant_stride_dim,
+    sz_stride_cache, sz_stride_head, sz_stride_dim,
+    out_stride_cache, out_stride_head, out_stride_dim,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    cache_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    if cache_idx >= cache_size or head_idx >= num_heads:
+        return
+
+    sz_base = cache_idx * sz_stride_cache + head_idx * sz_stride_head
+    scale = tl.load(scales_zeros_ptr + sz_base + 0 * sz_stride_dim).to(tl.float32)
+    zero = tl.load(scales_zeros_ptr + sz_base + 1 * sz_stride_dim).to(tl.float32)
+
+    octant_dim = head_dim // 8
+    dim_offsets = tl.arange(0, BLOCK_SIZE_DIM)
+    dim_mask = dim_offsets < octant_dim
+
+    quant_offset = (
+        cache_idx * quant_stride_cache + head_idx * quant_stride_head
+        + dim_offsets * quant_stride_dim
+    )
+    packed = tl.load(quantized_ptr + quant_offset, mask=dim_mask, other=0)
+
+    out_base = cache_idx * out_stride_cache + head_idx * out_stride_head
+    for i in tl.static_range(8):
+        d_i = (((packed >> i) & 0x01).to(tl.float32) - zero) * scale
+        tl.store(
+            output_ptr + out_base + (dim_offsets + i * octant_dim) * out_stride_dim,
+            d_i,
+            mask=dim_mask,
+        )
+
+
+@triton.jit
+def _dequantize_kv_int1_grouped_kernel(
+    quantized_ptr,
+    scales_zeros_ptr,
+    output_ptr,
+    cache_size,
+    num_heads,
+    quant_stride_cache,
+    quant_stride_head,
+    quant_stride_dim,
+    sz_stride_cache,
+    sz_stride_head,
+    sz_stride_dim,
+    out_stride_cache,
+    out_stride_head,
+    out_stride_dim,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS_OCTANT: tl.constexpr,
+):
+    """Groupwise INT1 dequantize. The 2D tile is shaped
+    ``[NUM_GROUPS_OCTANT, GROUP_SIZE]`` so that each of the 8 1-bit slots
+    inside a packed byte at ``(g, e)`` consistently belongs to a single group:
+    slot k uses group ``g + k * NUM_GROUPS_OCTANT``.
+    Requires ``num_groups % 8 == 0``.
+    """
+    cache_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    if cache_idx >= cache_size or head_idx >= num_heads:
+        return
+
+    octant_dim = NUM_GROUPS_OCTANT * GROUP_SIZE
+
+    g_ids = tl.arange(0, NUM_GROUPS_OCTANT)
+    e_ids = tl.arange(0, GROUP_SIZE)
+    dim_offsets_2d = g_ids[:, None] * GROUP_SIZE + e_ids[None, :]
+
+    quant_offset = (
+        cache_idx * quant_stride_cache
+        + head_idx * quant_stride_head
+        + dim_offsets_2d * quant_stride_dim
+    )
+    packed = tl.load(quantized_ptr + quant_offset)
+
+    sz_base = cache_idx * sz_stride_cache + head_idx * sz_stride_head
+    out_base = cache_idx * out_stride_cache + head_idx * out_stride_head
+
+    for i in tl.static_range(8):
+        gi = g_ids + i * NUM_GROUPS_OCTANT
+        s_i = tl.load(scales_zeros_ptr + sz_base + (gi * 2) * sz_stride_dim).to(tl.float32)
+        z_i = tl.load(scales_zeros_ptr + sz_base + (gi * 2 + 1) * sz_stride_dim).to(tl.float32)
+        q_i = ((packed >> i) & 0x01).to(tl.float32)
+        d_i = (q_i - z_i[:, None]) * s_i[:, None]
+        tl.store(
+            output_ptr + out_base + (dim_offsets_2d + i * octant_dim) * out_stride_dim,
+            d_i,
+        )
+
+
+@triton.jit
+def _gather_dequantize_kv_int1_kernel(
+    quantized_ptr,
+    scales_zeros_ptr,
+    indices_ptr,
+    output_ptr,
+    n_indices,
+    num_heads,
+    head_dim,
+    quant_stride_cache,
+    quant_stride_head,
+    quant_stride_dim,
+    sz_stride_cache,
+    sz_stride_head,
+    sz_stride_dim,
+    out_stride_token,
+    out_stride_head,
+    out_stride_dim,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    """Gather + dequant int1 single-scale kernel. Reads slot id from
+    ``indices_ptr[token_idx]`` and writes dequantized row to
+    ``output[token_idx]``.
+    """
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    if token_idx >= n_indices or head_idx >= num_heads:
+        return
+
+    slot = tl.load(indices_ptr + token_idx).to(tl.int64)
+
+    sz_base = slot * sz_stride_cache + head_idx * sz_stride_head
+    scale = tl.load(scales_zeros_ptr + sz_base + 0 * sz_stride_dim).to(tl.float32)
+    zero = tl.load(scales_zeros_ptr + sz_base + 1 * sz_stride_dim).to(tl.float32)
+
+    octant_dim = head_dim // 8
+    dim_offsets = tl.arange(0, BLOCK_SIZE_DIM)
+    dim_mask = dim_offsets < octant_dim
+
+    quant_offset = (
+        slot * quant_stride_cache + head_idx * quant_stride_head
+        + dim_offsets * quant_stride_dim
+    )
+    packed = tl.load(quantized_ptr + quant_offset, mask=dim_mask, other=0)
+
+    out_base = token_idx * out_stride_token + head_idx * out_stride_head
+    for i in tl.static_range(8):
+        d_i = (((packed >> i) & 0x01).to(tl.float32) - zero) * scale
+        tl.store(
+            output_ptr + out_base + (dim_offsets + i * octant_dim) * out_stride_dim,
+            d_i,
+            mask=dim_mask,
+        )
+
+
+@triton.jit
+def _gather_dequantize_kv_int1_grouped_kernel(
+    quantized_ptr,
+    scales_zeros_ptr,
+    indices_ptr,
+    output_ptr,
+    n_indices,
+    num_heads,
+    quant_stride_cache,
+    quant_stride_head,
+    quant_stride_dim,
+    sz_stride_cache,
+    sz_stride_head,
+    sz_stride_dim,
+    out_stride_token,
+    out_stride_head,
+    out_stride_dim,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS_OCTANT: tl.constexpr,
+):
+    """Gather + dequant int1 grouped kernel. ``num_groups % 8 == 0`` required."""
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    if token_idx >= n_indices or head_idx >= num_heads:
+        return
+
+    slot = tl.load(indices_ptr + token_idx).to(tl.int64)
+
+    octant_dim = NUM_GROUPS_OCTANT * GROUP_SIZE
+
+    g_ids = tl.arange(0, NUM_GROUPS_OCTANT)
+    e_ids = tl.arange(0, GROUP_SIZE)
+    dim_offsets_2d = g_ids[:, None] * GROUP_SIZE + e_ids[None, :]
+
+    quant_offset = (
+        slot * quant_stride_cache
+        + head_idx * quant_stride_head
+        + dim_offsets_2d * quant_stride_dim
+    )
+    packed = tl.load(quantized_ptr + quant_offset)
+
+    sz_base = slot * sz_stride_cache + head_idx * sz_stride_head
+    out_base = token_idx * out_stride_token + head_idx * out_stride_head
+
+    for i in tl.static_range(8):
+        gi = g_ids + i * NUM_GROUPS_OCTANT
+        s_i = tl.load(scales_zeros_ptr + sz_base + (gi * 2) * sz_stride_dim).to(tl.float32)
+        z_i = tl.load(scales_zeros_ptr + sz_base + (gi * 2 + 1) * sz_stride_dim).to(tl.float32)
+        q_i = ((packed >> i) & 0x01).to(tl.float32)
+        d_i = (q_i - z_i[:, None]) * s_i[:, None]
+        tl.store(
+            output_ptr + out_base + (dim_offsets_2d + i * octant_dim) * out_stride_dim,
+            d_i,
+        )
+
+
+def gather_dequantize_kv_int1_triton(
+    quantized: torch.Tensor,
+    scales_zeros: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim: int,
+    model_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Gather rows of an INT1 KV buffer at ``indices`` and dequantize to
+    ``model_dtype``. Result has shape ``(len(indices), num_heads, head_dim)``.
+
+    Used by the int1 decode path: rather than implementing a separate
+    int1-aware attention kernel, the rows referenced by ``kv_indices`` are
+    materialized as bf16 once per layer and fed to the standard non-quantized
+    attention kernel with a remapped index range ``[0, len(indices))``.
+    """
+    assert head_dim % 8 == 0, (
+        f"head_dim ({head_dim}) must be divisible by 8 for INT1"
+    )
+    n_indices = int(indices.shape[0])
+    num_heads = quantized.shape[1]
+    if out is None:
+        out = torch.empty(
+            (n_indices, num_heads, head_dim),
+            dtype=model_dtype,
+            device=quantized.device,
+        )
+    else:
+        assert out.shape == (n_indices, num_heads, head_dim), (
+            f"out shape {tuple(out.shape)} != "
+            f"({n_indices}, {num_heads}, {head_dim})"
+        )
+        assert out.dtype == model_dtype
+    if n_indices == 0:
+        return out
+
+    num_groups = _get_num_scale_groups(scales_zeros)
+    grid = (n_indices, num_heads)
+
+    if num_groups == 1:
+        BLOCK_SIZE_DIM = triton.next_power_of_2(head_dim // 8)
+        _gather_dequantize_kv_int1_kernel[grid](
+            quantized,
+            scales_zeros,
+            indices,
+            out,
+            n_indices,
+            num_heads,
+            head_dim,
+            quantized.stride(0),
+            quantized.stride(1),
+            quantized.stride(2),
+            scales_zeros.stride(0),
+            scales_zeros.stride(1),
+            scales_zeros.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
+        )
+        return out
+
+    group_size = head_dim // num_groups
+    if not _can_use_triton_groupwise(num_groups, group_size, packing=8):
+        raise NotImplementedError(
+            f"int1 KV gather+dequant: unsupported quant grouping "
+            f"(num_groups={num_groups}, group_size={group_size})."
+        )
+
+    _gather_dequantize_kv_int1_grouped_kernel[grid](
+        quantized,
+        scales_zeros,
+        indices,
+        out,
+        n_indices,
+        num_heads,
+        quantized.stride(0),
+        quantized.stride(1),
+        quantized.stride(2),
+        scales_zeros.stride(0),
+        scales_zeros.stride(1),
+        scales_zeros.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        GROUP_SIZE=group_size,
+        NUM_GROUPS_OCTANT=num_groups // 8,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
+def dequantize_kv_int1_triton(
+    quantized: torch.Tensor, scales_zeros: torch.Tensor,
+    head_dim: int, model_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize INT1 KV cache to ``model_dtype``."""
+    assert head_dim % 8 == 0, (
+        f"head_dim ({head_dim}) must be divisible by 8 for INT1"
+    )
+    cache_size, num_heads, _ = quantized.shape
+    output = torch.empty(
+        (cache_size, num_heads, head_dim), dtype=model_dtype, device=quantized.device
+    )
+    grid = (cache_size, num_heads)
+    num_groups = _get_num_scale_groups(scales_zeros)
+
+    if num_groups == 1:
+        BLOCK_SIZE_DIM = triton.next_power_of_2(head_dim // 8)
+        _dequantize_kv_int1_kernel[grid](
+            quantized, scales_zeros, output,
+            cache_size, num_heads, head_dim,
+            quantized.stride(0), quantized.stride(1), quantized.stride(2),
+            scales_zeros.stride(0), scales_zeros.stride(1), scales_zeros.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
+        )
+        return output
+
+    group_size = head_dim // num_groups
+    if not _can_use_triton_groupwise(num_groups, group_size, packing=8):
+        raise NotImplementedError(
+            f"int1 KV dequantize: unsupported quant grouping "
+            f"(num_groups={num_groups}, group_size={group_size}). "
+            f"The int1 Triton kernel requires num_groups and group_size to be "
+            f"powers of two with num_groups % 8 == 0."
+        )
+
+    _dequantize_kv_int1_grouped_kernel[grid](
+        quantized,
+        scales_zeros,
+        output,
+        cache_size,
+        num_heads,
+        quantized.stride(0),
+        quantized.stride(1),
+        quantized.stride(2),
+        scales_zeros.stride(0),
+        scales_zeros.stride(1),
+        scales_zeros.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        GROUP_SIZE=group_size,
+        NUM_GROUPS_OCTANT=num_groups // 8,
         num_warps=1,
         num_stages=1,
     )

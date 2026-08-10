@@ -497,7 +497,7 @@ class ModelRunnerKVCacheMixin:
                 enable_mixed_kv = (
                     envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
                     and _attention_supports_mixed_kv(self.server_args)
-                    and self.kv_cache_dtype == "int2"
+                    and self.kv_cache_dtype in ("int2", "int1", "pq_k_int2v")
                     and not self.is_hybrid_swa
                     and self.server_args.disaggregation_mode in (None, "null")
                     and self.server_args.speculative_algorithm is None
@@ -562,10 +562,11 @@ class ModelRunnerKVCacheMixin:
                         (hp_prefix_pool + n_q - 1) // n_q * n_q
                     )
                     logger.info(
-                        "Enable unified mixed KV (int2): prefix=%s recent=%s "
+                        "Enable unified mixed KV (%s): prefix=%s recent=%s "
                         "flush_interval=%s num_quant_pages=%s N_Q=%s "
                         "hp_dtype=%s scale_dtype=%s max_total_num_tokens=%s "
                         "max_req_slots=%s hp_prefix_pool_tokens=%s",
+                        self.kv_cache_dtype,
                         p_tokens,
                         envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
                         n_q,
@@ -602,17 +603,26 @@ class ModelRunnerKVCacheMixin:
                         scale_dtype=scale_dtype,
                     )
                 else:
-                    # For int2 KV cache, scale/zero dtype is configurable via
-                    # SGLANG_MIXED_KV_SCALE_DTYPE (defaults to float32 to match
-                    # the historical behavior). For non-int2 dtypes the pool
-                    # ignores this kwarg.
+                    if self.kv_cache_dtype in ("int1", "pq_k_int2v"):
+                        raise ValueError(
+                            f"{self.kv_cache_dtype} KV cache requires the unified "
+                            "mixed HP+quant pool. Set "
+                            "SGLANG_ENABLE_MIXED_KV_WINDOWS=1 and use a supported "
+                            "Triton decode configuration without speculative "
+                            "decoding, disaggregation, or hybrid SWA."
+                        )
+                    # For int2/int1 KV cache, scale/zero dtype is configurable
+                    # via SGLANG_MIXED_KV_SCALE_DTYPE (defaults to float32 to
+                    # match the historical behavior). For non-int2/int1 dtypes
+                    # the pool ignores this kwarg.
                     int2_scale_dtype = None
-                    if self.kv_cache_dtype == "int2":
+                    if self.kv_cache_dtype in ("int2", "int1", "pq_k_int2v"):
                         int2_scale_dtype = resolve_scale_dtype(
                             envs.SGLANG_MIXED_KV_SCALE_DTYPE.get()
                         )
                         logger.info(
-                            "int2 KV cache: scale_dtype=%s",
+                            "%s KV cache: scale_dtype=%s",
+                            self.kv_cache_dtype,
                             envs.SGLANG_MIXED_KV_SCALE_DTYPE.get(),
                         )
                     self.token_to_kv_pool = MHATokenToKVPool(

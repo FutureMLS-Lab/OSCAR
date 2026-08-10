@@ -202,6 +202,9 @@ class TritonAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
             decode_attention_fwd_int2_unified,
+            decode_attention_fwd_int1_unified,
+            decode_attention_fwd_int1_via_dequant,
+            decode_attention_fwd_pqk_int2v_unified,
             decode_attention_fwd_quantized,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
@@ -218,6 +221,15 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.decode_attention_fwd_int2_unified = torch.compiler.disable(
             decode_attention_fwd_int2_unified
+        )
+        self.decode_attention_fwd_int1_unified = torch.compiler.disable(
+            decode_attention_fwd_int1_unified
+        )
+        self.decode_attention_fwd_int1_via_dequant = torch.compiler.disable(
+            decode_attention_fwd_int1_via_dequant
+        )
+        self.decode_attention_fwd_pqk_int2v_unified = torch.compiler.disable(
+            decode_attention_fwd_pqk_int2v_unified
         )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
@@ -1430,6 +1442,11 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets = None
 
         kv_pool = forward_batch.token_to_kv_pool
+        # int1 cannot use the quantized-dense prefill fast path (which lives
+        # in quantized_kv_prefill.py and is int2-specific); int1 prefill
+        # writes go through the unified pool's oscar rotate+pack int1 kernel
+        # and prefill attention falls back to standard fa3/triton on the HP
+        # tier (no quant read at prefill).
         use_quantized_dense_prefill = (
             hasattr(kv_pool, "dtype")
             and kv_pool.dtype == "int2"
@@ -1745,9 +1762,18 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        # Int2 quantized KV cache path (the only supported quant tier).
+        # Int2/Int1/Ternary quantized KV cache path. Ternary shares the int2
+        # 2-bit storage and dequant kernel (zero=1.0, scale=max|x| stored in
+        # sz_buf → packed {0,1,2} dequants to {-1,0,+1}*scale).
         kv_pool = forward_batch.token_to_kv_pool
-        if hasattr(kv_pool, "dtype") and kv_pool.dtype == "int2":
+        if hasattr(kv_pool, "dtype") and kv_pool.dtype in (
+            "int2",
+            "int1",
+            "pq_k_int2v",
+        ):
+            kv_dtype = kv_pool.dtype
+            is_int1 = kv_dtype == "int1"
+            is_pqk_int2v = kv_pool.dtype == "pq_k_int2v"
             uses_oscar = _pool_uses_oscar_rotation(kv_pool)
 
             q_for_decode = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1756,13 +1782,11 @@ class TritonAttnBackend(AttentionBackend):
             )
             mixed_decode_enabled = (
                 self.enable_mixed_kv
-                and kv_pool.dtype == "int2"
                 and sinks is None
                 and mixed_decode_metadata_available
             )
             if (
                 self.enable_mixed_kv
-                and kv_pool.dtype == "int2"
                 and mixed_decode_metadata_available
                 and sinks is not None
             ):
@@ -1770,18 +1794,7 @@ class TritonAttnBackend(AttentionBackend):
                     "Mixed KV windows do not support sink tokens in Triton decode."
                 )
 
-            # Hard guarantee that the upstream gating actually held: if mixed
-            # KV is enabled with an int2 pool, ``init_forward_metadata`` must
-            # have built the per-tier indices. Falling through to the
-            # non-mixed ``decode_attention_fwd_quantized`` path would treat
-            # HP slot ids (>= HP_OFFSET) as quant slot ids and read OOB
-            # garbage from the quant buffer. The known offenders are the
-            # ``spec_info != None`` decode-or-idle paths (currently gated out
-            # at server-args / model-runner level); this assertion makes the
-            # gating load-bearing at the kernel boundary so any future
-            # widening of those upstream gates surfaces here loudly instead
-            # of silently corrupting attention output.
-            if self.enable_mixed_kv and kv_pool.dtype == "int2":
+            if self.enable_mixed_kv:
                 assert mixed_decode_metadata_available, (
                     "Mixed-KV pool active but mixed decode metadata not built. "
                     "spec_info / non-decode-or-idle paths must not reach the "
@@ -1800,54 +1813,110 @@ class TritonAttnBackend(AttentionBackend):
                 q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
             if mixed_decode_enabled:
                 bs = q_for_decode.shape[0]
-                self.decode_attention_fwd_int2_unified(
-                    q_for_decode,
-                    kv_pool.get_hp_key_buffer(layer.layer_id),
-                    kv_pool.get_hp_value_buffer(layer.layer_id),
-                    kv_pool.get_raw_key_buffer(layer.layer_id),
-                    kv_pool.get_raw_value_buffer(layer.layer_id),
-                    kv_pool.get_key_scales_zeros(layer.layer_id),
-                    kv_pool.get_value_scales_zeros(layer.layer_id),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.forward_metadata.mixed_hp_kv_indptr,
-                    self.forward_metadata.mixed_hp_kv_indices,
-                    self.forward_metadata.mixed_quant_kv_indptr,
-                    self.forward_metadata.mixed_quant_kv_indices,
-                    self.forward_metadata.mixed_attn_logits[:bs],
-                    self.forward_metadata.mixed_attn_lse[:bs],
-                    self.forward_metadata.mixed_hp_num_kv_splits[:bs],
-                    self.forward_metadata.mixed_quant_num_kv_splits[:bs],
-                    self.max_hp_kv_splits,
-                    self.max_kv_splits,
-                    layer.scaling,
-                    logit_cap=logits_soft_cap,
-                    sinks=sinks,
-                    xai_temperature_len=layer.xai_temperature_len,
-                )
+                if is_pqk_int2v:
+                    self.decode_attention_fwd_pqk_int2v_unified(
+                        q_for_decode,
+                        kv_pool.get_hp_key_buffer(layer.layer_id),
+                        kv_pool.get_hp_value_buffer(layer.layer_id),
+                        kv_pool.get_raw_key_buffer(layer.layer_id),
+                        kv_pool.get_raw_value_buffer(layer.layer_id),
+                        kv_pool.get_key_scales_zeros(layer.layer_id),
+                        kv_pool.get_value_scales_zeros(layer.layer_id),
+                        kv_pool.get_pq_codebook(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        self.forward_metadata.mixed_hp_kv_indptr,
+                        self.forward_metadata.mixed_hp_kv_indices,
+                        self.forward_metadata.mixed_quant_kv_indptr,
+                        self.forward_metadata.mixed_quant_kv_indices,
+                        self.forward_metadata.mixed_attn_logits[:bs],
+                        self.forward_metadata.mixed_attn_lse[:bs],
+                        self.forward_metadata.mixed_hp_num_kv_splits[:bs],
+                        self.forward_metadata.mixed_quant_num_kv_splits[:bs],
+                        self.max_hp_kv_splits,
+                        self.max_kv_splits,
+                        layer.scaling,
+                        logit_cap=logits_soft_cap,
+                        sinks=sinks,
+                        xai_temperature_len=layer.xai_temperature_len,
+                        quant_k_buffer2=kv_pool.get_raw_key_buffer2(layer.layer_id),
+                        pq_codebook2=kv_pool.get_rvq_cb2(layer.layer_id),
+                        pq_v_codebook=kv_pool.get_pq_v_codebook(layer.layer_id),
+                    )
+                else:
+                    unified_kernel = (
+                        self.decode_attention_fwd_int1_unified
+                        if is_int1
+                        else self.decode_attention_fwd_int2_unified
+                    )
+                    unified_kernel(
+                        q_for_decode,
+                        kv_pool.get_hp_key_buffer(layer.layer_id),
+                        kv_pool.get_hp_value_buffer(layer.layer_id),
+                        kv_pool.get_raw_key_buffer(layer.layer_id),
+                        kv_pool.get_raw_value_buffer(layer.layer_id),
+                        kv_pool.get_key_scales_zeros(layer.layer_id),
+                        kv_pool.get_value_scales_zeros(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        self.forward_metadata.mixed_hp_kv_indptr,
+                        self.forward_metadata.mixed_hp_kv_indices,
+                        self.forward_metadata.mixed_quant_kv_indptr,
+                        self.forward_metadata.mixed_quant_kv_indices,
+                        self.forward_metadata.mixed_attn_logits[:bs],
+                        self.forward_metadata.mixed_attn_lse[:bs],
+                        self.forward_metadata.mixed_hp_num_kv_splits[:bs],
+                        self.forward_metadata.mixed_quant_num_kv_splits[:bs],
+                        self.max_hp_kv_splits,
+                        self.max_kv_splits,
+                        layer.scaling,
+                        logit_cap=logits_soft_cap,
+                        sinks=sinks,
+                        xai_temperature_len=layer.xai_temperature_len,
+                    )
             else:
-                # Use optimized quantized attention kernel
-                self.decode_attention_fwd_quantized(
-                    q_for_decode,
-                    kv_pool.get_raw_key_buffer(layer.layer_id),
-                    kv_pool.get_raw_value_buffer(layer.layer_id),
-                    kv_pool.get_key_scales_zeros(layer.layer_id),
-                    kv_pool.get_value_scales_zeros(layer.layer_id),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    kv_indptr,
-                    kv_indices,
-                    self.forward_metadata.attn_logits,
-                    self.forward_metadata.attn_lse,
-                    self.forward_metadata.num_kv_splits,
-                    self.max_kv_splits,
-                    layer.scaling,
-                    kv_pool.dtype,
-                    logit_cap=logits_soft_cap,
-                    sinks=sinks,
-                    xai_temperature_len=layer.xai_temperature_len,
-                )
-            # int2: V is always rotated, so apply the inverse rotation to the
-            # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
-            # the segmented FWHT (self-inverse with 1/sqrt(N)).
+                if is_int1:
+                    self.decode_attention_fwd_int1_via_dequant(
+                        q_for_decode,
+                        kv_pool.get_raw_key_buffer(layer.layer_id),
+                        kv_pool.get_raw_value_buffer(layer.layer_id),
+                        kv_pool.get_key_scales_zeros(layer.layer_id),
+                        kv_pool.get_value_scales_zeros(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        kv_indptr,
+                        kv_indices,
+                        self.forward_metadata.attn_logits,
+                        self.forward_metadata.attn_lse,
+                        self.forward_metadata.num_kv_splits,
+                        self.max_kv_splits,
+                        layer.scaling,
+                        logit_cap=logits_soft_cap,
+                        sinks=sinks,
+                        xai_temperature_len=layer.xai_temperature_len,
+                    )
+                else:
+                    self.decode_attention_fwd_quantized(
+                        q_for_decode,
+                        kv_pool.get_raw_key_buffer(layer.layer_id),
+                        kv_pool.get_raw_value_buffer(layer.layer_id),
+                        kv_pool.get_key_scales_zeros(layer.layer_id),
+                        kv_pool.get_value_scales_zeros(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        kv_indptr,
+                        kv_indices,
+                        self.forward_metadata.attn_logits,
+                        self.forward_metadata.attn_lse,
+                        self.forward_metadata.num_kv_splits,
+                        self.max_kv_splits,
+                        layer.scaling,
+                        kv_dtype,
+                        logit_cap=logits_soft_cap,
+                        sinks=sinks,
+                        xai_temperature_len=layer.xai_temperature_len,
+                    )
+            # int2/int1: V is stored in R_v-rotated space (either because it
+            # was explicitly rotated at store time, or because qkv_proj was
+            # modified to produce V_r = V @ R_v directly when V rotation is
+            # absorbed).  Either way, apply the inverse rotation to the output.
+            # Oscar mode: o @ R_v.T.  Hadamard mode: segmented FWHT (self-inv).
             if uses_oscar:
                 R_v = kv_pool._R_v[oscar_layer_idx]
                 o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)

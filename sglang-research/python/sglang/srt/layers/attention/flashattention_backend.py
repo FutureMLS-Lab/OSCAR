@@ -552,13 +552,14 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        # Int2 takes a dedicated rotation-aware path below: Q/K/V are
+        # Int2/int1/PQ take a dedicated rotation-aware path below: Q/K/V are
         # pre-rotated (Hadamard or Oscar) once, and the rotated K/V is then
         # written to the pool with ``already_hadamard_transformed=True`` so the
         # pool does not rotate a second time. We therefore skip the eager save
-        # here for int2 and defer to the quantized prefill branch.
+        # here and defer to the quantized prefill branch.
         int2_deferred_save = (
-            self.kv_cache_dtype_str == "int2" and not self.use_mla
+            self.kv_cache_dtype_str in ("int2", "int1", "pq_k_int2v")
+            and not self.use_mla
         )
         if k is not None:
             assert v is not None
@@ -608,7 +609,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
-        if self.kv_cache_dtype_str == "int2":
+        if self.kv_cache_dtype_str in ("int2", "int1", "pq_k_int2v"):
             pass
         elif (
             self.kv_cache_dtype_str != "auto"
@@ -684,7 +685,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            if self.kv_cache_dtype_str == "int2":
+            if self.kv_cache_dtype_str in ("int2", "int1", "pq_k_int2v"):
                 # Rotation-aware path that shares logic with TritonAttnBackend
                 # (see python/sglang/srt/layers/attention/quantized_kv_prefill.py).
                 # Handles the pure-int2 ``MHATokenToKVPool`` and the mixed
@@ -1192,10 +1193,11 @@ class FlashAttentionBackend(AttentionBackend):
         # kv_cache_dtype=int2`` at startup, so this branch should never be
         # reached with int2; the explicit guard here is a belt-and-braces
         # assertion rather than a silent ``.to("int2")`` TypeError.
-        assert self.kv_cache_dtype_str != "int2", (
-            "FA3 forward_decode does not support int2 KV cache; use "
-            "--prefill-attention-backend fa3 --decode-attention-backend "
-            "triton instead (HybridAttnBackend routes int2 decode to triton)."
+        assert self.kv_cache_dtype_str not in ("int2", "int1", "pq_k_int2v"), (
+            f"FA3 forward_decode does not support {self.kv_cache_dtype_str} "
+            "KV cache; use --prefill-attention-backend fa3 "
+            "--decode-attention-backend triton instead (HybridAttnBackend "
+            f"routes {self.kv_cache_dtype_str} decode to triton)."
         )
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:

@@ -500,7 +500,13 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_H = 16
+    requested_block_h = 16
+    if requested_block_h >= kv_group_num:
+        BLOCK_H = triton.next_power_of_2(kv_group_num)
+    else:
+        BLOCK_H = requested_block_h
+        while BLOCK_H > 1 and kv_group_num % BLOCK_H != 0:
+            BLOCK_H //= 2
     MAX_KV_SPLITS = max_kv_splits
     grid = (
         batch,
@@ -627,7 +633,9 @@ def _fwd_kernel_stage2(
     if WRITE_LSE:
         # Per-seq log-sum-exp = e_max + log(e_sum). O_lse has shape
         # [bs, num_heads]; batch stride = stride_obs // Lv = num_heads.
-        tl.store(O_lse + cur_batch * (stride_obs // Lv) + cur_head, e_max + tl.log(e_sum))
+        tl.store(
+            O_lse + cur_batch * (stride_obs // Lv) + cur_head, e_max + tl.log(e_sum)
+        )
 
 
 def _decode_softmax_reducev_fwd(
@@ -962,6 +970,7 @@ def _fwd_kernel_stage1_quant_int2(
     Lv: tl.constexpr,
     xai_temperature_len: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    INT1: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -1024,14 +1033,22 @@ def _fwd_kernel_stage1_quant_int2(
                 other=0,
             )
 
-            # Load packed INT2 K (uint8, 4 values per byte)
+            # Load packed K into four logical quarters. INT2 has one crumb
+            # from each quarter per byte. INT1 has two octants per quarter,
+            # so each physical byte is loaded twice with a different bit.
             offs_d_packed = tl.arange(0, BLOCK_DMODEL // 4)
             mask_d_packed = offs_d_packed < (Lk // 4)
+            if INT1:
+                k_byte_offsets = offs_d_packed % (Lk // 8)
+                k_bit_in_quarter = offs_d_packed // (Lk // 8)
+            else:
+                k_byte_offsets = offs_d_packed
+                k_bit_in_quarter = tl.zeros([BLOCK_DMODEL // 4], dtype=tl.int32)
 
             offs_buf_k_packed = (
                 kv_loc[:, None] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
-                + offs_d_packed[None, :]
+                + k_byte_offsets[None, :]
             )
             k_quant_packed = tl.load(
                 K_Buffer + offs_buf_k_packed,
@@ -1049,9 +1066,7 @@ def _fwd_kernel_stage1_quant_int2(
                 safe_group_k_q1 = tl.where(mask_d_packed, offs_group_k_q1, 0)
                 safe_group_k_q2 = tl.where(mask_d_packed, offs_group_k_q2, 0)
                 safe_group_k_q3 = tl.where(mask_d_packed, offs_group_k_q3, 0)
-                offs_sz_k = (
-                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_sz_kh
-                )
+                offs_sz_k = kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 k_scale_q0 = tl.load(
                     K_Scales_Zeros + offs_sz_k + 2 * safe_group_k_q0[None, :],
                     mask=(offs_n[:, None] < split_kv_end) & (mask_d_packed[None, :]),
@@ -1092,23 +1107,34 @@ def _fwd_kernel_stage1_quant_int2(
                     mask=(offs_n[:, None] < split_kv_end) & (mask_d_packed[None, :]),
                     other=0.0,
                 )
-                # Dequantize INT2 K inline: unpack 4 crumbs and dequantize per-group.
-                k_q0 = (
-                    ((k_quant_packed & 0x03).to(tl.float32) - k_zero_q0)
-                    * k_scale_q0
-                ).to(q_q0.dtype)
-                k_q1 = (
-                    (((k_quant_packed >> 2) & 0x03).to(tl.float32) - k_zero_q1)
-                    * k_scale_q1
-                ).to(q_q0.dtype)
-                k_q2 = (
-                    (((k_quant_packed >> 4) & 0x03).to(tl.float32) - k_zero_q2)
-                    * k_scale_q2
-                ).to(q_q0.dtype)
-                k_q3 = (
-                    (((k_quant_packed >> 6) & 0x03).to(tl.float32) - k_zero_q3)
-                    * k_scale_q3
-                ).to(q_q0.dtype)
+                if INT1:
+                    k_q0_raw = (k_quant_packed >> k_bit_in_quarter[None, :]) & 0x01
+                    k_q1_raw = (
+                        k_quant_packed >> (2 + k_bit_in_quarter[None, :])
+                    ) & 0x01
+                    k_q2_raw = (
+                        k_quant_packed >> (4 + k_bit_in_quarter[None, :])
+                    ) & 0x01
+                    k_q3_raw = (
+                        k_quant_packed >> (6 + k_bit_in_quarter[None, :])
+                    ) & 0x01
+                else:
+                    k_q0_raw = k_quant_packed & 0x03
+                    k_q1_raw = (k_quant_packed >> 2) & 0x03
+                    k_q2_raw = (k_quant_packed >> 4) & 0x03
+                    k_q3_raw = (k_quant_packed >> 6) & 0x03
+                k_q0 = ((k_q0_raw.to(tl.float32) - k_zero_q0) * k_scale_q0).to(
+                    q_q0.dtype
+                )
+                k_q1 = ((k_q1_raw.to(tl.float32) - k_zero_q1) * k_scale_q1).to(
+                    q_q0.dtype
+                )
+                k_q2 = ((k_q2_raw.to(tl.float32) - k_zero_q2) * k_scale_q2).to(
+                    q_q0.dtype
+                )
+                k_q3 = ((k_q3_raw.to(tl.float32) - k_zero_q3) * k_scale_q3).to(
+                    q_q0.dtype
+                )
             else:
                 offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 k_scale_1d = tl.load(
@@ -1121,21 +1147,33 @@ def _fwd_kernel_stage1_quant_int2(
                     mask=offs_n < split_kv_end,
                     other=0.0,
                 )
+                if INT1:
+                    k_q0_raw = (k_quant_packed >> k_bit_in_quarter[None, :]) & 0x01
+                    k_q1_raw = (
+                        k_quant_packed >> (2 + k_bit_in_quarter[None, :])
+                    ) & 0x01
+                    k_q2_raw = (
+                        k_quant_packed >> (4 + k_bit_in_quarter[None, :])
+                    ) & 0x01
+                    k_q3_raw = (
+                        k_quant_packed >> (6 + k_bit_in_quarter[None, :])
+                    ) & 0x01
+                else:
+                    k_q0_raw = k_quant_packed & 0x03
+                    k_q1_raw = (k_quant_packed >> 2) & 0x03
+                    k_q2_raw = (k_quant_packed >> 4) & 0x03
+                    k_q3_raw = (k_quant_packed >> 6) & 0x03
                 k_q0 = (
-                    ((k_quant_packed & 0x03).to(tl.float32) - k_zero_1d[:, None])
-                    * k_scale_1d[:, None]
+                    (k_q0_raw.to(tl.float32) - k_zero_1d[:, None]) * k_scale_1d[:, None]
                 ).to(q_q0.dtype)
                 k_q1 = (
-                    (((k_quant_packed >> 2) & 0x03).to(tl.float32) - k_zero_1d[:, None])
-                    * k_scale_1d[:, None]
+                    (k_q1_raw.to(tl.float32) - k_zero_1d[:, None]) * k_scale_1d[:, None]
                 ).to(q_q0.dtype)
                 k_q2 = (
-                    (((k_quant_packed >> 4) & 0x03).to(tl.float32) - k_zero_1d[:, None])
-                    * k_scale_1d[:, None]
+                    (k_q2_raw.to(tl.float32) - k_zero_1d[:, None]) * k_scale_1d[:, None]
                 ).to(q_q0.dtype)
                 k_q3 = (
-                    (((k_quant_packed >> 6) & 0x03).to(tl.float32) - k_zero_1d[:, None])
-                    * k_scale_1d[:, None]
+                    (k_q3_raw.to(tl.float32) - k_zero_1d[:, None]) * k_scale_1d[:, None]
                 ).to(q_q0.dtype)
 
             # Compute QK from 4 partial dot products
@@ -1155,14 +1193,20 @@ def _fwd_kernel_stage1_quant_int2(
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
-            # Load packed INT2 V
+            # Load packed V into four logical quarters (same layout as K).
             offs_dv_packed = tl.arange(0, BLOCK_DV // 4)
             mask_dv_packed = offs_dv_packed < (Lv // 4)
+            if INT1:
+                v_byte_offsets = offs_dv_packed % (Lv // 8)
+                v_bit_in_quarter = offs_dv_packed // (Lv // 8)
+            else:
+                v_byte_offsets = offs_dv_packed
+                v_bit_in_quarter = tl.zeros([BLOCK_DV // 4], dtype=tl.int32)
 
             offs_buf_v_packed = (
                 kv_loc[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
-                + offs_dv_packed[None, :]
+                + v_byte_offsets[None, :]
             )
             v_quant_packed = tl.load(
                 V_Buffer + offs_buf_v_packed,
@@ -1180,9 +1224,7 @@ def _fwd_kernel_stage1_quant_int2(
                 safe_group_v_q1 = tl.where(mask_dv_packed, offs_group_v_q1, 0)
                 safe_group_v_q2 = tl.where(mask_dv_packed, offs_group_v_q2, 0)
                 safe_group_v_q3 = tl.where(mask_dv_packed, offs_group_v_q3, 0)
-                offs_sz_v = (
-                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
-                )
+                offs_sz_v = kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 v_scale_q0 = tl.load(
                     V_Scales_Zeros + offs_sz_v + 2 * safe_group_v_q0[None, :],
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv_packed[None, :]),
@@ -1223,23 +1265,34 @@ def _fwd_kernel_stage1_quant_int2(
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv_packed[None, :]),
                     other=0.0,
                 )
-                # Dequantize INT2 V inline: unpack 4 crumbs per-group.
-                v_q0 = (
-                    ((v_quant_packed & 0x03).to(tl.float32) - v_zero_q0)
-                    * v_scale_q0
-                ).to(q_q0.dtype)
-                v_q1 = (
-                    (((v_quant_packed >> 2) & 0x03).to(tl.float32) - v_zero_q1)
-                    * v_scale_q1
-                ).to(q_q0.dtype)
-                v_q2 = (
-                    (((v_quant_packed >> 4) & 0x03).to(tl.float32) - v_zero_q2)
-                    * v_scale_q2
-                ).to(q_q0.dtype)
-                v_q3 = (
-                    (((v_quant_packed >> 6) & 0x03).to(tl.float32) - v_zero_q3)
-                    * v_scale_q3
-                ).to(q_q0.dtype)
+                if INT1:
+                    v_q0_raw = (v_quant_packed >> v_bit_in_quarter[None, :]) & 0x01
+                    v_q1_raw = (
+                        v_quant_packed >> (2 + v_bit_in_quarter[None, :])
+                    ) & 0x01
+                    v_q2_raw = (
+                        v_quant_packed >> (4 + v_bit_in_quarter[None, :])
+                    ) & 0x01
+                    v_q3_raw = (
+                        v_quant_packed >> (6 + v_bit_in_quarter[None, :])
+                    ) & 0x01
+                else:
+                    v_q0_raw = v_quant_packed & 0x03
+                    v_q1_raw = (v_quant_packed >> 2) & 0x03
+                    v_q2_raw = (v_quant_packed >> 4) & 0x03
+                    v_q3_raw = (v_quant_packed >> 6) & 0x03
+                v_q0 = ((v_q0_raw.to(tl.float32) - v_zero_q0) * v_scale_q0).to(
+                    q_q0.dtype
+                )
+                v_q1 = ((v_q1_raw.to(tl.float32) - v_zero_q1) * v_scale_q1).to(
+                    q_q0.dtype
+                )
+                v_q2 = ((v_q2_raw.to(tl.float32) - v_zero_q2) * v_scale_q2).to(
+                    q_q0.dtype
+                )
+                v_q3 = ((v_q3_raw.to(tl.float32) - v_zero_q3) * v_scale_q3).to(
+                    q_q0.dtype
+                )
             else:
                 offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 v_scale_1d = tl.load(
@@ -1252,21 +1305,33 @@ def _fwd_kernel_stage1_quant_int2(
                     mask=offs_n < split_kv_end,
                     other=0.0,
                 )
+                if INT1:
+                    v_q0_raw = (v_quant_packed >> v_bit_in_quarter[None, :]) & 0x01
+                    v_q1_raw = (
+                        v_quant_packed >> (2 + v_bit_in_quarter[None, :])
+                    ) & 0x01
+                    v_q2_raw = (
+                        v_quant_packed >> (4 + v_bit_in_quarter[None, :])
+                    ) & 0x01
+                    v_q3_raw = (
+                        v_quant_packed >> (6 + v_bit_in_quarter[None, :])
+                    ) & 0x01
+                else:
+                    v_q0_raw = v_quant_packed & 0x03
+                    v_q1_raw = (v_quant_packed >> 2) & 0x03
+                    v_q2_raw = (v_quant_packed >> 4) & 0x03
+                    v_q3_raw = (v_quant_packed >> 6) & 0x03
                 v_q0 = (
-                    ((v_quant_packed & 0x03).to(tl.float32) - v_zero_1d[:, None])
-                    * v_scale_1d[:, None]
+                    (v_q0_raw.to(tl.float32) - v_zero_1d[:, None]) * v_scale_1d[:, None]
                 ).to(q_q0.dtype)
                 v_q1 = (
-                    (((v_quant_packed >> 2) & 0x03).to(tl.float32) - v_zero_1d[:, None])
-                    * v_scale_1d[:, None]
+                    (v_q1_raw.to(tl.float32) - v_zero_1d[:, None]) * v_scale_1d[:, None]
                 ).to(q_q0.dtype)
                 v_q2 = (
-                    (((v_quant_packed >> 4) & 0x03).to(tl.float32) - v_zero_1d[:, None])
-                    * v_scale_1d[:, None]
+                    (v_q2_raw.to(tl.float32) - v_zero_1d[:, None]) * v_scale_1d[:, None]
                 ).to(q_q0.dtype)
                 v_q3 = (
-                    (((v_quant_packed >> 6) & 0x03).to(tl.float32) - v_zero_1d[:, None])
-                    * v_scale_1d[:, None]
+                    (v_q3_raw.to(tl.float32) - v_zero_1d[:, None]) * v_scale_1d[:, None]
                 ).to(q_q0.dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
@@ -1395,6 +1460,7 @@ def _fwd_grouped_kernel_stage1_quant_int2(
     xai_temperature_len: tl.constexpr,
     L: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    INT1: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -1498,14 +1564,20 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 other=0,
             )
 
-            # Load packed INT2 K in transposed format for efficient dot product
+            # Load packed K in transposed logical-quarter format.
             offs_d_packed = tl.arange(0, BLOCK_D // 4)
             mask_d_packed = offs_d_packed < (L // 4)
+            if INT1:
+                k_byte_offsets = offs_d_packed % (L // 8)
+                k_bit_in_quarter = offs_d_packed // (L // 8)
+            else:
+                k_byte_offsets = offs_d_packed
+                k_bit_in_quarter = tl.zeros([BLOCK_D // 4], dtype=tl.int32)
 
             offs_buf_k_packed = (
                 kv_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
-                + offs_d_packed[:, None]
+                + k_byte_offsets[:, None]
             )
             k_packed = tl.load(
                 K_Buffer + offs_buf_k_packed,
@@ -1530,75 +1602,99 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     )
                     k_scale_q0_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q0_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     k_scale_q1_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q1[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q1_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q1[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     k_scale_q2_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q2[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q2_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q2[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     k_scale_q3_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q3[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q3_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q3[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     # Broadcast per-group across GROUP_SIZE dims via reshape.
                     k_scale_q0 = tl.reshape(
-                        tl.broadcast_to(k_scale_q0_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q0_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q0 = tl.reshape(
-                        tl.broadcast_to(k_zero_q0_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q0_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_scale_q1 = tl.reshape(
-                        tl.broadcast_to(k_scale_q1_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q1_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q1 = tl.reshape(
-                        tl.broadcast_to(k_zero_q1_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q1_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_scale_q2 = tl.reshape(
-                        tl.broadcast_to(k_scale_q2_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q2_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q2 = tl.reshape(
-                        tl.broadcast_to(k_zero_q2_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q2_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_scale_q3 = tl.reshape(
-                        tl.broadcast_to(k_scale_q3_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q3_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q3 = tl.reshape(
-                        tl.broadcast_to(k_zero_q3_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q3_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                 else:
@@ -1610,46 +1706,94 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
                     grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
                     grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
-                    k_scale_q0_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q0_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q1_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q1_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q2_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q2_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q3_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q3_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q0 = tl.broadcast_to(k_scale_q0_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q0  = tl.broadcast_to(k_zero_q0_t[None, :],  (BLOCK_D // 4, BLOCK_N))
-                    k_scale_q1 = tl.broadcast_to(k_scale_q1_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q1  = tl.broadcast_to(k_zero_q1_t[None, :],  (BLOCK_D // 4, BLOCK_N))
-                    k_scale_q2 = tl.broadcast_to(k_scale_q2_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q2  = tl.broadcast_to(k_zero_q2_t[None, :],  (BLOCK_D // 4, BLOCK_N))
-                    k_scale_q3 = tl.broadcast_to(k_scale_q3_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q3  = tl.broadcast_to(k_zero_q3_t[None, :],  (BLOCK_D // 4, BLOCK_N))
+                    k_scale_q0_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q0_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q1_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q1_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q2_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q2_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q3_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q3_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q0 = tl.broadcast_to(
+                        k_scale_q0_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q0 = tl.broadcast_to(
+                        k_zero_q0_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_scale_q1 = tl.broadcast_to(
+                        k_scale_q1_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q1 = tl.broadcast_to(
+                        k_zero_q1_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_scale_q2 = tl.broadcast_to(
+                        k_scale_q2_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q2 = tl.broadcast_to(
+                        k_zero_q2_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_scale_q3 = tl.broadcast_to(
+                        k_scale_q3_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q3 = tl.broadcast_to(
+                        k_zero_q3_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
                 # Cast scales/zeros to q's dtype ONCE so the per-element dequant
                 # below stays entirely in bf16 (saves 2 fp32↔bf16 casts per crumb).
                 k_scale_q0 = k_scale_q0.to(q_q0.dtype)
-                k_zero_q0  = k_zero_q0.to(q_q0.dtype)
+                k_zero_q0 = k_zero_q0.to(q_q0.dtype)
                 k_scale_q1 = k_scale_q1.to(q_q0.dtype)
-                k_zero_q1  = k_zero_q1.to(q_q0.dtype)
+                k_zero_q1 = k_zero_q1.to(q_q0.dtype)
                 k_scale_q2 = k_scale_q2.to(q_q0.dtype)
-                k_zero_q2  = k_zero_q2.to(q_q0.dtype)
+                k_zero_q2 = k_zero_q2.to(q_q0.dtype)
                 k_scale_q3 = k_scale_q3.to(q_q0.dtype)
-                k_zero_q3  = k_zero_q3.to(q_q0.dtype)
-                # Dequantize INT2 K inline: unpack 4 crumbs per-group.
-                # k_packed shape: [BLOCK_D//4, BLOCK_N] (transposed)
-                k_q0 = ((k_packed & 0x03).to(q_q0.dtype) - k_zero_q0) * k_scale_q0
-                k_q1 = (((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_q1) * k_scale_q1
-                k_q2 = (((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_q2) * k_scale_q2
-                k_q3 = (((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_q3) * k_scale_q3
+                k_zero_q3 = k_zero_q3.to(q_q0.dtype)
+                if INT1:
+                    k_q0_raw = (k_packed >> k_bit_in_quarter[:, None]) & 0x01
+                    k_q1_raw = (k_packed >> (2 + k_bit_in_quarter[:, None])) & 0x01
+                    k_q2_raw = (k_packed >> (4 + k_bit_in_quarter[:, None])) & 0x01
+                    k_q3_raw = (k_packed >> (6 + k_bit_in_quarter[:, None])) & 0x01
+                else:
+                    k_q0_raw = k_packed & 0x03
+                    k_q1_raw = (k_packed >> 2) & 0x03
+                    k_q2_raw = (k_packed >> 4) & 0x03
+                    k_q3_raw = (k_packed >> 6) & 0x03
+                k_q0 = (k_q0_raw.to(q_q0.dtype) - k_zero_q0) * k_scale_q0
+                k_q1 = (k_q1_raw.to(q_q0.dtype) - k_zero_q1) * k_scale_q1
+                k_q2 = (k_q2_raw.to(q_q0.dtype) - k_zero_q2) * k_scale_q2
+                k_q3 = (k_q3_raw.to(q_q0.dtype) - k_zero_q3) * k_scale_q3
             else:
                 offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 k_scale_1d = tl.load(
@@ -1662,18 +1806,28 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     mask=offs_n < split_kv_end,
                     other=0.0,
                 ).to(q_q0.dtype)
-                k_q0 = (
-                    (k_packed & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
-                ) * k_scale_1d[None, :]
-                k_q1 = (
-                    ((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
-                ) * k_scale_1d[None, :]
-                k_q2 = (
-                    ((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
-                ) * k_scale_1d[None, :]
-                k_q3 = (
-                    ((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
-                ) * k_scale_1d[None, :]
+                if INT1:
+                    k_q0_raw = (k_packed >> k_bit_in_quarter[:, None]) & 0x01
+                    k_q1_raw = (k_packed >> (2 + k_bit_in_quarter[:, None])) & 0x01
+                    k_q2_raw = (k_packed >> (4 + k_bit_in_quarter[:, None])) & 0x01
+                    k_q3_raw = (k_packed >> (6 + k_bit_in_quarter[:, None])) & 0x01
+                else:
+                    k_q0_raw = k_packed & 0x03
+                    k_q1_raw = (k_packed >> 2) & 0x03
+                    k_q2_raw = (k_packed >> 4) & 0x03
+                    k_q3_raw = (k_packed >> 6) & 0x03
+                k_q0 = (k_q0_raw.to(q_q0.dtype) - k_zero_1d[None, :]) * k_scale_1d[
+                    None, :
+                ]
+                k_q1 = (k_q1_raw.to(q_q0.dtype) - k_zero_1d[None, :]) * k_scale_1d[
+                    None, :
+                ]
+                k_q2 = (k_q2_raw.to(q_q0.dtype) - k_zero_1d[None, :]) * k_scale_1d[
+                    None, :
+                ]
+                k_q3 = (k_q3_raw.to(q_q0.dtype) - k_zero_1d[None, :]) * k_scale_1d[
+                    None, :
+                ]
 
             # Compute QK as ONE fused MMA instead of 4 small ones by stacking
             # the 4 dequantized quarters into a contiguous D axis.
@@ -1684,18 +1838,18 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             # We use tl.join (which adds a new last axis) + tl.reshape to
             # interleave: [BLOCK_D//4, BLOCK_N] -> [4, BLOCK_D//4, BLOCK_N]
             # via two binary joins -> permute -> reshape to [BLOCK_D, BLOCK_N].
-            k_01 = tl.join(k_q0, k_q1)        # [BLOCK_D//4, BLOCK_N, 2]
-            k_23 = tl.join(k_q2, k_q3)        # [BLOCK_D//4, BLOCK_N, 2]
-            k_full = tl.join(k_01, k_23)      # [BLOCK_D//4, BLOCK_N, 2, 2]
+            k_01 = tl.join(k_q0, k_q1)  # [BLOCK_D//4, BLOCK_N, 2]
+            k_23 = tl.join(k_q2, k_q3)  # [BLOCK_D//4, BLOCK_N, 2]
+            k_full = tl.join(k_01, k_23)  # [BLOCK_D//4, BLOCK_N, 2, 2]
             k_full = tl.reshape(k_full, (BLOCK_D // 4, BLOCK_N, 4))
-            k_full = tl.permute(k_full, (2, 0, 1))      # [4, BLOCK_D//4, BLOCK_N]
+            k_full = tl.permute(k_full, (2, 0, 1))  # [4, BLOCK_D//4, BLOCK_N]
             k_full = tl.reshape(k_full, (BLOCK_D, BLOCK_N))
 
-            q_01 = tl.join(q_q0, q_q1)        # [BLOCK_H, BLOCK_D//4, 2]
+            q_01 = tl.join(q_q0, q_q1)  # [BLOCK_H, BLOCK_D//4, 2]
             q_23 = tl.join(q_q2, q_q3)
-            q_full = tl.join(q_01, q_23)      # [BLOCK_H, BLOCK_D//4, 2, 2]
+            q_full = tl.join(q_01, q_23)  # [BLOCK_H, BLOCK_D//4, 2, 2]
             q_full = tl.reshape(q_full, (BLOCK_H, BLOCK_D // 4, 4))
-            q_full = tl.permute(q_full, (0, 2, 1))      # [BLOCK_H, 4, BLOCK_D//4]
+            q_full = tl.permute(q_full, (0, 2, 1))  # [BLOCK_H, 4, BLOCK_D//4]
             q_full = tl.reshape(q_full, (BLOCK_H, BLOCK_D))
 
             qk = tl.dot(q_full, k_full)
@@ -1712,24 +1866,31 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
 
-            # Load packed INT2 V and dequantize. V layout: [BLOCK_N, BLOCK_D//4]
+            # Load packed V into four logical quarters.
             offs_d_packed_v = tl.arange(0, BLOCK_D // 4)
+            if INT1:
+                v_byte_offsets = offs_d_packed_v % (L // 8)
+                v_bit_in_quarter = offs_d_packed_v // (L // 8)
+            else:
+                v_byte_offsets = offs_d_packed_v
+                v_bit_in_quarter = tl.zeros([BLOCK_D // 4], dtype=tl.int32)
             offs_buf_v_packed = (
                 kv_loc[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
-                + offs_d_packed_v[None, :]
+                + v_byte_offsets[None, :]
             )
             v_packed = tl.load(
                 V_Buffer + offs_buf_v_packed,
-                mask=(offs_n[:, None] < split_kv_end) & (offs_d_packed_v[None, :] < (L // 4)),
+                mask=(offs_n[:, None] < split_kv_end)
+                & (offs_d_packed_v[None, :] < (L // 4)),
                 other=0,
             )
 
             # Load V scales and zeros for dequantization
             if GROUPED:
                 if FAST:
-                    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
-                    offs_grp_v = tl.arange(0, NUM_GROUPS_QUARTER)
+                    NUM_GROUPS_QUARTER_V: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
+                    offs_grp_v = tl.arange(0, NUM_GROUPS_QUARTER_V)
                     offs_grp_v_q1 = (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
                     offs_grp_v_q2 = 2 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
                     offs_grp_v_q3 = 3 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
@@ -1738,74 +1899,98 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     )
                     v_scale_q0_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q0_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q1_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q1[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q1_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q1[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q2_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q2[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q2_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q2[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q3_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q3[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q3_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q3[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q0 = tl.reshape(
-                        tl.broadcast_to(v_scale_q0_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q0_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q0 = tl.reshape(
-                        tl.broadcast_to(v_zero_q0_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q0_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q1 = tl.reshape(
-                        tl.broadcast_to(v_scale_q1_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q1_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q1 = tl.reshape(
-                        tl.broadcast_to(v_zero_q1_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q1_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q2 = tl.reshape(
-                        tl.broadcast_to(v_scale_q2_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q2_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q2 = tl.reshape(
-                        tl.broadcast_to(v_zero_q2_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q2_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q3 = tl.reshape(
-                        tl.broadcast_to(v_scale_q3_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q3_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q3 = tl.reshape(
-                        tl.broadcast_to(v_zero_q3_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q3_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER_V, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                 else:
@@ -1815,45 +2000,94 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     v_grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
                     v_grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
                     v_grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_scale_q0_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q0_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q1_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q1_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q2_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q2_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q3_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q3_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q0 = tl.broadcast_to(v_scale_q0_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q0  = tl.broadcast_to(v_zero_q0_t[:, None],  (BLOCK_N, BLOCK_D // 4))
-                    v_scale_q1 = tl.broadcast_to(v_scale_q1_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q1  = tl.broadcast_to(v_zero_q1_t[:, None],  (BLOCK_N, BLOCK_D // 4))
-                    v_scale_q2 = tl.broadcast_to(v_scale_q2_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q2  = tl.broadcast_to(v_zero_q2_t[:, None],  (BLOCK_N, BLOCK_D // 4))
-                    v_scale_q3 = tl.broadcast_to(v_scale_q3_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q3  = tl.broadcast_to(v_zero_q3_t[:, None],  (BLOCK_N, BLOCK_D // 4))
+                    v_scale_q0_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q0_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q1_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q1_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q2_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q2_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q3_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q3_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q0 = tl.broadcast_to(
+                        v_scale_q0_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q0 = tl.broadcast_to(
+                        v_zero_q0_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_scale_q1 = tl.broadcast_to(
+                        v_scale_q1_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q1 = tl.broadcast_to(
+                        v_zero_q1_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_scale_q2 = tl.broadcast_to(
+                        v_scale_q2_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q2 = tl.broadcast_to(
+                        v_zero_q2_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_scale_q3 = tl.broadcast_to(
+                        v_scale_q3_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q3 = tl.broadcast_to(
+                        v_zero_q3_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
                 # Cast V scales/zeros to q's dtype ONCE so per-element dequant
                 # below stays in bf16 (saves 2 fp32↔bf16 casts per crumb).
                 v_scale_q0 = v_scale_q0.to(q_q0.dtype)
-                v_zero_q0  = v_zero_q0.to(q_q0.dtype)
+                v_zero_q0 = v_zero_q0.to(q_q0.dtype)
                 v_scale_q1 = v_scale_q1.to(q_q0.dtype)
-                v_zero_q1  = v_zero_q1.to(q_q0.dtype)
+                v_zero_q1 = v_zero_q1.to(q_q0.dtype)
                 v_scale_q2 = v_scale_q2.to(q_q0.dtype)
-                v_zero_q2  = v_zero_q2.to(q_q0.dtype)
+                v_zero_q2 = v_zero_q2.to(q_q0.dtype)
                 v_scale_q3 = v_scale_q3.to(q_q0.dtype)
-                v_zero_q3  = v_zero_q3.to(q_q0.dtype)
-                # Dequantize INT2 V inline: unpack 4 crumbs per-group.
-                v_q0 = ((v_packed & 0x03).to(q_q0.dtype) - v_zero_q0) * v_scale_q0
-                v_q1 = (((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_q1) * v_scale_q1
-                v_q2 = (((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_q2) * v_scale_q2
-                v_q3 = (((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_q3) * v_scale_q3
+                v_zero_q3 = v_zero_q3.to(q_q0.dtype)
+                if INT1:
+                    v_q0_raw = (v_packed >> v_bit_in_quarter[None, :]) & 0x01
+                    v_q1_raw = (v_packed >> (2 + v_bit_in_quarter[None, :])) & 0x01
+                    v_q2_raw = (v_packed >> (4 + v_bit_in_quarter[None, :])) & 0x01
+                    v_q3_raw = (v_packed >> (6 + v_bit_in_quarter[None, :])) & 0x01
+                else:
+                    v_q0_raw = v_packed & 0x03
+                    v_q1_raw = (v_packed >> 2) & 0x03
+                    v_q2_raw = (v_packed >> 4) & 0x03
+                    v_q3_raw = (v_packed >> 6) & 0x03
+                v_q0 = (v_q0_raw.to(q_q0.dtype) - v_zero_q0) * v_scale_q0
+                v_q1 = (v_q1_raw.to(q_q0.dtype) - v_zero_q1) * v_scale_q1
+                v_q2 = (v_q2_raw.to(q_q0.dtype) - v_zero_q2) * v_scale_q2
+                v_q3 = (v_q3_raw.to(q_q0.dtype) - v_zero_q3) * v_scale_q3
             else:
                 offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 v_scale_1d = tl.load(
@@ -1866,18 +2100,28 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     mask=offs_n < split_kv_end,
                     other=0.0,
                 ).to(q_q0.dtype)
-                v_q0 = (
-                    (v_packed & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
-                ) * v_scale_1d[:, None]
-                v_q1 = (
-                    ((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
-                ) * v_scale_1d[:, None]
-                v_q2 = (
-                    ((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
-                ) * v_scale_1d[:, None]
-                v_q3 = (
-                    ((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
-                ) * v_scale_1d[:, None]
+                if INT1:
+                    v_q0_raw = (v_packed >> v_bit_in_quarter[None, :]) & 0x01
+                    v_q1_raw = (v_packed >> (2 + v_bit_in_quarter[None, :])) & 0x01
+                    v_q2_raw = (v_packed >> (4 + v_bit_in_quarter[None, :])) & 0x01
+                    v_q3_raw = (v_packed >> (6 + v_bit_in_quarter[None, :])) & 0x01
+                else:
+                    v_q0_raw = v_packed & 0x03
+                    v_q1_raw = (v_packed >> 2) & 0x03
+                    v_q2_raw = (v_packed >> 4) & 0x03
+                    v_q3_raw = (v_packed >> 6) & 0x03
+                v_q0 = (v_q0_raw.to(q_q0.dtype) - v_zero_1d[:, None]) * v_scale_1d[
+                    :, None
+                ]
+                v_q1 = (v_q1_raw.to(q_q0.dtype) - v_zero_1d[:, None]) * v_scale_1d[
+                    :, None
+                ]
+                v_q2 = (v_q2_raw.to(q_q0.dtype) - v_zero_1d[:, None]) * v_scale_1d[
+                    :, None
+                ]
+                v_q3 = (v_q3_raw.to(q_q0.dtype) - v_zero_1d[:, None]) * v_scale_1d[
+                    :, None
+                ]
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -1955,6 +2199,7 @@ def _decode_att_m_fwd_quant_int2(
     sm_scale,
     logit_cap,
     xai_temperature_len=-1,
+    int1=False,
 ):
     """
     INT2 quantized KV cache attention wrapper (MHA).
@@ -1965,10 +2210,9 @@ def _decode_att_m_fwd_quant_int2(
     if _is_hip:
         BLOCK = 8
     MAX_KV_SPLITS = max_kv_splits
-    # For INT2, the buffer stores packed values (head_dim//4)
-    # But we need to work with the actual head_dim
-    Lk = k_buffer.shape[-1] * 4  # Unpack to get real dimension
-    Lv = v_buffer.shape[-1] * 4
+    pack_factor = 8 if int1 else 4
+    Lk = k_buffer.shape[-1] * pack_factor
+    Lv = v_buffer.shape[-1] * pack_factor
 
     batch, head_num = q.shape[0], q.shape[1]
 
@@ -1984,9 +2228,7 @@ def _decode_att_m_fwd_quant_int2(
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
-    group_size = _get_shared_kv_scale_group_size(
-        Lk, Lv, k_scales_zeros, v_scales_zeros
-    )
+    group_size = _get_shared_kv_scale_group_size(Lk, Lv, k_scales_zeros, v_scales_zeros)
 
     _fwd_kernel_stage1_quant_int2[grid](
         q,
@@ -2025,6 +2267,7 @@ def _decode_att_m_fwd_quant_int2(
         Lk=Lk,
         Lv=Lv,
         GROUP_SIZE=group_size,
+        INT1=int1,
     )
 
 
@@ -2043,6 +2286,7 @@ def _decode_grouped_att_m_fwd_quant_int2(
     sm_scale,
     logit_cap,
     xai_temperature_len=-1,
+    int1=False,
 ):
     """
     INT2 quantized KV cache attention wrapper (GQA/MQA).
@@ -2058,21 +2302,18 @@ def _decode_grouped_att_m_fwd_quant_int2(
     crumb → mask/shift → cast → sub zero → mul scale → tl.dot) over more KV
     tokens; smaller BLOCK_H lowers register pressure so more blocks fit per SM.
     """
-    # For INT2, k_buffer is packed, so actual head dim is 4x the last dimension.
-    # K and V share the same head dim in this path (no MLA/DPE split).
-    L = k_buffer.shape[-1] * 4
-    assert v_buffer.shape[-1] * 4 == L, "INT2 KV cache requires Lk == Lv"
+    pack_factor = 8 if int1 else 4
+    L = k_buffer.shape[-1] * pack_factor
+    assert v_buffer.shape[-1] * pack_factor == L, "Quantized KV cache requires Lk == Lv"
     BLOCK_D = triton.next_power_of_2(L)
-    group_size = _get_shared_kv_scale_group_size(
-        L, L, k_scales_zeros, v_scales_zeros
-    )
+    group_size = _get_shared_kv_scale_group_size(L, L, k_scales_zeros, v_scales_zeros)
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     MAX_KV_SPLITS = max_kv_splits
 
-    # Tile heuristic 
+    # Tile heuristic
     if kv_group_num <= 8:
         if batch >= 16:
             _bn_default, _bh_default, _nw_default = 32, 4, 1
@@ -2085,7 +2326,15 @@ def _decode_grouped_att_m_fwd_quant_int2(
         _bh_default = 16 if batch >= 16 else 8
         _nw_default = 4
     BLOCK = int(os.environ.get("SGL_INT2_BLOCK_N", _bn_default))
-    BLOCK_H = int(os.environ.get("SGL_INT2_BLOCK_H", _bh_default))
+    requested_block_h = max(1, int(os.environ.get("SGL_INT2_BLOCK_H", _bh_default)))
+    if requested_block_h >= kv_group_num:
+        BLOCK_H = triton.next_power_of_2(kv_group_num)
+    else:
+        BLOCK_H = triton.next_power_of_2(requested_block_h)
+        if BLOCK_H > requested_block_h:
+            BLOCK_H //= 2
+        while BLOCK_H > 1 and kv_group_num % BLOCK_H != 0:
+            BLOCK_H //= 2
     num_warps = int(os.environ.get("SGL_INT2_NUM_WARPS", _nw_default))
     num_stages = int(os.environ.get("SGL_INT2_NUM_STAGES", 3))
 
@@ -2137,6 +2386,7 @@ def _decode_grouped_att_m_fwd_quant_int2(
         num_stages=num_stages,
         L=L,
         GROUP_SIZE=group_size,
+        INT1=int1,
         **extra_kargs,
     )
 
@@ -2463,7 +2713,9 @@ def decode_attention_fwd_int2_unified(
             )
 
     if quant_kv_indices.numel() > 0:
-        if kv_group_num == 1:
+        # The grouped kernel uses one shared D axis. Fall back to the
+        # per-query-head kernel for legal attention layouts with Lk != Lv.
+        if kv_group_num == 1 or quant_k_buffer.shape[-1] != quant_v_buffer.shape[-1]:
             _decode_att_m_fwd_quant_int2(
                 q,
                 quant_k_buffer,
@@ -2496,6 +2748,920 @@ def decode_attention_fwd_int2_unified(
                 sm_scale,
                 logit_cap,
                 xai_temperature_len,
+            )
+
+    _unified_stage2(
+        attn_logits,
+        attn_lse,
+        o,
+        total_splits=total_splits,
+    )
+    return o
+
+
+@triton.jit
+def _pq_build_lut_kernel(
+    Q,
+    Codebook,
+    Lut,
+    HEAD_DIM: tl.constexpr,
+    N_SUB: tl.constexpr,
+    SUB_DIM: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
+):
+    batch_q_head = tl.program_id(0)
+    sub = tl.program_id(1)
+    centroids = tl.arange(0, N_CENTROIDS)
+    acc = tl.zeros([N_CENTROIDS], dtype=tl.float32)
+    for dim in tl.static_range(SUB_DIM):
+        q_value = tl.load(Q + batch_q_head * HEAD_DIM + sub * SUB_DIM + dim).to(
+            tl.float32
+        )
+        centroid = tl.load(
+            Codebook + (sub * N_CENTROIDS + centroids) * SUB_DIM + dim
+        ).to(tl.float32)
+        acc += q_value * centroid
+    tl.store(
+        Lut + (batch_q_head * N_SUB + sub) * N_CENTROIDS + centroids,
+        acc,
+    )
+
+
+def _build_pq_lut(q: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    batch, q_heads, head_dim = q.shape
+    n_sub, n_centroids, sub_dim = codebook.shape
+    assert q.is_contiguous() and codebook.is_contiguous()
+    assert head_dim == n_sub * sub_dim
+    lut = torch.empty(
+        (batch, q_heads, n_sub, n_centroids),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    _pq_build_lut_kernel[(batch * q_heads, n_sub)](
+        q,
+        codebook,
+        lut,
+        HEAD_DIM=head_dim,
+        N_SUB=int(n_sub),
+        SUB_DIM=int(sub_dim),
+        N_CENTROIDS=int(n_centroids),
+        num_warps=8,
+        num_stages=2,
+    )
+    return lut
+
+
+@triton.jit
+def _fwd_grouped_kernel_stage1_pq(
+    Q,
+    K_Codes,
+    V_Buffer,
+    V_Scales_Zeros,
+    K_Codebook,
+    K_Lut,
+    K_Codes2,
+    K_Codebook2,
+    K_Lut2,
+    V_Codebook,
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_ks,
+    stride_lut_b,
+    stride_lut_h,
+    stride_lut_sub,
+    stride_lut_centroid,
+    stride_k2bs,
+    stride_k2h,
+    stride_k2s,
+    stride_lut2_b,
+    stride_lut2_h,
+    stride_lut2_sub,
+    stride_lut2_centroid,
+    stride_vbs,
+    stride_vh,
+    stride_vs,
+    stride_vszbs,
+    stride_vszh,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    BLOCK_DK: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    K_SUB_DIM: tl.constexpr,
+    K_N_CENTROIDS: tl.constexpr,
+    K2_N_CENTROIDS: tl.constexpr,
+    V_SUB_DIM: tl.constexpr,
+    V_N_CENTROIDS: tl.constexpr,
+    V_GROUP_SIZE: tl.constexpr,
+    HAS_K_STAGE2: tl.constexpr,
+    V_IS_PQ: tl.constexpr,
+    USE_ADC: tl.constexpr,
+):
+    """Graph-safe PQ-K attention with optional RVQ-K and PQ-V.
+
+    The kernel follows the tier-local indptr directly. No gathered tensor has
+    a data-dependent Python shape, so padded CUDA Graph index buffers are safe.
+    """
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < q_head_num)
+    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+
+    offs_dk = tl.arange(0, BLOCK_DK)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_dk = offs_dk < Lk
+    mask_dv = offs_dv < Lv
+    q = tl.load(
+        Q + cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dk[None, :],
+        mask=mask_h[:, None] & mask_dk[None, :],
+        other=0.0,
+    )
+
+    batch_kv_start = tl.load(kv_indptr + cur_batch)
+    seq_len = tl.load(kv_indptr + cur_batch + 1) - batch_kv_start
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_len_per_split = tl.cdiv(tl.cdiv(seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    split_start = kv_len_per_split * split_kv_id
+    split_end = tl.minimum(split_start + kv_len_per_split, seq_len)
+
+    if xai_temperature_len > 0:
+        offs_qidx = seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, qtemp, 1.0)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_end > split_start:
+        k_sub = offs_dk // K_SUB_DIM
+        k_sub_off = offs_dk % K_SUB_DIM
+        if not V_IS_PQ:
+            v_byte_dim: tl.constexpr = Lv // 4
+            v_byte_off = offs_dv % v_byte_dim
+            v_shift = (offs_dv // v_byte_dim) * 2
+            v_group = offs_dv // V_GROUP_SIZE
+
+        for start_n in range(split_start, split_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            valid_n = offs_n < split_end
+            kv_loc = tl.load(
+                kv_indices + batch_kv_start + offs_n,
+                mask=valid_n,
+                other=0,
+            ).to(tl.int64)
+
+            if USE_ADC:
+                qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+                for sub in tl.static_range(Lk // K_SUB_DIM):
+                    code = tl.load(
+                        K_Codes
+                        + kv_loc * stride_kbs
+                        + cur_kv_head * stride_kh
+                        + sub * stride_ks,
+                        mask=valid_n,
+                        other=0,
+                    ).to(tl.int32)
+                    qk += tl.load(
+                        K_Lut
+                        + cur_batch * stride_lut_b
+                        + cur_head[:, None] * stride_lut_h
+                        + sub * stride_lut_sub
+                        + code[None, :] * stride_lut_centroid,
+                        mask=mask_h[:, None] & valid_n[None, :],
+                        other=0.0,
+                    )
+                    if HAS_K_STAGE2:
+                        code2 = tl.load(
+                            K_Codes2
+                            + kv_loc * stride_k2bs
+                            + cur_kv_head * stride_k2h
+                            + sub * stride_k2s,
+                            mask=valid_n,
+                            other=0,
+                        ).to(tl.int32)
+                        qk += tl.load(
+                            K_Lut2
+                            + cur_batch * stride_lut2_b
+                            + cur_head[:, None] * stride_lut2_h
+                            + sub * stride_lut2_sub
+                            + code2[None, :] * stride_lut2_centroid,
+                            mask=mask_h[:, None] & valid_n[None, :],
+                            other=0.0,
+                        )
+                qk *= sm_scale
+            else:
+                k_code = tl.load(
+                    K_Codes
+                    + kv_loc[None, :] * stride_kbs
+                    + cur_kv_head * stride_kh
+                    + k_sub[:, None] * stride_ks,
+                    mask=mask_dk[:, None] & valid_n[None, :],
+                    other=0,
+                ).to(tl.int64)
+                k = tl.load(
+                    K_Codebook
+                    + (k_sub[:, None] * K_N_CENTROIDS + k_code) * K_SUB_DIM
+                    + k_sub_off[:, None],
+                    mask=mask_dk[:, None] & valid_n[None, :],
+                    other=0.0,
+                ).to(q.dtype)
+                if HAS_K_STAGE2:
+                    k_code2 = tl.load(
+                        K_Codes2
+                        + kv_loc[None, :] * stride_k2bs
+                        + cur_kv_head * stride_k2h
+                        + k_sub[:, None] * stride_k2s,
+                        mask=mask_dk[:, None] & valid_n[None, :],
+                        other=0,
+                    ).to(tl.int64)
+                    k += tl.load(
+                        K_Codebook2
+                        + (k_sub[:, None] * K2_N_CENTROIDS + k_code2) * K_SUB_DIM
+                        + k_sub_off[:, None],
+                        mask=mask_dk[:, None] & valid_n[None, :],
+                        other=0.0,
+                    ).to(q.dtype)
+                qk = tl.dot(q, k) * sm_scale
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg
+            qk = tl.where(mask_h[:, None] & valid_n[None, :], qk, float("-inf"))
+
+            next_e_max = tl.maximum(tl.max(qk, axis=1), e_max)
+            rescale = tl.exp(e_max - next_e_max)
+            p = tl.exp(qk - next_e_max[:, None])
+            acc *= rescale[:, None]
+
+            if V_IS_PQ and BLOCK_DV == Lv:
+                # Decode and accumulate one 8-D product-quantization subspace
+                # at a time. This avoids materializing [BLOCK_N, 128] V in a
+                # single program and loads each code byte only once.
+                v_dim = tl.arange(0, V_SUB_DIM)
+                v_sub_ids = tl.arange(0, Lv // V_SUB_DIM)
+                for sub in tl.static_range(Lv // V_SUB_DIM):
+                    code = tl.load(
+                        V_Buffer
+                        + kv_loc * stride_vbs
+                        + cur_kv_head * stride_vh
+                        + sub * stride_vs,
+                        mask=valid_n,
+                        other=0,
+                    ).to(tl.int64)
+                    values = tl.load(
+                        V_Codebook
+                        + (sub * V_N_CENTROIDS + code[:, None]) * V_SUB_DIM
+                        + v_dim[None, :],
+                        mask=valid_n[:, None],
+                        other=0.0,
+                    ).to(q.dtype)
+                    partial = tl.dot(p.to(values.dtype), values)
+                    partial_full = tl.broadcast_to(
+                        partial[:, None, :],
+                        (
+                            BLOCK_H,
+                            Lv // V_SUB_DIM,
+                            V_SUB_DIM,
+                        ),
+                    )
+                    sub_mask = v_sub_ids[None, :, None] == sub
+                    acc += tl.reshape(
+                        tl.where(sub_mask, partial_full, 0.0),
+                        (BLOCK_H, BLOCK_DV),
+                    )
+            elif V_IS_PQ:
+                v_sub = offs_dv // V_SUB_DIM
+                v_sub_off = offs_dv % V_SUB_DIM
+                v_code = tl.load(
+                    V_Buffer
+                    + kv_loc[:, None] * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + v_sub[None, :] * stride_vs,
+                    mask=valid_n[:, None] & mask_dv[None, :],
+                    other=0,
+                ).to(tl.int64)
+                v = tl.load(
+                    V_Codebook
+                    + (v_sub[None, :] * V_N_CENTROIDS + v_code) * V_SUB_DIM
+                    + v_sub_off[None, :],
+                    mask=valid_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                ).to(q.dtype)
+                acc += tl.dot(p.to(v.dtype), v)
+            else:
+                v_packed = tl.load(
+                    V_Buffer
+                    + kv_loc[:, None] * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + v_byte_off[None, :] * stride_vs,
+                    mask=valid_n[:, None] & mask_dv[None, :],
+                    other=0,
+                )
+                v_q = ((v_packed >> v_shift[None, :]) & 0x03).to(tl.float32)
+                v_sz_base = kv_loc[:, None] * stride_vszbs + cur_kv_head * stride_vszh
+                v_scale = tl.load(
+                    V_Scales_Zeros + v_sz_base + 2 * v_group[None, :],
+                    mask=valid_n[:, None] & mask_dv[None, :],
+                    other=1.0,
+                ).to(tl.float32)
+                v_zero = tl.load(
+                    V_Scales_Zeros + v_sz_base + 2 * v_group[None, :] + 1,
+                    mask=valid_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                v = ((v_q - v_zero) * v_scale).to(q.dtype)
+                acc += tl.dot(p.to(v.dtype), v)
+            e_sum = e_sum * rescale + tl.sum(p, axis=1)
+            e_max = next_e_max
+
+        out_base = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        )
+        tl.store(
+            Att_Out + out_base + offs_dv[None, :],
+            acc / e_sum[:, None],
+            mask=mask_h[:, None] & mask_dv[None, :],
+        )
+        lse_off = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+        tl.store(
+            Att_Lse + lse_off,
+            e_max + tl.log(e_sum),
+            mask=mask_h,
+        )
+
+
+def _decode_grouped_att_m_fwd_pq(
+    q,
+    k_codes,
+    v_buffer,
+    v_scales_zeros,
+    k_codebook,
+    att_out,
+    att_lse,
+    kv_indptr,
+    kv_indices,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap,
+    xai_temperature_len=-1,
+    k_codes2=None,
+    k_codebook2=None,
+    v_codebook=None,
+):
+    """Launch graph-safe inline PQ/RVQ decode for MHA, GQA, or MQA."""
+    Lk = int(q.shape[-1])
+    Lv = int(att_out.shape[-1])
+    k_n_sub, k_n_centroids, k_sub_dim = k_codebook.shape
+    assert int(k_n_sub) * int(k_sub_dim) == Lk
+    assert k_codes.shape[-1] == k_n_sub
+
+    has_k_stage2 = k_codes2 is not None
+    if has_k_stage2:
+        assert k_codebook2 is not None
+        assert k_codebook2.shape[0] == k_n_sub
+        assert k_codebook2.shape[2] == k_sub_dim
+        k_codes2_arg = k_codes2
+        k_codebook2_arg = k_codebook2
+        k2_n_centroids = int(k_codebook2.shape[1])
+    else:
+        k_codes2_arg = k_codes
+        k_codebook2_arg = k_codebook
+        k2_n_centroids = int(k_n_centroids)
+
+    batch, q_head_num = q.shape[0], q.shape[1]
+    adc_mode = envs.SGLANG_PQ_USE_ADC.get()
+    use_adc = batch < 4 if adc_mode < 0 else adc_mode != 0
+    if use_adc:
+        k_lut = _build_pq_lut(q, k_codebook)
+        k_lut2 = _build_pq_lut(q, k_codebook2_arg) if has_k_stage2 else k_lut
+        lut_strides = k_lut.stride()
+        lut2_strides = k_lut2.stride()
+    else:
+        # Pointer/stride placeholders for the compile-time disabled ADC branch.
+        k_lut = k_codebook
+        k_lut2 = k_codebook2_arg
+        lut_strides = (0, 0, k_codebook.stride(0), k_codebook.stride(1))
+        lut2_strides = (
+            0,
+            0,
+            k_codebook2_arg.stride(0),
+            k_codebook2_arg.stride(1),
+        )
+
+    v_is_pq = v_codebook is not None
+    if v_is_pq:
+        v_n_sub, v_n_centroids, v_sub_dim = v_codebook.shape
+        assert int(v_n_sub) * int(v_sub_dim) == Lv
+        assert v_buffer.shape[-1] == v_n_sub
+        v_codebook_arg = v_codebook
+        v_group_size = Lv
+    else:
+        assert v_buffer.shape[-1] * 4 == Lv
+        v_n_centroids = 1
+        v_sub_dim = 1
+        v_codebook_arg = k_codebook
+        v_num_groups = int(v_scales_zeros.shape[-1]) // 2
+        assert Lv % v_num_groups == 0
+        v_group_size = Lv // v_num_groups
+
+    kv_group_num = q_head_num // k_codes.shape[1]
+    configured_block_h = envs.SGLANG_PQ_BLOCK_H.get()
+    requested_block_h = (
+        configured_block_h
+        if configured_block_h > 0
+        else (1 if use_adc and batch < 4 else 4)
+    )
+    if requested_block_h >= kv_group_num:
+        block_h = triton.next_power_of_2(kv_group_num)
+    else:
+        block_h = 1 << (requested_block_h.bit_length() - 1)
+        while block_h > 1 and kv_group_num % block_h != 0:
+            block_h //= 2
+    # H100 tuning for Qwen/Llama D=128. Low batch benefits from a larger
+    # sequence tile (fewer Python-range loop iterations); high batch already
+    # exposes enough blocks and needs the lower-register BN=32 kernel.
+    large_tile_safe = max(Lk, Lv) <= 128 and v_is_pq and not has_k_stage2
+    if large_tile_safe:
+        if batch < 16:
+            default_block_n, default_warps, default_stages = 256, 8, 2
+        else:
+            default_block_n, default_warps, default_stages = 64, 4, 2
+    else:
+        default_block_n, default_warps, default_stages = 32, 4, 2
+    configured_block_n = envs.SGLANG_PQ_BLOCK_N.get()
+    configured_warps = envs.SGLANG_PQ_NUM_WARPS.get()
+    configured_stages = envs.SGLANG_PQ_NUM_STAGES.get()
+    requested_block_n = triton.next_power_of_2(
+        max(
+            16,
+            configured_block_n if configured_block_n > 0 else default_block_n,
+        )
+    )
+    max_block_n = 256 if large_tile_safe else 64
+    block_n = min(requested_block_n, max_block_n)
+    requested_warps = configured_warps if configured_warps > 0 else default_warps
+    num_warps = min(8, triton.next_power_of_2(requested_warps))
+    requested_stages = configured_stages if configured_stages > 0 else default_stages
+    max_stages = 2 if block_n >= 256 else 3
+    num_stages = min(max(1, requested_stages), max_stages)
+    block_dk = triton.next_power_of_2(Lk)
+    block_dv = triton.next_power_of_2(Lv)
+    grid = (
+        batch,
+        triton.cdiv(q_head_num, min(block_h, kv_group_num)),
+        max_kv_splits,
+    )
+    _fwd_grouped_kernel_stage1_pq[grid](
+        q,
+        k_codes,
+        v_buffer,
+        v_scales_zeros,
+        k_codebook,
+        k_lut,
+        k_codes2_arg,
+        k_codebook2_arg,
+        k_lut2,
+        v_codebook_arg,
+        sm_scale,
+        kv_indptr,
+        kv_indices,
+        att_out,
+        att_lse,
+        num_kv_splits,
+        q.stride(0),
+        q.stride(1),
+        k_codes.stride(0),
+        k_codes.stride(1),
+        k_codes.stride(2),
+        *lut_strides,
+        k_codes2_arg.stride(0),
+        k_codes2_arg.stride(1),
+        k_codes2_arg.stride(2),
+        *lut2_strides,
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        v_buffer.stride(2),
+        v_scales_zeros.stride(0),
+        v_scales_zeros.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        kv_group_num=kv_group_num,
+        q_head_num=q_head_num,
+        BLOCK_DK=block_dk,
+        BLOCK_DV=block_dv,
+        BLOCK_N=block_n,
+        BLOCK_H=block_h,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        Lk=Lk,
+        Lv=Lv,
+        K_SUB_DIM=int(k_sub_dim),
+        K_N_CENTROIDS=int(k_n_centroids),
+        K2_N_CENTROIDS=k2_n_centroids,
+        V_SUB_DIM=int(v_sub_dim),
+        V_N_CENTROIDS=int(v_n_centroids),
+        V_GROUP_SIZE=v_group_size,
+        HAS_K_STAGE2=has_k_stage2,
+        V_IS_PQ=v_is_pq,
+        USE_ADC=use_adc,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+def decode_attention_fwd_pqk_int2v_unified(
+    q,
+    hp_k_buffer,
+    hp_v_buffer,
+    quant_k_buffer,  # PQ codes [cache, heads, N_SUB] uint8
+    quant_v_buffer,  # INT2 V [cache, heads, v_head_dim//4] uint8
+    quant_k_scales_zeros,  # unused for PQ K (dummy)
+    quant_v_scales_zeros,
+    pq_codebook,  # [N_SUB, N_CENTS, SUB_DIM] fp16
+    o,
+    hp_kv_indptr,
+    hp_kv_indices,
+    quant_kv_indptr,
+    quant_kv_indices,
+    attn_logits,
+    attn_lse,
+    hp_num_kv_splits,
+    quant_num_kv_splits,
+    hp_max_kv_splits,
+    quant_max_kv_splits,
+    sm_scale,
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+    quant_k_buffer2=None,  # RVQ stage-2 codes (None = plain PQ K)
+    pq_codebook2=None,  # RVQ stage-2 codebook
+    pq_v_codebook=None,  # PQ V codebook (None = INT2 V)
+):
+    """Unified HP + PQ-K + INT2-V decode attention.
+
+    HP stage: FP16 K/V attention (unchanged from INT2 unified).
+    Quant stage: pre-decode PQ K codes + INT2 V to FP16, then FP16 attention.
+    Stage-2: shared LSE reduce (same as INT2 unified).
+    """
+    if sinks is not None:
+        raise NotImplementedError(
+            "Mixed KV windows do not support sink tokens in pqk_int2v decode."
+        )
+
+    total_splits = hp_max_kv_splits + quant_max_kv_splits
+    assert attn_logits.shape[2] == total_splits
+
+    attn_lse.fill_(float("-inf"))
+
+    hp_logits = attn_logits[:, :, :hp_max_kv_splits, :]
+    hp_lse = attn_lse[:, :, :hp_max_kv_splits]
+    quant_logits = attn_logits[:, :, hp_max_kv_splits:, :]
+    quant_lse = attn_lse[:, :, hp_max_kv_splits:]
+
+    kv_group_num = q.shape[1] // hp_k_buffer.shape[1]
+
+    # HP stage: FP16 K+V attention
+    if hp_kv_indices.numel() > 0:
+        if kv_group_num == 1:
+            _decode_att_m_fwd(
+                q,
+                hp_k_buffer,
+                hp_v_buffer,
+                hp_logits,
+                hp_lse,
+                hp_kv_indptr,
+                hp_kv_indices,
+                hp_num_kv_splits,
+                hp_max_kv_splits,
+                sm_scale,
+                logit_cap,
+                xai_temperature_len,
+            )
+        else:
+            _decode_grouped_att_m_fwd(
+                q,
+                hp_k_buffer,
+                hp_v_buffer,
+                hp_logits,
+                hp_lse,
+                hp_kv_indptr,
+                hp_kv_indices,
+                hp_num_kv_splits,
+                hp_max_kv_splits,
+                sm_scale,
+                logit_cap,
+                xai_temperature_len,
+            )
+
+    # Quant stage: decode PQ/RVQ centroids inline while following indptr.
+    # The index buffer may be a padded CUDA Graph allocation; only entries
+    # selected by quant_kv_indptr are ever loaded.
+    if quant_kv_indices.numel() > 0:
+        _decode_grouped_att_m_fwd_pq(
+            q,
+            quant_k_buffer,
+            quant_v_buffer,
+            quant_v_scales_zeros,
+            pq_codebook,
+            quant_logits,
+            quant_lse,
+            quant_kv_indptr,
+            quant_kv_indices,
+            quant_num_kv_splits,
+            quant_max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+            k_codes2=quant_k_buffer2,
+            k_codebook2=pq_codebook2,
+            v_codebook=pq_v_codebook,
+        )
+
+    _unified_stage2(attn_logits, attn_lse, o, total_splits=total_splits)
+    return o
+
+
+# ---------------------------------------------------------------------------
+# INT1 decode attention: gather+dequant the referenced int1 rows to bf16, then
+# route through the standard non-quantized attention kernels. Slower than an
+# inline-dequant kernel but avoids duplicating the int2 stage-1 kernels (which
+# would need 8 octants instead of 4 quarters and ~2x the body size).
+# ---------------------------------------------------------------------------
+
+
+def _dequant_int1_for_attention(
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    k_scales_zeros: torch.Tensor,
+    v_scales_zeros: torch.Tensor,
+    kv_indices: torch.Tensor,
+    head_dim_k: int,
+    head_dim_v: int,
+    out_dtype: torch.dtype,
+):
+    """Gather + dequant K and V int1 rows at ``kv_indices``.
+
+    Returns ``(k_bf16, v_bf16, remapped_kv_indices)`` where ``k_bf16`` /
+    ``v_bf16`` have shape ``(n_indices, num_heads, head_dim_{k,v})`` and
+    ``remapped_kv_indices`` is ``arange(n_indices)`` so the caller can drop
+    the dequant buffer in as a stand-in for an HP K/V buffer.
+    """
+    from sglang.srt.mem_cache.kv_quant_kernels import (
+        gather_dequantize_kv_int1_triton,
+    )
+
+    n_indices = int(kv_indices.shape[0])
+    k_dequant = gather_dequantize_kv_int1_triton(
+        k_buffer, k_scales_zeros, kv_indices, head_dim_k, out_dtype
+    )
+    v_dequant = gather_dequantize_kv_int1_triton(
+        v_buffer, v_scales_zeros, kv_indices, head_dim_v, out_dtype
+    )
+    remapped = torch.arange(n_indices, dtype=kv_indices.dtype, device=kv_indices.device)
+    return k_dequant, v_dequant, remapped
+
+
+def decode_attention_fwd_int1_via_dequant(
+    q,
+    k_buffer,
+    v_buffer,
+    k_scales_zeros,
+    v_scales_zeros,
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+    output_lse=None,
+):
+    """INT1 decode attention via gather+dequant. Dispatches to the standard
+    non-quantized attention path after materializing the referenced int1
+    rows as bf16.
+    """
+    if kv_indices.numel() == 0:
+        return o
+
+    head_dim_k = int(k_buffer.shape[-1]) * 8
+    head_dim_v = int(v_buffer.shape[-1]) * 8
+    out_dtype = q.dtype
+
+    k_dequant, v_dequant, remapped = _dequant_int1_for_attention(
+        k_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        kv_indices,
+        head_dim_k,
+        head_dim_v,
+        out_dtype,
+    )
+
+    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    if kv_group_num == 1:
+        _decode_att_m_fwd(
+            q,
+            k_dequant,
+            v_dequant,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            remapped,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+        )
+    else:
+        _decode_grouped_att_m_fwd(
+            q,
+            k_dequant,
+            v_dequant,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            remapped,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+        )
+
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        attn_lse,
+        q,
+        o,
+        1.0,  # v_scale (already dequantized)
+        v_dequant,
+        kv_indptr,
+        num_kv_splits,
+        max_kv_splits,
+        sinks,
+        output_lse=output_lse,
+    )
+    return o
+
+
+def decode_attention_fwd_int1_unified(
+    q,
+    hp_k_buffer,
+    hp_v_buffer,
+    quant_k_buffer,
+    quant_v_buffer,
+    quant_k_scales_zeros,
+    quant_v_scales_zeros,
+    o,
+    hp_kv_indptr,
+    hp_kv_indices,
+    quant_kv_indptr,
+    quant_kv_indices,
+    attn_logits,
+    attn_lse,
+    hp_num_kv_splits,
+    quant_num_kv_splits,
+    hp_max_kv_splits,
+    quant_max_kv_splits,
+    sm_scale,
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+):
+    """Unified HP + int1 decode attention via gather+dequant of the quant
+    portion. Mirrors :func:`decode_attention_fwd_int2_unified` but routes
+    int1 through the non-quantized stage-1 kernel after materializing the
+    referenced rows as bf16.
+    """
+    if sinks is not None:
+        raise NotImplementedError(
+            "Mixed KV windows do not support sink tokens in Triton decode yet."
+        )
+
+    total_splits = hp_max_kv_splits + quant_max_kv_splits
+    assert attn_logits.shape[2] == total_splits, (
+        f"attn_logits split dim ({attn_logits.shape[2]}) must equal hp_max_kv_splits "
+        f"({hp_max_kv_splits}) + quant_max_kv_splits ({quant_max_kv_splits})"
+    )
+
+    attn_lse.fill_(float("-inf"))
+
+    hp_logits = attn_logits[:, :, :hp_max_kv_splits, :]
+    hp_lse = attn_lse[:, :, :hp_max_kv_splits]
+    quant_logits = attn_logits[:, :, hp_max_kv_splits:, :]
+    quant_lse = attn_lse[:, :, hp_max_kv_splits:]
+
+    kv_group_num = q.shape[1] // hp_k_buffer.shape[1]
+
+    if hp_kv_indices.numel() > 0:
+        if kv_group_num == 1:
+            _decode_att_m_fwd(
+                q,
+                hp_k_buffer,
+                hp_v_buffer,
+                hp_logits,
+                hp_lse,
+                hp_kv_indptr,
+                hp_kv_indices,
+                hp_num_kv_splits,
+                hp_max_kv_splits,
+                sm_scale,
+                logit_cap,
+                xai_temperature_len,
+            )
+        else:
+            _decode_grouped_att_m_fwd(
+                q,
+                hp_k_buffer,
+                hp_v_buffer,
+                hp_logits,
+                hp_lse,
+                hp_kv_indptr,
+                hp_kv_indices,
+                hp_num_kv_splits,
+                hp_max_kv_splits,
+                sm_scale,
+                logit_cap,
+                xai_temperature_len,
+            )
+
+    if quant_kv_indices.numel() > 0:
+        if kv_group_num == 1 or quant_k_buffer.shape[-1] != quant_v_buffer.shape[-1]:
+            _decode_att_m_fwd_quant_int2(
+                q,
+                quant_k_buffer,
+                quant_v_buffer,
+                quant_k_scales_zeros,
+                quant_v_scales_zeros,
+                quant_logits,
+                quant_lse,
+                quant_kv_indptr,
+                quant_kv_indices,
+                quant_num_kv_splits,
+                quant_max_kv_splits,
+                sm_scale,
+                logit_cap,
+                xai_temperature_len,
+                int1=True,
+            )
+        else:
+            _decode_grouped_att_m_fwd_quant_int2(
+                q,
+                quant_k_buffer,
+                quant_v_buffer,
+                quant_k_scales_zeros,
+                quant_v_scales_zeros,
+                quant_logits,
+                quant_lse,
+                quant_kv_indptr,
+                quant_kv_indices,
+                quant_num_kv_splits,
+                quant_max_kv_splits,
+                sm_scale,
+                logit_cap,
+                xai_temperature_len,
+                int1=True,
             )
 
     _unified_stage2(
