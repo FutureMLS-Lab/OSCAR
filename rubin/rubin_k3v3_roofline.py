@@ -14,7 +14,7 @@ import json
 HARDWARE = (
     ("H100 SXM", 3.35, 1.979, False),
     ("B200 SXM", 8.0, 4.5, False),
-    ("Rubin", 22.0, 8.75, True),
+    ("Rubin", 22.0, 17.5, True),
 )
 
 
@@ -29,6 +29,7 @@ def project(
     recent: int,
     hbm_bytes_per_second: float,
     dense_fp8_flops_per_second: float,
+    lutb_full_tile_flops_per_second: float | None = None,
     mma_m: int = 128,
     mma_n: int = 8,
     packed_query_rows: int | None = None,
@@ -50,9 +51,13 @@ def project(
     arithmetic_intensity = attention_flops_layer / kv_bytes_layer
     bandwidth_roof_flops = arithmetic_intensity * hbm_bytes_per_second
     packed_query_rows = packed_query_rows or (q_heads // kv_heads)
-    lutb_b_compute_cap = dense_fp8_flops_per_second * min(
-        packed_query_rows / mma_m, 1.0
-    )
+    tile_utilization = min(packed_query_rows / mma_m, 1.0)
+    if lutb_full_tile_flops_per_second is None:
+        # NVIDIA publishes 17.5 PFLOP/s as a dense FP8/FP6 specification, but
+        # does not publish a separate LUT-B throughput. Defaulting to the dense
+        # rate is a sensitivity endpoint, not a hardware prediction.
+        lutb_full_tile_flops_per_second = dense_fp8_flops_per_second
+    lutb_b_compute_cap = lutb_full_tile_flops_per_second * tile_utilization
     hypothetical_kv_a_compute_cap = dense_fp8_flops_per_second * min(
         packed_query_rows / mma_n, 1.0
     )
@@ -93,7 +98,13 @@ def project(
         "packed_query_rows": packed_query_rows,
         "mma_m": mma_m,
         "mma_n": mma_n,
-        "lutb_b_tile_utilization": min(packed_query_rows / mma_m, 1.0),
+        "lutb_b_tile_utilization": tile_utilization,
+        "lutb_full_tile_assumption_pflop_per_second": (
+            lutb_full_tile_flops_per_second / 1e15
+        ),
+        "critical_lutb_full_tile_pflop_per_second": (
+            bandwidth_roof_flops / tile_utilization / 1e15
+        ),
         "lutb_b_compute_cap_tflop_per_second": lutb_b_compute_cap / 1e12,
         "hypothetical_kv_a_compute_cap_tflop_per_second": (
             hypothetical_kv_a_compute_cap / 1e12
@@ -117,8 +128,6 @@ def project(
         "roofline_speedup_over_bf16": (
             roof_token_rate / bf16_bandwidth_token_rate
         ),
-        "practical_60pct_hbm_tflop_per_second": roof_flops * 0.60 / 1e12,
-        "practical_80pct_hbm_tflop_per_second": roof_flops * 0.80 / 1e12,
         "no_gqa_reuse_tflop_per_second": bandwidth_roof_flops
         / (q_heads / kv_heads)
         / 1e12,
@@ -138,8 +147,17 @@ def main() -> None:
     parser.add_argument(
         "--dense-fp8-pflop-s",
         type=float,
-        default=8.75,
-        help="Dense ceiling; half of NVIDIA's 17.5 PFLOP/s sparse figure.",
+        default=17.5,
+        help="Published dense FP8/FP6 ceiling.",
+    )
+    parser.add_argument(
+        "--lutb-full-tile-pflop-s",
+        type=float,
+        default=None,
+        help=(
+            "Unpublished LUT-B full-tile throughput assumption. Defaults to "
+            "the dense FP8 rate as a sensitivity endpoint, not a prediction."
+        ),
     )
     parser.add_argument("--mma-m", type=int, default=128)
     parser.add_argument("--mma-n", type=int, default=8)
@@ -168,6 +186,11 @@ def main() -> None:
                     recent=args.recent,
                     hbm_bytes_per_second=bandwidth * 1e12,
                     dense_fp8_flops_per_second=fp8 * 1e15,
+                    lutb_full_tile_flops_per_second=(
+                        args.lutb_full_tile_pflop_s * 1e15
+                        if args.lutb_full_tile_pflop_s is not None
+                        else None
+                    ),
                     mma_m=args.mma_m,
                     mma_n=args.mma_n,
                     packed_query_rows=args.packed_query_rows,
@@ -189,6 +212,11 @@ def main() -> None:
                 recent=args.recent,
                 hbm_bytes_per_second=args.hbm_tb_s * 1e12,
                 dense_fp8_flops_per_second=args.dense_fp8_pflop_s * 1e15,
+                lutb_full_tile_flops_per_second=(
+                    args.lutb_full_tile_pflop_s * 1e15
+                    if args.lutb_full_tile_pflop_s is not None
+                    else None
+                ),
                 mma_m=args.mma_m,
                 mma_n=args.mma_n,
                 packed_query_rows=args.packed_query_rows,
@@ -219,10 +247,10 @@ def main() -> None:
 
     print(
         "| Context | Effective KV bits | KV MB/layer | FLOP/token | AI | "
-        "Operand-corrected TFLOP/s | 60-80% projected TFLOP/s | vs BF16 | "
-        "Attention-only tok/s |"
+        "LUT-B full-tile assumption | Critical LUT-B rate | Bound | "
+        "Roofline TFLOP/s | vs BF16 | Attention-only tok/s |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|")
     for row in rows:
         print(
             f"| {row['context'] // 1024}K "
@@ -230,9 +258,10 @@ def main() -> None:
             f"| {row['kv_megabytes_per_layer']:.3f} "
             f"| {row['attention_gflop_per_token_all_layers']:.3f}G "
             f"| {row['arithmetic_intensity_flop_per_byte']:.2f} "
+            f"| {row['lutb_full_tile_assumption_pflop_per_second']:.2f}P "
+            f"| {row['critical_lutb_full_tile_pflop_per_second']:.2f}P "
+            f"| {row['limiting_resource']} "
             f"| {row['roofline_tflop_per_second']:.1f} "
-            f"| {row['practical_60pct_hbm_tflop_per_second']:.1f}-"
-            f"{row['practical_80pct_hbm_tflop_per_second']:.1f} "
             f"| {row['roofline_speedup_over_bf16']:.2f}x "
             f"| {row['roofline_attention_tokens_per_second']:.0f} |"
         )

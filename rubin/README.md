@@ -20,6 +20,22 @@ Rebuild the H100, B200, and Rubin roofline projection:
 python3 rubin/rubin_k3v3_roofline.py --compare-hardware
 ```
 
+NVIDIA publishes 17.5 PFLOP/s as Rubin's dense FP8/FP6 specification, but
+does not publish the full-tile throughput of `decompress::lut::b`. The default
+uses 17.5 PFLOP/s only as a sensitivity endpoint. Compare it with a hypothetical
+half-rate LUT-B mode explicitly:
+
+```bash
+python3 rubin/rubin_k3v3_roofline.py \
+  --lutb-full-tile-pflop-s 17.5
+python3 rubin/rubin_k3v3_roofline.py \
+  --lutb-full-tile-pflop-s 8.75
+```
+
+Neither command is a hardware prediction. A concrete speedup requires Rubin
+measurements of LUT-B tile throughput, achieved HBM bandwidth, and collector
+reuse in a fused attention kernel.
+
 Compile the SM107 LUT-B probes with a CUDA 13.4 toolchain:
 
 ```bash
