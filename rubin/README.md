@@ -22,6 +22,19 @@ python3 rubin/rubin_k3v3_roofline.py --compare-hardware
 
 The default contexts are 8K, 32K, and 1M tokens.
 
+Rebuild the Kimi-K3-style TP8 MLA capacity ceiling:
+
+```bash
+python3 rubin/mla_context_capacity.py
+```
+
+The default assumes 8 × 288 GB Rubin GPUs, 1.56 TB of perfectly sharded
+weights, 24 growing MLA layers, a 512-d 3.125-bit latent, a 64-d BF16 RoPE
+suffix, and a replicated latent cache under ordinary TP. It reports the
+zero-workspace 11.81M mathematical ceiling, the 10M target with 14.3 GB of
+remaining HBM per GPU, and several other runtime-reserve cases. Use
+`--kv-shard-factor` only for an explicit context-parallel cache design.
+
 NVIDIA publishes 17.5 PFLOP/s as Rubin's dense FP8/FP6 specification, but
 does not publish the full-tile throughput of `decompress::lut::b`. The default
 uses 17.5 PFLOP/s only as a sensitivity endpoint. Compare it with a hypothetical
