@@ -85,8 +85,14 @@ def main():
             if os.path.exists(rp):
                 print(f"\n=== full MLA path with the real layer-{lid} rotation")
                 st = torch.load(rp, map_location=dev)
-                R = (st["rotation"] if isinstance(st, dict) and "rotation" in st
-                     else next(iter(st["layers"].values()))["rotation"]).float()
+                # GLM-5.2 stores one bare [D, D] tensor per layer file; other
+                # models wrap it in {"layers": {id: {"rotation": ...}}}
+                if isinstance(st, torch.Tensor):
+                    R = st.float()
+                elif "rotation" in st:
+                    R = st["rotation"].float()
+                else:
+                    R = next(iter(st["layers"].values()))["rotation"].float()
                 for lloyd in (False, True):
                     rot = c @ R
                     ref = _fake_quant_int2_groupwise(rot, G, lloyd) @ R.T

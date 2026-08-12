@@ -42,12 +42,19 @@ from sglang.srt.mem_cache.mla_int2_kv_pool import (
 
 @triton.jit
 def _round_half_even(x):
-    """torch.round semantics (ties to even) without depending on libdevice,
-    whose symbol path moves between Triton versions."""
-    r = tl.floor(x + 0.5)
-    is_tie = (r - x) == 0.5
-    is_odd = (r - 2.0 * tl.floor(r * 0.5)) == 1.0
-    return tl.where(is_tie & is_odd, r - 1.0, r)
+    """torch.round semantics (ties to even), exactly.
+
+    NOT ``floor(x + 0.5)``: for x just below a .5 boundary the fp32 addition
+    itself rounds up to the boundary and floor then jumps a whole step. That
+    produced off-by-one codes on 1.34 % of real GLM-5.2 c_kv groups -- an error
+    of one full quantization step, not an epsilon. ``x - floor(x)`` is exact for
+    the [0, 3] range used here, so comparing the fraction is safe.
+    """
+    f = tl.floor(x)
+    frac = x - f
+    is_odd = (f - 2.0 * tl.floor(f * 0.5)) == 1.0
+    up = (frac > 0.5) | ((frac == 0.5) & is_odd)   # tie -> round to even
+    return f + tl.where(up, 1.0, 0.0)
 
 
 @triton.jit
