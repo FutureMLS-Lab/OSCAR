@@ -77,7 +77,7 @@ def _quant_pack_kernel(
         d = x - mean
         std = tl.sqrt(tl.sum(d * d, axis=0) / group_size + 1e-8)
         scale = LM_SPAN3 * LM_RATIO * std
-        zero = -LM_C0 / LM_SPAN3 - mean / scale
+        zero = -LM_C0 / LM_SPAN3 - tl.fdiv(mean, scale, ieee_rounding=True)
     else:
         x_min = tl.min(x, axis=0)
         rng = tl.max(x, axis=0) - x_min
@@ -96,12 +96,16 @@ def _quant_pack_kernel(
     for j in tl.static_range(4):
         xj = tl.load(x_ptr + base + 4 * ob + j).to(tl.float32)
         if LLOYD:
-            zj = (xj - mean) / std
+            zj = tl.fdiv(xj - mean, std, ieee_rounding=True)
             qj = ((zj >= T0).to(tl.float32)
                   + (zj >= T1).to(tl.float32)
                   + (zj >= T2).to(tl.float32))
         else:
-            qj = _round_half_even((xj - zero) / scale)
+            # IEEE round-to-nearest division: Triton's default fast division
+            # differs from torch by 1 ULP, which flips the rounding whenever the
+            # quotient sits exactly on a .5 boundary. That was 402 codes (0.010 %)
+            # off by a full step on real GLM-5.2 c_kv.
+            qj = _round_half_even(tl.fdiv(xj - zero, scale, ieee_rounding=True))
             qj = tl.minimum(tl.maximum(qj, 0.0), 3.0)
         packed |= qj.to(tl.int32) << (2 * j)
 
