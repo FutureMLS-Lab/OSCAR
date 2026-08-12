@@ -228,6 +228,7 @@ class Envs:
     SGLANG_OSCAR_MLA_KV_DUMP_DIR = EnvStr("")
     SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
     SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
+    SGLANG_OSCAR_MLA_KV_REAL_KERNEL = EnvBool(False)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in

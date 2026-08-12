@@ -171,6 +171,22 @@ def _fake_quant_int2_groupwise(
     return x_deq.reshape(orig_shape)
 
 
+def _real_kernel_enabled() -> bool:
+    """Use the packed-INT2 Triton kernels instead of the torch fake-quant.
+
+    The arithmetic is the same (verified to relL2 ~4e-06 on real GLM-5.2 c_kv
+    through the rotate->quantize->unrotate path), so accuracy should be
+    unchanged; this exercises the kernel in the real serving path. It does not
+    yet save memory -- the codes are unpacked straight back into the BF16 pool,
+    because the MLA attention path has no INT2 read support.
+    """
+    try:
+        from sglang.srt import environ as envs
+        return bool(envs.SGLANG_OSCAR_MLA_KV_REAL_KERNEL.get())
+    except Exception:
+        return False
+
+
 def _quant_requested() -> bool:
     try:
         from sglang.srt import environ as envs
@@ -260,7 +276,18 @@ class _Int2HPMixin:
         Rf = self.rotations_f32.get(layer_id) if self.rotations_f32 else None
         if Rf is not None:
             c_kv = torch.matmul(c_kv.to(torch.float32), Rf)
-        c_kv_q = _fake_quant_int2_groupwise(c_kv, self._group_size, self._lloyd_max)
+        if _real_kernel_enabled() and c_kv.is_cuda and (
+            c_kv.shape[-1] % self._group_size == 0
+        ):
+            from sglang.QuantKernel.mla_latent_int2 import dequantize, quantize_pack
+
+            codes, params = quantize_pack(c_kv, self._group_size, self._lloyd_max)
+            c_kv_q = dequantize(
+                codes, params, c_kv.shape, self._group_size,
+                torch.float32, self._lloyd_max,
+            )
+        else:
+            c_kv_q = _fake_quant_int2_groupwise(c_kv, self._group_size, self._lloyd_max)
         c_kv_q = c_kv_q.to(torch.float32) if c_hp is not None else c_kv_q.to(self.dtype)
         if Rf is not None:
             c_kv_q = torch.matmul(c_kv_q.to(torch.float32), Rf.T)
