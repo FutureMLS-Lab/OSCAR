@@ -82,9 +82,9 @@ def _quant_pack_kernel(
     offs = tl.arange(0, group_size)
     x = tl.load(x_ptr + base + offs).to(tl.float32)
     if LLOYD:
-        mean = tl.fdiv(tl.sum(x, axis=0), group_size, ieee_rounding=True)
+        mean = tl.fdiv(tl.sum(x, axis=0), float(group_size), ieee_rounding=True)
         d = x - mean
-        std = tl.sqrt(tl.fdiv(tl.sum(d * d, axis=0), group_size, ieee_rounding=True) + 1e-8)
+        std = tl.sqrt(tl.fdiv(tl.sum(d * d, axis=0), float(group_size), ieee_rounding=True) + 1e-8)
         scale = LM_SPAN3 * LM_RATIO * std
         zero = -LM_C0 / LM_SPAN3 - tl.fdiv(mean, scale, ieee_rounding=True)
     else:
