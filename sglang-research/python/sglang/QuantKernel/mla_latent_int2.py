@@ -19,6 +19,15 @@ Both quantizer modes of ``_fake_quant_int2_groupwise`` are reproduced exactly:
            -> (scale, zero) = (uniform_scale, uniform_zero),
               x_deq = (q - zero) * scale
 
+Known, measured limit: ~0.010 % of codes can differ from the torch reference by
+one step when quantizing *raw* (unrotated, BF16-coarse) c_kv. Those are values
+whose quotient lands within half a ULP of a .5 rounding boundary -- e.g. a true
+quotient of 1.49999997 is exactly 1.5 once rounded to fp32, so torch rounds it
+to 2 while a quotient computed 1 ULP lower rounds to 1. Both are defensible;
+matching torch exactly would require replicating its instruction sequence. On
+the path that actually runs (rotate -> quantize -> unrotate) the effect is
+relL2 ~3.6e-07, seven orders below the quantization error itself.
+
 Dequant mirrors whichever form the reference uses -- ``q * scale + min`` for
 uniform, ``(q - zero) * scale`` for Lloyd-Max -- because the algebraically equal
 alternative rounds differently in fp32 and costs bit-exactness.
