@@ -19,8 +19,9 @@ Both quantizer modes of ``_fake_quant_int2_groupwise`` are reproduced exactly:
            -> (scale, zero) = (uniform_scale, uniform_zero),
               x_deq = (q - zero) * scale
 
-To keep one dequant kernel for both, the uniform mode stores ``zero`` already
-negated (``-min/scale``) so that ``(q - zero) * scale == q * scale + min``.
+Dequant mirrors whichever form the reference uses -- ``q * scale + min`` for
+uniform, ``(q - zero) * scale`` for Lloyd-Max -- because the algebraically equal
+alternative rounds differently in fp32 and costs bit-exactness.
 """
 
 from __future__ import annotations
@@ -74,8 +75,10 @@ def _quant_pack_kernel(
         x_min = tl.min(x, axis=0)
         rng = tl.max(x, axis=0) - x_min
         scale = tl.where(tl.abs(rng) > 1e-8, rng / 3.0, 1.0)
-        # stored pre-negated so dequant is (q - zero) * scale in both modes
-        zero = -x_min / scale
+        # store x_min itself: dequant then mirrors the reference's
+        # ``q * scale + x_min`` exactly instead of an algebraically equal but
+        # differently-rounded ``(q - zero) * scale``
+        zero = x_min
         mean = 0.0
         std = 1.0
 
@@ -91,7 +94,7 @@ def _quant_pack_kernel(
                   + (zj >= T1).to(tl.float32)
                   + (zj >= T2).to(tl.float32))
         else:
-            qj = _round_half_even(xj / scale + zero)
+            qj = _round_half_even((xj - zero) / scale)
             qj = tl.minimum(tl.maximum(qj, 0.0), 3.0)
         packed |= qj.to(tl.int32) << (2 * j)
 
@@ -103,7 +106,7 @@ def _quant_pack_kernel(
 @triton.jit
 def _dequant_kernel(
     codes_ptr, params_ptr, out_ptr,
-    n_groups, group_size: tl.constexpr,
+    n_groups, group_size: tl.constexpr, LLOYD: tl.constexpr,
 ):
     gid = tl.program_id(0)
     if gid >= n_groups:
@@ -113,7 +116,11 @@ def _dequant_kernel(
     q = ((byte >> (2 * (offs % 4))) & 0x3).to(tl.float32)
     scale = tl.load(params_ptr + gid * 2 + 0)
     zero = tl.load(params_ptr + gid * 2 + 1)
-    tl.store(out_ptr + gid * group_size + offs, (q - zero) * scale)
+    if LLOYD:
+        val = (q - zero) * scale        # reference: (q - uniform_zero) * uniform_scale
+    else:
+        val = q * scale + zero          # reference: q * scale + x_min
+    tl.store(out_ptr + gid * group_size + offs, val)
 
 
 def quantize_pack(x: torch.Tensor, group_size: int = 128, lloyd_max: bool = False):
@@ -133,10 +140,10 @@ def quantize_pack(x: torch.Tensor, group_size: int = 128, lloyd_max: bool = Fals
 
 
 def dequantize(codes: torch.Tensor, params: torch.Tensor, shape, group_size: int = 128,
-               dtype: torch.dtype = torch.float32) -> torch.Tensor:
+               dtype: torch.dtype = torch.float32, lloyd_max: bool = False) -> torch.Tensor:
     n = codes.shape[0]
     out = torch.empty((n, group_size), dtype=torch.float32, device=codes.device)
-    _dequant_kernel[(n,)](codes, params, out, n, group_size=group_size)
+    _dequant_kernel[(n,)](codes, params, out, n, group_size=group_size, LLOYD=lloyd_max)
     return out.reshape(shape).to(dtype)
 
 
