@@ -73,15 +73,17 @@ def _quant_pack_kernel(
     offs = tl.arange(0, group_size)
     x = tl.load(x_ptr + base + offs).to(tl.float32)
     if LLOYD:
-        mean = tl.sum(x, axis=0) / group_size
+        mean = tl.fdiv(tl.sum(x, axis=0), group_size, ieee_rounding=True)
         d = x - mean
-        std = tl.sqrt(tl.sum(d * d, axis=0) / group_size + 1e-8)
+        std = tl.sqrt(tl.fdiv(tl.sum(d * d, axis=0), group_size, ieee_rounding=True) + 1e-8)
         scale = LM_SPAN3 * LM_RATIO * std
         zero = -LM_C0 / LM_SPAN3 - tl.fdiv(mean, scale, ieee_rounding=True)
     else:
         x_min = tl.min(x, axis=0)
         rng = tl.max(x, axis=0) - x_min
-        scale = tl.where(tl.abs(rng) > 1e-8, rng / 3.0, 1.0)
+        # true division, not multiply-by-reciprocal: a 1-ULP difference in
+        # scale shifts every quotient downstream
+        scale = tl.where(tl.abs(rng) > 1e-8, tl.fdiv(rng, 3.0, ieee_rounding=True), 1.0)
         # store x_min itself: dequant then mirrors the reference's
         # ``q * scale + x_min`` exactly instead of an algebraically equal but
         # differently-rounded ``(q - zero) * scale``
