@@ -172,3 +172,94 @@ def dequantize(codes: torch.Tensor, params: torch.Tensor, shape, group_size: int
 def bytes_per_value(group_size: int = 128) -> float:
     """Storage cost: 2 bits of codes + two fp32 group params, amortized."""
     return (group_size / 4 + 8) / group_size
+
+
+# ── fused, block-tiled variant ───────────────────────────────────────────────
+# The kernels above use one program per 128-value group. That is 512 bytes of
+# work per program, so at any realistic token count the run time is pure launch
+# and scheduling overhead -- measured 0.033 ms whether you hand it 1 token or
+# 4096. This variant gives each program GROUPS_PER_BLOCK groups and folds the
+# dequant into the same launch, which is what the current wiring needs anyway
+# (the codes are unpacked straight back).
+
+
+@triton.jit
+def _fused_quant_dequant_kernel(
+    x_ptr, codes_ptr, params_ptr, out_ptr,
+    n_groups,
+    GS: tl.constexpr, GPB: tl.constexpr, LLOYD: tl.constexpr,
+    T0: tl.constexpr, T1: tl.constexpr, T2: tl.constexpr,
+    LM_SPAN3: tl.constexpr, LM_RATIO: tl.constexpr, LM_C0: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * GPB + tl.arange(0, GPB)
+    rmask = rows < n_groups
+    cols = tl.arange(0, GS)
+    idx = rows[:, None] * GS + cols[None, :]
+    x = tl.load(x_ptr + idx, mask=rmask[:, None], other=0.0).to(tl.float32)
+
+    if LLOYD:
+        mean = tl.fdiv(tl.sum(x, axis=1), float(GS), ieee_rounding=True)
+        d = x - mean[:, None]
+        std = tl.sqrt(
+            tl.fdiv(tl.sum(d * d, axis=1), float(GS), ieee_rounding=True) + 1e-8
+        )
+        z = tl.fdiv(d, std[:, None], ieee_rounding=True)
+        q = ((z >= T0).to(tl.float32)
+             + (z >= T1).to(tl.float32)
+             + (z >= T2).to(tl.float32))
+        scale = LM_SPAN3 * LM_RATIO * std
+        zero = -LM_C0 / LM_SPAN3 - tl.fdiv(mean, scale, ieee_rounding=True)
+        deq = (q - zero[:, None]) * scale[:, None]
+    else:
+        big = tl.full(x.shape, float("inf"), tl.float32)
+        x_min = tl.min(tl.where(rmask[:, None], x, big), axis=1)
+        x_max = tl.max(tl.where(rmask[:, None], x, -big), axis=1)
+        rng = x_max - x_min
+        scale = tl.where(
+            tl.abs(rng) > 1e-8, tl.fdiv(rng, 3.0, ieee_rounding=True), 1.0
+        )
+        zero = x_min
+        q = _round_half_even(
+            tl.fdiv(x - zero[:, None], scale[:, None], ieee_rounding=True)
+        )
+        q = tl.minimum(tl.maximum(q, 0.0), 3.0)
+        deq = q * scale[:, None] + zero[:, None]
+
+    tl.store(out_ptr + idx, deq, mask=rmask[:, None])
+    tl.store(params_ptr + rows * 2 + 0, scale, mask=rmask)
+    tl.store(params_ptr + rows * 2 + 1, zero, mask=rmask)
+
+    # pack four interleaved lanes into one byte
+    nb: tl.constexpr = GS // 4
+    q4 = tl.reshape(q, (GPB, nb, 4))
+    packed = (q4[:, :, 0].to(tl.int32)
+              | (q4[:, :, 1].to(tl.int32) << 2)
+              | (q4[:, :, 2].to(tl.int32) << 4)
+              | (q4[:, :, 3].to(tl.int32) << 6))
+    ob = tl.arange(0, nb)
+    tl.store(codes_ptr + rows[:, None] * nb + ob[None, :],
+             packed.to(tl.uint8), mask=rmask[:, None])
+
+
+def quantize_dequantize_fused(x, group_size: int = 128, lloyd_max: bool = False,
+                              groups_per_block: int = 16):
+    """One launch: quantize, pack, and write the dequantized values back.
+
+    Returns (codes, params, dequantized) so a caller that still needs BF16 in the
+    pool pays a single kernel instead of two plus a round trip through memory.
+    """
+    assert x.shape[-1] % group_size == 0 and group_size % 4 == 0
+    flat = x.reshape(-1, group_size).contiguous().to(torch.float32)
+    n = flat.shape[0]
+    codes = torch.empty((n, group_size // 4), dtype=torch.uint8, device=x.device)
+    params = torch.empty((n, 2), dtype=torch.float32, device=x.device)
+    out = torch.empty_like(flat)
+    grid = (triton.cdiv(n, groups_per_block),)
+    _fused_quant_dequant_kernel[grid](
+        flat, codes, params, out, n,
+        GS=group_size, GPB=groups_per_block, LLOYD=lloyd_max,
+        T0=_LM_THRESHOLDS[0], T1=_LM_THRESHOLDS[1], T2=_LM_THRESHOLDS[2],
+        LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=_LM_RATIO, LM_C0=_LM_CENTROIDS[0],
+    )
+    return codes, params, out.reshape(x.shape)
