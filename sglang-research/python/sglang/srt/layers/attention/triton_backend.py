@@ -800,6 +800,10 @@ class TritonAttnBackend(AttentionBackend):
         mixed_attn_lse = None
         mixed_swa_attn_logits = None
         mixed_swa_attn_lse = None
+        mixed_swa_hp_kv_indptr = None
+        mixed_swa_hp_kv_indices = None
+        mixed_swa_quant_kv_indptr = None
+        mixed_swa_quant_kv_indices = None
         mixed_hp_num_kv_splits = None
         mixed_quant_num_kv_splits = None
         mixed_swa_hp_kv_indptr = None
@@ -1132,12 +1136,12 @@ class TritonAttnBackend(AttentionBackend):
             mixed_attn_lse=mixed_attn_lse,
             mixed_swa_attn_logits=mixed_swa_attn_logits,
             mixed_swa_attn_lse=mixed_swa_attn_lse,
-            mixed_hp_num_kv_splits=mixed_hp_num_kv_splits,
-            mixed_quant_num_kv_splits=mixed_quant_num_kv_splits,
             mixed_swa_hp_kv_indptr=mixed_swa_hp_kv_indptr,
             mixed_swa_hp_kv_indices=mixed_swa_hp_kv_indices,
             mixed_swa_quant_kv_indptr=mixed_swa_quant_kv_indptr,
             mixed_swa_quant_kv_indices=mixed_swa_quant_kv_indices,
+            mixed_hp_num_kv_splits=mixed_hp_num_kv_splits,
+            mixed_quant_num_kv_splits=mixed_quant_num_kv_splits,
         )
 
     def init_cuda_graph_state(
@@ -1206,6 +1210,30 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                # Sliding layers need their own windowed HP/quant indices. Without
+                # them the decode path falls back to the full-context indices and
+                # reads KV from outside the window -- which shows up as digit soup
+                # at small cuda-graph bs and an illegal access at larger bs.
+                self.cuda_graph_mixed_swa_hp_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_mixed_swa_quant_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_mixed_swa_hp_kv_indices = torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.int64, device=self.device,
+                )
+                self.cuda_graph_mixed_swa_quant_kv_indices = torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.int64, device=self.device,
+                )
+            else:
+                self.cuda_graph_mixed_swa_hp_kv_indptr = None
+                self.cuda_graph_mixed_swa_quant_kv_indptr = None
+                self.cuda_graph_mixed_swa_hp_kv_indices = None
+                self.cuda_graph_mixed_swa_quant_kv_indices = None
             total_splits = self.max_kv_splits + self.max_hp_kv_splits
             # Single combined stage-1 scratch. LSE pre-filled to -inf so the
             # tier-agnostic stage-2 skips unused splits.
@@ -1281,6 +1309,10 @@ class TritonAttnBackend(AttentionBackend):
         mixed_attn_lse = None
         mixed_swa_attn_logits = None
         mixed_swa_attn_lse = None
+        mixed_swa_hp_kv_indptr = None
+        mixed_swa_hp_kv_indices = None
+        mixed_swa_quant_kv_indptr = None
+        mixed_swa_quant_kv_indices = None
         mixed_hp_num_kv_splits = None
         mixed_quant_num_kv_splits = None
 
@@ -1322,6 +1354,14 @@ class TritonAttnBackend(AttentionBackend):
                     mixed_hp_kv_indices = self.cuda_graph_mixed_hp_kv_indices
                     mixed_quant_kv_indptr = self.cuda_graph_mixed_quant_kv_indptr
                     mixed_quant_kv_indices = self.cuda_graph_mixed_quant_kv_indices
+                    mixed_swa_hp_kv_indptr = self.cuda_graph_mixed_swa_hp_kv_indptr
+                    mixed_swa_hp_kv_indices = self.cuda_graph_mixed_swa_hp_kv_indices
+                    mixed_swa_quant_kv_indptr = (
+                        self.cuda_graph_mixed_swa_quant_kv_indptr
+                    )
+                    mixed_swa_quant_kv_indices = (
+                        self.cuda_graph_mixed_swa_quant_kv_indices
+                    )
                     mixed_attn_logits = self.cuda_graph_mixed_attn_logits
                     mixed_attn_lse = self.cuda_graph_mixed_attn_lse
                     mixed_hp_num_kv_splits = self.cuda_graph_mixed_hp_num_kv_splits
@@ -1455,6 +1495,10 @@ class TritonAttnBackend(AttentionBackend):
             mixed_attn_lse=mixed_attn_lse,
             mixed_swa_attn_logits=mixed_swa_attn_logits,
             mixed_swa_attn_lse=mixed_swa_attn_lse,
+            mixed_swa_hp_kv_indptr=mixed_swa_hp_kv_indptr,
+            mixed_swa_hp_kv_indices=mixed_swa_hp_kv_indices,
+            mixed_swa_quant_kv_indptr=mixed_swa_quant_kv_indptr,
+            mixed_swa_quant_kv_indices=mixed_swa_quant_kv_indices,
             mixed_hp_num_kv_splits=mixed_hp_num_kv_splits,
             mixed_quant_num_kv_splits=mixed_quant_num_kv_splits,
         )
@@ -1523,6 +1567,25 @@ class TritonAttnBackend(AttentionBackend):
                         self.cuda_graph_mixed_quant_kv_indices,
                         bs,
                     )
+                    if self.cuda_graph_mixed_swa_quant_kv_indptr is not None:
+                        # Same windowed indices the non-graph path builds; the
+                        # decode path only takes the sliding branch when these
+                        # are non-None, so skipping them silently served
+                        # out-of-window KV on every sliding layer.
+                        window_tokens = self.sliding_window_size + 1
+                        swa_start_pos = torch.clamp(
+                            seq_lens[:bs].to(torch.int32) - window_tokens, min=0
+                        )
+                        self._build_mixed_kv_indices(
+                            req_pool_indices,
+                            seq_lens,
+                            self.cuda_graph_mixed_swa_hp_kv_indptr,
+                            self.cuda_graph_mixed_swa_hp_kv_indices,
+                            self.cuda_graph_mixed_swa_quant_kv_indptr,
+                            self.cuda_graph_mixed_swa_quant_kv_indices,
+                            bs,
+                            start_pos=swa_start_pos,
+                        )
                     mixed_hp_num_kv_splits[:bs] = self.max_hp_kv_splits
                     # The unified attention wrapper fills LSE with -inf every
                     # call, so the shared scratch is always in a known state
