@@ -1701,6 +1701,14 @@ class _OscarRotationProxy:
             )
         return self._inner[self._map[global_id]]
 
+    # Some call sites treat the rotation as a tensor (dtype, device, shape) even
+    # though they only index it per layer; forward those to the inner tensor.
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __len__(self):
+        return len(self._map)
+
 
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
@@ -1808,34 +1816,12 @@ class HybridLinearKVPool(KVCache):
         self.v_quant_group_size = getattr(
             self.full_kv_pool, "v_quant_group_size", None
         )
-        self._R_k = None
-        self._R_v = None
-        if getattr(self.full_kv_pool, "_R_k", None) is not None:
-            rotation_span = max(full_attention_layer_ids) - self.start_layer + 1
-            self._R_k = torch.stack(
-                [
-                    torch.eye(
-                        self.head_dim,
-                        dtype=self.full_kv_pool._R_k.dtype,
-                        device=self.device,
-                    )
-                    for _ in range(rotation_span)
-                ]
-            )
-            self._R_v = torch.stack(
-                [
-                    torch.eye(
-                        self.v_head_dim,
-                        dtype=self.full_kv_pool._R_v.dtype,
-                        device=self.device,
-                    )
-                    for _ in range(rotation_span)
-                ]
-            )
-            for global_id, local_id in self.full_attention_layer_id_mapping.items():
-                idx = global_id - self.start_layer
-                self._R_k[idx].copy_(self.full_kv_pool._R_k[local_id])
-                self._R_v[idx].copy_(self.full_kv_pool._R_v[local_id])
+        # Kimi materialised a dense [span, hd, hd] identity stack here and copied
+        # the inner pool's rotations into the sparse slots. This branch keeps the
+        # _R_k/_R_v properties below instead: they proxy the inner pool and
+        # translate the global layer id lazily, which also works for per-head
+        # (3-D) rotations and heterogeneous head dims that an identity stack
+        # built from a single self.head_dim cannot represent.
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
         else:
