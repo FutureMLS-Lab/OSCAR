@@ -173,6 +173,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=getattr(layer, "gate_lower_bound", None),
         )
 
     def forward_extend(

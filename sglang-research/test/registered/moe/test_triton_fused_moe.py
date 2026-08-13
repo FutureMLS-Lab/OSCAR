@@ -190,6 +190,74 @@ class TestFusedMOE(CustomTestCase):
                                         torch.cuda.empty_cache()
                                     pbar.update(1)
 
+    def test_situ_with_checkpoint_parameters(self):
+        m, n, k, e, topk = 4, 128, 128, 8, 2
+        dtype = torch.bfloat16
+        a = self.create_random_cuda_tensor((m, k), dtype, std=0.1)
+        gate_up = self.create_random_cuda_tensor((e, 2 * n, k), dtype, std=0.1)
+        w2 = self.create_random_cuda_tensor((e, k, n), dtype, std=0.1)
+        score = self.create_random_cuda_tensor((m, e), dtype)
+
+        # triton_kernels applies its fused activation to adjacent output pairs.
+        # Kimi's separate w1/w3 checkpoint rows are interleaved before swizzle.
+        gate_up_interleaved = (
+            gate_up.view(e, 2, n, k)
+            .transpose(1, 2)
+            .reshape(e, 2 * n, k)
+            .contiguous()
+        )
+        w1_tri = gate_up_interleaved.transpose(-2, -1).contiguous()
+        w2_tri = w2.transpose(-2, -1).contiguous()
+
+        topk_op = TopK(top_k=topk, renormalize=False, use_grouped_topk=False)
+        topk_op.topk_config.output_format = TopKOutputFormat.TRITON_KERNEL
+        triton_topk_output = topk_op.forward_cuda(
+            hidden_states=a,
+            router_logits=score,
+        )
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=a,
+            hidden_states_scale=None,
+            topk_output=triton_topk_output,
+        )
+        quant_info = TritonKernelsQuantInfo(
+            w13_weight=w1_tri,
+            w2_weight=w2_tri,
+            w13_bias=torch.zeros(e, 2 * n, device="cuda", dtype=torch.float32),
+            w2_bias=torch.zeros(e, k, device="cuda", dtype=torch.float32),
+        )
+        config = MoeRunnerConfig(
+            inplace=False,
+            activation="situ",
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+        )
+        actual = MoeRunner(MoeRunnerBackend.TRITON_KERNELS, config).run(
+            dispatch_output, quant_info
+        ).hidden_states
+
+        scores = torch.softmax(score.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(scores, topk)
+        expected = torch.zeros_like(actual)
+        for token_id in range(m):
+            for route_id in range(topk):
+                expert_id = topk_ids[token_id, route_id]
+                gate = a[token_id].float() @ gate_up[expert_id, :n].float().T
+                up = a[token_id].float() @ gate_up[expert_id, n:].float().T
+                activated = (
+                    4.0
+                    * torch.tanh(gate / 4.0)
+                    * torch.sigmoid(gate)
+                    * 25.0
+                    * torch.tanh(up / 25.0)
+                )
+                expert_output = activated @ w2[expert_id].float().T
+                expected[token_id] += (
+                    expert_output * topk_weights[token_id, route_id]
+                ).to(dtype)
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
 
 if __name__ == "__main__":
     unittest.main()

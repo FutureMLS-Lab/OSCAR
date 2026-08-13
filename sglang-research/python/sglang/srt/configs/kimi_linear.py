@@ -159,3 +159,22 @@ class KimiLinearConfig(PretrainedConfig):
         )
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+def as_kimi_linear_config(config: PretrainedConfig) -> KimiLinearConfig:
+    """Normalize a remote/nested Kimi text config once.
+
+    Kimi-K3 stores the KDA channel size in ``linear_attn_config`` and may omit
+    the legacy top-level ``head_dim`` field.
+    """
+    if isinstance(config, KimiLinearConfig):
+        return config
+    if getattr(config, "model_type", None) != "kimi_linear":
+        raise TypeError(
+            f"Expected a kimi_linear text config, got {type(config).__name__}"
+        )
+    values = config.to_dict()
+    linear_attn_config = values.get("linear_attn_config")
+    if values.get("head_dim") is None and isinstance(linear_attn_config, dict):
+        values["head_dim"] = linear_attn_config.get("head_dim")
+    return KimiLinearConfig(**values)

@@ -958,12 +958,21 @@ def kda_gate_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    SAFE_GATE: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
+    A_PER_DIM: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
 
-    b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
+    n_d = tl.arange(0, BD)
+    dim_mask = n_d < D
+    if A_PER_DIM:
+        b_a = tl.exp(
+            tl.load(A + n_d, mask=dim_mask, other=0.0).to(tl.float32)
+        )
+    else:
+        b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
 
     stride_row = H * D
     stride_col = 1
@@ -989,20 +998,23 @@ def kda_gate_fwd_kernel(
     b_g = tl.load(g_ptr, boundary_check=(0, 1)).to(tl.float32)
 
     if HAS_BIAS:
-        n_d = tl.arange(0, BD)
-        bias_mask = n_d < D
-        b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(
+        b_bias = tl.load(g_bias + i_h * D + n_d, mask=dim_mask, other=0.0).to(
             tl.float32
         )
         b_g = b_g + b_bias[None, :]
 
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if SAFE_GATE:
+        b_y = LOWER_BOUND * tl.sigmoid(b_a * b_g)
+    else:
+        # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
+        g_scaled = b_g * beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(
+            use_linear,
+            b_g,
+            (1.0 / beta) * log(1.0 + tl.exp(g_scaled)),
+        )
+        b_y = -b_a * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1014,22 +1026,35 @@ def fused_kda_gate(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """
     Forward pass for KDA gate:
       input g: [..., H*D]
-      param A: [H] or [1, 1, H, 1]
+      param A: one value per head ([H]) or key channel ([D])
       beta: softplus beta parameter
       threshold: softplus threshold parameter
+      lower_bound: optional safe-gate lower bound in [-5, 0)
       return  : [..., H, D]
     """
+    if lower_bound is not None and not (-5.0 <= lower_bound < 0.0):
+        raise ValueError(
+            f"KDA lower_bound must be in [-5, 0), got {lower_bound}"
+        )
     orig_shape = g.shape[:-1]
 
     g = g.view(-1, g.shape[-1])
     T = g.shape[0]
     HD = g.shape[1]
-    H = A.numel()
-    assert H * head_k_dim == HD
+    if HD % head_k_dim != 0:
+        raise ValueError(f"g width {HD} is not divisible by head_k_dim {head_k_dim}")
+    H = HD // head_k_dim
+    if A.numel() not in (H, head_k_dim):
+        raise ValueError(
+            f"A must contain one value per head ({H}) or key channel "
+            f"({head_k_dim}), got {A.numel()}"
+        )
+    a_per_dim = A.numel() == head_k_dim
 
     y = torch.empty_like(g, dtype=torch.float32)
 
@@ -1048,6 +1073,9 @@ def fused_kda_gate(
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        SAFE_GATE=lower_bound is not None,
+        LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
+        A_PER_DIM=a_per_dim,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)

@@ -635,6 +635,7 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
+                    v_head_dim=self.model_config.v_head_dim,
                     full_attention_layer_ids=full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
@@ -643,6 +644,15 @@ class ModelRunnerKVCacheMixin:
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool=hybrid_full_kv_pool,
+                    model_dtype=self.dtype,
+                    kv_cache_quant_group_size=(
+                        self.server_args.kv_cache_quant_group_size
+                    ),
+                    scale_dtype=(
+                        resolve_scale_dtype(envs.SGLANG_MIXED_KV_SCALE_DTYPE.get())
+                        if self.kv_cache_dtype == "int2"
+                        else None
+                    ),
                     **extra_args,
                 )
             else:

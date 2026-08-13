@@ -215,8 +215,12 @@ class DeepseekMHAForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        use_expanded_cache = getattr(self, "use_expanded_mha_cache", False)
+        if not use_expanded_cache:
+            self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
+            not use_expanded_cache
+            and
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
@@ -262,6 +266,12 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
 
             k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        if use_expanded_cache:
+            qkv_capture = getattr(self, "expanded_qkv_capture", None)
+            if qkv_capture is not None:
+                qkv_capture(q, k, v, forward_batch)
+            output_gate = self.g_proj(hidden_states)[0].sigmoid()
+            return q, k, v, forward_batch, output_gate
         return q, k, v, forward_batch
 
     def forward_normal_core(
@@ -270,9 +280,18 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_gate: torch.Tensor = None,
     ) -> torch.Tensor:
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=getattr(self, "use_expanded_mha_cache", False),
+        )
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if output_gate is not None:
+            attn_output = attn_output * output_gate
         output, _ = self.o_proj(attn_output)
         return output
 

@@ -700,6 +700,9 @@ class ServerArgs:
     # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
+    # Explicit calibration-only Q/K/V capture for OSCAR rotations.
+    oscar_qkv_dump_path: Optional[str] = None
+    oscar_qkv_dump_tokens: int = 0
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -1955,7 +1958,11 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM", "BailingMoeV2_5ForCausalLM"]:
+        elif model_arch in [
+            "KimiLinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
+            "BailingMoeV2_5ForCausalLM",
+        ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
@@ -6114,6 +6121,18 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+        parser.add_argument(
+            "--oscar-qkv-dump-path",
+            type=str,
+            default=ServerArgs.oscar_qkv_dump_path,
+            help="Calibration-only directory for expanded-attention Q/K/V tensors.",
+        )
+        parser.add_argument(
+            "--oscar-qkv-dump-tokens",
+            type=int,
+            default=ServerArgs.oscar_qkv_dump_tokens,
+            help="Maximum Q/K/V tokens captured per attention layer.",
         )
 
         # PD disaggregation

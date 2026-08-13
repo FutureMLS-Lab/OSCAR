@@ -48,6 +48,8 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    activation_situ_beta: float = 1.0
+    activation_situ_linear_beta: Optional[float] = None
 
 
 @dataclass

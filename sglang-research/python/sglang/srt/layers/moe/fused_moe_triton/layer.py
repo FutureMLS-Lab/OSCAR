@@ -179,6 +179,8 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        activation_situ_beta: float = 1.0,
+        activation_situ_linear_beta: Optional[float] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -262,6 +264,8 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
+            activation_situ_beta=activation_situ_beta,
+            activation_situ_linear_beta=activation_situ_linear_beta,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
         )
@@ -584,19 +588,59 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # if expert_id is None, then
         # all the experts are loaded at the same time
-        if (
-            not expert_id
-            and self.quant_config is not None
+        is_static_mxfp4 = (
+            self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
-        ):
-            if "bias" in weight_name:
-                dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+        )
+        if is_static_mxfp4:
+            if expert_id is None:
+                if "bias" in weight_name:
+                    dim1 = loaded_weight.shape[1]
+                    param.data[:, :dim1].copy_(loaded_weight)
+                elif "scale" in weight_name:
+                    param.data[
+                        : loaded_weight.shape[0],
+                        : loaded_weight.shape[1],
+                        : loaded_weight.shape[2],
+                    ].copy_(loaded_weight)
+                else:
+                    dim1 = loaded_weight.shape[1]
+                    dim2 = loaded_weight.shape[2]
+                    param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                return
+
+            local_expert_id = expert_id
+            if not getattr(param, "_sglang_require_global_experts", False):
+                local_expert_id = self._map_global_expert_id_to_local_expert_id(
+                    expert_id
+                )
+                if local_expert_id == -1:
+                    return
+
+            expert_data = param.data[local_expert_id]
+            tp_rank = self.moe_tp_rank
+            if shard_id in ("w1", "w3"):
+                shard_size = expert_data.shape[0] // 2
+                loaded_shard = loaded_weight.narrow(
+                    0, tp_rank * shard_size, shard_size
+                )
+                target_start = 0 if shard_id == "w1" else shard_size
+                expert_data.narrow(0, target_start, shard_size).copy_(loaded_shard)
+            elif shard_id == "w2":
+                if "bias" in weight_name:
+                    expert_data.copy_(loaded_weight)
+                else:
+                    shard_size = expert_data.shape[-1]
+                    expert_data.copy_(
+                        loaded_weight.narrow(
+                            -1, tp_rank * shard_size, shard_size
+                        )
+                    )
             else:
-                dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                raise ValueError(
+                    f"shard_id must be ['w1','w2','w3'] but got {shard_id}."
+                )
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()

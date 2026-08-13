@@ -5,21 +5,41 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import (
     FlexCtx,
-    FnSpecs,
-    FusedActivation,
     PrecisionConfig,
     matmul_ogs,
 )
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
+
+from sglang.srt.layers.moe.triton_kernels_compat import (
+    IS_LEGACY,
+    GatherIndx,
+    RoutingData,
+    ScatterIndx,
+    make_fused_activation,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
+
+
+@triton.jit(repr=lambda _: "_situ")
+def _situ_fn(input, beta, linear_beta):
+    gate, up = tl.split(
+        tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2))
+    )
+    gate = gate.to(tl.float32)
+    up = up.to(tl.float32)
+    if linear_beta is not None:
+        up = linear_beta * (2.0 * tl.sigmoid(2.0 * up / linear_beta) - 1.0)
+    tanh_gate = 2.0 * tl.sigmoid(2.0 * gate / beta) - 1.0
+    return beta * tanh_gate * tl.sigmoid(gate) * up
 
 
 def quantize(w, dtype, dev, **opt):
@@ -60,6 +80,8 @@ def triton_kernel_moe_forward(
         scatter_idx,
         inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
+        activation_situ_beta=moe_runner_config.activation_situ_beta,
+        activation_situ_linear_beta=moe_runner_config.activation_situ_linear_beta,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
@@ -83,6 +105,8 @@ def triton_kernel_fused_experts(
     scatter_indx: ScatterIndx,
     inplace: bool = False,
     activation: str = "silu",
+    activation_situ_beta: float = 1.0,
+    activation_situ_linear_beta: Optional[float] = None,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
@@ -147,6 +171,22 @@ def triton_kernel_fused_experts(
         silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
     elif activation == "gelu":
         gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+    elif activation == "situ":
+        gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+        gate = gate.float()
+        up = up.float()
+        if activation_situ_linear_beta is not None:
+            up = activation_situ_linear_beta * torch.tanh(
+                up / activation_situ_linear_beta
+            )
+        intermediate_cache2.copy_(
+            (
+                activation_situ_beta
+                * torch.tanh(gate / activation_situ_beta)
+                * torch.sigmoid(gate)
+                * up
+            ).to(intermediate_cache2.dtype)
+        )
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -202,6 +242,8 @@ def triton_kernel_moe_with_bias_forward(
         scatter_indx=scatter_idx,
         inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
+        activation_situ_beta=moe_runner_config.activation_situ_beta,
+        activation_situ_linear_beta=moe_runner_config.activation_situ_linear_beta,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
@@ -230,6 +272,8 @@ def triton_kernel_fused_experts_with_bias(
     scatter_indx: ScatterIndx,
     inplace: bool = False,
     activation: str = "silu",
+    activation_situ_beta: float = 1.0,
+    activation_situ_linear_beta: Optional[float] = None,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
@@ -288,19 +332,33 @@ def triton_kernel_fused_experts_with_bias(
         w2, w2_flex = quantize(w2, "bf16", device, **optg)
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
-    act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
-        (gemm1_alpha, gemm1_clamp_limit),
-        2,
+    if activation == "situ":
+        act_name = "situ"
+        act_fn = _situ_fn
+        act_arg_names = ("beta", "linear_beta")
+        act_args = (activation_situ_beta, activation_situ_linear_beta)
+    elif activation == "silu":
+        act_name = "swiglu"
+        act_fn = swiglu_fn
+        act_arg_names = ("alpha", "limit")
+        act_args = (gemm1_alpha, gemm1_clamp_limit)
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+    act = make_fused_activation(
+        act_name, act_fn, act_arg_names, act_args, reduction_n=2
     )
 
+    leading_shape = () if IS_LEGACY else (1,)
     intermediate_cache = torch.empty(
-        (1, M * n_expts_act, N // 2),
+        (*leading_shape, M * n_expts_act, N // 2),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     output = torch.empty(
-        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+        (*leading_shape, M, K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
     )
 
     matmul_ogs(
@@ -315,14 +373,45 @@ def triton_kernel_fused_experts_with_bias(
         y=intermediate_cache,
     )
 
-    matmul_ogs(
-        intermediate_cache.view(M * n_expts_act, N // 2),
-        w2,
-        b2,
-        routing_data,
-        scatter_indx=scatter_indx,
-        precision_config=w2_pcg,
-        gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
-        y=output,
-    )
+    if IS_LEGACY:
+        expert_output = torch.empty(
+            (M * n_expts_act, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        matmul_ogs(
+            intermediate_cache.view(M * n_expts_act, N // 2),
+            w2,
+            b2,
+            routing_data,
+            precision_config=w2_pcg,
+            y=expert_output,
+        )
+        if not apply_router_weight_on_input:
+            expert_output.mul_(routing_data.gate_scal[:, None])
+        token_idx = scatter_indx.dst_indx // n_expts_act
+        output_fp32 = torch.zeros(
+            (M, K), device=hidden_states.device, dtype=torch.float32
+        )
+        for start in range(0, token_idx.numel(), 16384):
+            end = min(start + 16384, token_idx.numel())
+            chunk_token_idx = token_idx[start:end]
+            chunk_valid = chunk_token_idx >= 0
+            output_fp32.index_add_(
+                0,
+                chunk_token_idx[chunk_valid].long(),
+                expert_output[start:end][chunk_valid].float(),
+            )
+        output.copy_(output_fp32.to(hidden_states.dtype))
+    else:
+        matmul_ogs(
+            intermediate_cache.view(M * n_expts_act, N // 2),
+            w2,
+            b2,
+            routing_data,
+            scatter_indx=scatter_indx,
+            precision_config=w2_pcg,
+            gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+            y=output,
+        )
     return output.view(M, K)
