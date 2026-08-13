@@ -230,14 +230,26 @@ def _fused_quant_dequant_kernel(
     tl.store(params_ptr + rows * 2 + 0, scale, mask=rmask)
     tl.store(params_ptr + rows * 2 + 1, zero, mask=rmask)
 
-    # pack four interleaved lanes into one byte
+    # Pack four interleaved lanes into one byte. Triton cannot index the last
+    # axis of a reshaped 3-D tile, so re-read each lane strided instead; the
+    # data is in L2 by now and this kernel is launch-bound, not bandwidth-bound.
     nb: tl.constexpr = GS // 4
-    q4 = tl.reshape(q, (GPB, nb, 4))
-    packed = (q4[:, :, 0].to(tl.int32)
-              | (q4[:, :, 1].to(tl.int32) << 2)
-              | (q4[:, :, 2].to(tl.int32) << 4)
-              | (q4[:, :, 3].to(tl.int32) << 6))
     ob = tl.arange(0, nb)
+    packed = tl.zeros([GPB, nb], dtype=tl.int32)
+    for j in tl.static_range(4):
+        jdx = rows[:, None] * GS + (4 * ob[None, :] + j)
+        xj = tl.load(x_ptr + jdx, mask=rmask[:, None], other=0.0).to(tl.float32)
+        if LLOYD:
+            zj = tl.fdiv(xj - mean[:, None], std[:, None], ieee_rounding=True)
+            qj = ((zj >= T0).to(tl.float32)
+                  + (zj >= T1).to(tl.float32)
+                  + (zj >= T2).to(tl.float32))
+        else:
+            qj = _round_half_even(
+                tl.fdiv(xj - zero[:, None], scale[:, None], ieee_rounding=True)
+            )
+            qj = tl.minimum(tl.maximum(qj, 0.0), 3.0)
+        packed |= qj.to(tl.int32) << (2 * j)
     tl.store(codes_ptr + rows[:, None] * nb + ob[None, :],
              packed.to(tl.uint8), mask=rmask[:, None])
 
