@@ -280,12 +280,14 @@ class _Int2HPMixin:
             c_kv.shape[-1] % self._group_size == 0
         ):
             from sglang.QuantKernel.mla_latent_int2 import (
-                quantize_dequantize_fused,
+                quantize_dequantize_reuse,
             )
 
-            # one launch instead of two: 2.4x the torch fake-quant on the full
-            # write path, and bit-identical codes to the two-kernel version
-            _codes, _params, c_kv_q = quantize_dequantize_fused(
+            # One launch on reused scratch: 2.6x the torch fake-quant on the full
+            # write path, bit-identical output. The returned tensor is a view into
+            # module scratch, which is fine because parent_setter copies it into
+            # the KV buffer before the next write.
+            _codes, _params, c_kv_q = quantize_dequantize_reuse(
                 c_kv, self._group_size, self._lloyd_max
             )
         else:
