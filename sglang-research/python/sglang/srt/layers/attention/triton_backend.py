@@ -1234,6 +1234,23 @@ class TritonAttnBackend(AttentionBackend):
                 self.cuda_graph_mixed_swa_quant_kv_indptr = None
                 self.cuda_graph_mixed_swa_hp_kv_indices = None
                 self.cuda_graph_mixed_swa_quant_kv_indices = None
+            # Sliding layers have their own head geometry (gemma4: 256 vs 512 on
+            # full layers), so they need their own stage-1 scratch. Sharing the
+            # full-geometry buffer writes at the wrong stride.
+            if self.swa_v_head_dim is not None:
+                _total_splits = self.max_kv_splits + self.max_hp_kv_splits
+                self.cuda_graph_mixed_swa_attn_logits = torch.zeros(
+                    (max_num_tokens, self.num_head, _total_splits,
+                     self.swa_v_head_dim),
+                    dtype=torch.float32, device=self.device,
+                )
+                self.cuda_graph_mixed_swa_attn_lse = torch.full(
+                    (max_num_tokens, self.num_head, _total_splits),
+                    float("-inf"), dtype=torch.float32, device=self.device,
+                )
+            else:
+                self.cuda_graph_mixed_swa_attn_logits = None
+                self.cuda_graph_mixed_swa_attn_lse = None
             total_splits = self.max_kv_splits + self.max_hp_kv_splits
             # Single combined stage-1 scratch. LSE pre-filled to -inf so the
             # tier-agnostic stage-2 skips unused splits.
@@ -1354,6 +1371,8 @@ class TritonAttnBackend(AttentionBackend):
                     mixed_hp_kv_indices = self.cuda_graph_mixed_hp_kv_indices
                     mixed_quant_kv_indptr = self.cuda_graph_mixed_quant_kv_indptr
                     mixed_quant_kv_indices = self.cuda_graph_mixed_quant_kv_indices
+                    mixed_swa_attn_logits = self.cuda_graph_mixed_swa_attn_logits
+                    mixed_swa_attn_lse = self.cuda_graph_mixed_swa_attn_lse
                     mixed_swa_hp_kv_indptr = self.cuda_graph_mixed_swa_hp_kv_indptr
                     mixed_swa_hp_kv_indices = self.cuda_graph_mixed_swa_hp_kv_indices
                     mixed_swa_quant_kv_indptr = (
