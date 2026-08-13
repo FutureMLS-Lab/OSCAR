@@ -155,6 +155,7 @@ class ModelConfig:
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
+                "KimiK3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
@@ -507,6 +508,20 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif "KimiK3ForConditionalGeneration" in self.hf_config.architectures:
+            # Kimi-K3 retains MLA projection weights but stores expanded MHA K/V
+            # for its full-attention layers so the OSCAR packed-INT2 backend can
+            # quantize the cache. KDA recurrent state is managed separately.
+            self.head_dim = (
+                self.hf_text_config.qk_nope_head_dim
+                + self.hf_text_config.qk_rope_head_dim
+            )
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.attention_arch = AttentionArch.MHA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.head_dim)
         elif "KimiLinearForCausalLM" in self.hf_config.architectures:
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA
@@ -704,8 +719,28 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None and self.hf_text_config is not self.hf_config:
+            quant_cfg = getattr(self.hf_text_config, "quantization_config", None)
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
+        if (
+            quant_cfg is not None
+            and "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            and "mxfp4" in quant_cfg.get("format", "")
+        ):
+            quant_cfg = dict(quant_cfg)
+            ignored = list(quant_cfg.get("ignore", []))
+            for pattern in (
+                r"re:.*mlp\.gate$",
+                r"re:.*self_attention_res_proj.*",
+                r"re:.*mlp_res_proj.*",
+                r"re:.*output_attn_res_proj.*",
+                r"re:.*routed_expert_down_proj.*",
+                r"re:.*routed_expert_up_proj.*",
+            ):
+                if pattern not in ignored:
+                    ignored.append(pattern)
+            quant_cfg["ignore"] = ignored
         if quant_cfg is not None:
             # Identify modelopt quantization
             if (

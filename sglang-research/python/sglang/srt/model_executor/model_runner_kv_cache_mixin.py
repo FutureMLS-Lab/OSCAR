@@ -475,6 +475,7 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
+                    v_head_dim=self.model_config.v_head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
                         [0]
@@ -491,6 +492,17 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    model_dtype=self.dtype,
+                    kv_cache_quant_group_size=(
+                        self.server_args.kv_cache_quant_group_size
+                    ),
+                    scale_dtype=(
+                        resolve_scale_dtype(
+                            envs.SGLANG_MIXED_KV_SCALE_DTYPE.get()
+                        )
+                        if self.kv_cache_dtype == "int2"
+                        else None
+                    ),
                     **extra_args,
                 )
             else:

@@ -42,6 +42,9 @@ from sglang.QuantKernel.fused_hadamard_int2_kv import (
     quantized_set_kv_int2_hadamard_fused_triton,
     validate_hadamard_order_for_kv_fuse_int2,
 )
+from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
+    quantized_set_kv_int2_pretransformed_clip_triton,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -140,6 +143,7 @@ def load_oscar_rotations(
     head_dim: int,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    layer_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Load per-layer Oscar rotation matrices from ``path``.
 
@@ -159,9 +163,18 @@ def load_oscar_rotations(
             f"Oscar rotation checkpoint at {path} missing 'layers' key"
         )
     layers = state["layers"]
+    requested_layer_ids = (
+        list(range(start_layer, start_layer + layer_num))
+        if layer_ids is None
+        else list(layer_ids)
+    )
+    if len(requested_layer_ids) != layer_num:
+        raise ValueError(
+            f"Expected {layer_num} Oscar layer ids, got {len(requested_layer_ids)}"
+        )
     out = torch.empty((layer_num, head_dim, head_dim), dtype=dtype)
     for local in range(layer_num):
-        global_lid = start_layer + local
+        global_lid = requested_layer_ids[local]
         if global_lid not in layers and str(global_lid) not in layers:
             raise ValueError(
                 f"Oscar rotation checkpoint at {path} missing layer {global_lid}"
@@ -873,6 +886,7 @@ class MHATokenToKVPool(KVCache):
         model_dtype: Optional[torch.dtype] = None,
         kv_cache_quant_group_size: Optional[int] = None,
         scale_dtype: Optional[torch.dtype] = None,
+        oscar_rotation_layer_ids: Optional[List[int]] = None,
     ):
         super().__init__(
             size,
@@ -908,6 +922,44 @@ class MHATokenToKVPool(KVCache):
             self.v_quant_group_size = None
             self.k_num_scale_groups = None
             self.v_num_scale_groups = None
+
+        self._R_k = None
+        self._R_v = None
+        if self.dtype == "int2" and (
+            envs.SGLANG_OSCAR_K_ROTATION_PATH.get()
+            or envs.SGLANG_OSCAR_V_ROTATION_PATH.get()
+        ):
+            oscar_cfg = load_oscar_rotation_config()
+            rotation_dtype = model_dtype or torch.bfloat16
+            self._R_k = load_oscar_rotations(
+                oscar_cfg.k_rotation_path,
+                layer_num=self.layer_num,
+                start_layer=self.start_layer,
+                head_dim=self.head_dim,
+                device=torch.device(self.device),
+                dtype=rotation_dtype,
+                layer_ids=oscar_rotation_layer_ids,
+            )
+            self._R_v = load_oscar_rotations(
+                oscar_cfg.v_rotation_path,
+                layer_num=self.layer_num,
+                start_layer=self.start_layer,
+                head_dim=self.v_head_dim,
+                device=torch.device(self.device),
+                dtype=rotation_dtype,
+                layer_ids=oscar_rotation_layer_ids,
+            )
+            self._k_clip_ratio = oscar_cfg.k_clip_ratio
+            self._v_clip_ratio = oscar_cfg.v_clip_ratio
+            self._lloyd_max = envs.SGLANG_LLOYD_MAX.get()
+            logger.info(
+                "MHATokenToKVPool: OSCAR INT2 rotation enabled "
+                "(layers=%s, k_clip=%.4f, v_clip=%.4f, lloyd_max=%s)",
+                oscar_rotation_layer_ids,
+                self._k_clip_ratio,
+                self._v_clip_ratio,
+                self._lloyd_max,
+            )
 
         self._create_buffers()
 
@@ -1261,6 +1313,28 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer.layer_id
 
         if self.dtype == "int2":
+            if self._R_k is not None:
+                idx = layer_id - self.start_layer
+                if not already_hadamard_transformed:
+                    cache_k = cache_k.to(self._R_k.dtype) @ self._R_k[idx]
+                    cache_v = cache_v.to(self._R_v.dtype) @ self._R_v[idx]
+                else:
+                    cache_k = cache_k.to(self._R_k.dtype)
+                    cache_v = cache_v.to(self._R_v.dtype)
+                quantized_set_kv_int2_pretransformed_clip_triton(
+                    cache_k,
+                    cache_v,
+                    loc,
+                    self.k_buffer[idx],
+                    self.v_buffer[idx],
+                    self.k_scales_zeros[idx],
+                    self.v_scales_zeros[idx],
+                    self._k_clip_ratio,
+                    self._v_clip_ratio,
+                    lloyd_max=self._lloyd_max,
+                )
+                return
+
             # INT2: Hadamard rotation is mandatory (always fused)
             hadamard_order = envs.HADAMARD_ORDER.get()
             validate_hadamard_order_for_kv_fuse_int2(
@@ -1561,12 +1635,16 @@ class HybridLinearKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
+        v_head_dim: Optional[int] = None,
         enable_memory_saver: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        model_dtype: Optional[torch.dtype] = None,
+        kv_cache_quant_group_size: Optional[int] = None,
+        scale_dtype: Optional[torch.dtype] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1592,7 +1670,7 @@ class HybridLinearKVPool(KVCache):
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
 
-            self.full_kv_pool = TokenToKVPoolClass(
+            pool_kwargs = dict(
                 size=size,
                 page_size=self.page_size,
                 dtype=dtype,
@@ -1602,6 +1680,15 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
             )
+            if not _is_npu:
+                pool_kwargs.update(
+                    v_head_dim=v_head_dim,
+                    model_dtype=model_dtype,
+                    kv_cache_quant_group_size=kv_cache_quant_group_size,
+                    scale_dtype=scale_dtype,
+                    oscar_rotation_layer_ids=full_attention_layer_ids,
+                )
+            self.full_kv_pool = TokenToKVPoolClass(**pool_kwargs)
         else:
 
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1626,6 +1713,42 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
+        self.v_head_dim = getattr(self.full_kv_pool, "v_head_dim", head_dim)
+        self.model_dtype = model_dtype
+        self.k_quant_group_size = getattr(
+            self.full_kv_pool, "k_quant_group_size", None
+        )
+        self.v_quant_group_size = getattr(
+            self.full_kv_pool, "v_quant_group_size", None
+        )
+        self._R_k = None
+        self._R_v = None
+        if getattr(self.full_kv_pool, "_R_k", None) is not None:
+            rotation_span = max(full_attention_layer_ids) - self.start_layer + 1
+            self._R_k = torch.stack(
+                [
+                    torch.eye(
+                        self.head_dim,
+                        dtype=self.full_kv_pool._R_k.dtype,
+                        device=self.device,
+                    )
+                    for _ in range(rotation_span)
+                ]
+            )
+            self._R_v = torch.stack(
+                [
+                    torch.eye(
+                        self.v_head_dim,
+                        dtype=self.full_kv_pool._R_v.dtype,
+                        device=self.device,
+                    )
+                    for _ in range(rotation_span)
+                ]
+            )
+            for global_id, local_id in self.full_attention_layer_id_mapping.items():
+                idx = global_id - self.start_layer
+                self._R_k[idx].copy_(self.full_kv_pool._R_k[local_id])
+                self._R_v[idx].copy_(self.full_kv_pool._R_v[local_id])
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
         else:
@@ -1685,6 +1808,30 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
+    def get_raw_key_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_raw_key_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_raw_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_raw_value_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_key_scales_zeros(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_key_scales_zeros(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_value_scales_zeros(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_value_scales_zeros(
+            self._transfer_full_attention_id(layer_id)
+        )
+
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
 
@@ -1708,6 +1855,8 @@ class HybridLinearKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        already_hadamard_transformed: bool = False,
+        is_decode: bool = False,
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
@@ -1719,6 +1868,8 @@ class HybridLinearKVPool(KVCache):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id,
+                already_hadamard_transformed=already_hadamard_transformed,
+                is_decode=is_decode,
             )
         else:
             with self._transfer_id_context(layer):
@@ -1733,7 +1884,7 @@ class HybridLinearKVPool(KVCache):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def get_v_head_dim(self):
-        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        return self.v_head_dim
 
     def set_mla_kv_buffer(
         self,

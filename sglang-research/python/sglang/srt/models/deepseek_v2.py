@@ -1385,6 +1385,9 @@ class DeepseekV2AttentionMLA(
             attention_backend = get_global_server_args().prefill_attention_backend
         self.current_attention_backend = attention_backend
 
+        if getattr(self, "use_expanded_mha_cache", False):
+            return AttnForwardMethod.MHA
+
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         return handler(self, forward_batch)
 
