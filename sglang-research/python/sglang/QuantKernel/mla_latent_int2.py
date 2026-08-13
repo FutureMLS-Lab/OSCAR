@@ -278,3 +278,52 @@ def quantize_dequantize_fused(x, group_size: int = 128, lloyd_max: bool = False,
         LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=_LM_RATIO, LM_C0=_LM_CENTROIDS[0],
     )
     return codes, params, out.reshape(x.shape)
+
+
+# ── scratch reuse ────────────────────────────────────────────────────────────
+# The overhead breakdown says the three per-call allocations are 23 % of the
+# wrapper cost (0.0052 of 0.023 ms) while the launch itself is 50-62 %. Reusing
+# scratch removes that 23 %.
+#
+# Safe because sglang writes the KV cache from one stream, serially, inside the
+# forward pass, and the returned dequantized view is consumed before the next
+# write. It is NOT safe to hold onto the returned tensors across calls -- copy
+# them if you need to.
+_SCRATCH: dict = {}
+
+
+def _scratch(n_groups: int, group_size: int, device, key: str):
+    cap, buf = _SCRATCH.get((key, device, group_size), (0, None))
+    if cap < n_groups:
+        cap = max(n_groups, cap * 2, 1024)
+        if key == "codes":
+            buf = torch.empty((cap, group_size // 4), dtype=torch.uint8, device=device)
+        elif key == "params":
+            buf = torch.empty((cap, 2), dtype=torch.float32, device=device)
+        else:
+            buf = torch.empty((cap, group_size), dtype=torch.float32, device=device)
+        _SCRATCH[(key, device, group_size)] = (cap, buf)
+    return buf[:n_groups]
+
+
+def quantize_dequantize_reuse(x, group_size: int = 128, lloyd_max: bool = False,
+                              groups_per_block: int = 4):
+    """Same as ``quantize_dequantize_fused`` but on reused scratch buffers.
+
+    Returns views into module-level scratch: valid until the next call.
+    """
+    assert x.shape[-1] % group_size == 0 and group_size % 4 == 0
+    flat = x.reshape(-1, group_size)
+    if not flat.is_contiguous() or flat.dtype != torch.float32:
+        flat = flat.contiguous().to(torch.float32)
+    n = flat.shape[0]
+    codes = _scratch(n, group_size, x.device, "codes")
+    params = _scratch(n, group_size, x.device, "params")
+    out = _scratch(n, group_size, x.device, "out")
+    _fused_quant_dequant_kernel[(triton.cdiv(n, groups_per_block),)](
+        flat, codes, params, out, n,
+        GS=group_size, GPB=groups_per_block, LLOYD=lloyd_max,
+        T0=_LM_THRESHOLDS[0], T1=_LM_THRESHOLDS[1], T2=_LM_THRESHOLDS[2],
+        LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=_LM_RATIO, LM_C0=_LM_CENTROIDS[0],
+    )
+    return codes, params, out.reshape(x.shape)

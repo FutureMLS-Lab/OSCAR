@@ -48,3 +48,24 @@ for n_tok in (512, 8192):
     print(f"  kernel launch     {t_kern:.4f} ms   ({t_kern/t_full*100:.0f}%)")
     print(f"  3 allocations     {t_alloc:.4f} ms   ({t_alloc/t_full*100:.0f}%)")
     print(f"  reshape+contig+f32 {t_prep:.4f} ms  ({t_prep/t_full*100:.0f}%)")
+
+# --- v3: reused scratch
+from sglang.QuantKernel.mla_latent_int2 import quantize_dequantize_reuse
+from sglang.srt.mem_cache.mla_int2_kv_pool import _fake_quant_int2_groupwise
+print("\n=== v2 (fresh allocs) vs v3 (reused scratch)")
+for n_tok in (1, 512, 8192, 65536):
+    x = torch.randn(n_tok, 512, device=dev)
+    t2 = timed(lambda: quantize_dequantize_fused(x, G, False, GPB))
+    t3 = timed(lambda: quantize_dequantize_reuse(x, G, False, GPB))
+    a = quantize_dequantize_fused(x, G, False, GPB)[2]
+    b = quantize_dequantize_reuse(x, G, False, GPB)[2]
+    print(f"  tokens={n_tok:<6} v2={t2:.4f} v3={t3:.4f} ms  {t2/t3:.2f}x  "
+          f"identical={torch.equal(a, b)}")
+print("\n=== full write path, 8192 tokens")
+x = torch.randn(8192, 512, device=dev)
+R = torch.linalg.qr(torch.randn(512, 512, device=dev))[0]
+tf = timed(lambda: _fake_quant_int2_groupwise(x @ R, G, False) @ R.T, iters=20)
+t2 = timed(lambda: quantize_dequantize_fused(x @ R, G, False, GPB)[2] @ R.T, iters=20)
+t3 = timed(lambda: quantize_dequantize_reuse(x @ R, G, False, GPB)[2] @ R.T, iters=20)
+print(f"  fake-quant {tf:.3f} | v2 {t2:.3f} | v3 {t3:.3f} ms   "
+      f"v3 vs fake {tf/t3:.2f}x, 78 层/step = {t3*78/8192*8192:.2f} ms")
