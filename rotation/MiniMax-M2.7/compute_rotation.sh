@@ -14,7 +14,7 @@ COMPUTE_SCRIPT="${SCRIPT_DIR}/../compute_kv_rotation.py"
 METHOD="${METHOD:-qqt_sst}"
 COMPOSITION="${COMPOSITION:-r_h_pbr}"
 HEAD_DIM="${HEAD_DIM:-128}"
-NUM_LAYERS="${NUM_LAYERS:?set NUM_LAYERS to the model's layer count}"
+NUM_LAYERS="${NUM_LAYERS:-62}"   # MiniMax-M2.7
 
 DATASET="${DATASET:-GPQA}"
 CALIB_DIR="${CALIB_DIR:-${SCRIPT_DIR}/${DATASET}/latest}"
