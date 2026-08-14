@@ -806,6 +806,12 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
                 v_clip_ratio=kv_pool._v_clip_ratio,
                 lloyd_max=getattr(kv_pool, "_lloyd_max", False),
                 apply_remap=(gi == n_groups - 1),
+                hp_k_layers=g["hp_k_layers"],
+                hp_v_layers=g["hp_v_layers"],
+                quant_k_layers=g["quant_k_layers"],
+                quant_v_layers=g["quant_v_layers"],
+                k_sz_layers=g["k_sz_layers"],
+                v_sz_layers=g["v_sz_layers"],
             )
 
     if batch.model_config.is_encoder_decoder:

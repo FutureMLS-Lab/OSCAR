@@ -636,6 +636,14 @@ class UnifiedInt2HPKVPool(KVCache):
                 assert _strides(self.v_scales_zeros[l]) == v_sz_stride
             self._flush_groups.append(
                 {
+                    # The pointer arrays feed the fused kernel; the tensor lists
+                    # feed the unfused fallback for non-power-of-two head dims.
+                    "hp_k_layers": [self.hp_k_buffer[l] for l in local_ids],
+                    "hp_v_layers": [self.hp_v_buffer[l] for l in local_ids],
+                    "quant_k_layers": [self.k_buffer[l] for l in local_ids],
+                    "quant_v_layers": [self.v_buffer[l] for l in local_ids],
+                    "k_sz_layers": [self.k_scales_zeros[l] for l in local_ids],
+                    "v_sz_layers": [self.v_scales_zeros[l] for l in local_ids],
                     "hp_k_ptrs": _base_ptrs(local_ids, self.hp_k_buffer),
                     "hp_v_ptrs": _base_ptrs(local_ids, self.hp_v_buffer),
                     "quant_k_ptrs": _base_ptrs(local_ids, self.k_buffer),

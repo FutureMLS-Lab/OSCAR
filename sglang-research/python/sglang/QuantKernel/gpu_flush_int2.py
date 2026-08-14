@@ -33,6 +33,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.kv_quant_kernels import _launch_quantize_int2
+
 
 @dataclass
 class FlushPlan:
@@ -547,6 +549,67 @@ def _flush_remap_kernel(
 # ---------------------------------------------------------------------------
 
 
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _launch_flush_remap(
+    plan: "FlushPlan",
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    bs: int,
+    flush_interval: int,
+) -> None:
+    """Point ``req_to_token`` at the quant slot for each flushed position.
+
+    Geometry-independent, so both the fused and unfused quant paths issue it
+    unchanged.
+    """
+    _flush_remap_kernel[(bs, flush_interval)](
+        req_pool_indices,
+        plan.flush_pos,
+        plan.dst_quant_slots,
+        plan.valid_mask,
+        req_to_token,
+        int(req_to_token.stride(0)),
+        FLUSH_INTERVAL=int(flush_interval),
+        num_warps=1,
+        num_stages=1,
+    )
+
+
+def _flush_quant_unfused(
+    *,
+    hp_layers: List[torch.Tensor],
+    quant_layers: List[torch.Tensor],
+    sz_layers: List[torch.Tensor],
+    src_hp_slot: torch.Tensor,
+    dst_quant_slots: torch.Tensor,
+    clip_ratio: float,
+) -> None:
+    """Flush path for head dims the fused kernel cannot express.
+
+    The fused kernel derives the int2 byte layout from
+    ``reshape(BLOCK_TOK, 4, HEAD_DIM // 4)``, which needs a power-of-two
+    ``HEAD_DIM`` (Triton block shapes) -- Kimi's K is 192. Padding to 256 is not
+    an option: it would pack dims ``(b, b+64, b+128, b+192)`` where the real
+    192-wide layout is ``(b, b+48, b+96, b+144)``, and decode reads back exactly
+    what prefill wrote.
+
+    So gather the rows and reuse the same writer prefill uses. Same layout by
+    construction, at the cost of a Python loop over layers and a materialized
+    gather -- correctness path, not a fast path.
+    """
+    for hp, quant, sz in zip(hp_layers, quant_layers, sz_layers):
+        rows = hp[src_hp_slot]  # [n, num_heads, head_dim]
+        if clip_ratio > 0.0:
+            index = _flush_clip_index(clip_ratio, rows.shape[-1])
+            if index >= 0:
+                threshold = rows.abs().sort(dim=-1).values[..., index : index + 1]
+                rows = torch.maximum(torch.minimum(rows, threshold), -threshold)
+        _launch_quantize_int2(rows, dst_quant_slots, quant, sz)
+
+
 def _resolve_kv_quant_config(
     head_dim: int, num_scale_groups: int
 ) -> Tuple[int, int, int]:
@@ -739,6 +802,15 @@ def gpu_flush_int2_apply(
     v_clip_ratio: float = 0.0,
     lloyd_max: bool = False,
     apply_remap: bool = True,
+    # Per-layer tensors for this group, needed only when a head dim is not a
+    # power of two and the fused kernel cannot be used (see
+    # ``_flush_quant_unfused``).
+    hp_k_layers: List[torch.Tensor] = None,
+    hp_v_layers: List[torch.Tensor] = None,
+    quant_k_layers: List[torch.Tensor] = None,
+    quant_v_layers: List[torch.Tensor] = None,
+    k_sz_layers: List[torch.Tensor] = None,
+    v_sz_layers: List[torch.Tensor] = None,
 ) -> None:
     """Apply phase: run fused quant + remap kernels using a prepared plan.
 
@@ -759,6 +831,44 @@ def gpu_flush_int2_apply(
     # padding row). Their quant outputs are garbage but are freed by the
     # caller in the same bulk free as the valid flushes.
     safe_src_hp_slot = plan.src_hp_slot.clamp(min=0)
+
+    if not (_is_pow2(head_dim) and _is_pow2(v_head_dim)):
+        if lloyd_max:
+            raise ValueError(
+                f"lloyd_max is unavailable for non-power-of-two head dims "
+                f"(head_dim={head_dim}, v_head_dim={v_head_dim}); the unfused "
+                f"flush path writes uniform int2 only"
+            )
+        if hp_k_layers is None:
+            raise ValueError(
+                f"head_dim={head_dim} / v_head_dim={v_head_dim} needs the "
+                f"unfused flush path, but the caller passed no per-layer tensors"
+            )
+        # Unlike the fused kernel this writes only the rows that actually flush,
+        # so an invalid row's destination slot is never touched.
+        keep = plan.valid_mask.bool()
+        src = safe_src_hp_slot[keep]
+        dst = plan.dst_quant_slots[keep]
+        if src.numel():
+            _flush_quant_unfused(
+                hp_layers=hp_k_layers,
+                quant_layers=quant_k_layers,
+                sz_layers=k_sz_layers,
+                src_hp_slot=src,
+                dst_quant_slots=dst,
+                clip_ratio=k_clip_ratio,
+            )
+            _flush_quant_unfused(
+                hp_layers=hp_v_layers,
+                quant_layers=quant_v_layers,
+                sz_layers=v_sz_layers,
+                src_hp_slot=src,
+                dst_quant_slots=dst,
+                clip_ratio=v_clip_ratio,
+            )
+        if apply_remap:
+            _launch_flush_remap(plan, req_pool_indices, req_to_token, bs, flush_interval)
+        return
 
     k_block_quarter, k_num_groups, k_group_size = _resolve_kv_quant_config(
         head_dim, k_num_scale_groups
@@ -846,18 +956,7 @@ def gpu_flush_int2_apply(
     )
 
     if apply_remap:
-        rtt_stride_row = int(req_to_token.stride(0))
-        _flush_remap_kernel[(bs, flush_interval)](
-            req_pool_indices,
-            plan.flush_pos,
-            plan.dst_quant_slots,
-            plan.valid_mask,
-            req_to_token,
-            rtt_stride_row,
-            FLUSH_INTERVAL=int(flush_interval),
-            num_warps=1,
-            num_stages=1,
-        )
+        _launch_flush_remap(plan, req_pool_indices, req_to_token, bs, flush_interval)
 
 
 def gpu_flush_int2(
