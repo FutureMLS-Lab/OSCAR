@@ -22,19 +22,21 @@ DUMP_PATH="${DUMP_PATH:-${CALIB_DIR}/qkv_dumps_merged}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CALIB_DIR}/rotations}"
 mkdir -p "${OUTPUT_DIR}"
 
-if [[ "${METHOD}" == "qqt_sst" && ! -d "${DUMP_PATH}" ]]; then
-    echo "no dump at ${DUMP_PATH} -- run save_qkv_m27.sh first" >&2
-    exit 1
+ARGS=(--method "${METHOD}"
+      --num-layers "${NUM_LAYERS}"
+      --head-dim "${HEAD_DIM}"
+      --output-dir "${OUTPUT_DIR}")
+
+# hadamard is data-free; only the calibrated method reads a dump.
+if [[ "${METHOD}" != "hadamard" ]]; then
+    if [[ ! -d "${DUMP_PATH}" ]]; then
+        echo "no dump at ${DUMP_PATH} -- run save_qkv_m27.sh first" >&2
+        exit 1
+    fi
+    ARGS+=(--dump-path "${DUMP_PATH}" --composition "${COMPOSITION}")
 fi
 
-python3 "${COMPUTE_SCRIPT}" \
-    --method "${METHOD}" \
-    --composition "${COMPOSITION}" \
-    --dump "${DUMP_PATH}" \
-    --layers "${NUM_LAYERS}" \
-    --head-dim "${HEAD_DIM}" \
-    --output-dir "${OUTPUT_DIR}" \
-    "$@"
+python3 "${COMPUTE_SCRIPT}" "${ARGS[@]}" "$@"
 
 echo "rotations -> ${OUTPUT_DIR}"
 ls -la "${OUTPUT_DIR}"
