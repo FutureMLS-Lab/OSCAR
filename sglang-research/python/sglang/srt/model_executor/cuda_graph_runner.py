@@ -117,6 +117,17 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
+def get_pp_proxy_tensor_shapes(model) -> Optional[Dict[str, Tuple[int, ...]]]:
+    """Per-token shapes of the PP proxy tensors this stage receives.
+
+    None means the default (hidden_states, residual). A model whose stages exchange
+    anything else must declare it, because CUDA graph capture allocates the receive
+    buffers ahead of the forward and cannot discover extra keys on its own.
+    """
+    fn = getattr(model, "get_pp_proxy_tensor_shapes", None)
+    return fn() if callable(fn) else None
+
+
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
 
@@ -159,6 +170,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
+        pp_proxy_tensor_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -187,9 +199,18 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # Most models hand the next stage (hidden_states, residual), both
+                # [num_tokens, hidden_size]. Models that carry extra state across the
+                # boundary (e.g. Kimi's stacked `block_residual`) declare their own
+                # per-token shapes; capture must allocate exactly those keys or the
+                # receiving stage raises KeyError inside the graph.
+                shapes = pp_proxy_tensor_shapes or {
+                    "hidden_states": (hidden_size,),
+                    "residual": (hidden_size,),
+                }
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    key: torch.zeros((max_bs, *shape), dtype=dtype)
+                    for key, shape in shapes.items()
                 }
             else:
                 pp_proxy_tensors = None
@@ -632,6 +653,7 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
+            pp_proxy_tensor_shapes=get_pp_proxy_tensor_shapes(model_runner.model),
         )
         self.buffers.share_buffers()
 

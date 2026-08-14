@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -921,6 +921,29 @@ class KimiLinearModel(nn.Module):
             "num_attention_heads must be divisible by world_size"
         )
 
+    def get_pp_proxy_tensor_shapes(self) -> Dict[str, Tuple[int, ...]]:
+        """Per-token shapes of the proxy tensors this stage receives.
+
+        With attention residuals the boundary carries `block_residual` instead of
+        `residual`: one stacked prefix-sum per residual block, so its width is the
+        number of blocks opened before this stage's first layer. Layer indices are
+        global and a block opens whenever ``idx % attn_res_block_size == 0``.
+        CUDA graph capture allocates these buffers up front, so the shapes have to
+        be derivable without running a forward.
+        """
+        hidden_size = self.config.hidden_size
+        if not self.use_attn_residuals:
+            return {
+                "hidden_states": (hidden_size,),
+                "residual": (hidden_size,),
+            }
+        block_size = self.config.attn_res_block_size
+        num_blocks = -(-self.start_layer // block_size)
+        return {
+            "hidden_states": (hidden_size,),
+            "block_residual": (num_blocks, hidden_size),
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1025,6 +1048,9 @@ class KimiLinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+
+    def get_pp_proxy_tensor_shapes(self) -> Dict[str, Tuple[int, ...]]:
+        return self.model.get_pp_proxy_tensor_shapes()
 
     @torch.no_grad()
     def forward(

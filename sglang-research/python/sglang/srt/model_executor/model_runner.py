@@ -126,6 +126,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
+    get_pp_proxy_tensor_shapes,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2254,6 +2255,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            pp_proxy_tensor_shapes=get_pp_proxy_tensor_shapes(self.model),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
