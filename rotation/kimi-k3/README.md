@@ -28,5 +28,6 @@ directories must be supplied by the caller.
    ./compute_rotation.sh
    ```
 
-`wikitext2_ppl.py` and `wikitext2_kl.py` evaluate an already-running server.
-They never launch Kubernetes jobs or assume a shared filesystem.
+`validate_rotations.py` checks a fitted rotation before you serve with it: a
+calibration that silently failed produces a loadable file that is no better than
+Hadamard, and 2-bit needs the K relative error at or below 0.1.
