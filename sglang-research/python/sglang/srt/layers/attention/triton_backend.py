@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.quantized_kv_prefill import (
@@ -687,13 +688,21 @@ class TritonAttnBackend(AttentionBackend):
             window_size = (-1, -1)
 
         head_dim = q3.shape[-1]
-        if head_dim > 256:
-            # FlashAttention (FA2/FA3) caps head_dim at 256; gemma4_unified's
-            # full-attention layers are head_dim 512. Fall back to a per-request
-            # SDPA pass on the already-dequantized dense K/V (handles arbitrary
-            # head_dim, causal + sliding window via an additive mask, and MQA/GQA
-            # via enable_gqa). gemma sets attention logit_cap=0, so SDPA (no
-            # softcap) is equivalent.
+        softcap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
+        # Two reasons to leave FlashAttention: it caps head_dim at 256 (gemma4's
+        # full-attention layers are 512), and sgl-kernel only builds it for
+        # sm8x/sm90, so it raises on Blackwell. The SDPA pass handles arbitrary
+        # head_dim, causal + sliding window via an additive mask, and MQA/GQA via
+        # enable_gqa -- but it has no softcap, so a capping layer must not
+        # silently take it.
+        use_sdpa = head_dim > 256 or not _is_fa3_supported()
+        if use_sdpa and softcap:
+            raise NotImplementedError(
+                f"int2 prefill needs a softcap ({softcap}) that the SDPA fallback "
+                f"cannot apply, and FlashAttention is unavailable here "
+                f"(head_dim={head_dim}, fa3_supported={_is_fa3_supported()})."
+            )
+        if use_sdpa:
             result = self._sdpa_varlen_prefill(
                 q3,
                 unified_k_parts,
@@ -717,7 +726,7 @@ class TritonAttnBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=causal,
                 window_size=window_size,
-                softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
+                softcap=softcap,
             )
         result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
         o.copy_(result.view_as(o))
