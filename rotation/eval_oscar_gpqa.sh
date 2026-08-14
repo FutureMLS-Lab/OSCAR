@@ -142,6 +142,21 @@ if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
 fi
 
 echo "[eval-oscar] launching eval via simple_evals (vendored at third_party/simple_evals)"
+# A fresh clone leaves third_party/simple_evals empty (it is a submodule) and
+# every grader imports it, so the eval dies with
+#   ImportError: cannot import name 'common' from 'simple_evals'
+# only after the model is loaded. Initialise it up front and fail loudly.
+SE="${REPO_ROOT}/third_party/simple_evals"
+if [[ ! -f "${SE}/common.py" ]]; then
+    echo "[eval-oscar] third_party/simple_evals is empty; initialising submodule"
+    git -C "${REPO_ROOT}" submodule update --init --recursive third_party/simple_evals || true
+    find "${SE}" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+fi
+if [[ ! -f "${SE}/common.py" ]]; then
+    echo "[eval-oscar] cannot find ${SE}/common.py -- run: git submodule update --init --recursive" >&2
+    exit 1
+fi
+
 RUNNER="${REPO_ROOT}/rotation/_eval_runner/run_simple_eval.py"
 python "${RUNNER}" \
     --task gpqa \
