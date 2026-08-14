@@ -38,6 +38,11 @@ DIST_PORT="${DIST_PORT:-41057}"
 MEM_FRAC="${MEM_FRAC:-0.8}"
 MAX_RUNNING="${MAX_RUNNING:-64}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
+# V-rotation absorption folds R_v into o_proj. It assumes one rotation per
+# layer, so it is invalid for per-head (format_version 2) checkpoints -- with
+# per-head rotations and absorption on, Qwen3-30B-A3B scores 34.3 on GPQA
+# against 58.6 with it off, i.e. worse than a shared rotation. Default off.
+ABSORB_V="${ABSORB_V:-0}"
 GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 NUM_WORKERS="${NUM_WORKERS:-32}"
@@ -108,7 +113,7 @@ echo "[eval-oscar] model=${MODEL} tp=${TP_SIZE} gpus=${GPUS} rot=${ROT_DIR} out=
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
 SGLANG_COQUANT_ROTATION_MODE=coquant \
-SGLANG_COQUANT_ABSORB_V_ROTATION=1 \
+SGLANG_OSCAR_ABSORB_V_ROTATION="${ABSORB_V:-0}" \
 SGLANG_MIXED_KV_HP_MAX_SPLITS=8 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
 SGLANG_MIXED_KV_RECENT_TOKENS=${SGLANG_MIXED_KV_RECENT_TOKENS:-256} \
