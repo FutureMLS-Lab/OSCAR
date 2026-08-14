@@ -12,9 +12,8 @@ rotation/*/Hadamard/
 rotation/*/qkv_dumps*/
 rotation/*/_eval_*/
 rotation/*/investigation/
-
-# MiniMax-M2.7 is internal-only for now (per-investigation work-in-progress).
-rotation/MiniMax-M2.7/
+rotation/*/bench_matrix/
+rotation/*/results/
 
 # Triton / CUDA JIT caches
 triton_cache/
