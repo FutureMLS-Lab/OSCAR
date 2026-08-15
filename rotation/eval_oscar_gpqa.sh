@@ -43,6 +43,10 @@ CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 # per-head rotations and absorption on, Qwen3-30B-A3B scores 34.3 on GPQA
 # against 58.6 with it off, i.e. worse than a shared rotation. Default off.
 ABSORB_V="${ABSORB_V:-0}"
+# MLA models (shared latent c_kv) rotate the latent, not per-head K/V, and read a
+# different variable. Set MLA_ROT_PATH to the directory of per-layer layer_*.pt;
+# the K/V paths above are then unused. Leaving it empty keeps the MHA path.
+MLA_ROT_PATH="${MLA_ROT_PATH:-}"
 GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 NUM_WORKERS="${NUM_WORKERS:-32}"
@@ -119,6 +123,8 @@ SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
 SGLANG_MIXED_KV_RECENT_TOKENS=${SGLANG_MIXED_KV_RECENT_TOKENS:-256} \
 SGLANG_MIXED_KV_HP_DTYPE=bfloat16 \
 SGLANG_MIXED_KV_SCALE_DTYPE=float32 \
+SGLANG_OSCAR_MLA_KV_ROTATION_PATH="${MLA_ROT_PATH:-}" \
+SGLANG_OSCAR_MLA_KV_GROUP_SIZE="${MLA_GROUP_SIZE:-128}" \
 SGLANG_OSCAR_K_ROTATION_PATH="${ROT_DIR}/${K_ROT_FILENAME:-k_rotation_qqt_r_h_pbr.pt}" \
 SGLANG_OSCAR_V_ROTATION_PATH="${ROT_DIR}/${V_ROT_FILENAME:-v_rotation_sst_r_h_pbr.pt}" \
 SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP:-0.96}" \
