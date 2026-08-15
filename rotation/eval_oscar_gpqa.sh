@@ -51,13 +51,15 @@ MLA_ROT_PATH="${MLA_ROT_PATH:-}"
 # KV cache itself in bf16; passing --kv-cache-dtype int2 makes sglang abort with
 # "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype".
 if [[ -n "${MLA_ROT_PATH}" ]]; then
-    KV_DTYPE_ARGS=""
+    # Arrays, not strings: an empty string still expands to one empty argv
+    # entry, which sglang's argparse rejects as an unexpected positional.
+    KV_DTYPE_ARGS=()
     # --kv-cache-quant-group-size is only accepted alongside int2, and the MLA
     # pool takes its group size from SGLANG_OSCAR_MLA_KV_GROUP_SIZE instead.
-    GROUP_SIZE_ARGS=""
+    GROUP_SIZE_ARGS=()
 else
-    KV_DTYPE_ARGS="--kv-cache-dtype int2"
-    GROUP_SIZE_ARGS="--kv-cache-quant-group-size ${GROUP_SIZE}"
+    KV_DTYPE_ARGS=(--kv-cache-dtype int2)
+    GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
 fi
 GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
@@ -106,8 +108,8 @@ SERVER_ARGS=(
     --tensor-parallel-size "${TP_SIZE}"
     --prefill-attention-backend fa3
     --decode-attention-backend triton
-    ${KV_DTYPE_ARGS}
-    ${GROUP_SIZE_ARGS}
+    "${KV_DTYPE_ARGS[@]}"
+    "${GROUP_SIZE_ARGS[@]}"
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
     --enable-cache-report
