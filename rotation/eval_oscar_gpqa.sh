@@ -47,6 +47,14 @@ ABSORB_V="${ABSORB_V:-0}"
 # different variable. Set MLA_ROT_PATH to the directory of per-layer layer_*.pt;
 # the K/V paths above are then unused. Leaving it empty keeps the MHA path.
 MLA_ROT_PATH="${MLA_ROT_PATH:-}"
+# MLA models quantize the shared latent through the rotation path and keep the
+# KV cache itself in bf16; passing --kv-cache-dtype int2 makes sglang abort with
+# "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype".
+if [[ -n "${MLA_ROT_PATH}" ]]; then
+    KV_DTYPE_ARGS=""
+else
+    KV_DTYPE_ARGS="--kv-cache-dtype int2"
+fi
 GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 NUM_WORKERS="${NUM_WORKERS:-32}"
@@ -94,7 +102,7 @@ SERVER_ARGS=(
     --tensor-parallel-size "${TP_SIZE}"
     --prefill-attention-backend fa3
     --decode-attention-backend triton
-    --kv-cache-dtype int2
+    ${KV_DTYPE_ARGS}
     --kv-cache-quant-group-size "${GROUP_SIZE}"
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
