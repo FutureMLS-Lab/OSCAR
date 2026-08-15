@@ -52,8 +52,12 @@ MLA_ROT_PATH="${MLA_ROT_PATH:-}"
 # "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype".
 if [[ -n "${MLA_ROT_PATH}" ]]; then
     KV_DTYPE_ARGS=""
+    # --kv-cache-quant-group-size is only accepted alongside int2, and the MLA
+    # pool takes its group size from SGLANG_OSCAR_MLA_KV_GROUP_SIZE instead.
+    GROUP_SIZE_ARGS=""
 else
     KV_DTYPE_ARGS="--kv-cache-dtype int2"
+    GROUP_SIZE_ARGS="--kv-cache-quant-group-size ${GROUP_SIZE}"
 fi
 GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
@@ -103,7 +107,7 @@ SERVER_ARGS=(
     --prefill-attention-backend fa3
     --decode-attention-backend triton
     ${KV_DTYPE_ARGS}
-    --kv-cache-quant-group-size "${GROUP_SIZE}"
+    ${GROUP_SIZE_ARGS}
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
     --enable-cache-report
