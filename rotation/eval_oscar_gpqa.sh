@@ -63,6 +63,18 @@ else
 fi
 GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
+# Multi-node. The 400B-class models (MiniMax-M3, GLM-5.2-FP8) do not fit on one
+# node, so without these the example cannot run them at all. Set NNODES>1 plus
+# NODE_RANK and DIST_ADDR on each node; only rank 0 drives the eval.
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+DIST_ADDR="${DIST_ADDR:-}"
+if [[ "${NNODES}" -gt 1 ]]; then
+    [[ -n "${DIST_ADDR}" ]] || { echo "[eval-oscar] NNODES>1 needs DIST_ADDR=<head-ip>:<port>" >&2; exit 1; }
+    MULTINODE_ARGS=(--nnodes "${NNODES}" --node-rank "${NODE_RANK}" --dist-init-addr "${DIST_ADDR}")
+else
+    MULTINODE_ARGS=()
+fi
 NUM_WORKERS="${NUM_WORKERS:-32}"
 N_REPEATS="${N_REPEATS:-1}"
 NAME="${NAME:-gpqa_oscar}"
@@ -108,6 +120,7 @@ SERVER_ARGS=(
     --tensor-parallel-size "${TP_SIZE}"
     --prefill-attention-backend fa3
     --decode-attention-backend triton
+    "${MULTINODE_ARGS[@]}"
     "${KV_DTYPE_ARGS[@]}"
     "${GROUP_SIZE_ARGS[@]}"
     --mem-fraction-static "${MEM_FRAC}"
