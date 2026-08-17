@@ -64,6 +64,12 @@ else
     GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
 fi
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
+# Attention backends. FA3's int2 prefill asserts on sliding-window layers, so a
+# model with local attention (Gemma-4 has 40 such layers) must set both of these
+# to triton -- the int2 prefill path reads the global one, so overriding only
+# PREFILL_BACKEND is not enough.
+ATTN_BACKEND="${ATTN_BACKEND:-fa3}"
+PREFILL_BACKEND="${PREFILL_BACKEND:-fa3}"
 # Multi-node. The 400B-class models (MiniMax-M3, GLM-5.2-FP8) do not fit on one
 # node, so without these the example cannot run them at all. Set NNODES>1 plus
 # NODE_RANK and DIST_ADDR on each node; only rank 0 drives the eval.
@@ -127,7 +133,8 @@ trap cleanup EXIT INT TERM
 SERVER_ARGS=(
     --model-path "${MODEL}"
     --tensor-parallel-size "${TP_SIZE}"
-    --prefill-attention-backend fa3
+    --attention-backend "${ATTN_BACKEND:-fa3}"
+    --prefill-attention-backend "${PREFILL_BACKEND:-fa3}"
     --decode-attention-backend triton
     "${MULTINODE_ARGS[@]}"
     "${KV_DTYPE_ARGS[@]}"
