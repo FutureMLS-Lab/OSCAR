@@ -36,7 +36,7 @@ export CUDA_VISIBLE_DEVICES="${GPU}"
 SERVER_ARGS=(
     --model-path "${MODEL}" --tensor-parallel-size 1
     --context-length 16384 --mem-fraction-static "${MEM_FRAC}"
-    --prefill-attention-backend triton --decode-attention-backend triton
+    --attention-backend triton --prefill-attention-backend triton --decode-attention-backend triton
     ${GRAPH_ARGS} --trust-remote-code
     --host 127.0.0.1 --port "${PORT}" --dist-init-addr "127.0.0.1:${DIST_PORT}"
 )
