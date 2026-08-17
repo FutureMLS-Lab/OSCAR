@@ -50,6 +50,8 @@ MLA_ROT_PATH="${MLA_ROT_PATH:-}"
 # MLA models quantize the shared latent through the rotation path and keep the
 # KV cache itself in bf16; passing --kv-cache-dtype int2 makes sglang abort with
 # "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype".
+GROUP_SIZE="${GROUP_SIZE:-128}"
+
 if [[ -n "${MLA_ROT_PATH}" ]]; then
     # Arrays, not strings: an empty string still expands to one empty argv
     # entry, which sglang's argparse rejects as an unexpected positional.
@@ -61,7 +63,6 @@ else
     KV_DTYPE_ARGS=(--kv-cache-dtype int2)
     GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
 fi
-GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 # Multi-node. The 400B-class models (MiniMax-M3, GLM-5.2-FP8) do not fit on one
 # node, so without these the example cannot run them at all. Set NNODES>1 plus
