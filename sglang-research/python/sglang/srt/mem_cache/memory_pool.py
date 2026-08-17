@@ -26,7 +26,9 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import dataclasses
+import hashlib
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -89,14 +91,124 @@ _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
+def ensure_oscar_rotation_paths(
+    model_path: str, revision: str | None
+) -> tuple[str, str]:
+    """Set deterministic cache destinations when neither path is configured."""
+    configured_k = envs.SGLANG_OSCAR_K_ROTATION_PATH.get()
+    configured_v = envs.SGLANG_OSCAR_V_ROTATION_PATH.get()
+    if configured_k and configured_v:
+        return configured_k, configured_v
+    if configured_k or configured_v:
+        raise ValueError(
+            "OSCAR requires both K/V rotation paths when either is configured"
+        )
+
+    model_identity = (
+        os.path.realpath(model_path) if os.path.exists(model_path) else model_path
+    )
+    prompt_path = envs.SGLANG_OSCAR_CALIBRATION_PROMPTS_PATH.get()
+    prompt_identity = (
+        os.path.realpath(os.path.abspath(prompt_path))
+        if prompt_path
+        else "openai-simple-evals/gpqa_diamond-seed0-v1"
+    )
+    digest = hashlib.sha256(
+        (
+            f"{model_identity}\0{revision or 'main'}\0{prompt_identity}\0"
+            f"{envs.SGLANG_OSCAR_CALIBRATION_TOKENS.get()}"
+        ).encode()
+    ).hexdigest()[:12]
+    model_name = os.path.basename(model_path.rstrip("/")) or "model"
+    safe_name = "".join(
+        char if char.isalnum() or char in "._-" else "-" for char in model_name
+    )[:64]
+    hf_home = os.path.realpath(
+        os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface"))
+    )
+    output_dir = os.path.join(hf_home, "oscar-rotations", f"{safe_name}-{digest}")
+    k_path = os.path.join(output_dir, "k_rotation_qqt_r_h_pbr.pt")
+    v_path = os.path.join(output_dir, "v_rotation_sst_r_h_pbr.pt")
+    envs.SGLANG_OSCAR_K_ROTATION_PATH.set(k_path)
+    envs.SGLANG_OSCAR_V_ROTATION_PATH.set(v_path)
+    logger.info("Using default Oscar rotation cache paths: K=%s V=%s", k_path, v_path)
+    return k_path, v_path
+
+
+def get_oscar_checkpoint_pair() -> tuple[str, str]:
+    k_path = envs.SGLANG_OSCAR_K_ROTATION_PATH.get()
+    v_path = envs.SGLANG_OSCAR_V_ROTATION_PATH.get()
+    if not k_path or not v_path:
+        raise ValueError(
+            "OSCAR requires both "
+            "SGLANG_OSCAR_K_ROTATION_PATH and SGLANG_OSCAR_V_ROTATION_PATH"
+        )
+    k_path = os.path.realpath(os.path.abspath(k_path))
+    v_path = os.path.realpath(os.path.abspath(v_path))
+    if k_path == v_path or (
+        os.path.isfile(k_path)
+        and os.path.isfile(v_path)
+        and os.path.samefile(k_path, v_path)
+    ):
+        raise ValueError("OSCAR K/V checkpoint destinations must be distinct files")
+    return k_path, v_path
+
+
+def get_oscar_pair_artifact_paths() -> dict[str, str]:
+    k_path, v_path = get_oscar_checkpoint_pair()
+    parent = os.path.dirname(k_path)
+    if parent != os.path.dirname(v_path):
+        raise ValueError(
+            "Startup OSCAR calibration requires K/V checkpoint destinations "
+            "in the same directory"
+        )
+    pair_id = hashlib.sha256(f"K={k_path}\0V={v_path}".encode()).hexdigest()[:16]
+    prefix = os.path.join(parent, f".oscar_{pair_id}")
+    lock_dir = os.path.realpath(
+        os.path.abspath(envs.SGLANG_OSCAR_CALIBRATION_LOCK_DIR.get())
+    )
+    return {
+        "lock": os.path.join(lock_dir, f"oscar_{pair_id}.lock"),
+        "pending": f"{prefix}.pending.json",
+        "complete": f"{prefix}.complete.json",
+    }
+
+
+def determine_oscar_calibration_required() -> bool:
+    """Snapshot whether the configured pair must be fitted at this launch."""
+    configured_k = envs.SGLANG_OSCAR_K_ROTATION_PATH.get()
+    configured_v = envs.SGLANG_OSCAR_V_ROTATION_PATH.get()
+    if not configured_k and not configured_v:
+        return False
+    if not configured_k or not configured_v:
+        raise ValueError(
+            "OSCAR requires both K/V rotation destination paths when either is set"
+        )
+    k_path, v_path = get_oscar_checkpoint_pair()
+    both_exist = os.path.isfile(k_path) and os.path.isfile(v_path)
+    if both_exist and os.path.dirname(k_path) != os.path.dirname(v_path):
+        return False
+    artifacts = get_oscar_pair_artifact_paths()
+    return not both_exist or os.path.isfile(artifacts["pending"])
+
+
+def oscar_calibration_required() -> bool:
+    """Return the immutable decision inherited by all scheduler processes."""
+    active = envs.SGLANG_OSCAR_CALIBRATION_ACTIVE
+    if active.is_set():
+        return active.get()
+    return determine_oscar_calibration_required()
+
+
 @dataclass(frozen=True)
 class OscarRotationConfig:
     """Config for the Oscar-style learned rotation + per-row clip applied to
     int2 KV cache. The rotation matrices in ``k_rotation_path`` /
     ``v_rotation_path`` (loaded via :func:`load_oscar_rotations`) are applied
     to K/V rows; clip ratios drive per-row quantile clipping. Empty rotation
-    paths disable the Oscar path (the unified pool then has no rotations
-    loaded and rejects construction)."""
+    paths are required. Missing files initially resolve to fixed-address
+    identity stacks that are replaced in-place before the server becomes
+    ready."""
 
     k_rotation_path: str
     v_rotation_path: str
@@ -153,6 +265,43 @@ def load_oscar_rotations(
     ``[start_layer, start_layer + layer_num)`` is missing or has mismatched
     head_dim.
     """
+    if oscar_calibration_required():
+        out = (
+            torch.eye(head_dim, dtype=dtype)
+            .unsqueeze(0)
+            .repeat(layer_num, 1, 1)
+            .contiguous()
+        )
+        logger.info(
+            "Initialized identity Oscar rotation for pending calibration: "
+            "layers=[%d, %d) head_dim=%d dtype=%s destination=%s",
+            start_layer,
+            start_layer + layer_num,
+            head_dim,
+            dtype,
+            path,
+        )
+        return out.to(device)
+
+    pending_marker = None
+    configured_k = envs.SGLANG_OSCAR_K_ROTATION_PATH.get()
+    configured_v = envs.SGLANG_OSCAR_V_ROTATION_PATH.get()
+    if configured_k and configured_v:
+        supplied_path = os.path.realpath(os.path.abspath(path))
+        raw_pair = {
+            os.path.realpath(os.path.abspath(configured_k)),
+            os.path.realpath(os.path.abspath(configured_v)),
+        }
+        if supplied_path in raw_pair:
+            canonical_k, canonical_v = get_oscar_checkpoint_pair()
+            if os.path.dirname(canonical_k) == os.path.dirname(canonical_v):
+                pending_marker = get_oscar_pair_artifact_paths()["pending"]
+    if pending_marker is not None and os.path.isfile(pending_marker):
+        raise RuntimeError(
+            f"Refusing to load OSCAR checkpoint while {pending_marker} exists. "
+            "Restart normally to recover and recalibrate the pair."
+        )
+
     state = torch.load(path, map_location="cpu")
     if "layers" not in state:
         raise ValueError(

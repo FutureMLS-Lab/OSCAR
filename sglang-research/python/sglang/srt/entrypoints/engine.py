@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
+import fcntl
 import logging
 import multiprocessing as mp
 import os
@@ -236,6 +237,28 @@ class Engine(EngineScoreMixin, EngineBase):
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+
+        from sglang.srt.mem_cache.memory_pool import oscar_calibration_required
+
+        if oscar_calibration_required():
+            if self.loop.is_running():
+                self.shutdown()
+                raise RuntimeError(
+                    "Synchronous Engine startup OSCAR calibration cannot run "
+                    "inside an already-running asyncio loop. Use the HTTP launcher "
+                    "or construct Engine outside the loop."
+                )
+            from sglang.srt.entrypoints.warmup import (
+                run_oscar_startup_calibration,
+            )
+
+            try:
+                self.loop.run_until_complete(
+                    run_oscar_startup_calibration(self.tokenizer_manager)
+                )
+            except Exception:
+                self.shutdown()
+                raise
 
     def _resolve_routed_dp_rank(
         self,
@@ -647,6 +670,53 @@ class Engine(EngineScoreMixin, EngineBase):
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import (
+            determine_oscar_calibration_required,
+            ensure_oscar_rotation_paths,
+            get_oscar_pair_artifact_paths,
+        )
+
+        if (
+            server_args.kv_cache_dtype == "int2"
+            and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+        ):
+            ensure_oscar_rotation_paths(
+                server_args.model_path,
+                server_args.revision,
+            )
+        oscar_calibration_active = determine_oscar_calibration_required()
+        envs.SGLANG_OSCAR_CALIBRATION_ACTIVE.set(oscar_calibration_active)
+        if oscar_calibration_active and server_args.enable_http2:
+            raise ValueError(
+                "Startup OSCAR calibration currently requires Uvicorn; "
+                "--enable-http2/Granian worker replacement is unsupported."
+            )
+        oscar_pair_read_lock = None
+        if not oscar_calibration_active:
+            try:
+                lock_path = get_oscar_pair_artifact_paths()["lock"]
+            except ValueError:
+                # Existing legacy pairs may live in different directories;
+                # online publication is not supported for that layout.
+                lock_path = None
+            if lock_path is not None:
+                os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+                oscar_pair_read_lock = open(lock_path, "a+")  # noqa: SIM115
+                fcntl.flock(oscar_pair_read_lock.fileno(), fcntl.LOCK_SH)
+
+        def _release_oscar_pair_read_lock():
+            nonlocal oscar_pair_read_lock
+            if oscar_pair_read_lock is not None:
+                fcntl.flock(oscar_pair_read_lock.fileno(), fcntl.LOCK_UN)
+                oscar_pair_read_lock.close()
+                oscar_pair_read_lock = None
+
+        if oscar_calibration_active:
+            # The collector is a Python-side prefill hook. Keep decode CUDA
+            # graphs, but do not compile/capture prefill around an idle hook.
+            server_args.enforce_piecewise_cuda_graph = False
+            server_args.disable_piecewise_cuda_graph = True
         server_args.check_server_args()
         _set_gc(server_args)
 
@@ -690,6 +760,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
             scheduler_init_result.wait_for_ready()
+            _release_oscar_pair_read_lock()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
@@ -736,6 +807,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Wait for the model to finish loading
         scheduler_init_result.wait_for_ready()
+        _release_oscar_pair_read_lock()
 
         # Get back some info from scheduler to tokenizer_manager
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][

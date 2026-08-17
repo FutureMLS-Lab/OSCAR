@@ -19,6 +19,9 @@
 #   NUM_WORKERS    simple-evals client workers (default 32)
 #   N_REPEATS      (default 1)
 #   PRE_ROPE_FA3   set to 1 to force prefill fa3 + decode triton (default 1)
+#   CALIB_PROMPTS  deterministic JSONL with {"messages": [...]} records
+#   CALIB_TIMEOUT  online calibration timeout in seconds (default 1800)
+#   SERVER_WAIT_SECS readiness timeout (default calibration timeout + 1200)
 
 set -euo pipefail
 export HF_HOME="${HF_HOME:-/shared/huggingface}"
@@ -43,6 +46,19 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 NUM_WORKERS="${NUM_WORKERS:-32}"
 N_REPEATS="${N_REPEATS:-1}"
 NAME="${NAME:-gpqa_oscar}"
+CALIB_PROMPTS="${CALIB_PROMPTS:-}"
+CALIB_TOKENS="${CALIB_TOKENS:-30000}"
+CALIB_TIMEOUT="${CALIB_TIMEOUT:-1800}"
+K_ROT_FILENAME="${K_ROT_FILENAME:-k_rotation_qqt_r_h_pbr.pt}"
+V_ROT_FILENAME="${V_ROT_FILENAME:-v_rotation_sst_r_h_pbr.pt}"
+if [[ -z "${SERVER_WAIT_SECS:-}" ]]; then
+    if [[ ! -f "${ROT_DIR}/${K_ROT_FILENAME}" \
+          || ! -f "${ROT_DIR}/${V_ROT_FILENAME}" ]]; then
+        SERVER_WAIT_SECS=$((CALIB_TIMEOUT + 1200))
+    else
+        SERVER_WAIT_SECS=1200
+    fi
+fi
 
 CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
@@ -104,13 +120,16 @@ echo "[eval-oscar] model=${MODEL} tp=${TP_SIZE} gpus=${GPUS} rot=${ROT_DIR} out=
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
 SGLANG_OSCAR_ABSORB_V_ROTATION=1 \
+SGLANG_OSCAR_CALIBRATION_PROMPTS_PATH="${CALIB_PROMPTS}" \
+SGLANG_OSCAR_CALIBRATION_TOKENS="${CALIB_TOKENS}" \
+SGLANG_OSCAR_CALIBRATION_TIMEOUT="${CALIB_TIMEOUT}" \
 SGLANG_MIXED_KV_HP_MAX_SPLITS=8 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
 SGLANG_MIXED_KV_RECENT_TOKENS=${SGLANG_MIXED_KV_RECENT_TOKENS:-256} \
 SGLANG_MIXED_KV_HP_DTYPE=bfloat16 \
 SGLANG_MIXED_KV_SCALE_DTYPE=float32 \
-SGLANG_OSCAR_K_ROTATION_PATH="${ROT_DIR}/${K_ROT_FILENAME:-k_rotation_qqt_r_h_pbr.pt}" \
-SGLANG_OSCAR_V_ROTATION_PATH="${ROT_DIR}/${V_ROT_FILENAME:-v_rotation_sst_r_h_pbr.pt}" \
+SGLANG_OSCAR_K_ROTATION_PATH="${ROT_DIR}/${K_ROT_FILENAME}" \
+SGLANG_OSCAR_V_ROTATION_PATH="${ROT_DIR}/${V_ROT_FILENAME}" \
 SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP:-0.96}" \
 SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP:-0.92}" \
 SGLANG_LLOYD_MAX="${SGLANG_LLOYD_MAX:-0}" \
@@ -118,8 +137,9 @@ CUDA_VISIBLE_DEVICES="${GPUS}" \
 python -m sglang.launch_server "${SERVER_ARGS[@]}" >> "${LOG_SERVER}" 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 240); do
-    if curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+WAIT_ITERS=$(((SERVER_WAIT_SECS + 4) / 5))
+for _ in $(seq 1 "${WAIT_ITERS}"); do
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
         echo "[eval-oscar] server ready"
         break
     fi
@@ -131,8 +151,8 @@ for _ in $(seq 1 240); do
     sleep 5
 done
 
-if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-    echo "[eval-oscar] server not ready after 20 min"
+if ! curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    echo "[eval-oscar] server not ready after ${SERVER_WAIT_SECS}s"
     tail -100 "${LOG_SERVER}" || true
     exit 1
 fi

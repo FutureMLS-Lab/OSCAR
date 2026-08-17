@@ -110,6 +110,9 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         )
         self.is_not_in_free_group = True
         self.free_group = []
+        reset_runtime_state = getattr(self._kvcache, "reset_runtime_state_", None)
+        if reset_runtime_state is not None:
+            reset_runtime_state()
 
     # -- Availability ------------------------------------------------------
 

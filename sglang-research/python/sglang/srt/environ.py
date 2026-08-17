@@ -226,6 +226,16 @@ class Envs:
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
+    # If both checkpoint destinations are configured but either file is
+    # missing, start the mixed KV pool with fixed-address identity rotations
+    # and fit qqt/sst rotations before the HTTP server becomes ready.
+    SGLANG_OSCAR_CALIBRATION_PROMPTS_PATH = EnvStr("")
+    SGLANG_OSCAR_CALIBRATION_TOKENS = EnvInt(30000)
+    SGLANG_OSCAR_CALIBRATION_BATCH_SIZE = EnvInt(32)
+    SGLANG_OSCAR_CALIBRATION_TIMEOUT = EnvInt(1800)
+    SGLANG_OSCAR_CALIBRATION_LOCK_DIR = EnvStr("/tmp/sglang-oscar-locks")
+    # Internal immutable decision snapshotted before scheduler processes spawn.
+    SGLANG_OSCAR_CALIBRATION_ACTIVE = EnvBool(False)
     # Fuse oscar K-rotation (rows @ R_k) into the prefill clip+quantize+pack
     # kernel. Eliminates the separate bf16 GEMM staging and the intermediate
     # rotated-K tensor for the quant pack. Requires oscar mode, V-rotation

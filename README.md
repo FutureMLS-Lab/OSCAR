@@ -275,6 +275,37 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
   bash rotation/qwen3-8B/eval_gpqa.sh
 ```
 
+### Compute missing rotations during server startup
+
+The serving fork can calibrate a missing K/V checkpoint pair after the engine
+initializes but before the HTTP server becomes ready. The first launch keeps
+fixed-address identity rotations, runs prefill-only calibration, atomically
+writes both checkpoints, flushes the identity-basis KV cache, and installs the
+new matrices in place. Later launches load the saved files normally.
+
+```bash
+ROT_DIR=rotation/qwen3-8B/online_rotations \
+  bash rotation/qwen3-8B/eval_gpqa.sh
+```
+
+When the K/V rotation pair is missing, calibration starts automatically. If
+neither rotation path is set, SGLang uses model-scoped destinations under
+`$HF_HOME/oscar-rotations/<model>-<hash>/`; explicitly configured paths still
+take precedence. By default it downloads GPQA-Diamond from the OpenAI
+simple-evals mirror and atomically materializes a deterministic JSONL under
+`$HF_HOME/oscar-calibration/`; later launches reuse the local cache without any
+Hugging Face login. For a custom calibration set, pass
+`CALIB_PROMPTS=/path/to/prompts.jsonl`; each line must contain
+`{"messages": [...]}`. The current online path targets single-node,
+full-attention Qwen3 with the standard Uvicorn server (or direct Engine API),
+DP=PP=1, and non-replicated TP KV-head shards; HTTP/2/Granian startup
+calibration is rejected.
+
+A local `CALIB_PROMPTS` path takes precedence over the default cache. Keep
+records complete: startup selects only whole prompts whose cumulative length
+stays at or below `CALIB_TOKENS`; it never truncates a prompt, and records the
+actual token count in the rotation checkpoint.
+
 ## Model support
 
 Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int2` (full-attention INT2 path); other rows point to feature branches.
@@ -346,6 +377,10 @@ python -m sglang.launch_server \
   --trust-remote-code
 ```
 
+The K/V path variables are optional. Omitting both selects the model-scoped
+cache paths above; existing files are loaded, otherwise startup calibrates and
+creates them before reporting ready.
+
 Sink (`PREFIX_TOKENS`) and recent window (`RECENT_TOKENS`) stay in BF16; the rest of the cache is INT2-quantized into 128-element groups along head-dim.
 
 ### Skip calibration — use a pre-fit rotation from RotationZoo
@@ -361,7 +396,9 @@ export SGLANG_OSCAR_V_ROTATION_PATH=$ROT/v_rotation_sst_r_h_pbr.pt
 
 ## Calibration knobs
 
-Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
+Dump knobs can be overridden when running
+`bash rotation/<model>/save_qkv_<model>.sh`; startup-calibration knobs are read
+by the serving process:
 
 | Env | Default | Effect |
 |---|---|---|
@@ -372,6 +409,11 @@ Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
 | `TP_SIZE` | per-model | Tensor parallel size for dump |
 | `GPU` | per-model | CUDA_VISIBLE_DEVICES |
 | `HF_HOME` | `/shared/huggingface` | HF cache (set to `$HOME/.cache/huggingface` on a fresh machine) |
+| `SGLANG_OSCAR_CALIBRATION_PROMPTS_PATH` | empty | Deterministic calibration JSONL (`{"messages": [...]}` per line) |
+| `SGLANG_OSCAR_CALIBRATION_TOKENS` | `30000` | Maximum online tokens; only complete prompts are selected |
+| `SGLANG_OSCAR_CALIBRATION_BATCH_SIZE` | `32` | Number of prefill-only prompts submitted per internal batch |
+| `SGLANG_OSCAR_CALIBRATION_TIMEOUT` | `1800` | Overall startup calibration timeout in seconds |
+| `SGLANG_OSCAR_CALIBRATION_LOCK_DIR` | `/tmp/sglang-oscar-locks` | Writable runtime directory for pair-coordination locks |
 
 ## Troubleshooting
 

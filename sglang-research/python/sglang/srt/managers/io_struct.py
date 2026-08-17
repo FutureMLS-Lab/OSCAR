@@ -374,6 +374,12 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if isinstance(self.extra_key, list):
+            if len(self.extra_key) != 1:
+                raise ValueError(
+                    "A single request accepts at most one extra_key value."
+                )
+            self.extra_key = self.extra_key[0]
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -395,6 +401,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_extra_key()
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -597,6 +604,19 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_extra_key(self):
+        if self.extra_key is None or isinstance(self.extra_key, str):
+            return
+        if not isinstance(self.extra_key, list):
+            raise ValueError("extra_key must be a string or a list of strings.")
+        if len(self.extra_key) != self.batch_size:
+            raise ValueError(
+                "The length of extra_key must equal the input batch size."
+            )
+        if not all(isinstance(value, str) for value in self.extra_key):
+            raise ValueError("Every extra_key value must be a string.")
+        self.extra_key = self.extra_key * self.parallel_sample_num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -677,7 +697,11 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=(
+                self.extra_key[i]
+                if isinstance(self.extra_key, list)
+                else self.extra_key
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1195,6 +1219,20 @@ class FlushCacheReqInput(BaseReq):
 class FlushCacheReqOutput(BaseReq):
     success: bool
     message: str = ""
+
+
+@dataclass
+class OscarCalibrationReqInput(BaseReq):
+    action: Literal["start", "finalize"]
+    prompt_sha256: str = ""
+    token_budget: int = 0
+
+
+@dataclass
+class OscarCalibrationReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    captured_tokens: int = 0
 
 
 @dataclass

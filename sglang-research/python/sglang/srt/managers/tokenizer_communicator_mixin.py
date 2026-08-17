@@ -62,6 +62,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    OscarCalibrationReqInput,
+    OscarCalibrationReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -210,6 +212,9 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.oscar_calibration_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.add_external_corpus_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -321,6 +326,10 @@ class TokenizerCommunicatorMixin:
                 (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
+                ),
+                (
+                    OscarCalibrationReqOutput,
+                    self.oscar_calibration_communicator.handle_recv,
                 ),
                 (
                     AddExternalCorpusReqOutput,
@@ -486,6 +495,30 @@ class TokenizerCommunicatorMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def oscar_calibration_control(
+        self: TokenizerManager,
+        action: str,
+        prompt_sha256: str = "",
+        token_budget: int = 0,
+    ) -> OscarCalibrationReqOutput:
+        self.auto_create_handle_loop()
+        responses = await self.oscar_calibration_communicator(
+            OscarCalibrationReqInput(
+                action=action,
+                prompt_sha256=prompt_sha256,
+                token_budget=token_budget,
+            )
+        )
+        success, message = _Communicator.merge_results(responses)
+        captured_tokens = min(
+            (response.captured_tokens for response in responses), default=0
+        )
+        return OscarCalibrationReqOutput(
+            success=success,
+            message=message,
+            captured_tokens=captured_tokens,
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

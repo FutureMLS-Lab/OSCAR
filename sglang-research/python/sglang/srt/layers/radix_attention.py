@@ -23,6 +23,7 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -113,6 +114,22 @@ class RadixAttention(nn.Module):
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+
+        calibrator = getattr(
+            forward_batch.token_to_kv_pool, "_oscar_calibrator", None
+        )
+        if (
+            calibrator is not None
+            and calibrator.state == "collecting"
+            and forward_batch.forward_mode
+            in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
+        ):
+            calibrator.observe(
+                layer_id=self.layer_id,
+                q=q.reshape(-1, self.tp_q_head_num, self.qk_head_dim),
+                k=k,
+                v=v,
+            )
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:

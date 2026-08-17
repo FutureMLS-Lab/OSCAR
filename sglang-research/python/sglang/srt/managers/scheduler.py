@@ -123,6 +123,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    OscarCalibrationReqInput,
+    OscarCalibrationReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -1253,6 +1255,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (OscarCalibrationReqInput, self.handle_oscar_calibration),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3012,6 +3015,220 @@ class Scheduler(
                 message="Ngram speculative decoding is not enabled.",
             )
         return self.external_corpus_manager.list(recv_req)
+
+    def handle_oscar_calibration(
+        self, recv_req: OscarCalibrationReqInput
+    ) -> OscarCalibrationReqOutput:
+        def _consensus(local_ok: bool) -> bool:
+            status = torch.tensor([int(local_ok)], dtype=torch.int32)
+            if self.tp_size > 1:
+                torch.distributed.all_reduce(
+                    status,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_cpu_group,
+                )
+            return bool(status.item())
+
+        if recv_req.action not in ("start", "finalize"):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=f"Unknown OSCAR calibration action: {recv_req.action}",
+            )
+
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        calibrator = getattr(pool, "_oscar_calibrator", None)
+        locally_ready = calibrator is not None and self.is_fully_idle()
+        if not _consensus(locally_ready):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=(
+                    "Every TP rank must have a pending OSCAR calibrator and an "
+                    "idle scheduler before calibration control"
+                ),
+            )
+
+        if recv_req.action == "start":
+            if not recv_req.prompt_sha256:
+                return OscarCalibrationReqOutput(
+                    success=False,
+                    message="OSCAR calibration start requires a prompt SHA-256",
+                )
+            if recv_req.token_budget <= 0:
+                return OscarCalibrationReqOutput(
+                    success=False,
+                    message="OSCAR calibration start requires a positive token count",
+                )
+            flush_error = ""
+            try:
+                flushed = self.flush_cache()
+            except Exception as exc:
+                flushed = False
+                flush_error = str(exc)
+            if not _consensus(flushed):
+                return OscarCalibrationReqOutput(
+                    success=False,
+                    message=flush_error
+                    or "A TP rank failed to flush cache before OSCAR calibration",
+                )
+            start_error = ""
+            try:
+                calibrator.start(
+                    prompt_sha256=recv_req.prompt_sha256,
+                    token_budget=recv_req.token_budget,
+                )
+                started = True
+            except Exception as exc:
+                started = False
+                start_error = str(exc)
+            if not _consensus(started):
+                return OscarCalibrationReqOutput(
+                    success=False,
+                    message=start_error
+                    or "A TP rank failed to arm the OSCAR collector",
+                )
+            return OscarCalibrationReqOutput(
+                success=True,
+                message="OSCAR calibration collector armed",
+            )
+
+        captured = min(calibrator._counts.values(), default=0)
+        captured_tensor = torch.tensor([captured], dtype=torch.int64)
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(
+                captured_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+        captured = int(captured_tensor.item())
+        if not _consensus(calibrator.complete):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=(
+                    "OSCAR calibration did not reach the token budget on every "
+                    f"rank/layer (local minimum={captured})"
+                ),
+                captured_tokens=captured,
+            )
+
+        covariance_error = ""
+        try:
+            covariance_sums = calibrator._local_covariance_sums()
+            covariance_ready = True
+        except Exception as exc:
+            covariance_sums = None
+            covariance_ready = False
+            covariance_error = str(exc)
+        if not _consensus(covariance_ready):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=covariance_error
+                or "A TP rank failed to prepare OSCAR covariance sums",
+                captured_tokens=captured,
+            )
+
+        allocation_error = ""
+        try:
+            result = calibrator.allocate_result()
+            allocated = True
+        except Exception as exc:
+            result = None
+            allocated = False
+            allocation_error = str(exc)
+        if not _consensus(allocated):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=allocation_error
+                or "A TP rank failed to allocate OSCAR result buffers",
+                captured_tokens=captured,
+            )
+
+        finalize_error = ""
+        try:
+            result = calibrator.finalize(covariance_sums, result)
+            finalized = True
+        except Exception as exc:
+            result = None
+            finalized = False
+            finalize_error = str(exc)
+        if not _consensus(finalized):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=finalize_error
+                or "A TP rank failed OSCAR eigendecomposition",
+                captured_tokens=captured,
+            )
+
+        broadcast_error = ""
+        try:
+            calibrator.broadcast_result(result)
+            broadcasted = True
+        except Exception as exc:
+            broadcasted = False
+            broadcast_error = str(exc)
+        if not _consensus(broadcasted):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=broadcast_error
+                or "A TP rank failed to broadcast OSCAR rotations",
+                captured_tokens=captured,
+            )
+
+        publish_error = ""
+        if self.attn_tp_rank == 0:
+            try:
+                calibrator.publish(result)
+            except Exception as exc:
+                publish_error = str(exc)
+                logger.exception("Failed to publish OSCAR calibration checkpoints")
+        if not _consensus(not publish_error):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=publish_error or "Another TP rank failed to publish checkpoints",
+                captured_tokens=captured,
+            )
+
+        install_error = ""
+        try:
+            self.device_module.synchronize()
+            flushed = self.flush_cache()
+        except Exception as exc:
+            flushed = False
+            install_error = str(exc)
+        if not _consensus(flushed):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=install_error
+                or "A TP rank failed to flush identity-basis KV cache",
+                captured_tokens=captured,
+            )
+
+        try:
+            pool.update_oscar_rotations_(
+                result.k_rotations,
+                result.v_rotations,
+            )
+            self.device_module.synchronize()
+            installed = True
+        except Exception as exc:
+            installed = False
+            install_error = str(exc)
+        if not _consensus(installed):
+            return OscarCalibrationReqOutput(
+                success=False,
+                message=install_error
+                or "A TP rank failed to install OSCAR rotations",
+                captured_tokens=captured,
+            )
+        if self.tp_size > 1:
+            barrier(group=self.tp_cpu_group)
+        calibrator.release()
+        torch.cuda.empty_cache()
+        envs.SGLANG_OSCAR_CALIBRATION_ACTIVE.set(False)
+        return OscarCalibrationReqOutput(
+            success=True,
+            message=f"Installed OSCAR rotation generation {result.generation_id}",
+            captured_tokens=captured,
+        )
 
     def flush_cache_wrapped(
         self, recv_req: FlushCacheReqInput

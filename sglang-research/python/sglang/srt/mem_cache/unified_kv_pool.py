@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     load_oscar_rotation_config,
     load_oscar_rotations,
+    oscar_calibration_required,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,6 +251,16 @@ class UnifiedInt2HPKVPool(KVCache):
         # the ``rows @ R`` pre-pass and ``result @ R.T`` inverse are plain
         # bf16 GEMMs.
         self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
+        self._oscar_calibration_pending = oscar_calibration_required()
+        if (
+            self._oscar_calibration_pending
+            and envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get()
+        ):
+            raise ValueError(
+                "Startup OSCAR calibration is incompatible with "
+                "SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT. The first launch must "
+                "keep V rotation at runtime so fixed CUDA-graph branches remain valid."
+            )
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
@@ -269,6 +280,8 @@ class UnifiedInt2HPKVPool(KVCache):
             device=torch.device(self.device),
             dtype=self.hp_dtype,
         )
+        self._oscar_rotation_version = 0
+        self._oscar_calibrator = None
         logger.info(
             "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
             self._k_clip_ratio,
@@ -311,6 +324,62 @@ class UnifiedInt2HPKVPool(KVCache):
 
     def mixed_kv_enabled(self) -> bool:
         return True
+
+    @property
+    def oscar_calibration_pending(self) -> bool:
+        return self._oscar_calibration_pending
+
+    def attach_oscar_calibrator(self, calibrator) -> None:
+        if not self._oscar_calibration_pending:
+            raise RuntimeError(
+                "Cannot attach an OSCAR calibrator when checkpoint calibration is not pending"
+            )
+        self._oscar_calibrator = calibrator
+
+    def update_oscar_rotations_(
+        self, k_rotations: torch.Tensor, v_rotations: torch.Tensor
+    ) -> None:
+        """Validate and install both rotation stacks without changing addresses."""
+
+        def _stage(
+            value: torch.Tensor, destination: torch.Tensor, name: str
+        ) -> torch.Tensor:
+            if tuple(value.shape) != tuple(destination.shape):
+                raise ValueError(
+                    f"{name} rotation shape {tuple(value.shape)} does not match "
+                    f"pool shape {tuple(destination.shape)}"
+                )
+            check = value.detach().to(device=self.device, dtype=torch.float32)
+            if not bool(torch.isfinite(check).all()):
+                raise ValueError(f"{name} rotation contains non-finite values")
+            eye = torch.eye(check.shape[-1], device=check.device, dtype=check.dtype)
+            orth_err = (
+                torch.matmul(check, check.transpose(-1, -2)) - eye
+            ).abs().amax()
+            if float(orth_err) > 5e-3:
+                raise ValueError(
+                    f"{name} rotation is not orthogonal (max error={float(orth_err):.3e})"
+                )
+            return value.detach().to(
+                device=destination.device, dtype=destination.dtype
+            ).contiguous()
+
+        # Stage and validate both tensors before mutating either destination.
+        staged_k = _stage(k_rotations, self._R_k, "K")
+        staged_v = _stage(v_rotations, self._R_v, "V")
+        self._R_k.copy_(staged_k)
+        self._R_v.copy_(staged_v)
+        self._oscar_rotation_version += 1
+        self._oscar_calibration_pending = False
+
+    def reset_runtime_state_(self) -> None:
+        """Reset per-request mixed-KV state during a whole-cache flush."""
+        pending = self._pending_forward_done
+        if pending is not None and hasattr(pending, "synchronize"):
+            pending.synchronize()
+        self._pending_forward_done = None
+        self._flush_counter.zero_()
+        self._next_slab_offset.zero_()
 
     def stash_pending_forward(self, event) -> None:
         """Record the most recent forward-stream completion event.

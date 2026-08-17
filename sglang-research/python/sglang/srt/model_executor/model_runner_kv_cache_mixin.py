@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
+    oscar_calibration_required,
 )
 from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
 from sglang.srt.mem_cache.unified_kv_pool import (
@@ -75,6 +76,45 @@ class ModelRunnerKVCacheMixin:
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
+
+        if oscar_calibration_required():
+            token_budget = envs.SGLANG_OSCAR_CALIBRATION_TOKENS.get()
+            if token_budget <= 0:
+                raise ValueError(
+                    "SGLANG_OSCAR_CALIBRATION_TOKENS must be positive"
+                )
+            attn_tp_size = get_attention_tp_size()
+            local_kv_heads = self.model_config.get_num_kv_heads(attn_tp_size)
+            activation_bytes = torch.empty(
+                (), dtype=self.dtype, device="cpu"
+            ).element_size()
+            retained_bytes = (
+                token_budget
+                * self.num_effective_layers
+                * local_kv_heads
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * activation_bytes
+            )
+            gram_bytes = (
+                self.num_effective_layers
+                * local_kv_heads
+                * self.model_config.head_dim
+                * self.model_config.head_dim
+                * 8
+            )
+            # K/V are retained in pinned host RAM so first-start calibration
+            # does not permanently shrink the fixed serving KV pool. Reserve
+            # only the persistent GPU Gram tensors; transient workspace uses
+            # the normal mem-fraction headroom.
+            reserve_bytes = gram_bytes
+            rest_memory -= reserve_bytes / (1 << 30)
+            logger.info(
+                "Reserve %.2f GiB GPU Gram storage and %.2f GiB pinned host K/V "
+                "for startup OSCAR calibration (token_budget=%d)",
+                reserve_bytes / (1 << 30),
+                retained_bytes / (1 << 30),
+                token_budget,
+            )
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
@@ -601,6 +641,63 @@ class ModelRunnerKVCacheMixin:
                         ),
                         scale_dtype=scale_dtype,
                     )
+                    if oscar_calibration_required():
+                        if (
+                            self.dp_size != 1
+                            or self.pp_size != 1
+                            or self.server_args.nnodes != 1
+                        ):
+                            raise ValueError(
+                                "Startup OSCAR calibration currently requires "
+                                "single-node DP=PP=1"
+                            )
+                        if self.attn_cp_size != 1:
+                            raise ValueError(
+                                "Startup OSCAR calibration currently requires attention CP=1"
+                            )
+                        if self.server_args.enable_hierarchical_cache:
+                            raise ValueError(
+                                "Startup OSCAR calibration is incompatible with HiCache"
+                            )
+                        if (
+                            self.server_args.grpc_mode
+                            or self.server_args.use_ray
+                            or self.server_args.encoder_only
+                            or self.server_args.enable_http2
+                        ):
+                            raise ValueError(
+                                "Startup OSCAR calibration currently supports only "
+                                "the standard HTTP launcher or direct Engine API"
+                            )
+                        if self.server_args.tokenizer_worker_num != 1:
+                            raise ValueError(
+                                "Startup OSCAR calibration requires exactly one "
+                                "tokenizer/HTTP worker"
+                            )
+                        if self.server_args.enable_torch_compile:
+                            raise ValueError(
+                                "Startup OSCAR calibration currently requires "
+                                "--enable-torch-compile to be off"
+                            )
+                        if not self.server_args.disable_piecewise_cuda_graph:
+                            logger.warning(
+                                "Disabling piecewise CUDA graph for the first "
+                                "OSCAR auto-calibration launch so every prefill "
+                                "executes the online QKV collector."
+                            )
+                            self.server_args.disable_piecewise_cuda_graph = True
+                        from sglang.srt.mem_cache.oscar_calibration import (
+                            OscarOnlineCalibrator,
+                        )
+
+                        calibrator = OscarOnlineCalibrator(
+                            pool=self.token_to_kv_pool,
+                            total_q_heads=self.model_config.num_attention_heads,
+                            total_kv_heads=self.model_config.get_total_num_kv_heads(),
+                            model_path=self.server_args.model_path,
+                            model_revision=self.server_args.revision,
+                        )
+                        self.token_to_kv_pool.attach_oscar_calibrator(calibrator)
                 else:
                     # For int2 KV cache, scale/zero dtype is configurable via
                     # SGLANG_MIXED_KV_SCALE_DTYPE (defaults to float32 to match
@@ -639,6 +736,15 @@ class ModelRunnerKVCacheMixin:
                         ),
                         scale_dtype=int2_scale_dtype,
                     )
+
+        if oscar_calibration_required() and getattr(
+            self.token_to_kv_pool, "_oscar_calibrator", None
+        ) is None:
+            raise ValueError(
+                "Startup OSCAR calibration requires the unified mixed INT2 KV pool. "
+                "Set SGLANG_ENABLE_MIXED_KV_WINDOWS=1, --kv-cache-dtype int2, "
+                "and use a supported FA3/Triton prefill plus Triton decode backend."
+            )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
