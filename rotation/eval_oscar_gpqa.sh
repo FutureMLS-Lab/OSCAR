@@ -169,6 +169,16 @@ CUDA_VISIBLE_DEVICES="${GPUS}" \
 python -m sglang.launch_server "${SERVER_ARGS[@]}" >> "${LOG_SERVER}" 2>&1 &
 SERVER_PID=$!
 
+
+# Only rank 0 has the HTTP server and drives the eval; the other ranks just serve
+# their shard. Without this they wait on a health endpoint that never comes up
+# and then tear the group down, which surfaces on rank 0 as
+# "DistNetworkError: Failed to recv, got 0 bytes".
+if [[ "${NODE_RANK}" != "0" ]]; then
+    echo "[eval-oscar] rank ${NODE_RANK}: serving only, waiting for the group"
+    wait "${SERVER_PID}"
+    exit 0
+fi
 for _ in $(seq 1 240); do
     if curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
         echo "[eval-oscar] server ready"
