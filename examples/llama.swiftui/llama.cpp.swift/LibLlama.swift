@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import llama
 
@@ -33,20 +34,42 @@ actor LlamaContext {
     /// This variable is used to store temporarily invalid cchars
     private var temporary_invalid_cchars: [CChar]
 
-    var n_len: Int32 = 1024
+    /// Budget for newly generated tokens. Thinking models routinely spend ~1k tokens
+    /// inside <think> before answering, so this needs headroom.
+    var n_max_new: Int32 = 4096
+    private var n_len: Int32 = 0
     var n_cur: Int32 = 0
 
     var n_decode: Int32 = 0
+
+    private static func shouldUseOscarInt2KV(path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return lowercasedPath.contains("rot-kv") || lowercasedPath.contains("oscar")
+    }
+
+    private static func configureOscarInt2KVEnvironment() {
+        setenv("LLAMA_KV_FUSED_FA", "1", 1)
+        setenv("LLAMA_KV_NO_HADAMARD", "1", 1)
+        setenv("LLAMA_KV_CLIP_RATIO", "0.96", 1)
+        setenv("LLAMA_KV_HP_SINK", "64", 1)
+        setenv("LLAMA_KV_HP_RECENT", "256", 1)
+    }
+
+    private let batch_capacity = 512
 
     init(model: OpaquePointer, context: OpaquePointer) {
         self.model = model
         self.context = context
         self.tokens_list = []
-        self.batch = llama_batch_init(512, 0, 1)
+        self.batch = llama_batch_init(Int32(batch_capacity), 0, 1)
         self.temporary_invalid_cchars = []
         let sparams = llama_sampler_chain_default_params()
         self.sampling = llama_sampler_chain_init(sparams)
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.4))
+        // Qwen3 / Qwen3-Thinking recommended sampling. Without the top-k/top-p
+        // truncation the 151k-entry tail stays in play and derails long generations.
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_top_k(20))
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_top_p(0.95, 1))
+        llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.6))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(1234))
         vocab = llama_model_get_vocab(model)
     }
@@ -60,6 +83,12 @@ actor LlamaContext {
     }
 
     static func create_context(path: String) throws -> LlamaContext {
+        let useOscarInt2KV = shouldUseOscarInt2KV(path: path)
+        if useOscarInt2KV {
+            configureOscarInt2KVEnvironment()
+            print("OSCAR INT2 KV enabled for \(path)")
+        }
+
         llama_backend_init()
         var model_params = llama_model_default_params()
 
@@ -77,13 +106,22 @@ actor LlamaContext {
         print("Using \(n_threads) threads")
 
         var ctx_params = llama_context_default_params()
-        ctx_params.n_ctx = 2048
+        ctx_params.n_ctx = useOscarInt2KV ? 8192 : 4096
+        ctx_params.n_batch = 256
+        ctx_params.n_ubatch = 128
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
+        print("Context params: n_ctx=\(ctx_params.n_ctx), n_batch=\(ctx_params.n_batch), n_ubatch=\(ctx_params.n_ubatch)")
+
+        if useOscarInt2KV {
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
+            ctx_params.type_k = GGML_TYPE_Q2_0
+            ctx_params.type_v = GGML_TYPE_Q2_0
+        }
 
         let context = llama_init_from_model(model, ctx_params)
         guard let context else {
-            print("Could not load context!")
+            print("Could not load context for \(path)")
             throw LlamaError.couldNotInitializeContext
         }
 
@@ -114,42 +152,103 @@ actor LlamaContext {
         return batch.n_tokens;
     }
 
-    func completion_init(text: String) {
+    /// Wrap the user turn in the model's own chat template. Returns nil when the model
+    /// ships no template, or when it is not one of the formats llama.cpp knows.
+    private func format_as_chat(_ text: String) -> String? {
+        guard let tmpl = llama_model_chat_template(model, nil) else {
+            return nil
+        }
+
+        return text.withCString { (content: UnsafePointer<CChar>) -> String? in
+            return "user".withCString { (role: UnsafePointer<CChar>) -> String? in
+                var message = llama_chat_message(role: role, content: content)
+                var buffer = [CChar](repeating: 0, count: max(2048, text.utf8.count * 4))
+                var n = llama_chat_apply_template(tmpl, &message, 1, true, &buffer, Int32(buffer.count))
+
+                if n > Int32(buffer.count) {
+                    buffer = [CChar](repeating: 0, count: Int(n) + 1)
+                    n = llama_chat_apply_template(tmpl, &message, 1, true, &buffer, Int32(buffer.count))
+                }
+
+                guard n > 0 else {
+                    return nil
+                }
+
+                return String(cString: Array(buffer[0..<Int(n)]) + [0])
+            }
+        }
+    }
+
+    func completion_init(text: String) -> Bool {
         print("attempting to complete \"\(text)\"")
 
-        tokens_list = tokenize(text: text, add_bos: true)
+        is_done = false
+        n_cur = 0
+        n_decode = 0
         temporary_invalid_cchars = []
 
-        let n_ctx = llama_n_ctx(context)
-        let n_kv_req = tokens_list.count + (Int(n_len) - tokens_list.count)
+        let formatted = format_as_chat(text)
+        if formatted == nil {
+            print("no usable chat template, falling back to raw text completion")
+        }
+        tokens_list = tokenize(text: formatted ?? text, add_bos: true, parse_special: formatted != nil)
 
-        print("\n n_len = \(n_len), n_ctx = \(n_ctx), n_kv_req = \(n_kv_req)")
-
-        if n_kv_req > n_ctx {
-            print("error: n_kv_req > n_ctx, the required KV cache size is not big enough")
+        guard !tokens_list.isEmpty else {
+            print("tokenize() returned no tokens")
+            is_done = true
+            return false
         }
 
-        for id in tokens_list {
-            print(String(cString: token_to_piece(token: id) + [0]))
+        let n_ctx = Int32(llama_n_ctx(context))
+        let n_prompt = Int32(tokens_list.count)
+
+        guard n_prompt < n_ctx else {
+            print("error: prompt is \(n_prompt) tokens, does not fit in a context of \(n_ctx)")
+            is_done = true
+            return false
         }
+
+        n_len = min(n_ctx, n_prompt + n_max_new)
+        print("\n n_prompt = \(n_prompt), n_len = \(n_len), n_ctx = \(n_ctx)")
 
         llama_batch_clear(&batch)
+        llama_memory_clear(llama_get_memory(context), true)
 
-        for i1 in 0..<tokens_list.count {
-            let i = Int(i1)
-            llama_batch_add(&batch, tokens_list[i], Int32(i), [0], false)
+        // llama_decode() rejects batches larger than n_batch, so feed the prompt in chunks
+        // and only ask for logits on the very last token.
+        let chunk_size = min(Int(llama_n_batch(context)), batch_capacity)
+        var i = 0
+        while i < tokens_list.count {
+            let n_chunk = min(chunk_size, tokens_list.count - i)
+
+            llama_batch_clear(&batch)
+            for j in 0..<n_chunk {
+                llama_batch_add(&batch, tokens_list[i + j], Int32(i + j), [0], false)
+            }
+
+            i += n_chunk
+            if i == tokens_list.count {
+                batch.logits[Int(batch.n_tokens) - 1] = 1 // true
+            }
+
+            if llama_decode(context, batch) != 0 {
+                print("llama_decode() failed")
+                is_done = true
+                return false
+            }
         }
-        batch.logits[Int(batch.n_tokens) - 1] = 1 // true
 
-        if llama_decode(context, batch) != 0 {
-            print("llama_decode() failed")
-        }
-
-        n_cur = batch.n_tokens
+        n_cur = n_prompt
+        return true
     }
 
     func completion_loop() -> String {
         var new_token_id: llama_token = 0
+
+        guard !is_done, batch.n_tokens > 0 else {
+            is_done = true
+            return ""
+        }
 
         new_token_id = llama_sampler_sample(sampling, context, batch.n_tokens - 1)
 
@@ -186,9 +285,14 @@ actor LlamaContext {
 
         if llama_decode(context, batch) != 0 {
             print("failed to evaluate llama!")
+            is_done = true
         }
 
         return new_token_str
+    }
+
+    func stop_completion() {
+        is_done = true
     }
 
     func bench(pp: Int, tg: Int, pl: Int, nr: Int = 1) -> String {
@@ -295,11 +399,11 @@ actor LlamaContext {
         llama_memory_clear(llama_get_memory(context), true)
     }
 
-    private func tokenize(text: String, add_bos: Bool) -> [llama_token] {
+    private func tokenize(text: String, add_bos: Bool, parse_special: Bool = false) -> [llama_token] {
         let utf8Count = text.utf8.count
         let n_tokens = utf8Count + (add_bos ? 1 : 0) + 1
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, false)
+        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, parse_special)
 
         var swiftTokens: [llama_token] = []
         for i in 0..<tokenCount {

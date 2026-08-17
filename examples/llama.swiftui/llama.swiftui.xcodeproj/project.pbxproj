@@ -17,6 +17,7 @@
 		8A3F84242AC4C891005E2EE8 /* models in Resources */ = {isa = PBXBuildFile; fileRef = 8A3F84232AC4C891005E2EE8 /* models */; };
 		8A907F332AC7138A006146EA /* LibLlama.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A907F322AC7134E006146EA /* LibLlama.swift */; };
 		8A9F7C4D2AC332EE008AE1EA /* LlamaState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9F7C4C2AC332EE008AE1EA /* LlamaState.swift */; };
+		C730A1D02C10A00100A1A001 /* oscar_logo_kv_transparent.png in Resources */ = {isa = PBXBuildFile; fileRef = C730A1CF2C10A00100A1A001 /* oscar_logo_kv_transparent.png */; };
 		DD84C9FD2D747FED007778EC /* llama.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = DD84C9FC2D747FED007778EC /* llama.xcframework */; };
 		DD84C9FE2D747FED007778EC /* llama.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = DD84C9FC2D747FED007778EC /* llama.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		F1FE20E22B465ECA00B45541 /* LoadCustomButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */; };
@@ -48,6 +49,7 @@
 		8A3F84232AC4C891005E2EE8 /* models */ = {isa = PBXFileReference; lastKnownFileType = folder; name = models; path = llama.swiftui/Resources/models; sourceTree = "<group>"; };
 		8A907F322AC7134E006146EA /* LibLlama.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibLlama.swift; sourceTree = "<group>"; };
 		8A9F7C4C2AC332EE008AE1EA /* LlamaState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LlamaState.swift; sourceTree = "<group>"; };
+		C730A1CF2C10A00100A1A001 /* oscar_logo_kv_transparent.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = oscar_logo_kv_transparent.png; path = ../../tools/ui/static/oscar_logo_kv_transparent.png; sourceTree = "<group>"; };
 		DD84C9FC2D747FED007778EC /* llama.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = llama.xcframework; path = "../../build-apple/llama.xcframework"; sourceTree = "<group>"; };
 		DF2D2FE72B4A59BE00FCB72D /* llama.cpp */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = llama.cpp; path = ../..; sourceTree = "<group>"; };
 		F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadCustomButton.swift; sourceTree = "<group>"; };
@@ -73,6 +75,7 @@
 				DF2D2FE72B4A59BE00FCB72D /* llama.cpp */,
 				8A907F312AC7134E006146EA /* llama.cpp.swift */,
 				8A3F84232AC4C891005E2EE8 /* models */,
+				C730A1CF2C10A00100A1A001 /* oscar_logo_kv_transparent.png */,
 				8A1C83752AC328BD0096AF73 /* llama.swiftui */,
 				8A1C83742AC328BD0096AF73 /* Products */,
 				8A39BE082AC7601000BFEB40 /* Frameworks */,
@@ -216,6 +219,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				8A3F84242AC4C891005E2EE8 /* models in Resources */,
+				C730A1D02C10A00100A1A001 /* oscar_logo_kv_transparent.png in Resources */,
 				8A1C837B2AC328BE0096AF73 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -366,7 +370,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = K5UQJPP73A;
+				DEVELOPMENT_TEAM = CUN3QK592H;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -380,7 +384,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bachittle.llama-swift";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.charles.oscar.llama-swift";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
@@ -398,7 +402,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = K5UQJPP73A;
+				DEVELOPMENT_TEAM = CUN3QK592H;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -412,7 +416,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bachittle.llama-swift";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.charles.oscar.llama-swift";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;

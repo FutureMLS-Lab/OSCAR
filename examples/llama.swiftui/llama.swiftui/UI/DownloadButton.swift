@@ -51,11 +51,13 @@ struct DownloadButton: View {
                     try FileManager.default.copyItem(at: temporaryURL, to: fileURL)
                     print("Writing to \(filename) completed")
 
-                    llamaState.cacheCleared = false
+                    DispatchQueue.main.async {
+                        llamaState.cacheCleared = false
 
-                    let model = Model(name: modelName, url: modelUrl, filename: filename, status: "downloaded")
-                    llamaState.downloadedModels.append(model)
-                    status = "downloaded"
+                        let model = Model(name: modelName, url: modelUrl, filename: filename, status: "downloaded")
+                        llamaState.downloadedModels.append(model)
+                        status = "downloaded"
+                    }
                 }
             } catch let err {
                 print("Error: \(err.localizedDescription)")
@@ -89,13 +91,11 @@ struct DownloadButton: View {
                         download()
                         return
                     }
-                    do {
-                        try llamaState.loadModel(modelUrl: fileURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
+                    Task {
+                        _ = await llamaState.loadModel(modelUrl: fileURL)
                     }
                 }) {
-                    Text("Load \(modelName)")
+                    Label("Load \(modelName)", systemImage: "bolt.fill")
                 }
             } else {
                 Text("Unknown status")

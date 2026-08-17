@@ -14,9 +14,14 @@ class LlamaState: ObservableObject {
     @Published var cacheCleared = false
     @Published var downloadedModels: [Model] = []
     @Published var undownloadedModels: [Model] = []
+    @Published var isLoadingModel = false
+    @Published var isGenerating = false
+    @Published var loadingStatus = "No model loaded"
+    @Published var loadedModelName: String?
     let NS_PER_S = 1_000_000_000.0
 
     private var llamaContext: LlamaContext?
+    private var stopRequested = false
     private var defaultModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-model", withExtension: "gguf", subdirectory: "models")
         // Bundle.main.url(forResource: "llama-2-7b-chat", withExtension: "Q2_K.gguf", subdirectory: "models")
@@ -25,6 +30,7 @@ class LlamaState: ObservableObject {
     init() {
         loadModelsFromDisk()
         loadDefaultModels()
+        runSimulatorSelfTestIfRequested()
     }
 
     private func loadModelsFromDisk() {
@@ -32,6 +38,10 @@ class LlamaState: ObservableObject {
             let documentsURL = getDocumentsDirectory()
             let modelURLs = try FileManager.default.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])
             for modelURL in modelURLs {
+                guard modelURL.pathExtension.lowercased() == "gguf" else {
+                    continue
+                }
+
                 let modelName = modelURL.deletingPathExtension().lastPathComponent
                 downloadedModels.append(Model(name: modelName, url: "", filename: modelURL.lastPathComponent, status: "downloaded"))
             }
@@ -41,10 +51,12 @@ class LlamaState: ObservableObject {
     }
 
     private func loadDefaultModels() {
-        do {
-            try loadModel(modelUrl: defaultModelUrl)
-        } catch {
-            messageLog += "Error!\n"
+        if let defaultModelUrl {
+            Task {
+                _ = await loadModel(modelUrl: defaultModelUrl)
+            }
+        } else {
+            messageLog += "OSCAR runtime ready. Import or download a GGUF model to begin.\n"
         }
 
         for model in defaultModels {
@@ -59,11 +71,75 @@ class LlamaState: ObservableObject {
         }
     }
 
+    private func runSimulatorSelfTestIfRequested() {
+        guard let filename = ProcessInfo.processInfo.environment["OSCAR_AUTOTEST_MODEL_FILENAME"] else {
+            return
+        }
+
+        Task {
+            let modelURL = getDocumentsDirectory().appendingPathComponent(filename)
+            resetSelfTestReport()
+            messageLog += "\n[SelfTest] Loading \(filename)\n"
+            recordSelfTest("[SelfTest] Loading \(filename)")
+            print("[SelfTest] Loading \(filename)")
+            let didLoad = await loadModel(modelUrl: modelURL)
+            guard didLoad else {
+                messageLog += "\n[SelfTest] FAILED\n"
+                recordSelfTest("[SelfTest] FAILED")
+                print("[SelfTest] FAILED")
+                return
+            }
+
+            let prompt = ProcessInfo.processInfo.environment["OSCAR_AUTOTEST_PROMPT"] ?? ""
+            let completionTokens = Int(ProcessInfo.processInfo.environment["OSCAR_AUTOTEST_COMPLETION_TOKENS"] ?? "") ?? 8
+            await runQuickCompletionSelfTest(prompt: prompt, maxTokens: completionTokens)
+            let benchPromptTokens = Int(ProcessInfo.processInfo.environment["OSCAR_AUTOTEST_BENCH_PP"] ?? "") ?? 8
+            let benchGenerationTokens = Int(ProcessInfo.processInfo.environment["OSCAR_AUTOTEST_BENCH_TG"] ?? "") ?? 4
+            await runQuickBenchmarkSelfTest(pp: benchPromptTokens, tg: benchGenerationTokens)
+            messageLog += "\n[SelfTest] COMPLETE\n"
+            recordSelfTest("[SelfTest] COMPLETE")
+            print("[SelfTest] COMPLETE")
+        }
+    }
+
+    private func selfTestReportURL() -> URL {
+        getDocumentsDirectory().appendingPathComponent("oscar-selftest.log")
+    }
+
+    private func resetSelfTestReport() {
+        try? FileManager.default.removeItem(at: selfTestReportURL())
+    }
+
+    private func recordSelfTest(_ line: String) {
+        guard ProcessInfo.processInfo.environment["OSCAR_AUTOTEST_MODEL_FILENAME"] != nil else {
+            return
+        }
+
+        let data = Data((line + "\n").utf8)
+        let url = selfTestReportURL()
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            }
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
     func getDocumentsDirectory() -> URL {
         let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
         return paths[0]
     }
     private let defaultModels: [Model] = [
+        Model(
+            name: "OSCAR Gemma-4-12B-it (Q4_K_M rot-kv, 7.4 GiB)",
+            url: "https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV/resolve/main/q4km-rot-kv/gemma-4-12b-it-rot-kv.gguf?download=true",
+            filename: "gemma-4-12b-it-rot-kv.gguf",
+            status: "download"
+        ),
         Model(name: "TinyLlama-1.1B (Q4_0, 0.6 GiB)",url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_0.gguf?download=true",filename: "tinyllama-1.1b-1t-openorca.Q4_0.gguf", status: "download"),
         Model(
             name: "TinyLlama-1.1B Chat (Q8_0, 1.1 GiB)",
@@ -100,17 +176,84 @@ class LlamaState: ObservableObject {
             filename: "openhermes-2.5-mistral-7b.Q3_K_M.gguf", status: "download"
         )
     ]
-    func loadModel(modelUrl: URL?) throws {
-        if let modelUrl {
-            messageLog += "Loading model...\n"
-            llamaContext = try LlamaContext.create_context(path: modelUrl.path())
-            messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
-
-            // Assuming that the model is successfully loaded, update the downloaded models
-            updateDownloadedModels(modelName: modelUrl.lastPathComponent, status: "downloaded")
-        } else {
+    func loadModel(modelUrl: URL?) async -> Bool {
+        guard let modelUrl else {
             messageLog += "Load a model from the list below\n"
+            return false
         }
+
+        guard !isLoadingModel else {
+            messageLog += "A model is already loading. Please wait.\n"
+            return false
+        }
+
+        isLoadingModel = true
+        loadingStatus = "Loading \(modelUrl.lastPathComponent)..."
+        messageLog += "\nLoading \(modelUrl.lastPathComponent)...\n"
+        llamaContext = nil
+        loadedModelName = nil
+
+        let path = modelUrl.path()
+        var didLoad = false
+        do {
+            let context = try await Task.detached(priority: .userInitiated) {
+                try LlamaContext.create_context(path: path)
+            }.value
+
+            llamaContext = context
+            loadedModelName = modelUrl.lastPathComponent
+            loadingStatus = "Loaded \(modelUrl.lastPathComponent)"
+            messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
+            recordSelfTest("[SelfTest] Loaded model \(modelUrl.lastPathComponent)")
+            print("[SelfTest] Loaded model \(modelUrl.lastPathComponent)")
+            updateDownloadedModels(modelName: modelUrl.lastPathComponent, status: "downloaded")
+            didLoad = true
+        } catch {
+            loadingStatus = "Failed to load \(modelUrl.lastPathComponent)"
+            messageLog += "Load failed: \(error.localizedDescription)\n"
+            recordSelfTest("[SelfTest] Load failed: \(error.localizedDescription)")
+        }
+
+        isLoadingModel = false
+        return didLoad
+    }
+
+    func importModel(from sourceURL: URL) async {
+        guard !isLoadingModel else {
+            messageLog += "A model is already loading. Please wait.\n"
+            return
+        }
+
+        let destinationURL = getDocumentsDirectory().appendingPathComponent(sourceURL.lastPathComponent)
+        let sourcePath = sourceURL.path
+        let destinationPath = destinationURL.path
+
+        isLoadingModel = true
+        loadingStatus = "Copying \(sourceURL.lastPathComponent)..."
+        messageLog += "\nCopying \(sourceURL.lastPathComponent) into app storage...\n"
+
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                if FileManager.default.fileExists(atPath: destinationPath) {
+                    try FileManager.default.removeItem(atPath: destinationPath)
+                }
+                try FileManager.default.copyItem(atPath: sourcePath, toPath: destinationPath)
+            }.value
+
+            let modelName = destinationURL.deletingPathExtension().lastPathComponent
+            downloadedModels.removeAll { $0.filename == destinationURL.lastPathComponent }
+            downloadedModels.append(Model(name: modelName, url: "", filename: destinationURL.lastPathComponent, status: "downloaded"))
+            loadingStatus = "Copied \(destinationURL.lastPathComponent)"
+            messageLog += "Copied model into app storage.\n"
+        } catch {
+            loadingStatus = "Failed to copy \(sourceURL.lastPathComponent)"
+            messageLog += "Import failed: \(error.localizedDescription)\n"
+            isLoadingModel = false
+            return
+        }
+
+        isLoadingModel = false
+        _ = await loadModel(modelUrl: destinationURL)
     }
 
 
@@ -120,45 +263,149 @@ class LlamaState: ObservableObject {
 
 
     func complete(text: String) async {
-        guard let llamaContext else {
+        if isLoadingModel {
+            messageLog += "Model is still loading. Please wait.\n"
             return
+        }
+
+        if isGenerating {
+            messageLog += "Generation is still running. Please wait.\n"
+            return
+        }
+
+        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            messageLog += "Enter a prompt before sending.\n"
+            return
+        }
+
+        guard let llamaContext else {
+            messageLog += "Load a model before sending a prompt.\n"
+            return
+        }
+
+        stopRequested = false
+        isGenerating = true
+        defer {
+            isGenerating = false
+            stopRequested = false
         }
 
         let t_start = DispatchTime.now().uptimeNanoseconds
-        await llamaContext.completion_init(text: text)
+        let didStart = await llamaContext.completion_init(text: prompt)
         let t_heat_end = DispatchTime.now().uptimeNanoseconds
         let t_heat = Double(t_heat_end - t_start) / NS_PER_S
 
-        messageLog += "\(text)"
-
-        Task.detached {
-            while await !llamaContext.is_done {
-                let result = await llamaContext.completion_loop()
-                await MainActor.run {
-                    self.messageLog += "\(result)"
-                }
-            }
-
-            let t_end = DispatchTime.now().uptimeNanoseconds
-            let t_generation = Double(t_end - t_heat_end) / self.NS_PER_S
-            let tokens_per_second = Double(await llamaContext.n_len) / t_generation
-
+        guard didStart else {
+            messageLog += "Could not start generation.\n"
             await llamaContext.clear()
+            return
+        }
 
-            await MainActor.run {
-                self.messageLog += """
-                    \n
-                    Done
-                    Heat up took \(t_heat)s
-                    Generated \(tokens_per_second) t/s\n
-                    """
+        messageLog += "\(prompt)"
+
+        while await !llamaContext.is_done {
+            if stopRequested {
+                await llamaContext.stop_completion()
+                break
             }
+            let result = await llamaContext.completion_loop()
+            messageLog += "\(result)"
+        }
+
+        let t_end = DispatchTime.now().uptimeNanoseconds
+        let t_generation = Double(t_end - t_heat_end) / NS_PER_S
+        let decoded = max(1, await llamaContext.n_decode)
+        let tokens_per_second = Double(decoded) / max(t_generation, 0.001)
+
+        await llamaContext.clear()
+
+        if stopRequested {
+            messageLog += "\n\nStopped\n"
+        } else {
+            messageLog += """
+                \n
+                Done
+                Heat up took \(t_heat)s
+                Generated \(tokens_per_second) t/s\n
+                """
         }
     }
 
-    func bench() async {
-        guard let llamaContext else {
+    func stopGeneration() {
+        guard isGenerating else {
             return
+        }
+
+        stopRequested = true
+        messageLog += "\nStopping...\n"
+        Task {
+            await llamaContext?.stop_completion()
+        }
+    }
+
+    private func runQuickCompletionSelfTest(prompt: String, maxTokens: Int) async {
+        guard let llamaContext else {
+            messageLog += "[SelfTest] completion skipped: no model loaded\n"
+            return
+        }
+
+        messageLog += "[SelfTest] completion prompt: \(prompt)\n"
+        let didStart = await llamaContext.completion_init(text: prompt)
+        guard didStart else {
+            messageLog += "[SelfTest] completion failed to start\n"
+            recordSelfTest("[SelfTest] completion failed")
+            return
+        }
+        messageLog += prompt
+
+        for _ in 0..<maxTokens {
+            if await llamaContext.is_done {
+                break
+            }
+            let result = await llamaContext.completion_loop()
+            messageLog += result
+        }
+
+        await llamaContext.clear()
+        messageLog += "\n[SelfTest] completion ok\n"
+        recordSelfTest("[SelfTest] completion ok")
+        print("[SelfTest] completion ok")
+    }
+
+    private func runQuickBenchmarkSelfTest(pp: Int, tg: Int) async {
+        guard let llamaContext else {
+            messageLog += "[SelfTest] bench skipped: no model loaded\n"
+            return
+        }
+
+        messageLog += "[SelfTest] bench start\n"
+        let result = await llamaContext.bench(pp: pp, tg: tg, pl: 1)
+        messageLog += result
+        messageLog += "\n[SelfTest] bench ok\n"
+        recordSelfTest("[SelfTest] bench ok")
+        print("[SelfTest] bench ok")
+    }
+
+    func bench() async {
+        if isLoadingModel {
+            messageLog += "Model is still loading. Please wait.\n"
+            return
+        }
+
+        if isGenerating {
+            messageLog += "Generation is still running. Please wait.\n"
+            return
+        }
+
+        guard let llamaContext else {
+            messageLog += "Load a model before benchmarking.\n"
+            return
+        }
+
+        isGenerating = true
+        defer {
+            isGenerating = false
         }
 
         messageLog += "\n"

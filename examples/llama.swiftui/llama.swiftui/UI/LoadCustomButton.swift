@@ -14,8 +14,9 @@ struct LoadCustomButton: View {
             Button(action: {
                 showFileImporter = true
             }) {
-                Text("Load Custom Model")
+                Label("Import GGUF from Files", systemImage: "square.and.arrow.down")
             }
+            .buttonStyle(.borderedProminent)
         }
         .fileImporter(
             isPresented: $showFileImporter,
@@ -25,16 +26,13 @@ struct LoadCustomButton: View {
             switch result {
             case .success(let files):
                 files.forEach { file in
-                    let gotAccess = file.startAccessingSecurityScopedResource()
-                    if !gotAccess { return }
+                    Task {
+                        let gotAccess = file.startAccessingSecurityScopedResource()
+                        if !gotAccess { return }
+                        defer { file.stopAccessingSecurityScopedResource() }
 
-                    do {
-                        try llamaState.loadModel(modelUrl: file.absoluteURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
+                        await llamaState.importModel(from: file.absoluteURL)
                     }
-
-                    file.stopAccessingSecurityScopedResource()
                 }
             case .failure(let error):
                 print(error)
