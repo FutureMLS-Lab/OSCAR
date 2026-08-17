@@ -47,7 +47,7 @@ if [[ "${MODE}" == "int2" ]]; then
     SERVER_ARGS+=(
         --kv-cache-dtype int2 --kv-cache-quant-group-size "${GROUP_SIZE}"
         --max-running-requests "${MAX_RUNNING:-32}"
-        --max-total-tokens "${MAX_TOTAL_TOKENS:-262144}"
+        --max-total-tokens "${MAX_TOTAL_TOKENS:-65536}"
     )
     OSCAR_ENV=(
         SGLANG_ENABLE_MIXED_KV_WINDOWS=1 SGLANG_OSCAR_ABSORB_V_ROTATION=1
