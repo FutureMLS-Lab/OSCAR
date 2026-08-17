@@ -26,7 +26,7 @@
 			<OscarBrand class="justify-center" logoClass="h-16 w-16" />
 
 			<h1 class="mt-5 text-2xl font-semibold tracking-tight text-foreground md:text-3xl">
-				OSCAR 2-bit Covariance
+				OSCAR 2-bit KV Covariance
 			</h1>
 
 			<p class="mx-auto mt-2 max-w-md text-sm leading-6 text-muted-foreground md:text-base">
