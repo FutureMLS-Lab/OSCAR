@@ -80,12 +80,20 @@ NUM_WORKERS="${NUM_WORKERS:-32}"
 N_REPEATS="${N_REPEATS:-1}"
 NAME="${NAME:-gpqa_oscar}"
 
-CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV_NAME}"
-
-export PATH="${CONDA_PREFIX}/bin:${PATH}"
+# Respect an environment the caller already activated. Gemma-4 needs
+# transformers >= 5.5 for Gemma4TextConfig and runs from its own venv; forcing
+# the default conda env here silently reverted it, and sglang then reported the
+# model as "not a registered model" because gemma4_unified failed to import.
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    echo "[eval-oscar] using pre-activated venv ${VIRTUAL_ENV}"
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+else
+    CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
+    CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_NAME}"
+    export PATH="${CONDA_PREFIX}/bin:${PATH}"
+fi
 # Prepend per-rank Triton cache redirector so TP workers don't race on shared
 # launcher .so / metadata files in TRITON_CACHE_DIR.
 export PYTHONPATH="${REPO_ROOT}/rotation/_triton_per_rank:${SGLANG_RESEARCH_DIR}/python:${PYTHONPATH:-}"
