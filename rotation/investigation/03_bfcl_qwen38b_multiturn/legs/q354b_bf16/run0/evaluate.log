@@ -1,0 +1,13 @@
+Number of models evaluated:   0%|          | 0/1 [00:00<?, ?it/s]🦍 Model: Qwen_Qwen3.5-4B-FC
+🔍 Running test: multi_turn_miss_param
+✅ Test completed: multi_turn_miss_param. 🎯 Accuracy: 40.50%
+🔍 Running test: multi_turn_miss_func
+✅ Test completed: multi_turn_miss_func. 🎯 Accuracy: 52.00%
+🔍 Running test: multi_turn_long_context
+✅ Test completed: multi_turn_long_context. 🎯 Accuracy: 48.00%
+🔍 Running test: multi_turn_base
+✅ Test completed: multi_turn_base. 🎯 Accuracy: 60.00%
+Number of models evaluated: 100%|██████████| 1/1 [00:03<00:00,  3.44s/it]Number of models evaluated: 100%|██████████| 1/1 [00:03<00:00,  3.44s/it]
+📈 Aggregating data to generate leaderboard score table...
+🏁 Evaluation completed. See /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/legs/q354b_bf16/run0/bfcl_root/score/data_overall.csv for overall evaluation results on BFCL V4.
+See /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/legs/q354b_bf16/run0/bfcl_root/score/data_live.csv, /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/legs/q354b_bf16/run0/bfcl_root/score/data_non_live.csv, /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/legs/q354b_bf16/run0/bfcl_root/score/data_multi_turn.csv, /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/legs/q354b_bf16/run0/bfcl_root/score/data_agentic.csv and /home/charlie/CoQuant/.RUD/hybridmodel-testing/work/CoQuant/rotation/investigation/03_bfcl_qwen38b_multiturn/legs/q354b_bf16/run0/bfcl_root/score/data_format_sensitivity.csv for detailed evaluation results on each sub-section categories respectively.

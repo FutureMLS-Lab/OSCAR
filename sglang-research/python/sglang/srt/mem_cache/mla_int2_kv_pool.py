@@ -371,16 +371,7 @@ class _Int2HPMixin:
         self._maybe_dump_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
         if self.rotations:  # only degrade quality when rotation is requested
             c_kv_q = self._apply_fake_int2_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
-            # torch.cat will not promote across Float8_e4m3fn and bf16, which is
-            # what an FP8 checkpoint hands us: k_pe stays fp8 while the quantizer
-            # returns bf16. Casting the quantized half *down* to fp8 costs a
-            # second lossy round-trip and collapses generation (GPQA 5.6 %, one
-            # or two tokens per answer), so widen k_pe instead and let the
-            # setter re-cast once on the way into the buffer.
-            c_kv_q = c_kv_q.reshape(c_kv.shape)
-            if k_pe.dtype != c_kv_q.dtype:
-                k_pe = k_pe.to(c_kv_q.dtype)
-            cache_k = torch.cat([c_kv_q, k_pe], dim=-1)
+            cache_k = torch.cat([c_kv_q.reshape(c_kv.shape), k_pe], dim=-1)
         parent_setter(layer, loc, cache_k, cache_v)
 
 

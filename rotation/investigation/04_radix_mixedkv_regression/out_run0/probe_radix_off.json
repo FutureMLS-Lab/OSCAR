@@ -1,0 +1,71 @@
+{
+ "divergent_seed": {
+  "degen": 0.027,
+  "len": 3191,
+  "boxed": true
+ },
+ "divergent": [
+  {
+   "degen": 0.027,
+   "len": 2427,
+   "boxed": true
+  },
+  {
+   "degen": 0.027,
+   "len": 2494,
+   "boxed": true
+  },
+  {
+   "degen": 0.027,
+   "len": 3067,
+   "boxed": true
+  },
+  {
+   "degen": 0.028,
+   "len": 2711,
+   "boxed": true
+  }
+ ],
+ "divergent_recheck": {
+  "degen": 0.027,
+  "len": 2683,
+  "boxed": true
+ },
+ "seq_cold": {
+  "degen": 0.027,
+  "len": 2061,
+  "boxed": true
+ },
+ "seq_hit": {
+  "degen": 0.027,
+  "len": 2111,
+  "boxed": true
+ },
+ "concurrent": [
+  {
+   "degen": 0.027,
+   "len": 2561,
+   "boxed": true
+  },
+  {
+   "degen": 0.027,
+   "len": 2111,
+   "boxed": true
+  },
+  {
+   "degen": 0.027,
+   "len": 2078,
+   "boxed": true
+  },
+  {
+   "degen": 0.032,
+   "len": 4447,
+   "boxed": true
+  },
+  {
+   "degen": 0.027,
+   "len": 2495,
+   "boxed": true
+  }
+ ]
+}
