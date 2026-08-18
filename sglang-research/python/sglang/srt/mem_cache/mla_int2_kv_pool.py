@@ -371,7 +371,12 @@ class _Int2HPMixin:
         self._maybe_dump_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
         if self.rotations:  # only degrade quality when rotation is requested
             c_kv_q = self._apply_fake_int2_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
-            cache_k = torch.cat([c_kv_q.reshape(c_kv.shape), k_pe], dim=-1)
+            # The quantizer works in float32 and hands back bf16, but on an FP8
+            # checkpoint k_pe is Float8_e4m3fn -- torch.cat refuses to promote
+            # across those two ("Promotion for Float8 Types is not supported").
+            # Restore c_kv's own dtype so the halves stay concatenable.
+            c_kv_q = c_kv_q.reshape(c_kv.shape).to(c_kv.dtype)
+            cache_k = torch.cat([c_kv_q, k_pe], dim=-1)
         parent_setter(layer, loc, cache_k, cache_v)
 
 
