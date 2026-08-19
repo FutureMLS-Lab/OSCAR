@@ -1,0 +1,35 @@
+run_name: qwen3.6-27b-nvfp4-greedy
+output_dir: runs
+hf_home: /data/huggingface
+reference:
+  model_path: Qwen/Qwen3.6-27B
+  image: lmsysorg/sglang:dev-dev-qwen36-27b-nvfp4
+  tp: 1
+  extra_args: --context-length 262144 --mem-fraction-static 0.85 --trust-remote-code
+candidates:
+  - name: nvfp4
+    model_path: nvidia/Qwen3.6-27B-NVFP4
+    image: lmsysorg/sglang:dev-dev-qwen36-27b-nvfp4
+    tp: 1
+    extra_args: --context-length 262144 --mem-fraction-static 0.85 --trust-remote-code
+prompts:
+  dataset: HuggingFaceH4/ultrachat_200k
+  split: test_sft
+  n: 512
+  seed: 0
+  max_prompt_tokens: 2048
+generation:
+  temperature: 0.0
+  top_p: 0.95
+  max_new_tokens: 256
+scoring:
+  top_logprobs_num: 20
+  concurrency: 32
+runtime:
+  ref:
+    gpus: [2]
+    port: 38090
+  candidates:
+    nvfp4:
+      gpus: [3]
+      port: 38091

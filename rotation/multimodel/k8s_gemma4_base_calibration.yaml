@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-gemma4-base-calibration-v1
+  namespace: charlie
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 43200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: calibrate
+          image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+          workingDir: /shared-work/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+            - {name: SGLANG_DUMP_CALIBRATION_QKV, value: "1"}
+            - {name: SGLANG_DUMP_CALIBRATION_TOKENS, value: "30000"}
+            - {name: SGLANG_DUMP_CALIBRATION_MIN_CHUNK_TOKENS, value: "256"}
+          resources:
+            requests: {nvidia.com/gpu: "1", cpu: "16", memory: 96Gi}
+            limits: {nvidia.com/gpu: "1", cpu: "32", memory: 192Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared-work}
+            - {name: hf, mountPath: /shared/huggingface}
+            - {name: shm, mountPath: /dev/shm}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              shopt -s nullglob
+              ROOT=/shared-work/oscar-int3-rubin-simulate
+              SRC=${ROOT}/source/multimodel/CoQuant
+              MODELS=(/shared/huggingface/hub/models--google--gemma-4-12B/snapshots/*)
+              [[ ${#MODELS[@]} -eq 1 ]]
+              MODEL=${MODELS[0]}
+              BASE=${ROOT}/multimodel/gemma4-12b-base
+              DUMP=${BASE}/calibration/qkv
+              ROT=${BASE}/rotations
+              BOOKS=${BASE}/codebooks
+              mkdir -p "$DUMP" "$ROT" "$BOOKS" /tmp/charlie
+              export PYTHONPATH=${ROOT}/source/multimodel-calibration-runtime/python
+              export SGLANG_DUMP_CALIBRATION_DIR=$DUMP
+              python3 -m sglang.launch_server --model-path "$MODEL" \
+                --tensor-parallel-size 1 --attention-backend triton \
+                --kv-cache-dtype bf16 --chunked-prefill-size 4096 \
+                --mem-fraction-static 0.75 --max-running-requests 1 \
+                --disable-radix-cache --disable-cuda-graph \
+                --disable-piecewise-cuda-graph --disable-overlap-schedule \
+                --skip-server-warmup \
+                --host 127.0.0.1 --port 31857 \
+                --dist-init-addr 127.0.0.1:41857 --trust-remote-code \
+                >${BASE}/calibration/server.log 2>&1 &
+              PID=$!
+              trap 'kill -TERM "$PID" 2>/dev/null || true' EXIT
+              for _ in $(seq 1 360); do
+                curl -fsS http://127.0.0.1:31857/health >/dev/null 2>&1 && break
+                kill -0 "$PID" 2>/dev/null || exit 1
+                sleep 5
+              done
+              python3 rotation/_eval_runner/dump_long_context_wikitext.py \
+                --model "$MODEL" --base-url http://127.0.0.1:31857 \
+                --target-tokens 32768 --dataset-config wikitext-103-raw-v1 \
+                --cache-dir /shared/huggingface/datasets --max-tokens 1 \
+                --raw-generate
+              kill -TERM "$PID" 2>/dev/null || true
+              wait "$PID" 2>/dev/null || true
+              trap - EXIT
+              python3 rotation/compute_kv_rotation.py --dump-path "$DUMP" \
+                --output-dir "$ROT" --head-dim 0 --chunk-id all \
+                --method qqt_sst --composition r_h_pbr
+              PY=python3 DUMP_PATH="$DUMP" ROT_DIR="$ROT" \
+                OUTPUT_DIR="$BOOKS" HEAD_DIM=0 FIT_DEVICE=cuda \
+                MAX_SAMPLES=500000 CALIBRATION_NAME=wikitext-103-raw-v1/train \
+                bash rotation/fit_offline_lutb_codebooks.sh
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}

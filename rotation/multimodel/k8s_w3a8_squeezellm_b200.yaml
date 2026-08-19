@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-squeezellm-b200-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimitPerIndex: 0
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate/w3a8
+              if [[ $JOB_COMPLETION_INDEX == 0 ]]; then
+                MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+                SLUG=qwen3-4b-thinking
+                ATTN=flash_attention_2
+              else
+                MODELS=(/shared/huggingface/hub/models--google--gemma-4-12B/snapshots/*)
+                [[ ${#MODELS[@]} -eq 1 ]]
+                MODEL=${MODELS[0]}
+                SLUG=gemma4-12b
+                ATTN=sdpa
+              fi
+              OUT=$ROOT/quality/$SLUG/squeezellm_lm_fisher100_mxfp8/ppl.json
+              REF=$ROOT/quality/$SLUG/bf16_bf16/kl_reference.json
+              [[ -s "$OUT" ]] && exit 0
+              test -s "$REF"
+              mkdir -p "$(dirname "$OUT")"
+              python3 /scripts/w3a8_lut_sim.py \
+                --model-path "$MODEL" \
+                --weight-method squeezellm_lm \
+                --activation mxfp8 \
+                --output "$OUT" \
+                --blocks-path "$ROOT/blocks/${SLUG}_8192.pt" \
+                --calibration-blocks-path "$ROOT/blocks/${SLUG}_train_8192.pt" \
+                --block-size 8192 \
+                --max-blocks 16 \
+                --kl-reference "$REF" \
+                --calibration-tokens 128 \
+                --fisher-samples 100 \
+                --lm-iterations 8 \
+                --chunk-tiles 256 \
+                --attn-implementation "$ATTN" \
+                --trust-remote-code
+          resources:
+            requests:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 160Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-scripts
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

@@ -1,0 +1,295 @@
+<title>{{TITLE}}</title>
+<style>
+:root{
+  --bg:#f4f5f8; --panel:#ffffff; --ink:#1a1d26; --muted:#5b6273; --faint:#8a90a2;
+  --line:#e3e6ee; --line2:#eef0f6; --accent:#4f46e5; --accent-soft:#eef0fe; --on-accent:#ffffff;
+  --best:#0f9d78; --best-bg:#e8f7f1; --warn:#b26a00; --warn-bg:#fdf1de; --warn-line:#e8c07a;
+  --hl:#fff6d8; --hl-line:#e7c65a;
+  --shadow:0 1px 2px rgba(20,24,40,.04),0 4px 16px rgba(20,24,40,.05);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e1017; --panel:#171a23; --ink:#e8eaf0; --muted:#9aa1b4; --faint:#6b7285;
+    --line:#262a37; --line2:#1e222d; --accent:#8b83ff; --accent-soft:#20213a; --on-accent:#12131f;
+    --best:#3fd6a5; --best-bg:#12271f; --warn:#e8b464; --warn-bg:#2b210f; --warn-line:#6f5a24;
+    --hl:#3a3313; --hl-line:#7a6a24;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme=light]{
+  --bg:#f4f5f8; --panel:#ffffff; --ink:#1a1d26; --muted:#5b6273; --faint:#8a90a2;
+  --line:#e3e6ee; --line2:#eef0f6; --accent:#4f46e5; --accent-soft:#eef0fe; --on-accent:#ffffff;
+  --best:#0f9d78; --best-bg:#e8f7f1; --warn:#b26a00; --warn-bg:#fdf1de; --warn-line:#e8c07a;
+  --hl:#fff6d8; --hl-line:#e7c65a;
+  --shadow:0 1px 2px rgba(20,24,40,.04),0 4px 16px rgba(20,24,40,.05);
+}
+:root[data-theme=dark]{
+  --bg:#0e1017; --panel:#171a23; --ink:#e8eaf0; --muted:#9aa1b4; --faint:#6b7285;
+  --line:#262a37; --line2:#1e222d; --accent:#8b83ff; --accent-soft:#20213a; --on-accent:#12131f;
+  --best:#3fd6a5; --best-bg:#12271f; --warn:#e8b464; --warn-bg:#2b210f; --warn-line:#6f5a24;
+  --hl:#3a3313; --hl-line:#7a6a24;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 24px 80px;}
+header.top{margin-bottom:8px;}
+.eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:700;}
+h1{font-size:26px;line-height:1.2;margin:6px 0 10px;font-weight:750;letter-spacing:-.01em;text-wrap:balance;}
+.meta{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:6px 18px;margin-bottom:4px;}
+.meta code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;color:var(--ink);
+  background:var(--accent-soft);padding:1px 7px;border-radius:5px;}
+.note{color:var(--faint);font-size:12.5px;margin-top:10px;max-width:82ch;}
+.note strong{color:var(--muted);}
+.note code{font-family:ui-monospace,monospace;font-size:11.5px;}
+
+.findings{display:grid;grid-template-columns:1fr;gap:14px;margin:24px 0 4px;}
+@media(min-width:720px){.findings{grid-template-columns:1fr 1fr;}}
+@media(min-width:1000px){.findings{grid-template-columns:repeat(4,1fr);}}
+.f{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px 16px 16px;
+  box-shadow:var(--shadow);display:flex;flex-direction:column;gap:7px;}
+.f .lbl{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;color:var(--faint);}
+.f .big{font-family:ui-monospace,monospace;font-size:23px;font-weight:700;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;line-height:1.1;}
+.f .sub{font-size:12.5px;color:var(--muted);}
+.f .sub code{font-family:ui-monospace,monospace;font-size:11.5px;color:var(--ink);}
+.f.good{border-left:3px solid var(--best);} .f.good .big{color:var(--best);}
+.f.flat{border-left:3px solid var(--faint);} .f.flat .big{color:var(--muted);}
+.f.warn{border-left:3px solid var(--warn-line);} .f.warn .big{color:var(--warn);}
+.f.key{border-left:3px solid var(--accent);} .f.key .big{color:var(--accent);}
+
+.controls{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(8px);padding:14px 0 12px;margin:22px 0 4px;border-bottom:1px solid var(--line);
+  display:flex;flex-direction:column;gap:11px;}
+.crow{display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+.lbl2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);font-weight:700;
+  margin-right:2px;}
+.chips{display:flex;flex-wrap:wrap;gap:7px;}
+.chip{display:inline-flex;align-items:center;gap:7px;padding:4px 11px 4px 8px;border:1px solid var(--line);
+  border-radius:999px;background:var(--panel);color:var(--muted);font-size:12px;cursor:pointer;
+  transition:border-color .12s ease,color .12s ease;user-select:none;font-family:ui-monospace,monospace;}
+.chip:hover{border-color:var(--accent);color:var(--ink);}
+.chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+.chip .dot{width:9px;height:9px;border-radius:50%;flex:none;}
+.chip.active{background:var(--hl);border-color:var(--hl-line);color:var(--ink);font-weight:600;}
+.chip.clear{font-family:inherit;font-style:italic;color:var(--faint);}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:var(--panel);}
+.seg button{appearance:none;border:0;background:transparent;color:var(--muted);cursor:pointer;
+  font:600 12px/1 ui-monospace,monospace;padding:7px 13px;}
+.seg button[aria-pressed=true]{background:var(--accent);color:var(--on-accent);}
+.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
+
+section.bucket{margin-top:26px;}
+section.profile{margin-top:28px;}
+.pcard{padding:16px 18px 18px;}
+.plegend{font-size:12.5px;color:var(--muted);margin-bottom:14px;max-width:70ch;}
+.pchart{position:relative;display:flex;flex-direction:column;gap:9px;padding-bottom:2px;}
+.pchart::after{content:"";position:absolute;top:-2px;bottom:-2px;left:calc(148px + var(--uni)*0.999);
+  border-left:1px dashed var(--faint);opacity:.85;}
+.prow{display:grid;grid-template-columns:140px 1fr 58px;align-items:center;gap:8px;}
+.pband{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted);white-space:nowrap;}
+.ptrack{height:20px;background:var(--line2);border-radius:5px;overflow:hidden;}
+.pbar{display:block;height:100%;border-radius:5px;}
+.pbar.hi{background:var(--accent);}
+.pbar.lo{background:var(--faint);opacity:.55;}
+.pval{font-family:ui-monospace,monospace;font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums;}
+.pnote{font-size:12.5px;color:var(--faint);margin-top:14px;max-width:78ch;}
+.pnote code{font-family:ui-monospace,monospace;}
+@media(max-width:560px){.prow{grid-template-columns:104px 1fr 50px;}.pchart::after{left:calc(112px + var(--uni)*0.999);}}
+.bhead{display:flex;align-items:baseline;gap:12px;margin:0 0 10px;flex-wrap:wrap;}
+.bhead h2{font-size:16px;margin:0;font-weight:700;letter-spacing:-.01em;}
+.bhead .pos{font-family:ui-monospace,monospace;font-size:12.5px;color:var(--accent);font-weight:600;}
+.bhead .tok{font-size:12px;color:var(--faint);}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden;}
+.scroll{overflow-x:auto;}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;min-width:760px;}
+thead th{position:sticky;top:0;background:var(--panel);text-align:right;font-size:10.5px;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--faint);font-weight:700;padding:11px 14px;border-bottom:1px solid var(--line);white-space:nowrap;}
+thead th.l{text-align:left;}
+thead th.on{color:var(--accent);}
+tbody td{padding:9px 14px;border-bottom:1px solid var(--line2);text-align:right;
+  font-family:ui-monospace,monospace;font-size:12.5px;white-space:nowrap;}
+tbody tr:last-child td{border-bottom:none;}
+td.rank{color:var(--faint);width:34px;text-align:center;font-size:11.5px;}
+td.model{text-align:left;font-family:ui-sans-serif,sans-serif;max-width:360px;white-space:normal;line-height:1.35;}
+td.model .full{font-weight:600;color:var(--ink);display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+td.model .dot{width:8px;height:8px;border-radius:50%;flex:none;}
+td.model .nm{word-break:break-word;}
+td.model .short{font-family:ui-monospace,monospace;font-size:11px;color:var(--faint);margin-left:16px;display:block;}
+.tag{font-family:ui-sans-serif,sans-serif;font-size:9.5px;font-weight:700;letter-spacing:.04em;
+  text-transform:uppercase;padding:1px 6px;border-radius:999px;white-space:nowrap;}
+.tag.hf{background:var(--accent-soft);color:var(--accent);}
+.tag.in-house{background:transparent;color:var(--faint);border:1px solid var(--line);}
+.tag.new{background:var(--accent);color:var(--on-accent);}
+td.kl{font-weight:700;}
+.klcell{display:inline-block;min-width:58px;padding:2px 8px;border-radius:6px;text-align:right;}
+tr.best td.rank{color:var(--best);font-weight:800;}
+tr.best .full .nm{color:var(--best);}
+tr.hl{background:var(--hl);}
+tr.hl td{border-color:var(--hl-line);}
+.dim{color:var(--muted);}
+footer{margin-top:40px;color:var(--faint);font-size:12px;border-top:1px solid var(--line);padding-top:16px;max-width:96ch;}
+footer code{font-family:ui-monospace,monospace;}
+footer p{margin:0 0 9px;}
+@media (max-width:560px){.wrap{padding:20px 14px 60px;}h1{font-size:21px;}.f .big{font-size:20px;}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <div class="eyebrow">kl-probe · mxfp8 placement experiment</div>
+  <h1>{{H1}}</h1>
+  <div class="meta">
+    <span>Reference <code id="ref"></code></span>
+    <span>Run <code id="run"></code></span>
+    <span id="ncand"></span>
+    <span><code id="nb"></code> buckets of <code id="bsz"></code> positions</span>
+  </div>
+{{INTRO}}
+</header>
+
+{{FINDINGS}}
+
+<div class="controls">
+  <div class="crow">
+    <span class="lbl2">Rank &amp; shade by</span>
+    <span class="seg" id="sortseg" role="group" aria-label="Ranking metric">
+      <button type="button" data-k="p99" aria-pressed="true">KL p99</button>
+      <button type="button" data-k="kl" aria-pressed="false">KL mean</button>
+    </span>
+  </div>
+  <div class="crow">
+    <span class="lbl2">Highlight</span>
+    <div class="chips" id="chips"></div>
+  </div>
+</div>
+
+{{EXTRA}}
+<div id="sections"></div>
+
+{{FOOTER}}
+</div>
+
+<script>
+const DATA = {{DATA}};
+
+document.getElementById('ref').textContent = DATA.ref;
+document.getElementById('run').textContent = DATA.run;
+document.getElementById('bsz').textContent = DATA.bucket_size;
+document.getElementById('ncand').textContent = DATA.candidates.length + ' candidates';
+document.getElementById('nb').textContent = DATA.nbuckets;
+
+const byName = {};
+DATA.candidates.forEach(c => { byName[c.name] = {}; c.buckets.forEach(b => byName[c.name][b.b] = b); });
+
+let sortKey = 'p99';
+let active = null;
+
+function range(key){
+  const v = [];
+  DATA.candidates.forEach(c => c.buckets.forEach(b => v.push(b[key])));
+  return [Math.log(Math.min(...v) + 1e-4), Math.log(Math.max(...v) + 1e-4)];
+}
+function isDark(){
+  const t = document.documentElement.getAttribute('data-theme');
+  if (t === 'dark') return true;
+  if (t === 'light') return false;
+  return matchMedia('(prefers-color-scheme:dark)').matches;
+}
+function heat(v, lo, hi){
+  let t = (Math.log(v + 1e-4) - lo) / (hi - lo);
+  t = Math.max(0, Math.min(1, t));
+  const H = 150 - 150 * t, dark = isDark();
+  return {
+    bg: `hsl(${H} ${dark ? 45 : 68}% ${dark ? 22 + 8 * t : 94 - 14 * t}%)`,
+    fg: dark ? `hsl(${H} 70% 78%)` : `hsl(${H} 60% 26%)`
+  };
+}
+const dot = h => `hsl(${h} 62% 55%)`;
+const esc = s => String(s).replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+
+function render(){
+  const [lo, hi] = range(sortKey);
+  const S = document.getElementById('sections');
+  S.innerHTML = '';
+  DATA.buckets.forEach(bk => {
+    const overall = bk.bucket === -1;
+    const rows = DATA.candidates.map(c => ({c, m: byName[c.name][bk.bucket]}))
+                   .filter(r => r.m).sort((a, b) => a.m[sortKey] - b.m[sortKey]);
+    const tok = rows.length ? rows[0].m.n : 0;
+    const sec = document.createElement('section');
+    sec.className = 'bucket';
+    let h = `<div class="bhead"><h2>${overall ? 'Overall' : 'Bucket ' + bk.bucket}</h2>` +
+            `<span class="pos">${bk.pos_range}</span>` +
+            `<span class="tok">${tok.toLocaleString()} tokens${overall ? ' · token-weighted across all ' + DATA.nbuckets + ' buckets' : ''}</span></div>` +
+            `<div class="card"><div class="scroll"><table><thead><tr>` +
+            `<th class="l" style="width:34px">#</th><th class="l">Model</th>` +
+            `<th class="${sortKey === 'kl' ? 'on' : ''}">KL mean</th>` +
+            `<th class="${sortKey === 'p99' ? 'on' : ''}">KL p99</th>` +
+            `<th>KL max</th><th>top-1</th><th>top-5</th>` +
+            `</tr></thead><tbody>`;
+    rows.forEach((r, i) => {
+      const hc = heat(r.m[sortKey], lo, hi);
+      const cls = 'row' + (i === 0 ? ' best' : '') + (active === r.c.name ? ' hl' : '');
+      const klm = sortKey === 'kl'
+        ? `<td class="kl"><span class="klcell" style="background:${hc.bg};color:${hc.fg}">${r.m.kl.toFixed(5)}</span></td>`
+        : `<td class="dim">${r.m.kl.toFixed(5)}</td>`;
+      const p99 = sortKey === 'p99'
+        ? `<td class="kl"><span class="klcell" style="background:${hc.bg};color:${hc.fg}">${r.m.p99.toFixed(4)}</span></td>`
+        : `<td class="dim">${r.m.p99.toFixed(4)}</td>`;
+      h += `<tr class="${cls}" data-name="${esc(r.c.name)}">` +
+           `<td class="rank">${i + 1}</td>` +
+           `<td class="model"><span class="full"><span class="dot" style="background:${dot(r.c.hue)}"></span>` +
+           `<span class="nm">${esc(r.c.full)}</span>` +
+           `<span class="tag ${r.c.origin}">${r.c.origin === 'hf' ? 'HF' : 'in-house'}</span>` +
+           (r.c.new ? '<span class="tag new">new</span>' : '') + `</span>` +
+           `<span class="short">${esc(r.c.sub || `K=${r.c.k} · MXFP8 layers ${r.c.layers}`)}` +
+           (r.c.shape ? ' · ' + esc(r.c.shape) : '') + `</span></td>` +
+           klm + p99 +
+           `<td class="dim">${r.m.mx.toFixed(3)}</td>` +
+           `<td>${r.m.t1.toFixed(2)}%</td>` +
+           `<td class="dim">${r.m.t5.toFixed(2)}%</td></tr>`;
+    });
+    h += `</tbody></table></div></div>`;
+    sec.innerHTML = h;
+    S.appendChild(sec);
+  });
+}
+
+const chipbox = document.getElementById('chips');
+function buildChips(){
+  chipbox.innerHTML = '';
+  DATA.candidates.forEach(c => {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'chip' + (active === c.name ? ' active' : '');
+    el.setAttribute('aria-pressed', active === c.name ? 'true' : 'false');
+    el.innerHTML = `<span class="dot" style="background:${dot(c.hue)}"></span>${esc(c.name)}` +
+                   (c.new ? ' <span class="tag new">new</span>' : '');
+    el.onclick = () => { active = active === c.name ? null : c.name; buildChips(); render(); };
+    chipbox.appendChild(el);
+  });
+  const clr = document.createElement('button');
+  clr.type = 'button';
+  clr.className = 'chip clear';
+  clr.textContent = 'clear';
+  clr.onclick = () => { active = null; buildChips(); render(); };
+  chipbox.appendChild(clr);
+}
+
+document.getElementById('sortseg').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  sortKey = b.dataset.k;
+  [...e.currentTarget.querySelectorAll('button')]
+    .forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+  render();
+});
+
+buildChips();
+render();
+matchMedia('(prefers-color-scheme:dark)').addEventListener('change', render);
+new MutationObserver(render).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+</script>

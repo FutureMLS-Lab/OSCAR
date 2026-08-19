@@ -1,0 +1,92 @@
+# Two model servers (reference + candidate), shared HF cache. Engine-specific
+# launch commands are built by kl_probe/servers.py and injected via .env files.
+# GPU device_ids are written to a generated docker/.devices.<project>.yml override.
+
+x-server: &server
+  ipc: host
+  restart: "no"
+  entrypoint: ["/bin/sh", "-c"]
+  volumes:
+    - ${HF_HOME_HOST:-/data/huggingface}:/hf
+    # Persist engine kernel caches (vllm/flashinfer autotune, minfer AOT,
+    # torch compile) across container recreations — autotuning a big model
+    # can take 10+ minutes per cold boot. The image ships nothing of value
+    # in /root/.cache (pip only), so shadowing it is safe.
+    - ${ENGINE_CACHE_HOST:-./.engine-cache}:/root/.cache
+    # Local checkpoints (model_path starting with /scratch/... or /data/...) —
+    # mounted at the same path so the config's model_path is valid on host and
+    # container alike (tokenizer load + prewarm happen on the host, serving
+    # in-container). HF_HUB_CACHE stays pinned to /hf/hub below, so the image's
+    # hardcoded /data/huggingface hub path is still overridden.
+    - /scratch:/scratch
+    - /data:/data
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - >-
+        python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:30000/health')" || exit 1
+    interval: 20s
+    timeout: 10s
+    retries: 60
+    start_period: 60s
+
+services:
+  ref:
+    <<: *server
+    profiles: [ref]
+    image: ${REF_IMAGE}
+    ports:
+      - "${REF_PORT}:30000"
+    environment:
+      - HF_HOME=/hf
+      # The host HF cache is bind-mounted at /hf, so the hub cache lives at
+      # /hf/hub. The tgl image hardcodes HF_HUB_CACHE=/data/huggingface (its
+      # host path), which is empty inside the container and overrides HF_HOME's
+      # default — so we must point it back at the mount or offline lookups miss.
+      - HF_HUB_CACHE=/hf/hub
+      # Cache is bind-mounted at /hf and every checkpoint is prewarmed into it
+      # before serving, so the container never needs the network. Force offline
+      # so HF uses the mounted snapshot directly instead of phoning home to
+      # validate config.json (which 401s on private repos without a token).
+      # Overridable per run via the config's env: block.
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    # Static wrapper: apply loader patches (validated basenames, bind-mounted
+    # under /kl-probe-patches by the generated override), then exec the server.
+    # ${REF_PATCHES}/${REF_LAUNCH_CMD} are compose-interpolated from the .env
+    # file; $$ escapes keep the loop variables for the container shell.
+    command:
+      - |
+        set -e
+        for p in $$(echo "${REF_PATCHES}" | tr ',' ' '); do
+          echo "applying loader patch: $$p"
+          python3 "/kl-probe-patches/$$p"
+        done
+        exec ${REF_LAUNCH_CMD}
+
+  cand:
+    <<: *server
+    profiles: [cand]
+    image: ${CAND_IMAGE}
+    ports:
+      - "${CAND_PORT}:30000"
+    environment:
+      - HF_HOME=/hf
+      # See ref service: point HF_HUB_CACHE at the /hf mount (image hardcodes a
+      # stale /data/huggingface) and force offline so the mounted /hf cache is
+      # used without a token (candidates are private repos). Overridable per run.
+      - HF_HUB_CACHE=/hf/hub
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    command:
+      - |
+        set -e
+        for p in $$(echo "${CAND_PATCHES}" | tr ',' ' '); do
+          echo "applying loader patch: $$p"
+          python3 "/kl-probe-patches/$$p"
+        done
+        exec ${CAND_LAUNCH_CMD}

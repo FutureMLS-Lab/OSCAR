@@ -1,0 +1,115 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-m3-native-smoke-b200-v1
+  namespace: charlie
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      priorityClassName: eight-gpu
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: smoke
+          image: lmsysorg/sglang:dev-minimax-m3
+          env:
+            - {name: HF_HOME, value: /hf}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: PYTHONPATH, value: /patch:/sgl-workspace/sglang/python}
+            - {name: MINIMAX_ROUTED_W3_METHOD, value: ""}
+            - {name: MINIMAX_ROUTED_W3_QUANTIZER, value: /patch/w3a8_lut_sim.py}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              MODEL=/hf/models--MiniMaxAI--MiniMax-M3/snapshots/f0e1c1e04d40177e4673a22097036854f536e9c0
+              LOG=/shared/minimax-m3/native-smoke.log
+              mkdir -p "$(dirname "$LOG")"
+              python3 -m sglang.launch_server \
+                --model-path "$MODEL" \
+                --model-loader-extra-config '{"enable_multithread_load":false}' \
+                --trust-remote-code \
+                --tp 8 \
+                --ep-size 8 \
+                --attention-backend fa4 \
+                --moe-runner-backend triton \
+                --page-size 128 \
+                --context-length 16384 \
+                --chunked-prefill-size 8192 \
+                --mem-fraction-static 0.80 \
+                --watchdog-timeout 3600 \
+                --disable-cuda-graph \
+                --skip-server-warmup \
+                --reasoning-parser auto \
+                --tool-call-parser auto \
+                --host 0.0.0.0 \
+                --port 30000 >"$LOG" 2>&1 &
+              SERVER_PID=$!
+              trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+              python3 - <<'PY'
+              import time
+              import requests
+
+              for _ in range(3600):
+                  try:
+                      response = requests.get(
+                          "http://127.0.0.1:30000/model_info",
+                          timeout=2,
+                      )
+                      if response.ok:
+                          break
+                  except requests.RequestException:
+                      pass
+                  time.sleep(2)
+              else:
+                  raise TimeoutError("MiniMax-M3 server did not become ready")
+
+              response = requests.post(
+                  "http://127.0.0.1:30000/generate",
+                  json={
+                      "text": "Hello",
+                      "sampling_params": {
+                          "max_new_tokens": 1,
+                          "temperature": 0,
+                      },
+                      "return_logprob": True,
+                      "logprob_start_len": 0,
+                  },
+                  timeout=600,
+              )
+              response.raise_for_status()
+              print("MINIMAX_M3_NATIVE_SMOKE_OK", response.json(), flush=True)
+              PY
+          resources:
+            requests:
+              cpu: "64"
+              memory: 768Gi
+              nvidia.com/gpu: "8"
+            limits:
+              cpu: "128"
+              memory: 1500Gi
+              nvidia.com/gpu: "8"
+          volumeMounts:
+            - {name: hf, mountPath: /hf}
+            - {name: patch, mountPath: /patch}
+            - {name: shm, mountPath: /dev/shm}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: hf
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc
+        - name: patch
+          configMap:
+            name: minimax-routed-w3-scripts
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

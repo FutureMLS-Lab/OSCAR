@@ -1,0 +1,53 @@
+# Smoke test: MiniMax-M3-0602 reference scored against ITSELF over a small
+# subset of the HLE response cache. It exercises the whole pipeline end to end
+# (ingest -> score -> metrics) with a SINGLE model load — the "candidate" reuses
+# the reference server via runtime.candidates.self.base_url, so nothing extra is
+# launched. Expect KL ~ 0 and top-1 ~ 100%; a nonzero result means the pipeline
+# (or server determinism) is off, not quantization.
+#
+#   uv run probe run -c configs/smoke.yaml --down
+run_name: smoke
+output_dir: runs
+hf_home: /data/huggingface
+
+allow_generations: false
+
+reference:
+  model_path: /scratch/tonyzhang/models/Minimax-M3-0602
+  image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+  tp: 4
+  extra_args: --quantization mxfp8 --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --chunked-prefill-size 16384 --trust-remote-code
+  env:
+    SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+    TORCHDYNAMO_DISABLE: 1
+
+# Same checkpoint as the reference; scored through the reference's own server
+# (see runtime below), so only model_path (tokenizer/identity) and image (engine
+# detection) matter here — this server is never launched.
+candidates:
+  - name: self
+    model_path: /scratch/tonyzhang/models/Minimax-M3-0602
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+
+ingest:
+  source: /scratch/tonyzhang/jheo_evals/runs/hle-mxfp8-0602-text2158/response_cache
+  format: hle_response_cache
+  require_finish_reason: stop     # drop the cap-truncated traces
+  max_prompts: 4                  # subset of prompts — bump for a longer smoke
+  max_score_tokens: 512           # cap per-sequence scored length
+
+scoring:
+  top_logprobs_num: auto          # no generation_config.json -> resolves to 40
+  concurrency: 1                  # all-position scoring is memory-heavy; keep low
+
+metrics:
+  bucket_size: 4096
+
+runtime:
+  ref:
+    gpus: [0, 1, 2, 3]
+    port: 38095
+  candidates:
+    self:
+      # Reuse the reference server instead of launching a second one.
+      base_url: http://127.0.0.1:38095

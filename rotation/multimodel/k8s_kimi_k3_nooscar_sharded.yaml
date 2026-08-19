@@ -1,0 +1,139 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-nooscar-ppl-sharded-v5
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 16
+  parallelism: 4
+  backoffLimit: 16
+  activeDeadlineSeconds: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate
+              SRC=${ROOT}/source/multimodel/CoQuant
+              BASE=${ROOT}/multimodel/kimi-k3
+              URLS=(http://kimi-k3-latent-head:30000 http://kimi-k3-nooscar-head:31101)
+              INDEX=${JOB_COMPLETION_INDEX}
+              URL=${URLS[$((INDEX % 2))]}
+              for _ in $(seq 1 1440); do
+                curl -fsS "${URL}/model_info" >/dev/null 2>&1 && break
+                sleep 5
+              done
+              mkdir -p ${BASE}/ppl_shards/offline_lm_qp
+              OUTPUT=$(printf "${BASE}/ppl_shards/offline_lm_qp/block%02d.json" "$INDEX")
+              [[ -s "$OUTPUT" ]] && exit 0
+              python3 ${SRC}/rotation/wikitext2_ppl.py \
+                --base-url "$URL" --model Kimi-K3-offline_lm_qp \
+                --tokenizer-path moonshotai/Kimi-K3 \
+                --blocks-path /shared/CoQuant/kimi3-official-2bit/wikitext2_test_8192.pt \
+                --block-size 8192 --score-tail-tokens 2048 \
+                --block-start "$INDEX" --block-end "$((INDEX + 1))" \
+                --timeout 7200 \
+                --output "$OUTPUT"
+          resources:
+            requests: {cpu: "4", memory: 12Gi}
+            limits: {cpu: "16", memory: 48Gi}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-nooscar-kl-sharded-v5
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 16
+  parallelism: 4
+  backoffLimit: 16
+  activeDeadlineSeconds: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate
+              SRC=${ROOT}/source/multimodel/CoQuant
+              BASE=${ROOT}/multimodel/kimi-k3
+              URLS=(http://kimi-k3-latent-head:30000 http://kimi-k3-nooscar-head:31101)
+              INDEX=${JOB_COMPLETION_INDEX}
+              URL=${URLS[$((INDEX % 2))]}
+              for _ in $(seq 1 1440); do
+                curl -fsS "${URL}/model_info" >/dev/null 2>&1 && break
+                sleep 5
+              done
+              mkdir -p ${BASE}/kl_shards/offline_lm_qp
+              OUTPUT=$(printf "${BASE}/kl_shards/offline_lm_qp/block%02d.json" "$INDEX")
+              [[ -s "$OUTPUT" ]] && exit 0
+              python3 ${SRC}/rotation/kimi_k3_latent/wikitext2_kl_tail.py \
+                --base-url "$URL" --model Kimi-K3-offline_lm_qp \
+                --blocks-path /shared/CoQuant/kimi3-official-2bit/wikitext2_test_8192.pt \
+                --teacher-reference ${BASE}/kl_8k/bf16/reference.json \
+                --block-start "$INDEX" --block-end "$((INDEX + 1))" \
+                --top-k 50 --max-blocks 16 --positions-per-block 16 \
+                --workers 1 --timeout 7200 \
+                --output "$OUTPUT"
+          resources:
+            requests: {cpu: "4", memory: 12Gi}
+            limits: {cpu: "16", memory: 48Gi}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-nooscar-gpqa-sharded-v5
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 12
+  parallelism: 8
+  backoffLimit: 24
+  activeDeadlineSeconds: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: TASK, value: gpqa}
+            - {name: MODE, value: offline_lm_qp}
+            - {name: NUM_SHARDS, value: "4"}
+            - {name: GPQA_WORKERS, value: "2"}
+            - {name: SKIP_CONTROL_MODE_CHECK, value: "1"}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              INDEX=${JOB_COMPLETION_INDEX}
+              URLS=(http://kimi-k3-latent-head:30000 http://kimi-k3-nooscar-head:31101)
+              export BASE_URL=${URLS[$((INDEX % 2))]}
+              export SEED=$((INDEX / 4))
+              export SHARD_INDEX=$((INDEX % 4))
+              METRICS=/shared/oscar-int3-rubin-simulate/multimodel/kimi-k3/gpqa/offline_lm_qp/seed${SEED}/shard${SHARD_INDEX}/metrics.json
+              [[ -s "$METRICS" ]] && exit 0
+              exec bash /shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant/rotation/kimi_k3_latent/run_quality_client.sh
+          resources:
+            requests: {cpu: "6", memory: 12Gi}
+            limits: {cpu: "20", memory: 48Gi}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}]

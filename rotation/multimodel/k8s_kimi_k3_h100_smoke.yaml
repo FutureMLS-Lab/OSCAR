@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-h100
+  namespace: charlie
+spec:
+  clusterIP: None
+  selector: {app: kimi-k3-h100}
+  ports:
+    - {name: http, port: 30000}
+    - {name: dist, port: 20000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kimi-k3-h100
+  namespace: charlie
+spec:
+  serviceName: kimi-k3-h100
+  podManagementPolicy: Parallel
+  replicas: 4
+  selector:
+    matchLabels: {app: kimi-k3-h100}
+  template:
+    metadata:
+      labels: {app: kimi-k3-h100}
+    spec:
+      runtimeClassName: nvidia
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: kimi-k3-h100}
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: server
+        image: lmsysorg/sglang:kimi-k3
+        securityContext:
+          capabilities:
+            add: [IPC_LOCK]
+        env:
+        - {name: HOME, value: /tmp/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: NCCL_CUMEM_ENABLE, value: "1"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: expandable_segments:True}
+        - {name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK, value: "0"}
+        - {name: SGLANG_K3_ATTN_RES_MODE, value: jit}
+        - {name: SGLANG_MOE_FUSED_GATE_RADIX, value: "1"}
+        - {name: SGLANG_HOST_IP, valueFrom: {fieldRef: {fieldPath: status.hostIP}}}
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          MODEL=moonshotai/Kimi-K3
+          RANK=${POD_NAME##*-}
+          exec sglang serve \
+            --model-path "$MODEL" \
+            --trust-remote-code \
+            --tp-size 32 \
+            --ep-size 32 \
+            --nnodes 4 \
+            --node-rank "$RANK" \
+            --dist-init-addr kimi-k3-h100-head:20000 \
+            --moe-runner-backend marlin \
+            --decode-attention-backend flashmla \
+            --mem-fraction-static 0.85 \
+            --dist-timeout 3600 \
+            --disable-cuda-graph \
+            --disable-piecewise-cuda-graph \
+            --skip-server-warmup \
+            --reasoning-parser kimi_k3 \
+            --tool-call-parser kimi_k3 \
+            --model-loader-extra-config '{"enable_multithread_load": true}' \
+            --host 0.0.0.0 \
+            --port 30000
+        resources:
+          requests: {nvidia.com/gpu: "8", cpu: "48", memory: 384Gi}
+          limits: {nvidia.com/gpu: "8", cpu: "96", memory: 768Gi}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: shm, mountPath: /dev/shm}
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: shm, emptyDir: {medium: Memory, sizeLimit: 192Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-h100-head
+  namespace: charlie
+spec:
+  clusterIP: None
+  selector:
+    statefulset.kubernetes.io/pod-name: kimi-k3-h100-0
+  ports:
+    - {name: dist, port: 20000}
+    - {name: http, port: 30000}

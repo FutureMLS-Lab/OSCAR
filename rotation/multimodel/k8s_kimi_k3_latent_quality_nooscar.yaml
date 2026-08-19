@@ -1,0 +1,92 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-latent-nooscar-ppl-v2
+  namespace: charlie
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: TASK, value: ppl}
+            - {name: MODE, value: offline_lm_qp}
+            - {name: BASE_URL, value: "http://kimi-k3-latent-head:30000"}
+            - {name: SKIP_CONTROL_MODE_CHECK, value: "1"}
+            - {name: HF_HOME, value: /shared/huggingface}
+          command: ["/bin/bash", "/shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant/rotation/kimi_k3_latent/run_quality_client.sh"]
+          resources:
+            requests: {cpu: "8", memory: 24Gi}
+            limits: {cpu: "32", memory: 96Gi}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-latent-nooscar-kl-v2
+  namespace: charlie
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: TASK, value: kl_student}
+            - {name: MODE, value: offline_lm_qp}
+            - {name: BASE_URL, value: "http://kimi-k3-latent-head:30000"}
+            - {name: SKIP_CONTROL_MODE_CHECK, value: "1"}
+            - {name: KL_WORKERS, value: "2"}
+            - {name: HF_HOME, value: /shared/huggingface}
+          command: ["/bin/bash", "/shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant/rotation/kimi_k3_latent/run_quality_client.sh"]
+          resources:
+            requests: {cpu: "8", memory: 24Gi}
+            limits: {cpu: "32", memory: 96Gi}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-latent-nooscar-gpqa-v2
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 12
+  parallelism: 4
+  backoffLimit: 12
+  activeDeadlineSeconds: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: TASK, value: gpqa}
+            - {name: MODE, value: offline_lm_qp}
+            - {name: BASE_URL, value: "http://kimi-k3-latent-head:30000"}
+            - {name: SKIP_CONTROL_MODE_CHECK, value: "1"}
+            - {name: NUM_SHARDS, value: "4"}
+            - {name: GPQA_WORKERS, value: "2"}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              export SEED=$((JOB_COMPLETION_INDEX / 4))
+              export SHARD_INDEX=$((JOB_COMPLETION_INDEX % 4))
+              exec bash /shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant/rotation/kimi_k3_latent/run_quality_client.sh
+          resources:
+            requests: {cpu: "8", memory: 16Gi}
+            limits: {cpu: "24", memory: 64Gi}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+      volumes: [{name: shared, persistentVolumeClaim: {claimName: shared-data}}]

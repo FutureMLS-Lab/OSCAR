@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-gemma4-base-kl-8k-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimit: 4
+  activeDeadlineSeconds: 43200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector: {nvidia.com/gpu.product: NVIDIA-B200}
+      containers:
+      - name: eval
+        image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+        workingDir: /shared-work/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          shopt -s nullglob
+          ROOT=/shared-work/oscar-int3-rubin-simulate
+          BASE=${ROOT}/multimodel/gemma4-12b-base
+          MODELS=(/shared/huggingface/hub/models--google--gemma-4-12B/snapshots/*)
+          MODEL=${MODELS[0]}
+          METHODS=(oscar_offline_lm_qp offline_lm_qp)
+          MODE=${METHODS[$JOB_COMPLETION_INDEX]}
+          CODEBOOK=${BASE}/codebooks/lloyd_max_v2.pt
+          [[ $MODE == oscar_* ]] && CODEBOOK=${BASE}/codebooks/oscar_lloyd_max_v2.pt
+          export PYTHONPATH=${ROOT}/source/multimodel-runtime/python
+          export SGLANG_OSCAR_K_ROTATION_PATH=${BASE}/rotations/k_rotation_qqt_r_h_pbr.pt
+          export SGLANG_OSCAR_V_ROTATION_PATH=${BASE}/rotations/v_rotation_sst_r_h_pbr.pt
+          export SGLANG_OSCAR_K_CLIP_RATIO=0.96
+          export SGLANG_OSCAR_V_CLIP_RATIO=0.92
+          SKIP_SERVER_WARMUP=1 PY=python3 MODE=$MODE MODEL=$MODEL \
+            RUN_DIR=${BASE}/kl_8k/$MODE CODEBOOK_PATH=$CODEBOOK \
+            BLOCKS_PATH=${BASE}/eval/wikitext2_test_8192_bos.pt \
+            EVAL_TASK=kl_student KL_TEACHER_REFERENCE=${BASE}/kl_8k/bf16/reference.json \
+            MEM_FRAC=0.65 MAX_RUNNING_REQUESTS=4 KL_WORKERS=4 \
+            KL_TOP_K=50 KL_MAX_BLOCKS=16 KL_POSITIONS_PER_BLOCK=16 \
+            bash rotation/eval_kv_ppl.sh
+        resources:
+          requests: {nvidia.com/gpu: "1", cpu: "16", memory: 64Gi}
+          limits: {nvidia.com/gpu: "1", cpu: "32", memory: 160Gi}
+        volumeMounts: [{name: shared, mountPath: /shared-work},{name: hf, mountPath: /shared/huggingface},{name: shm, mountPath: /dev/shm}]
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+      - {name: shm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}

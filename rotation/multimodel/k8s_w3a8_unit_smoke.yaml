@@ -1,0 +1,241 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-unit-smoke-v3
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: smoke
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              python3 - <<'PY'
+              import importlib.util
+              import torch
+
+              spec = importlib.util.spec_from_file_location(
+                  "w3", "/scripts/w3a8_lut_sim.py"
+              )
+              w3 = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(w3)
+              assert w3.RUBIN_NATIVE_B_SCALE_MODES == {
+                  "none", "global", "native_k64", "global_native_k64"
+              }
+              assert w3.ALGORITHM_ORACLE_B_SCALE_MODES == {
+                  "legacy_k32", "global_legacy_k32"
+              }
+              torch.manual_seed(20260812)
+              indices = (
+                  torch.arange(512, device="cuda", dtype=torch.uint8) % 8
+              )
+              packed = w3.pack_int3(indices)
+              assert packed.numel() == 192
+              assert torch.equal(w3.unpack_int3(packed), indices)
+              weight = torch.randn(
+                  19, 133, device="cuda", dtype=torch.bfloat16
+              )
+              importance = torch.rand(133, device="cuda")
+              results = {}
+              for method in (
+                  "uniform",
+                  "nf3",
+                  "lloyd_max",
+                  "sensitivity_lm",
+                  "scale_lm",
+                  "squeezellm_lm",
+              ):
+                  restored, stats = w3.quantize_weight_lutb(
+                      weight,
+                      method=method,
+                      iterations=4,
+                      chunk_tiles=32,
+                      channel_importance=(
+                          importance if method == "sensitivity_lm" else None
+                      ),
+                      element_importance=(
+                          torch.rand_like(weight, dtype=torch.float32)
+                          if method == "squeezellm_lm"
+                          else None
+                      ),
+                  )
+                  assert restored.shape == weight.shape
+                  assert torch.isfinite(restored).all()
+                  results[method] = stats["relative_mse"]
+              assert results["lloyd_max"] <= results["uniform"]
+              for scale_mode in (
+                  "none",
+                  "global",
+                  "native_k64",
+                  "global_native_k64",
+                  "legacy_k32",
+                  "global_legacy_k32",
+              ):
+                  scaled, scale_stats = w3.quantize_weight_lutb(
+                      weight,
+                      method="lloyd_max",
+                      iterations=4,
+                      chunk_tiles=32,
+                      b_scale_mode=scale_mode,
+                  )
+                  assert scaled.shape == weight.shape
+                  assert torch.isfinite(scaled).all()
+                  assert scale_stats["b_scale_mode"] == scale_mode
+              for mma_k in (32, 64):
+                  activation_qdq = w3.activation_mxfp8_qdq(
+                      torch.randn(3, 128, device="cuda"),
+                      block_size=mma_k,
+                  )
+                  assert activation_qdq.shape == (3, 128)
+                  assert torch.isfinite(activation_qdq).all()
+              gptq_weight = torch.randn(
+                  16, 128, device="cuda", dtype=torch.bfloat16
+              )
+              gptq_inputs = torch.randn(256, 128, device="cuda")
+              gptq_blocks = gptq_inputs.view(256, 2, 64)
+              gptq_hessian = torch.einsum(
+                  "tki,tkj->kij", gptq_blocks, gptq_blocks
+              ) / gptq_inputs.shape[0]
+              gptq_restored, gptq_stats = (
+                  w3.quantize_weight_lutb_gptq(
+                      gptq_weight,
+                      hessian=gptq_hessian,
+                      iterations=4,
+                      damp_percent=0.01,
+                  )
+              )
+              assert gptq_restored.shape == gptq_weight.shape
+              assert torch.isfinite(gptq_restored).all()
+              assert gptq_stats["gptq_hessian_blocks"] == 2
+              weighted_gptq, weighted_gptq_stats = (
+                  w3.quantize_weight_lutb_gptq(
+                      gptq_weight,
+                      hessian=gptq_hessian,
+                      iterations=4,
+                      damp_percent=0.01,
+                      weighted_codebook=True,
+                  )
+              )
+              assert torch.isfinite(weighted_gptq).all()
+              assert weighted_gptq_stats["gptq_weighted_codebook"]
+              inter_gptq, inter_stats = w3.quantize_weight_lutb_gptq(
+                  gptq_weight,
+                  hessian=gptq_hessian,
+                  iterations=4,
+                  damp_percent=0.01,
+                  inter_iterations=4,
+                  inter_tolerance=0.0,
+                  inter_codebook_damp=1e-4,
+                  inter_chunk_tiles=8,
+              )
+              assert torch.isfinite(inter_gptq).all()
+              trace = inter_stats["inter_proxy_objective_trace"]
+              assert trace
+              assert all(
+                  current <= previous + 1e-10
+                  for previous, current in zip(trace, trace[1:])
+              ), trace
+              assert trace[-1] <= trace[0] + 1e-10
+              assert inter_stats["inter_lloymax_gptq"]
+              awq_scale = w3.awq_input_scale(weight, importance, 0.5)
+              awq_weight, _ = w3.quantize_weight_lutb(
+                  (weight.float() * awq_scale.unsqueeze(0)).to(weight.dtype),
+                  method="lloyd_max",
+                  iterations=4,
+                  chunk_tiles=32,
+              )
+              test_input = torch.randn(
+                  3, 133, device="cuda", dtype=torch.bfloat16
+              )
+              awq_output = (
+                  test_input / awq_scale.to(test_input.dtype)
+              ) @ awq_weight.T
+              assert torch.isfinite(awq_output).all()
+
+              class MockRMSNorm(torch.nn.Module):
+                  def __init__(self, size):
+                      super().__init__()
+                      self.weight = torch.nn.Parameter(
+                          torch.rand(size, device="cuda") + 0.5
+                      )
+
+                  def forward(self, values):
+                      normalized = values * torch.rsqrt(
+                          values.square().mean(-1, keepdim=True) + 1e-6
+                      )
+                      return normalized * self.weight
+
+              norm = MockRMSNorm(133)
+              consumers = [
+                  torch.nn.Linear(133, 19, bias=False, device="cuda"),
+                  torch.nn.Linear(133, 23, bias=False, device="cuda"),
+              ]
+              fold_input = torch.randn(5, 133, device="cuda")
+              before = [consumer(norm(fold_input)) for consumer in consumers]
+              fold_scale = w3.awq_group_scale(
+                  [consumer.weight for consumer in consumers],
+                  importance,
+                  0.5,
+              )
+              w3.fold_awq_group(norm, consumers, fold_scale)
+              after = [consumer(norm(fold_input)) for consumer in consumers]
+              for expected, actual in zip(before, after):
+                  torch.testing.assert_close(
+                      actual, expected, rtol=1e-5, atol=1e-5
+                  )
+
+              hadamard_input = torch.randn(7, 128, device="cuda")
+              hadamard_weight = torch.randn(19, 128, device="cuda")
+              hadamard_signs = (
+                  torch.randint(
+                      0, 2, (2, 64), device="cuda", dtype=torch.int8
+                  )
+                  * 2
+                  - 1
+              )
+              expected = hadamard_input @ hadamard_weight.T
+              transformed_input = w3.random_hadamard_k64(
+                  hadamard_input, hadamard_signs
+              )
+              transformed_weight = w3.random_hadamard_k64(
+                  hadamard_weight, hadamard_signs
+              )
+              actual = transformed_input @ transformed_weight.T
+              torch.testing.assert_close(
+                  actual, expected, rtol=1e-5, atol=1e-5
+              )
+
+              activation = torch.randn(
+                  2, 7, 133, device="cuda", dtype=torch.bfloat16
+              )
+              restored = w3.activation_mxfp8_qdq(activation)
+              assert restored.shape == activation.shape
+              assert torch.isfinite(restored).all()
+              print("W3A8_UNIT_SMOKE_OK", results)
+              PY
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-scripts-v3

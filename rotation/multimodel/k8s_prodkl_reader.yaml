@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: w3a8-prodkl-reader
+  namespace: charlie
+spec:
+  restartPolicy: Never
+  containers:
+    - name: reader
+      image: python:3.11-slim
+      command: ["sleep", "1800"]
+      resources:
+        requests: {cpu: "1", memory: 2Gi}
+        limits: {cpu: "2", memory: 4Gi}
+      volumeMounts:
+        - {name: shared, mountPath: /shared, readOnly: true}
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: shared-data

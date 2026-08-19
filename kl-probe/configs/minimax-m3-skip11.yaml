@@ -1,0 +1,461 @@
+# MiniMax-M3 MXFP8-skip PLACEMENT experiment, K=11, over the precomputed HLE
+# response cache (ingest mode, no generation). See docs/mxfp8-skip-variants-plan.md.
+#
+# All candidates are the same weight family: NVFP4 routed experts from
+# /data/huggingface/MiniMax-M3-NVFP4 (RTN, input_scale=1.0 everywhere) with the
+# routed experts of a chosen layer subset swapped to MXFP8 from the 0602 reference.
+# Every arm holds exactly 11 MoE layers at MXFP8 and 46 at NVFP4, so any KL
+# difference between arms is PLACEMENT, not budget. Both anchors are live: c1
+# (nvfp4-alt3x6, 21 MXFP8 layers) is the upper end and c11 (nvidia-nvfp4, 0 MXFP8
+# layers) the lower, so the run yields a same-run 0 -> 11 -> 21 curve. c2-c6 are the
+# requested placement shapes, c7-c10 the literature-derived arms (see
+# docs/mxfp8-skip-variants-plan.md §2), c12-c16 the pinned-end + uniform-lattice
+# family. 16 candidates = 16 sequential server bring-ups, but c1-c11 are already
+# scored in runs/minimax-m3-skip11/2026-07-24_18-17-13, so reusing that run cuts
+# this to the 5 new arms.
+#
+# NOTE: the FP4 candidates run on a different tgl build than the mxfp8 reference,
+# and use fp8_e4m3 KV vs the reference's bf16 — so absolute KL vs the reference also
+# captures engine-build + KV differences. Those confounds cancel in arm-vs-arm
+# comparisons, which is what this config is for.
+#
+#   # reuse generations + ref + all 11 already-scored arms from the last run
+#   # (807,253 positions); only the 5 new pin* arms are launched and scored
+#   uv run probe run -c configs/minimax-m3-skip11.yaml \
+#     --reuse runs/minimax-m3-skip11/2026-07-24_18-17-13 --down
+#   # bare --reuse resolves to the most recent run under runs/minimax-m3-skip11/,
+#   # which is the same thing once this run has completed
+#   uv run probe run -c configs/minimax-m3-skip11.yaml --reuse --down
+#
+# The original bootstrap (before this config had a run of its own) was
+#   --reuse runs/minimax-m3-eval/2026-07-23_11-25-27
+# which supplied generations + ref + nvfp4-alt3x6; nvidia-nvfp4 was scored fresh.
+run_name: minimax-m3-skip11
+output_dir: runs
+hf_home: /data/huggingface
+
+allow_generations: false
+
+# Reference: togethercomputer/Minimax-M3-0602, uniform mxfp8. See
+# minimax-m3-eval.yaml for the deep_gemm MoE-runner rationale. No excluded-MoE
+# patch: only gate routers + vision/lm_head/embed are in ignore.
+reference:
+  model_path: /scratch/tonyzhang/models/Minimax-M3-0602
+  image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+  tp: 4
+  extra_args: --quantization mxfp8 --dtype bfloat16 --kv-cache-dtype bfloat16 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm --disable-cuda-graph --skip-server-warmup --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --chunked-prefill-size 4096 --trust-remote-code
+  env:
+    SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+    TORCHDYNAMO_DISABLE: 1
+
+candidates:
+  # ------------------------------------------------------------------
+  # c1 — UPPER ANCHOR, K=21. togethercomputer/MiniMax-M3-NVFP4-alt3x6-0708:
+  # NVFP4 routed experts, but the exclude_modules SKIP-family keeps 21 whole MoE
+  # expert layers [3,4,5, 12,13,14, 21,22,23, 30,31,32, 39,40,41, 48,49,50,
+  # 57,58,59] at MXFP8, so serving REQUIRES the excluded-MoE MXFP8 rebuild patch.
+  # FP4 tgl image (721a615d) + --quantization modelopt_fp4 + flashinfer_trtllm.
+  # --disable-cuda-graph + --skip-server-warmup because scoring is prefill-only.
+  # This checkpoint IS "the NVFP4 donor with 21 expert shards replaced", so it is
+  # the same family as c2-c6 and the natural K=21 end of the curve.
+  # ------------------------------------------------------------------
+  - name: nvfp4-alt3x6
+    model_path: /scratch/huggingface/MiniMax-M3-NVFP4-alt3x6-0708
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # ------------------------------------------------------------------
+  # c2-c6 — the K=11 placement arms. Each model_path is a symlink farm built by
+  # scripts/make_skip_variant.py: 31 shared non-expert shards + 57 per-layer expert
+  # shards, taken from /data/huggingface/MiniMax-M3-NVFP4 (NVFP4) or from
+  # /data/huggingface/_m3-mxfp8-expert-bank (MXFP8, extracted from 0602). Same FP4
+  # image, extra_args and patch as c1 — only the checkpoint differs.
+  #
+  # THESE PATHS MUST EXIST BEFORE RUNNING: the startup tokenizer check opens every
+  # candidate's model_path and crashes on a missing dir. Build the expert bank and
+  # the five variant dirs first, and run the validation step (plan §4 step 3) — a
+  # tensor missing from a variant's index is loaded as torch.empty garbage with no
+  # error, i.e. it shows up as a plausible-but-wrong KL rather than a crash.
+  #
+  # The extra OMP env on c2-c6 is the sched_setaffinity workaround carried over from
+  # the nvidia-nvfp4 arm (OpenMP binds the master thread on `import torch` and can
+  # wedge the host kernel in affine_move_task). Prophylactic, not diagnosed: c1 is
+  # also an 88-shard checkpoint and does not trip it, so shard count is unlikely to
+  # be the real trigger. Harmless to keep; drop it if it ever gets in the way.
+  # ------------------------------------------------------------------
+
+  # c2 — MXFP8 layers 3,4,5 / 21,22 / 39,40 / 48,49 / 57,58. The leading layers of
+  # each 9-layer block, blocks 12 and 30 absent. Pairs with c3 to ask whether the
+  # exact layer WITHIN a block matters or only which block does.
+  - name: mxfp8skip11-blockstart
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-blockstart
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c3 — MXFP8 layers 4 / 13,14 / 22,23 / 40,41 / 49,50 / 57,58. Same blocks as c2
+  # but shifted one layer later. (Requested set was 13 layers: 3,4 / 13,14 / 22,23 /
+  # 40,41 / 49,50 / 57,58,59 — layers 3 and 59 dropped to hit K=11.)
+  - name: mxfp8skip11-blockshift
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-blockshift
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c4 — MXFP8 layers 4,14,17,27,30,32,38,45,50,55,59. Uniform random draw over the
+  # 57 MoE layers, seed 20260724 (random.Random(20260724).sample(range(3,60),11)).
+  # One draw, not "the random baseline"; c6 is its structured counterpart.
+  - name: mxfp8skip11-random
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-random
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c5 — MXFP8 layers 3,4,5,6,7 / 54,55,56,57,58,59. First 5 + last 6 MoE layers:
+  # all the high-precision budget at the two ends of the stack. Same shape family as
+  # the existing mxfp8fill checkpoint ({3-9, 53-59}, K=14) but inside a family that
+  # has both anchors, so it is interpretable. Pairs with c6.
+  - name: mxfp8skip11-edge
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-edge
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c6 — MXFP8 layers 3,9,14,20,25,31,37,42,48,53,59. Evenly spaced across the whole
+  # MoE stack (gaps of 5-6): the maximally-distributed opposite of c5, and the
+  # non-random control for c4. c5-vs-c6 is the cleanest test of "does placement
+  # matter at all".
+  - name: mxfp8skip11-spread
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-spread
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # ------------------------------------------------------------------
+  # c7-c10 — LITERATURE-GROUNDED arms (plan §2). The published record contradicts
+  # itself about depth, and these four arms are the discriminator. Same block as
+  # c2-c6; only the layer set differs.
+  # ------------------------------------------------------------------
+
+  # c7 — MXFP8 layers 3..13 (contiguous first 11 MoE layers). EARLY-HEAVY camp: the
+  # literal "First-k" experiment from QuantMoE-Bench (arXiv:2406.08155), which scored
+  # Mixtral-8x7B First-8 = 58.16 vs Last-8 = 47.36. Corroborated by massive activations
+  # emerging in the initial layers (Sun et al., COLM 2024) and the super weight always
+  # sitting in an early mlp.down_proj (Yu et al., arXiv:2411.07191). Head-to-head with
+  # c8 is the single highest-information run available.
+  - name: mxfp8skip11-early
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-early
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c8 — MXFP8 layers 49..59 (contiguous last 11). LATE-HEAVY camp, and the strongest
+  # a-priori candidate because it is the only rule derived from NVFP4/MXFP8 themselves:
+  # NVIDIA's NVFP4 pretraining report (arXiv:2509.25149) finds "the final few linear
+  # layers in our models cause training to diverge" and recommends leaving "fewer than
+  # 15%" of the final layers in BF16 or MXFP8; Nemotron 3 Ultra (arXiv:2606.15007) kept
+  # the final 15%. SpQR (arXiv:2306.03078): "more sensitive outliers are present for
+  # deeper layers".
+  - name: mxfp8skip11-late
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-late
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c9 — MXFP8 layers 3,4,5 + 52..59 (first 3 + final 8). BOTH-ENDS / production
+  # consensus: llama.cpp's use_more_bits protects the first and last eighth, Llama 3
+  # (§6.2) excludes the first and last transformer layers from FP8, and the NVFP4 report
+  # pairs a small shallow anchor with the final blocks. NOTE nearly the same shape as c6
+  # (mxfp8skip11-edge, first 5 + last 6) — the pair costs two servers to distinguish
+  # 5+6 from 3+8, so drop one if GPU time is tight.
+  - name: mxfp8skip11-tail8
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-tail8
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c10 — MXFP8 layers 26..36 (contiguous middle 11). FALSIFICATION arm: every
+  # depth-aware source predicts this is the worst possible placement — ShortGPT (Men et
+  # al., Findings of ACL 2025) puts redundancy in "the middle to later layers", Gromov et
+  # al. (ICLR 2025) in the deeper layers. Only Q-BERT (AAAI 2020) puts sensitivity here.
+  # If this TIES the spread control, placement is inside noise and the question is
+  # closed — which is what MoQE (arXiv:2310.02410, routed experts are the most
+  # quantization-robust weights) actually predicts. Cheap insurance against a false
+  # positive on c7/c8.
+  - name: mxfp8skip11-mid
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-mid
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c11 — LOWER ANCHOR, K=0 (all 57 MoE layers NVFP4): the exact base the K=11 arms
+  # are built from, so the K-curve endpoint. Already scored in the minimax-m3-rtn
+  # run, but ingest caps / token counts differ between runs and KL is only
+  # comparable WITHIN a run, so it is scored again here to close the curve.
+  # No MXFP8 routed experts, so NO patch.
+  - name: nvidia-nvfp4
+    model_path: /data/huggingface/MiniMax-M3-NVFP4
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+
+  # ------------------------------------------------------------------
+  # c12-c16 — PINNED-END + UNIFORM-LATTICE family (added 2026-07-27). Every arm
+  # pins the tail layer 59 plus EXACTLY ONE shallow layer (3 xor 4, never both),
+  # and spends the remaining budget on a single-step interior comb. Knobs: which
+  # shallow layer, whether 58 also gets a slot, and the comb's step + phase.
+  # Layer sets live in scripts/make_skip_variant.py ARMS; all five dirs are built
+  # and `validate`-clean. Same image / extra_args / patch as c2-c10.
+  #
+  # The design is matched contrasts, not independent draws:
+  #   c15 vs c16  10/11 layers identical -> isolates shallow pin 3-vs-4, and
+  #               doubles as the cheapest run-to-run replicate (a 1-of-11 swap
+  #               should be nil, so a non-zero delta measures the noise floor
+  #               that docs/mxfp8-skip-variants-plan.md §6 step 1 asks for)
+  #   c12 vs c13  same pins and step 6, comb phase shifted -3 (2/11 shared)
+  #   c12 vs c16  uniform +1 on all ten comb layers — second replicate
+  #   c12 vs c15  one comb slot traded for layer 58: prices the tail neighbour
+  #   c14         no coverage between 4 and 14, buying a dense step-5 lattice;
+  #               expected best of the family if the shallow third is wasted
+  #               budget (`early` was the worst K=11 arm at 0.02859)
+  # ------------------------------------------------------------------
+
+  # c12 — pin 3 + 59; exact step-6 lattice 3 -> 57.
+  - name: mxfp8skip11-pin3s6
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-pin3s6
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c13 — pin 3 + 59; same step 6 as c12, comb phase -3 (6 -> 54).
+  - name: mxfp8skip11-pin3s6lo
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-pin3s6lo
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c14 — pin 4 + 59; nothing between 4 and 14, then exact step-5 lattice to 59.
+  - name: mxfp8skip11-pin4s5
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-pin4s5
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c15 — pin 3 + 58,59; step-6 comb 10 -> 58. Pairs with c16.
+  - name: mxfp8skip11-pin3t58
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-pin3t58
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c16 — pin 4 + 58,59; exact step-6 lattice 4 -> 58. Identical to c15 except
+  # the shallow pin (4 instead of 3) — the 3-vs-4 / noise-floor contrast.
+  - name: mxfp8skip11-pin4t58
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-pin4t58
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+ingest:
+  source: /scratch/tonyzhang/jheo_evals/runs/hle-mxfp8-0602-text2158/response_cache
+  format: hle_response_cache
+  require_finish_reason: stop     # drop the cap-truncated traces
+  # SMOKE caps — remove both for the full 2158-trace run. NOTE these are inert
+  # under --reuse (generations.jsonl is copied verbatim from the source run), and
+  # must NOT be changed while reusing: they define the token set every arm is
+  # compared on. On this token set (64 prompts, 807,253 positions) the anchors
+  # measured K=0 nvidia-nvfp4 = 0.03007 and K=21 alt3x6 = 0.02501, so the whole
+  # placement budget is a 0.0051 band and the K=11 arms span 0.0268-0.0286.
+  # 64 prompts IS enough to rank them, but only with a PAIRED bootstrap over pid
+  # (paired CIs ±0.0004; per-arm marginal CIs are ±0.0012 and overlap for every
+  # arm, which reads as underpowered and is not). Raise for a confirmation run.
+  max_prompts: 64
+  max_score_tokens: 16384
+
+scoring:
+  top_logprobs_num: auto          # no generation_config.json -> resolves to 40
+  concurrency: 1                  # all-position scoring is memory-heavy; keep 1-2
+  score_chunk_size: 0
+
+metrics:
+  bucket_size: 1024
+
+runtime:
+  # TP=4: reference and all candidates share GPUs 0-3 and run one at a time
+  # (sequential staging), each on its own port.
+  ref:
+    gpus: [0,1,2,3]
+    port: 38095
+  candidates:
+    nvfp4-alt3x6:
+      gpus: [0,1,2,3]
+      port: 38096
+    mxfp8skip11-blockstart:
+      gpus: [0,1,2,3]
+      port: 38117
+    mxfp8skip11-blockshift:
+      gpus: [0,1,2,3]
+      port: 38118
+    mxfp8skip11-random:
+      gpus: [0,1,2,3]
+      port: 38119
+    mxfp8skip11-edge:
+      gpus: [0,1,2,3]
+      port: 38120
+    mxfp8skip11-spread:
+      gpus: [0,1,2,3]
+      port: 38121
+    mxfp8skip11-early:
+      gpus: [0,1,2,3]
+      port: 38122
+    mxfp8skip11-late:
+      gpus: [0,1,2,3]
+      port: 38123
+    mxfp8skip11-tail8:
+      gpus: [0,1,2,3]
+      port: 38124
+    mxfp8skip11-mid:
+      gpus: [0,1,2,3]
+      port: 38125
+    nvidia-nvfp4:
+      gpus: [0,1,2,3]
+      port: 38098
+    mxfp8skip11-pin3s6:
+      gpus: [0,1,2,3]
+      port: 38126
+    mxfp8skip11-pin3s6lo:
+      gpus: [0,1,2,3]
+      port: 38127
+    mxfp8skip11-pin4s5:
+      gpus: [0,1,2,3]
+      port: 38128
+    mxfp8skip11-pin3t58:
+      gpus: [0,1,2,3]
+      port: 38129
+    mxfp8skip11-pin4t58:
+      gpus: [0,1,2,3]
+      port: 38130

@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-model-smoke-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimitPerIndex: 0
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      containers:
+        - name: smoke
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate/w3a8
+              if [[ ${JOB_COMPLETION_INDEX} == 0 ]]; then
+                MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+                SLUG=qwen3-4b-thinking
+              else
+                MODELS=(/shared/huggingface/hub/models--google--gemma-4-12B/snapshots/*)
+                [[ ${#MODELS[@]} -eq 1 ]]
+                MODEL=${MODELS[0]}
+                SLUG=gemma4-12b
+              fi
+              mkdir -p "$ROOT/smoke/$SLUG" "$ROOT/blocks"
+              python3 /scripts/w3a8_lut_sim.py \
+                --model-path "$MODEL" \
+                --weight-method lloyd_max \
+                --activation mxfp8 \
+                --output "$ROOT/smoke/$SLUG/result.json" \
+                --blocks-path "$ROOT/blocks/${SLUG}_512.pt" \
+                --block-size 512 \
+                --max-blocks 1 \
+                --max-linear-layers 2 \
+                --lm-iterations 2 \
+                --chunk-tiles 64 \
+                --attn-implementation sdpa \
+                --trust-remote-code
+          resources:
+            requests:
+              cpu: "12"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "24"
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-scripts
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

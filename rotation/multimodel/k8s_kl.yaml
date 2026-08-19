@@ -1,0 +1,176 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-multimodel-kl-teacher-v1
+  namespace: charlie
+  labels:
+    app: oscar-multimodel-k3v3
+    phase: kl-teacher
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimit: 4
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: oscar-multimodel-k3v3
+        phase: kl-teacher
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+          workingDir: /shared-work/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: XDG_CACHE_HOME, value: /tmp/charlie/cache}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+            - {name: TRANSFORMERS_CACHE, value: /shared/huggingface/hub}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: SGLANG_RMSNORM_NATIVE, value: "true"}
+            - {name: SGLANG_GEMMA4_RMSNORM_NATIVE, value: "true"}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+          resources:
+            requests: {nvidia.com/gpu: "1", cpu: "12", memory: 64Gi}
+            limits: {nvidia.com/gpu: "1", cpu: "24", memory: 160Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared-work}
+            - {name: hf, mountPath: /shared/huggingface}
+            - {name: shm, mountPath: /dev/shm}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              ROOT=/shared-work/oscar-int3-rubin-simulate
+              SRC=${ROOT}/source/multimodel/CoQuant
+              MODELS=(
+                /shared/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+                /shared/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+              )
+              SLUGS=(qwen3.5-35b-a3b gemma4-12b-it)
+              MODEL=${MODELS[$JOB_COMPLETION_INDEX]}
+              SLUG=${SLUGS[$JOB_COMPLETION_INDEX]}
+              BASE=${ROOT}/multimodel/${SLUG}
+              BLOCKS=${BASE}/eval/wikitext2_test_2048_oscar_offline_lm_qp.pt
+              RUN=${BASE}/kl/bf16
+              if [[ -s "${RUN}/reference.json" ]]; then
+                echo "reuse ${RUN}/reference.json"
+                exit 0
+              fi
+              test -s "${BLOCKS}"
+              mkdir -p /tmp/charlie "${RUN}"
+              export PYTHONPATH=${ROOT}/source/multimodel-calibration-runtime/python
+              PY=python3 MODE=bf16 MODEL="${MODEL}" RUN_DIR="${RUN}" \
+                BLOCKS_PATH="${BLOCKS}" EVAL_TASK=kl_teacher \
+                MEM_FRAC=0.75 MAX_RUNNING_REQUESTS=4 \
+                KL_WORKERS=4 KL_TOP_K=50 KL_MAX_BLOCKS=16 \
+                KL_POSITIONS_PER_BLOCK=16 bash rotation/eval_kv_ppl.sh
+              test -s "${RUN}/reference.json"
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 64Gi}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-multimodel-kl-v1
+  namespace: charlie
+  labels:
+    app: oscar-multimodel-k3v3
+    phase: kl
+spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 0
+  backoffLimit: 8
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: oscar-multimodel-k3v3
+        phase: kl
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+          workingDir: /shared-work/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: XDG_CACHE_HOME, value: /tmp/charlie/cache}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+            - {name: TRANSFORMERS_CACHE, value: /shared/huggingface/hub}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: SGLANG_RMSNORM_NATIVE, value: "true"}
+            - {name: SGLANG_GEMMA4_RMSNORM_NATIVE, value: "true"}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+          resources:
+            requests: {nvidia.com/gpu: "1", cpu: "12", memory: 64Gi}
+            limits: {nvidia.com/gpu: "1", cpu: "24", memory: 160Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared-work}
+            - {name: hf, mountPath: /shared/huggingface}
+            - {name: shm, mountPath: /dev/shm}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              ROOT=/shared-work/oscar-int3-rubin-simulate
+              SRC=${ROOT}/source/multimodel/CoQuant
+              MODELS=(
+                /shared/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+                /shared/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+              )
+              SLUGS=(qwen3.5-35b-a3b gemma4-12b-it)
+              METHODS=(oscar_offline_lm_qp offline_lm_qp)
+              INDEX=${JOB_COMPLETION_INDEX}
+              MODEL_INDEX=$((INDEX / 2))
+              METHOD_INDEX=$((INDEX % 2))
+              MODEL=${MODELS[$MODEL_INDEX]}
+              SLUG=${SLUGS[$MODEL_INDEX]}
+              METHOD=${METHODS[$METHOD_INDEX]}
+              BASE=${ROOT}/multimodel/${SLUG}
+              CODEBOOK=${BASE}/codebooks/lloyd_max_v2.pt
+              if [[ "${METHOD}" == oscar_* ]]; then
+                CODEBOOK=${BASE}/codebooks/oscar_lloyd_max_v2.pt
+              fi
+              BLOCKS=${BASE}/eval/wikitext2_test_2048_oscar_offline_lm_qp.pt
+              TEACHER=${BASE}/kl/bf16/reference.json
+              RUN=${BASE}/kl/${METHOD}
+              test -s "${TEACHER}"
+              mkdir -p /tmp/charlie "${RUN}"
+              export PYTHONPATH=${ROOT}/source/multimodel-runtime/python
+              export SGLANG_OSCAR_K_ROTATION_PATH=${BASE}/rotations/k_rotation_qqt_r_h_pbr.pt
+              export SGLANG_OSCAR_V_ROTATION_PATH=${BASE}/rotations/v_rotation_sst_r_h_pbr.pt
+              export SGLANG_OSCAR_K_CLIP_RATIO=0.96
+              export SGLANG_OSCAR_V_CLIP_RATIO=0.92
+              PY=python3 MODE="${METHOD}" MODEL="${MODEL}" RUN_DIR="${RUN}" \
+                CODEBOOK_PATH="${CODEBOOK}" BLOCKS_PATH="${BLOCKS}" \
+                EVAL_TASK=kl_student KL_TEACHER_REFERENCE="${TEACHER}" \
+                MEM_FRAC=0.75 MAX_RUNNING_REQUESTS=4 \
+                KL_WORKERS=4 KL_TOP_K=50 KL_MAX_BLOCKS=16 \
+                KL_POSITIONS_PER_BLOCK=16 bash rotation/eval_kv_ppl.sh
+              test -s "${RUN}/kl.json"
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 64Gi}

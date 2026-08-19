@@ -1,0 +1,98 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-gemma4-gpqa-h100-v2
+  namespace: charlie
+  labels:
+    app: oscar-multimodel-k3v3
+    phase: gemma4-gpqa-h100
+spec:
+  completionMode: Indexed
+  completions: 24
+  parallelism: 8
+  backoffLimit: 16
+  activeDeadlineSeconds: 129600
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: oscar-multimodel-k3v3
+        phase: gemma4-gpqa-h100
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+          workingDir: /shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: USER, value: charlie}
+            - {name: LOGNAME, value: charlie}
+            - {name: XDG_CACHE_HOME, value: /tmp/charlie/cache}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+            - {name: TRANSFORMERS_CACHE, value: /shared/huggingface/hub}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "12"
+              memory: 64Gi
+            limits:
+              nvidia.com/gpu: "1"
+              cpu: "24"
+              memory: 160Gi
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+            - {name: shm, mountPath: /dev/shm}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate
+              MODEL=/shared/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+              METHODS=(oscar_offline_lm_qp offline_lm_qp)
+              INDEX=${JOB_COMPLETION_INDEX}
+              METHOD_INDEX=$((INDEX / 12))
+              WITHIN_METHOD=$((INDEX % 12))
+              SEED=$((WITHIN_METHOD / 4))
+              SHARD=$((WITHIN_METHOD % 4))
+              METHOD=${METHODS[$METHOD_INDEX]}
+              BASE=${ROOT}/multimodel/gemma4-12b-it
+              USE_OSCAR=0
+              CODEBOOK=${BASE}/codebooks/lloyd_max_v2.pt
+              if [[ "${METHOD}" == oscar_* ]]; then
+                USE_OSCAR=1
+                CODEBOOK=${BASE}/codebooks/oscar_lloyd_max_v2.pt
+              fi
+              RUN=${BASE}/gpqa_k3_fixed/${METHOD}/seed${SEED}/shard${SHARD}
+              if [[ -s "${RUN}/metrics.json" ]]; then
+                echo "reuse ${RUN}/metrics.json"
+                exit 0
+              fi
+              mkdir -p /tmp/charlie "${RUN}"
+              export PYTHONPATH=${ROOT}/source/multimodel-runtime/python
+              export SGLANG_OSCAR_K_ROTATION_PATH=${BASE}/rotations/k_rotation_qqt_r_h_pbr.pt
+              export SGLANG_OSCAR_V_ROTATION_PATH=${BASE}/rotations/v_rotation_sst_r_h_pbr.pt
+              export SGLANG_OSCAR_K_CLIP_RATIO=0.96
+              export SGLANG_OSCAR_V_CLIP_RATIO=0.92
+              MODEL="${MODEL}" CODEBOOK_PATH="${CODEBOOK}" RUN_DIR="${RUN}" \
+                SEED="${SEED}" USE_OSCAR="${USE_OSCAR}" Q_QDQ=1 P_QDQ=1 \
+                MEM_FRAC=0.82 MAX_RUNNING=8 NUM_WORKERS=8 \
+                NUM_SHARDS=4 SHARD_INDEX="${SHARD}" \
+                MAX_NEW_TOKENS=32768 REQUEST_TIMEOUT=14400 \
+                bash rotation/eval_lutb_block_gpqa.sh
+              test -s "${RUN}/metrics.json"
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

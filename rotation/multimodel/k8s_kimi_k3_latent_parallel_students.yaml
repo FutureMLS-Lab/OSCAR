@@ -1,0 +1,167 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-students
+  namespace: charlie
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: kimi-k3-students}
+  ports:
+    - {name: placeholder, port: 31999}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-nooscar-head
+  namespace: charlie
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    statefulset.kubernetes.io/pod-name: kimi-k3-students-0
+  ports:
+    - {name: http, port: 31101}
+    - {name: dist, port: 21101}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-oscar-head
+  namespace: charlie
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    statefulset.kubernetes.io/pod-name: kimi-k3-students-8
+  ports:
+    - {name: http, port: 31102}
+    - {name: dist, port: 21102}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kimi-k3-students
+  namespace: charlie
+spec:
+  serviceName: kimi-k3-students
+  podManagementPolicy: Parallel
+  # Start no-OSCAR (ordinals 0-7). Scale to 16 to add OSCAR (8-15).
+  replicas: 8
+  selector:
+    matchLabels: {app: kimi-k3-students}
+  template:
+    metadata:
+      labels: {app: kimi-k3-students}
+    spec:
+      runtimeClassName: nvidia
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+        topology.csi.weka.io/accessible: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - research-common-h100-079.cloud.together.ai
+                      - research-common-h100-073.cloud.together.ai
+                      - research-common-h100-124.cloud.together.ai
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: kimi-k3-students}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie/flashinfer}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+            - {name: TRITON_CACHE_DIR, value: /tmp/charlie/triton}
+            - {name: NCCL_CUMEM_ENABLE, value: "1"}
+            - {name: NCCL_SOCKET_IFNAME, value: bond0}
+            - {name: GLOO_SOCKET_IFNAME, value: bond0}
+            - {name: NCCL_IB_DISABLE, value: "1"}
+            - {name: CUDA_DEVICE_MAX_CONNECTIONS, value: "1"}
+            - {name: SGLANG_MODEL_LOAD_BARRIER_TIMEOUT_S, value: "3600"}
+            - {name: PYTORCH_CUDA_ALLOC_CONF, value: expandable_segments:True}
+            - {name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK, value: "0"}
+            - {name: SGLANG_K3_ATTN_RES_MODE, value: jit}
+            - {name: SGLANG_MOE_FUSED_GATE_RADIX, value: "1"}
+            - {name: SGLANG_KIMI_LATENT_LAYER_IDS, value: "3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63,67,71,75,79,83,87,91,92"}
+            - {name: SGLANG_KIMI_LATENT_OSCAR_CLIP_RATIO, value: "0.96"}
+            - {name: SGLANG_KIMI_LATENT_Q_QDQ, value: "1"}
+            - {name: SGLANG_KIMI_LATENT_P_QDQ, value: "1"}
+            - {name: SGLANG_HOST_IP, valueFrom: {fieldRef: {fieldPath: status.hostIP}}}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate
+              SOURCE=${ROOT}/source/multimodel/CoQuant
+              BASE=${ROOT}/multimodel/kimi-k3
+              ORDINAL=${POD_NAME##*-}
+              if (( ORDINAL < 8 )); then
+                MODE=offline_lm_qp
+                NODE_RANK=$ORDINAL
+                DIST_ADDR=kimi-k3-nooscar-head:21101
+                HTTP_PORT=31101
+                export SGLANG_KIMI_LATENT_K3_CODEBOOK=${BASE}/codebooks/latent_lloyd_max.pt
+                export SGLANG_KIMI_LATENT_USE_OSCAR=0
+              else
+                MODE=oscar_offline_lm_qp
+                NODE_RANK=$((ORDINAL - 8))
+                DIST_ADDR=kimi-k3-oscar-head:21102
+                HTTP_PORT=31102
+                export SGLANG_KIMI_LATENT_K3_CODEBOOK=${BASE}/codebooks/latent_oscar_lloyd_max.pt
+                export SGLANG_KIMI_LATENT_USE_OSCAR=1
+              fi
+              RUNTIME=/tmp/charlie/kimi-${MODE}-runtime
+              mkdir -p "$RUNTIME/python"
+              cp -a /sgl-workspace/sglang/python/sglang "$RUNTIME/python/"
+              python3 "${SOURCE}/rotation/kimi_k3_latent/patch_stock_runtime.py" \
+                "$RUNTIME/python"
+              export PYTHONPATH="$RUNTIME/python"
+              exec python3 -m sglang.launch_server \
+                --model-path moonshotai/Kimi-K3 \
+                --trust-remote-code \
+                --tp-size 32 --ep-size 32 \
+                --nnodes 8 --node-rank "$NODE_RANK" \
+                --dist-init-addr "$DIST_ADDR" \
+                --moe-runner-backend marlin \
+                --attention-backend triton \
+                --decode-attention-backend triton \
+                --linear-attn-backend triton \
+                --chunked-prefill-size 8192 \
+                --mem-fraction-static 0.85 \
+                --dist-timeout 3600 \
+                --watchdog-timeout 7200 \
+                --disable-radix-cache \
+                --disable-cuda-graph \
+                --disable-piecewise-cuda-graph \
+                --skip-server-warmup \
+                --reasoning-parser kimi_k3 \
+                --tool-call-parser kimi_k3 \
+                --model-loader-extra-config '{"enable_multithread_load": true}' \
+                --host 0.0.0.0 --port "$HTTP_PORT"
+          resources:
+            requests: {nvidia.com/gpu: "4", cpu: "32", memory: 256Gi}
+            limits: {nvidia.com/gpu: "4", cpu: "64", memory: 512Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 192Gi}}

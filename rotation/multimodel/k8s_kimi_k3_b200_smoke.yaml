@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3
+  namespace: charlie
+spec:
+  clusterIP: None
+  selector:
+    app: kimi-k3
+  ports:
+    - {name: http, port: 30000}
+    - {name: dist, port: 20000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kimi-k3
+  namespace: charlie
+spec:
+  serviceName: kimi-k3
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kimi-k3
+  template:
+    metadata:
+      labels:
+        app: kimi-k3
+    spec:
+      runtimeClassName: nvidia
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: kimi-k3
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: lmsysorg/sglang:kimi-k3
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: NCCL_CUMEM_ENABLE, value: "1"}
+            - {name: PYTORCH_CUDA_ALLOC_CONF, value: expandable_segments:True}
+            - {name: SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK, value: "0"}
+            - {name: SGLANG_HOST_IP, valueFrom: {fieldRef: {fieldPath: status.hostIP}}}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              shopt -s nullglob
+              MODELS=(/shared/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/*)
+              [[ ${#MODELS[@]} -eq 1 ]]
+              MODEL=${MODELS[0]}
+              RANK=${HOSTNAME##*-}
+              exec sglang serve \
+                --model-path "$MODEL" \
+                --trust-remote-code \
+                --tp-size 8 \
+                --pp-size 2 \
+                --nnodes 2 \
+                --node-rank "$RANK" \
+                --dist-init-addr kimi-k3-0.kimi-k3:20000 \
+                --dcp-size 8 \
+                --ep-size 8 \
+                --moe-runner-backend flashinfer_mxfp4 \
+                --decode-attention-backend cutedsl_mla \
+                --mem-fraction-static 0.85 \
+                --chunked-prefill-size 8192 \
+                --disable-flashinfer-autotune \
+                --watchdog-timeout 3600 \
+                --reasoning-parser kimi_k3 \
+                --tool-call-parser kimi_k3 \
+                --model-loader-extra-config '{"enable_multithread_load": true}' \
+                --host 0.0.0.0 \
+                --port 30000
+          resources:
+            requests:
+              nvidia.com/gpu: "8"
+              cpu: "48"
+              memory: 384Gi
+            limits:
+              nvidia.com/gpu: "8"
+              cpu: "96"
+              memory: 768Gi
+          volumeMounts:
+            - {name: hf, mountPath: /shared/huggingface}
+            - {name: shared, mountPath: /shared-work}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 192Gi}}

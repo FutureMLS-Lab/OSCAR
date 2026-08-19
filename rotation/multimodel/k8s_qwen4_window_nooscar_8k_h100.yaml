@@ -1,0 +1,96 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-qwen4-window-nooscar-ppl-8k-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 3
+  parallelism: 3
+  backoffLimit: 6
+  activeDeadlineSeconds: 43200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector: {nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3}
+      containers:
+      - name: eval
+        image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+        workingDir: /shared/oscar-int3-rubin-simulate/source/block-v1/CoQuant
+        env:
+        - {name: HOME, value: /tmp/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+        - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          ROOT=/shared/oscar-int3-rubin-simulate
+          MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+          BOOKS=${ROOT}/codebooks/qwen3-4b-thinking-2507/offline-wikitext-v2
+          NAMES=(s0_r256 s64_r0 s0_r0); SINKS=(0 64 0); RECENTS=(256 0 0); I=${JOB_COMPLETION_INDEX}
+          MODE=offline_lm MODEL=$MODEL \
+            RUN_DIR=${ROOT}/offline-v2/window-ablation-8k/no-oscar/ppl/${NAMES[$I]} \
+            CODEBOOK_PATH=${BOOKS}/lloyd_max_v2.pt \
+            BLOCKS_PATH=${ROOT}/block-v1/wikitext2_test_8192.pt \
+            SINK_TOKENS=${SINKS[$I]} RECENT_TOKENS=${RECENTS[$I]} \
+            PPL_BLOCK_SIZE=8192 PPL_MAX_BLOCKS=16 MEM_FRAC=0.82 \
+            bash rotation/eval_kv_ppl.sh
+        resources:
+          requests: {nvidia.com/gpu: "1", cpu: "12", memory: 48Gi}
+          limits: {nvidia.com/gpu: "1", cpu: "24", memory: 128Gi}
+        volumeMounts: [{name: shared, mountPath: /shared},{name: shm, mountPath: /dev/shm}]
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: shm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-qwen4-window-nooscar-kl-8k-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 3
+  parallelism: 3
+  backoffLimit: 6
+  activeDeadlineSeconds: 43200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector: {nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3}
+      containers:
+      - name: eval
+        image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+        workingDir: /shared/oscar-int3-rubin-simulate/source/block-v1/CoQuant
+        env:
+        - {name: HOME, value: /tmp/charlie}
+        - {name: HF_HOME, value: /shared/huggingface}
+        - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+        - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          ROOT=/shared/oscar-int3-rubin-simulate
+          MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+          BOOKS=${ROOT}/codebooks/qwen3-4b-thinking-2507/offline-wikitext-v2
+          NAMES=(s0_r256 s64_r0 s0_r0); SINKS=(0 64 0); RECENTS=(256 0 0); I=${JOB_COMPLETION_INDEX}
+          PY=python3 MODE=offline_lm MODEL=$MODEL \
+            RUN_DIR=${ROOT}/offline-v2/window-ablation-8k/no-oscar/kl/${NAMES[$I]} \
+            CODEBOOK_PATH=${BOOKS}/lloyd_max_v2.pt \
+            BLOCKS_PATH=${ROOT}/block-v1/wikitext2_test_8192.pt \
+            EVAL_TASK=kl_student \
+            KL_TEACHER_REFERENCE=${ROOT}/offline-v2-8k/kl/bf16/reference.json \
+            SINK_TOKENS=${SINKS[$I]} RECENT_TOKENS=${RECENTS[$I]} \
+            MEM_FRAC=0.82 MAX_RUNNING_REQUESTS=16 KL_WORKERS=16 \
+            KL_TOP_K=50 KL_MAX_BLOCKS=16 KL_POSITIONS_PER_BLOCK=16 \
+            bash rotation/eval_kv_ppl.sh
+        resources:
+          requests: {nvidia.com/gpu: "1", cpu: "12", memory: 48Gi}
+          limits: {nvidia.com/gpu: "1", cpu: "24", memory: 128Gi}
+        volumeMounts: [{name: shared, mountPath: /shared},{name: shm, mountPath: /dev/shm}]
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: shm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}

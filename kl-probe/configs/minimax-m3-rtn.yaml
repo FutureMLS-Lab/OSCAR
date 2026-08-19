@@ -1,0 +1,112 @@
+# MiniMax-M3 NVFP4 RTN comparison over the HLE response cache (mimics
+# configs/minimax-m3-eval.yaml). Reference = the uniform-MXFP8 0602 baseline;
+# three NVFP4 candidates are prefill-scored on every position and compared to it.
+# NOTE: the FP4 candidates run on a different tgl build than the mxfp8 reference
+# (see their blocks) — so the KL also captures engine-build differences.
+#
+#   uv run probe run -c configs/minimax-m3-rtn.yaml --down
+#   uv run probe run -c configs/minimax-m3-rtn.yaml --reuse --down  # reuse ref + already-scored candidates
+run_name: minimax-m3-rtn
+output_dir: runs
+hf_home: /data/huggingface
+
+allow_generations: false
+
+# Reference: togethercomputer/Minimax-M3-0602, uniform mxfp8. See
+# minimax-m3-eval.yaml for the deep_gemm MoE-runner rationale. No excluded-MoE
+# patch: only gate routers + vision/lm_head/embed are in ignore.
+reference:
+  model_path: /scratch/tonyzhang/models/Minimax-M3-0602
+  image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+  tp: 4
+  extra_args: --quantization mxfp8 --dtype bfloat16 --kv-cache-dtype bfloat16 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm --disable-cuda-graph --skip-server-warmup --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --chunked-prefill-size 4096 --trust-remote-code
+  env:
+    SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+    TORCHDYNAMO_DISABLE: 1
+
+candidates:
+  # c1 — togethercomputer/MiniMax-M3-NVFP4-alt3x6-0708: NVFP4 routed experts, but
+  # the exclude_modules SKIP-family keeps 21 whole MoE expert layers at MXFP8, so
+  # serving REQUIRES the excluded-MoE MXFP8 rebuild patch. FP4 tgl image
+  # (721a615d) + --quantization modelopt_fp4 + flashinfer_trtllm. --disable-cuda-graph
+  # + --skip-server-warmup because scoring is prefill-only.
+  - name: nvfp4-alt3x6
+    model_path: /scratch/huggingface/MiniMax-M3-NVFP4-alt3x6-0708
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # c2 — nvidia/MiniMax-M3-NVFP4: plain modelopt NVFP4 (group_size 16). ALL 57
+  # routed-expert layers are NVFP4 (U8) — NOT skip-family, no MXFP8 experts — so
+  # NO patch. exclude_modules keeps attn + shared_experts + gates + dense layers
+  # 0-1 + lm_head/embed high-precision. hf_quant_config exclude_modules format
+  # (config.json also mirrors it as a modelopt quant_config, not config_groups),
+  # which the FP4 image serves coherently. Same FP4 image + flags as the others.
+  - name: nvidia-nvfp4
+    model_path: /data/huggingface/MiniMax-M3-NVFP4
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      # WORKAROUND: this 88-shard checkpoint reproducibly wedges the host kernel
+      # in sched_setaffinity/affine_move_task at startup (OpenMP binds the master
+      # thread on `import torch`). Disable OpenMP thread binding so that affinity
+      # syscall is never issued. (c1/c3 with 31 shards don't trip it.)
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+
+  # c3 — togethercomputer/Minimax-M3-0602-NVFP4-RTN-inputscale1: NVFP4 RTN quant
+  # of the 0602 base with input_scale forced to 1.0. NVFP4 (group_size 16),
+  # hf_quant_config exclude_modules format (no config.json quant config). Routed
+  # experts NVFP4, everything else (attn, shared_experts, gates, dense layers 0-1,
+  # lm_head/embed) excluded/high-precision — no MXFP8 skip experts, so NO patch.
+  # Same FP4 image + flags.
+  - name: rtn-0602-inscale1
+    model_path: /data/huggingface/Minimax-M3-0602-NVFP4-RTN-inputscale1
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+
+ingest:
+  source: /scratch/tonyzhang/jheo_evals/runs/hle-mxfp8-0602-text2158/response_cache
+  format: hle_response_cache
+  require_finish_reason: stop     # drop the cap-truncated traces
+  # SMOKE caps — remove both for the full 2158-trace run.
+  max_prompts: 64
+  max_score_tokens: 4096
+
+scoring:
+  top_logprobs_num: auto          # no generation_config.json -> resolves to 40
+  concurrency: 1                  # all-position scoring is memory-heavy; keep 1-2
+  score_chunk_size: 0
+
+metrics:
+  bucket_size: 1024
+
+runtime:
+  # TP=4: reference and the candidates share GPUs 4-7 and run one at a time
+  # (sequential staging), each on its own port.
+  ref:
+    gpus: [0,1,2,3]
+    port: 38095
+  candidates:
+    nvfp4-alt3x6:
+      gpus: [0,1,2,3]
+      port: 38096
+    nvidia-nvfp4:
+      gpus: [0,1,2,3]
+      port: 38098
+    rtn-0602-inscale1:
+      gpus: [0,1,2,3]
+      port: 38099

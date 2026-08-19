@@ -1,0 +1,99 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-64k-quality-b200-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 14
+  parallelism: 14
+  backoffLimitPerIndex: 0
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate/w3a8
+              METHODS=(bf16 uniform nf3 lloyd_max scale_lm sensitivity_lm squeezellm_lm)
+              RUNS=(bf16_mxfp8 uniform_mxfp8 nf3_zero_mxfp8 lloyd_max_mxfp8 scale_lm_mxfp8 sensitivity_lm_train_mxfp8 squeezellm_lm_fisher100_mxfp8)
+              ITERATIONS=(4 4 4 4 4 8 8)
+              CALIBRATION_TOKENS=(512 512 512 512 512 512 128)
+              FISHER_SAMPLES=(1 1 1 1 1 1 100)
+              PER_MODEL=${#METHODS[@]}
+              MODEL_INDEX=$((JOB_COMPLETION_INDEX / PER_MODEL))
+              METHOD_INDEX=$((JOB_COMPLETION_INDEX % PER_MODEL))
+              METHOD=${METHODS[$METHOD_INDEX]}
+              RUN=${RUNS[$METHOD_INDEX]}
+              if [[ $MODEL_INDEX == 0 ]]; then
+                MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+                SLUG=qwen3-4b-thinking
+                ATTN=flash_attention_2
+                EVAL_ARGS=()
+              else
+                MODELS=(/shared/huggingface/hub/models--google--gemma-4-12B/snapshots/*)
+                [[ ${#MODELS[@]} -eq 1 ]]
+                MODEL=${MODELS[0]}
+                SLUG=gemma4-12b
+                ATTN=sdpa
+                EVAL_ARGS=(--eval-chunk-size 4096)
+              fi
+              OUT=$ROOT/quality64k/$SLUG/$RUN/ppl.json
+              REF=$ROOT/quality64k/$SLUG/bf16_bf16/kl_reference.json
+              [[ -s "$OUT" ]] && exit 0
+              for _ in $(seq 1 2160); do
+                [[ -s "$REF" ]] && break
+                sleep 5
+              done
+              test -s "$REF"
+              mkdir -p "$(dirname "$OUT")"
+              python3 /scripts/w3a8_lut_sim.py \
+                --model-path "$MODEL" \
+                --weight-method "$METHOD" \
+                --activation mxfp8 \
+                --output "$OUT" \
+                --blocks-path "$ROOT/blocks/${SLUG}_65536.pt" \
+                --calibration-blocks-path "$ROOT/blocks/${SLUG}_train_65536.pt" \
+                --block-size 65536 \
+                --max-blocks 2 \
+                --kl-reference "$REF" \
+                --kl-positions-per-block 128 \
+                --calibration-tokens "${CALIBRATION_TOKENS[$METHOD_INDEX]}" \
+                --fisher-samples "${FISHER_SAMPLES[$METHOD_INDEX]}" \
+                --lm-iterations "${ITERATIONS[$METHOD_INDEX]}" \
+                --chunk-tiles 256 \
+                "${EVAL_ARGS[@]}" \
+                --attn-implementation "$ATTN" \
+                --trust-remote-code
+          resources:
+            requests:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 160Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-scripts
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

@@ -1,0 +1,158 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-m3-routed-quality-b200-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  backoffLimitPerIndex: 3
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      priorityClassName: eight-gpu
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: quality
+          image: lmsysorg/sglang:dev-cu13-minimax-m3
+          env:
+            - {name: HF_HOME, value: /hf}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: PYTHONPATH, value: /patch:/sgl-workspace/sglang/python}
+            - {name: MINIMAX_ROUTED_W3_QUANTIZER, value: /patch/w3a8_lut_sim.py}
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              METHODS=(uniform nf3 lloyd_max scale_lm)
+              METHOD=${METHODS[$JOB_COMPLETION_INDEX]}
+              export MINIMAX_ROUTED_W3_METHOD=$METHOD
+              MODEL=/hf/models--MiniMaxAI--MiniMax-M3/snapshots/f0e1c1e04d40177e4673a22097036854f536e9c0
+              BASE=/shared/minimax-m3
+              LOG=$BASE/${METHOD}-quality-${HOSTNAME}.log
+              mkdir -p "$BASE" "$BASE/blocks"
+              python3 - <<'PY'
+              import shutil
+              from pathlib import Path
+              shutil.rmtree(Path.home() / ".cache/minfer/fmha_sm100", ignore_errors=True)
+              from fmha_sm100 import jit
+              assert hasattr(jit.get_plan_fn(), "plan")
+              assert hasattr(jit.get_reduction_module(), "reduction")
+              jit.get_sparse_topk_module()
+              variant = jit.get_fmha_variant(
+                  jit._dlpack_dtype_code(__import__("torch").bfloat16),
+                  128, True, 0, 128, True, 8,
+              )
+              assert hasattr(variant, "run")
+              print("MINIMAX_MSA_PRECOMPILE_OK", flush=True)
+              PY
+              python3 -m sglang.launch_server \
+                --model-path "$MODEL" \
+                --model-loader-extra-config '{"enable_multithread_load":false}' \
+                --weight-loader-drop-cache-after-load \
+                --trust-remote-code \
+                --tp 8 \
+                --ep-size 8 \
+                --attention-backend fa4 \
+                --moe-runner-backend triton \
+                --page-size 128 \
+                --context-length 131200 \
+                --chunked-prefill-size 8192 \
+                --mem-fraction-static 0.80 \
+                --watchdog-timeout 3600 \
+                --disable-cuda-graph \
+                --skip-server-warmup \
+                --reasoning-parser auto \
+                --tool-call-parser auto \
+                --host 0.0.0.0 \
+                --port 30000 >"$LOG" 2>&1 &
+              SERVER_PID=$!
+              trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+              python3 - <<'PY'
+              import time
+              import requests
+              for _ in range(7200):
+                  try:
+                      response=requests.get("http://127.0.0.1:30000/model_info",timeout=2)
+                      if response.ok: break
+                  except requests.RequestException: pass
+                  time.sleep(2)
+              else: raise TimeoutError("MiniMax-M3 server did not become ready")
+              PY
+              SIZES=(8192 65536 131072)
+              BLOCK_COUNTS=(16 2 1)
+              KL_POSITIONS=(16 128 256)
+              LABELS=(8k 64k 128k)
+              for i in 0 1 2; do
+                SIZE=${SIZES[$i]}
+                COUNT=${BLOCK_COUNTS[$i]}
+                POSITIONS=${KL_POSITIONS[$i]}
+                LABEL=${LABELS[$i]}
+                RUN=$BASE/quality/$LABEL/$METHOD
+                NATIVE=$BASE/quality/$LABEL/native
+                BLOCKS=$BASE/blocks/wikitext2_test_${SIZE}.pt
+                for _ in $(seq 1 7200); do
+                  [[ -s "$NATIVE/kl_reference.json" ]] && break
+                  sleep 2
+                done
+                test -s "$NATIVE/kl_reference.json"
+                mkdir -p "$RUN"
+                python3 /patch/wikitext2_ppl.py \
+                  --base-url http://127.0.0.1:30000 \
+                  --model "MiniMaxAI/MiniMax-M3:$METHOD" \
+                  --tokenizer-path "$MODEL" \
+                  --output "$RUN/ppl.json" \
+                  --blocks-path "$BLOCKS" \
+                  --dataset-cache /shared/huggingface/datasets \
+                  --block-size "$SIZE" \
+                  --max-blocks "$COUNT" \
+                  --timeout 7200
+                python3 /patch/wikitext2_kl_tail.py \
+                  --base-url http://127.0.0.1:30000 \
+                  --model "MiniMaxAI/MiniMax-M3:$METHOD" \
+                  --blocks-path "$BLOCKS" \
+                  --output "$RUN/kl.json" \
+                  --teacher-reference "$NATIVE/kl_reference.json" \
+                  --max-blocks "$COUNT" \
+                  --positions-per-block "$POSITIONS" \
+                  --workers 1 \
+                  --timeout 7200
+              done
+              echo "MINIMAX_M3_ROUTED_QUALITY_OK=$METHOD"
+          resources:
+            requests:
+              cpu: "64"
+              memory: 768Gi
+              nvidia.com/gpu: "8"
+            limits:
+              cpu: "128"
+              memory: 1500Gi
+              nvidia.com/gpu: "8"
+          volumeMounts:
+            - {name: hf, mountPath: /hf}
+            - {name: patch, mountPath: /patch}
+            - {name: shm, mountPath: /dev/shm}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: hf
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc
+        - name: patch
+          configMap:
+            name: minimax-routed-w3-scripts
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

@@ -70,6 +70,25 @@ def teacher_block(
     return samples
 
 
+def prod_truncated_kl(
+    teacher_logprobs: list[float],
+    student_logprobs: list[float],
+) -> tuple[float, float]:
+    """kl-probe's truncated_kl: KL(ref~||cand~) renormalized over the
+    reference top-k support; the uncovered reference tail mass is returned
+    separately instead of entering the sum. Student logprobs are exact
+    (token_ids_logprob), so the candidate-floor clamp never triggers."""
+    p = [math.exp(value) for value in teacher_logprobs]
+    q = [math.exp(value) for value in student_logprobs]
+    p_sum = sum(p)
+    q_sum = sum(q)
+    kl = sum(
+        (pi / p_sum) * (math.log(pi / p_sum) - math.log(qi / q_sum))
+        for pi, qi in zip(p, q)
+    )
+    return max(kl, 0.0), max(1.0 - p_sum, 0.0)
+
+
 def bucketed_forward_kl(sample: dict, student: dict[int, float]) -> float:
     token_ids = [int(value) for value in sample["token_ids"]]
     teacher_logprobs = [float(value) for value in sample["teacher_logprobs"]]
@@ -124,7 +143,12 @@ def student_block(
     values = []
     for sample, row in zip(samples, rows):
         student = {int(item[1]): float(item[0]) for item in row}
-        values.append(bucketed_forward_kl(sample, student))
+        kl50 = bucketed_forward_kl(sample, student)
+        token_ids = [int(value) for value in sample["token_ids"]]
+        teacher_logprobs = [float(value) for value in sample["teacher_logprobs"]]
+        student_logprobs = [student[token_id] for token_id in token_ids]
+        prod_kl, tail = prod_truncated_kl(teacher_logprobs, student_logprobs)
+        values.append((kl50, prod_kl, tail))
     return values
 
 
@@ -241,11 +265,14 @@ def main() -> None:
                 )
                 for block_id in sorted(grouped)
             ]
-            values = [
+            triples = [
                 value
                 for future in futures
                 for value in future.result()
             ]
+        values = [item[0] for item in triples]
+        prod_values = [item[1] for item in triples]
+        tail_values = [item[2] for item in triples]
         output = {
             "kind": "topk_bucketed_forward_kl",
             "protocol": teacher["protocol"],
@@ -262,7 +289,13 @@ def main() -> None:
             "median_kl_nats": statistics.median(values),
             "p95_kl_nats": percentile(values, 0.95),
             "max_kl_nats": max(values),
+            "prod_kl_mean_nats": statistics.fmean(prod_values),
+            "prod_kl_median_nats": statistics.median(prod_values),
+            "prod_kl_p95_nats": percentile(prod_values, 0.95),
+            "prod_kl_max_nats": max(prod_values),
+            "prod_kl_ref_tail_mass_mean": statistics.fmean(tail_values),
             "values": values,
+            "prod_values": prod_values,
         }
     args.output.write_text(json.dumps(output, indent=2) + "\n")
     print(
@@ -270,7 +303,7 @@ def main() -> None:
             {
                 key: value
                 for key, value in output.items()
-                if key not in {"samples", "values"}
+                if key not in {"samples", "values", "prod_values"}
             }
         ),
         flush=True,

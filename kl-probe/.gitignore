@@ -1,0 +1,10 @@
+runs/
+.venv/
+__pycache__/
+docker/.env.*
+docker/.devices.*
+docker/.engine-cache/
+*.egg-info/
+*.lock
+.pytest_cache/
+.ruff_cache/

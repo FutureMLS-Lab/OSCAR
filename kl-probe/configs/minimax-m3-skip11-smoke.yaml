@@ -1,0 +1,78 @@
+# SMOKE TEST — throwaway. One arm only, to prove a symlink-farm variant actually
+# loads and scores on the FP4 tgl image. Everything structural has been verified
+# (bytes, headers, dtypes, index consistency, exclude_modules); what is unproven is
+# the forward pass through a mixed 46-NVFP4 / 11-MXFP8 routed-expert stack.
+#
+# Bootstrapped off the rtn run, which supplies generations.jsonl + scores_ref, so the
+# reference server is never launched and the 64 prompts / 4096 score-tokens are the
+# SAME token set the existing anchors were scored on:
+#
+#   uv run probe run -c configs/minimax-m3-skip11-smoke.yaml \
+#     --reuse runs/minimax-m3-rtn/2026-07-23_21-05-37 --down
+#
+# That makes the resulting KL directly comparable to the measured anchors
+# (K=0 nvidia-nvfp4 = 0.0470, K=21 nvfp4-alt3x6 = 0.0395), so this is both a smoke
+# test and the first real datapoint. A coherent load lands in ~0.035-0.050; a broken
+# load looks like ~6.0 with top-1 near zero (the known config_groups failure mode).
+#
+# Delete this file once the real ladder runs.
+run_name: minimax-m3-skip11-smoke
+output_dir: runs
+hf_home: /data/huggingface
+
+allow_generations: false
+
+reference:
+  model_path: /scratch/tonyzhang/models/Minimax-M3-0602
+  image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+  tp: 4
+  extra_args: --quantization mxfp8 --dtype bfloat16 --kv-cache-dtype bfloat16 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm --disable-cuda-graph --skip-server-warmup --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --chunked-prefill-size 4096 --trust-remote-code
+  env:
+    SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+    TORCHDYNAMO_DISABLE: 1
+
+candidates:
+  # mxfp8skip11-late — MXFP8 routed experts on layers 49..59, NVFP4 on 3..48.
+  # Chosen for the smoke test because it is the strongest a-priori arm (the NVFP4
+  # pretraining report's tail rule is the only rule derived from these exact
+  # formats), so a successful run yields a useful datapoint rather than only a
+  # pass/fail. Symlink farm: 77 shards from the NVFP4 donor, 11 from the expert bank.
+  - name: mxfp8skip11-late
+    model_path: /data/huggingface/MiniMax-M3-NVFP4-mxfp8skip11-late
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 4096 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+      OMP_PROC_BIND: "false"
+      KMP_AFFINITY: disabled
+      OMP_NUM_THREADS: "8"
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+# Ignored when --reuse supplies generations.jsonl; kept so the config also works
+# standalone (without --reuse it would ingest 4 prompts and score the ref too).
+ingest:
+  source: /scratch/tonyzhang/jheo_evals/runs/hle-mxfp8-0602-text2158/response_cache
+  format: hle_response_cache
+  require_finish_reason: stop
+  max_prompts: 4
+  max_score_tokens: 2048
+
+scoring:
+  top_logprobs_num: auto
+  concurrency: 1
+  score_chunk_size: 0
+
+metrics:
+  bucket_size: 1024
+
+runtime:
+  ref:
+    gpus: [0,1,2,3]
+    port: 38095
+  candidates:
+    mxfp8skip11-late:
+      gpus: [0,1,2,3]
+      port: 38123

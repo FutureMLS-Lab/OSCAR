@@ -1,0 +1,98 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-rms2-analysis-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 12
+  parallelism: 12
+  backoffLimitPerIndex: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate/w3a8
+              MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+              METHODS=(inter_lloymax_gptq_hadamard inter_lloymax_gptq_hadamard inter_lloymax_gptq_hadamard inter_lloymax_gptq_hadamard inter_lloymax_gptq_hadamard inter_lloymax_gptq_hadamard_sensitivity inter_lloymax_gptq_hadamard_sensitivity inter_lloymax_gptq_hadamard_sensitivity inter_lloymax_gptq_hadamard_sensitivity inter_lloymax_gptq_hadamard_sensitivity inter_lloymax_gptq_hadamard_sensitivity inter_lloymax_gptq_hadamard_sensitivity)
+              LABELS=(calib4096-hadamard64 calib4096-hadamard64 calib4096-hadamard64 calib4096-hadamard64 calib4096-hadamard64 calib4096-h64-rms2-native calib4096-h64-rms2-native calib4096-h64-rms2-native calib4096-h64-rms2-native calib4096-h64-rms2-native alpha025-h64-rms2-native alpha050-h64-rms2-native)
+              ROUNDS=(0 1 2 3 4 0 1 2 3 4 0 0)
+              CALIBS=(4096 4096 4096 4096 4096 4096 4096 4096 4096 4096 512 512)
+              ALPHAS=(1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 0.25 0.5)
+              METHOD=${METHODS[$JOB_COMPLETION_INDEX]}
+              LABEL=${LABELS[$JOB_COMPLETION_INDEX]}
+              R=${ROUNDS[$JOB_COMPLETION_INDEX]}
+              CALIB=${CALIBS[$JOB_COMPLETION_INDEX]}
+              ALPHA=${ALPHAS[$JOB_COMPLETION_INDEX]}
+              OUT=$ROOT/inter-lloymax-gptq-v2/qwen3-4b-thinking/$LABEL/iter${R}/result.json
+              REF=$ROOT/quality/qwen3-4b-thinking/bf16_bf16/kl_reference.json
+              test -s "$REF"
+              mkdir -p "$(dirname "$OUT")"
+              python3 /scripts/w3a8_lut_sim.py \
+                --model-path "$MODEL" \
+                --weight-method "$METHOD" \
+                --activation mxfp8 \
+                --b-scale-mode global_native_k64 \
+                --mma-k 64 \
+                --output "$OUT" \
+                --blocks-path "$ROOT/blocks/qwen3-4b-thinking_8192.pt" \
+                --calibration-blocks-path "$ROOT/blocks/qwen3-4b-thinking_train_8192.pt" \
+                --block-size 8192 \
+                --max-blocks 16 \
+                --kl-reference "$REF" \
+                --calibration-tokens "$CALIB" \
+                --gptq-damp-percent 0.1 \
+                --lm-iterations 8 \
+                --sensitivity-alpha "$ALPHA" \
+                --inter-gptq-iterations "$R" \
+                --inter-gptq-tolerance 0 \
+                --inter-gptq-codebook-damp 0.0001 \
+                --chunk-tiles 128 \
+                --attn-implementation flash_attention_2 \
+                --trust-remote-code
+              python3 - "$OUT" "$METHOD" "$R" <<'PY'
+              import json, sys
+              r = json.load(open(sys.argv[1]))
+              assert r["weight_method"] == sys.argv[2]
+              assert r["inter_gptq_iterations"] == int(sys.argv[3])
+              assert r["scored_tokens"] == 16 * (8192 - 1)
+              assert r["kl50_samples"] == 256
+              assert r["prod_kl_mean_nats"] is not None
+              print("RMS2_ANALYSIS_OK", sys.argv[2], sys.argv[3],
+                    r["calibration_tokens"], r.get("sensitivity_alpha"),
+                    r["ppl"], r["kl50_mean_nats"], r["prod_kl_mean_nats"])
+              PY
+          resources:
+            requests:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 160Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-inter-gptq-v3
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

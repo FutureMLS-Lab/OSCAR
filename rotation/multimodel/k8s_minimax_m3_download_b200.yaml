@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-m3-download-b200-v1
+  namespace: charlie
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: download
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /hf}
+            - {name: HF_HUB_ENABLE_HF_TRANSFER, value: "1"}
+            - {name: HF_XET_HIGH_PERFORMANCE, value: "1"}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              python3 - <<'PY'
+              from huggingface_hub import snapshot_download
+
+              path = snapshot_download(
+                  "MiniMaxAI/MiniMax-M3",
+                  cache_dir="/hf",
+                  max_workers=32,
+              )
+              print(f"MINIMAX_M3_DOWNLOAD_OK={path}", flush=True)
+              PY
+          resources:
+            requests:
+              cpu: "16"
+              memory: 32Gi
+            limits:
+              cpu: "32"
+              memory: 64Gi
+          volumeMounts:
+            - {name: hf, mountPath: /hf}
+      volumes:
+        - name: hf
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc

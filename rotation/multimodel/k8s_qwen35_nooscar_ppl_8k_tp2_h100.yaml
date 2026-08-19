@@ -1,0 +1,55 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-qwen35-nooscar-ppl-8k-tp2-h100-v2
+  namespace: charlie
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 43200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+          workingDir: /shared/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: USER, value: charlie}
+            - {name: LOGNAME, value: charlie}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate
+              BASE=${ROOT}/multimodel/qwen3.5-35b-a3b
+              MODEL=/shared/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+              export PYTHONPATH=${ROOT}/source/multimodel-runtime/python
+              export SGLANG_OSCAR_K_ROTATION_PATH=${BASE}/rotations/k_rotation_qqt_r_h_pbr.pt
+              export SGLANG_OSCAR_V_ROTATION_PATH=${BASE}/rotations/v_rotation_sst_r_h_pbr.pt
+              export SGLANG_OSCAR_K_CLIP_RATIO=0.96
+              export SGLANG_OSCAR_V_CLIP_RATIO=0.92
+              TP_SIZE=2 GPUS=0,1 SKIP_SERVER_WARMUP=1 \
+                PPL_BLOCK_SIZE=8192 MODE=offline_lm_qp MODEL=$MODEL \
+                RUN_DIR=${BASE}/ppl_8k/offline_lm_qp \
+                CODEBOOK_PATH=${BASE}/codebooks/lloyd_max_v2.pt \
+                BLOCKS_PATH=${BASE}/eval/wikitext2_test_8192.pt \
+                PPL_MAX_BLOCKS=16 CHUNKED_PREFILL_SIZE=64 \
+                MAX_RUNNING_REQUESTS=1 MEM_FRAC=0.82 \
+                bash rotation/eval_kv_ppl.sh
+              test -s ${BASE}/ppl_8k/offline_lm_qp/ppl.json
+          resources:
+            requests: {nvidia.com/gpu: "2", cpu: "24", memory: 96Gi}
+            limits: {nvidia.com/gpu: "2", cpu: "48", memory: 240Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 96Gi}}

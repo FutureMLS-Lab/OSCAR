@@ -1,0 +1,333 @@
+# MiniMax-M3 quantization eval over the PG-19 long-book corpus (raw text, no
+# chat template). Reference = the uniform-MXFP8 0602 baseline; each candidate is
+# prefill-scored on every position of a 32k-token book chunk and compared to it.
+# Same reference/candidates/runtime as minimax-m3-eval.yaml — only the input
+# corpus differs (PG-19 test split instead of the HLE response cache).
+# NOTE: the FP4 candidates run on a different tgl build than the mxfp8 reference
+# (see their blocks) — so the KL also captures engine-build differences.
+#
+#   uv run probe run -c configs/minimax-m3-pg19.yaml --down
+#   uv run probe run -c configs/minimax-m3-pg19.yaml --reuse --down  # reuse ref + already-scored candidates from the latest run
+run_name: minimax-m3-pg19
+output_dir: runs
+hf_home: /data/huggingface
+
+allow_generations: false
+
+# Reference: togethercomputer/Minimax-M3-0602, uniform mxfp8. Serving args mirror
+# quant-bench/scripts/launch_m3_0602_mxfp8.sh (bf16 KV cache) EXCEPT the MoE
+# runner: this image's server_args._handle_moe_kernel_config only accepts
+# {cutlass, deep_gemm, flashinfer_trtllm, flashinfer_trtllm_routed} for mxfp8 and
+# silently overrides anything else (e.g. the script's `triton`) to
+# flashinfer_trtllm — whose fp8 kernel here rejects the swigluoai `gemm1_alpha`
+# and hard-crashes at warmup. So use deep_gemm: valid for mxfp8 and not a trtllm
+# kernel, so it keeps the swigluoai alpha/clamp. No excluded-MoE patch: only gate
+# routers + vision/lm_head/embed are in ignore.
+reference:
+  model_path: /scratch/tonyzhang/models/Minimax-M3-0602
+  image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+  tp: 4
+  # Scoring is prefill-only, so: --disable-cuda-graph (eager — skip the unused
+  # decode cuda-graph capture) + --skip-server-warmup (skip the dummy DECODE
+  # warmup batch, which on the FP4 image trips an eager-path seq_lens.dtype
+  # assertion in the minimax sparse-decode backend; we never decode, so skipping
+  # it is harmless and keeps startup lean).
+  extra_args: --quantization mxfp8 --dtype bfloat16 --kv-cache-dtype bfloat16 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm --disable-cuda-graph --skip-server-warmup --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --chunked-prefill-size 2048 --trust-remote-code
+  env:
+    SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+    TORCHDYNAMO_DISABLE: 1
+
+candidates:
+  # ------------------------------------------------------------------
+  # DISABLED 2026-07-21: the 8 candidates below were scored on 07-17 but
+  # their checkpoints were since wiped from /scratch/huggingface; the
+  # startup tokenizer check crashes on missing model_paths. Restore the
+  # checkpoints and uncomment to re-enable (candidate + runtime entries).
+  # ------------------------------------------------------------------
+  # togethercomputer/MiniMax-M3-NVFP4-alt3x6-0708: NVFP4 routed experts, but the
+  # exclude_modules SKIP-family keeps whole MoE expert layers at MXFP8, so serving
+  # REQUIRES the excluded-MoE MXFP8 rebuild patch. Served on the FP4 tgl image
+  # (commit 721a615d, x86-jheo rebuild with the piecewise-cudagraph sampler
+  # clone-fix baked in) per quant-bench/scripts/launch_minimax_m3_fp4.sh:
+  # --quantization modelopt_fp4 + flashinfer_trtllm, whose FP4 MoE kernels DO
+  # handle the swigluoai gemm1_alpha (unlike the mxfp8 path). fp8_e4m3 KV per that
+  # script. --disable-cuda-graph + --skip-server-warmup: scoring is prefill-only,
+  # so run eager and skip the dummy DECODE warmup batch — that batch otherwise
+  # trips an eager-path `seq_lens.dtype == torch.int32` assertion in the minimax
+  # sparse-decode backend (the FP4 script instead runs decode via piecewise cuda
+  # graph). We never decode, so skipping it is harmless. Downloaded to /scratch/huggingface.
+  - name: nvfp4-alt3x6
+    model_path: /scratch/huggingface/MiniMax-M3-NVFP4-alt3x6-0708
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # togethercomputer/MiniMax-M3-GPTQ-NVFP4: modelopt / NVFP4 in the newer
+  # config_groups+ignore format (exclude_modules is EMPTY). NOT the skip-family,
+  # so no patch. BROKEN on this FP4 image: it loads + serves but INCOHERENTLY
+  # (mean KL 6.67, top-1 0.18% vs ref) — the 721a615d image doesn't correctly
+  # apply the config_groups NVFP4 weights (silent). Kept for reference; superseded
+  # by gptq-nvfp4-0714 below, which uses the hf_quant_config+exclude_modules
+  # format this image actually supports.
+  # - name: gptq-nvfp4
+  #   model_path: /scratch/huggingface/MiniMax-M3-GPTQ-NVFP4
+  #   image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+  #   tp: 4
+  #   extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+  #   env:
+  #     SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+  #     TORCHDYNAMO_DISABLE: 1
+
+  # togethercomputer/Minimax-M3-07-14-NVFP4-GPTQ: modelopt NVFP4 (group_size 16)
+  # in the hf_quant_config.json + exclude_modules format — routed experts are
+  # NVFP4, everything else (attn, shared_experts, gates, early layers 0-1,
+  # lm_head/embed) kept high precision. This is the exclude_modules family the FP4
+  # image (721a615d) is verified against, so it serves via --quantization
+  # modelopt_fp4 + flashinfer_trtllm with NO patch (not skipedge: routed experts
+  # are quantized, not excluded). Same FP4 image + serving flags as the others.
+  - name: gptq-nvfp4-0714
+    model_path: /scratch/huggingface/Minimax-M3-07-14-NVFP4-GPTQ
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+
+  # Minimax-M3-07-14-NVFP4-GPTQ-mxfp8skip21: built in-house (see scratchpad
+  # build_variant.py) = the 07-14 GPTQ base with the routed experts of 21 layers
+  # [3,4,5,12,13,14,21,22,23,30,31,32,39,40,41,48,49,50,57,58,59] switched
+  # NVFP4 -> MXFP8 (copied from alt3x6, which shares the same base weights); the
+  # other 36 MoE layers keep 07-14's GPTQ-NVFP4. Because it now has excluded
+  # MXFP8 routed experts (skip-family, like alt3x6) it REQUIRES the excluded-MoE
+  # MXFP8 rebuild patch. Same FP4 image + serving flags otherwise.
+  - name: mxfp8skip21
+    model_path: /scratch/huggingface/Minimax-M3-07-14-NVFP4-GPTQ-mxfp8skip21
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # mxfp8skip21 but with every NVFP4 input_scale forced to 1.0 (unit activation
+  # scaling, like alt3x6) instead of 07-14's static calibrated scales (~0.026).
+  # A/B test of static vs unit activation scaling on the 36 GPTQ-NVFP4 layers;
+  # weights + everything else identical to mxfp8skip21. Same patch/flags.
+  - name: mxfp8skip21-inscale1
+    model_path: /scratch/huggingface/Minimax-M3-07-14-NVFP4-GPTQ-mxfp8skip21-inscale1
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # MiniMax-M3-GPTQ-NVFP4-mxfp8fill: built in-house (scratchpad build_mxfp8fill.py)
+  # = keep GPTQ-NVFP4's NVFP4 routed experts on layers 10-52 (with input_scale set
+  # to 1.0), and replace ALL its other (bf16) modules with 0602's — MXFP8 attn /
+  # shared / dense-MLP + MXFP8 edge-layer experts (3-9, 53-59), bf16 norms/lm_head/
+  # embed. Config rewritten to alt3x6's coherent format (exclude_modules present,
+  # config_groups removed — the fix for GPTQ-NVFP4's incoherence). Has excluded
+  # MXFP8 experts -> REQUIRES the excluded-MoE patch. Same FP4 image + flags.
+  - name: mxfp8fill
+    model_path: /scratch/huggingface/MiniMax-M3-GPTQ-NVFP4-mxfp8fill
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # togethercomputer/Minimax-M3-0717-GPTQ-HLE with all input_scale forced to 1.0.
+  # Same format as gptq-nvfp4-0714 (hf_quant_config exclude_modules, no
+  # config_groups): NVFP4 routed experts on all 57 layers + MXFP8 attn/shared,
+  # bf16 norms/lm_head/embed. Serves coherently with NO patch. Ships its own
+  # tokenizer/processor aux. input_scale=1.0 built via scratchpad build_0717_inscale1.py.
+  - name: gptq-hle-0717
+    model_path: /scratch/huggingface/Minimax-M3-0717-GPTQ-HLE-inscale1
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+
+  # gptq-hle-0717 with alt3x6's skip pattern: routed experts of 21 layers
+  # [3,4,5,12,13,14,21,22,23,30,31,32,39,40,41,48,49,50,57,58,59] switched
+  # NVFP4 -> MXFP8 (from 0602); other 36 layers keep 0717's NVFP4 (input_scale=1.0).
+  # Has excluded MXFP8 experts -> REQUIRES the excluded-MoE patch. Built via
+  # scratchpad build_0717_skip21.py.
+  - name: gptq-hle-0717-skip21
+    model_path: /scratch/huggingface/Minimax-M3-0717-GPTQ-HLE-mxfp8skip21
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # togethercomputer/Minimax-M3-0721-GPTQ-HLE-ALL-EXP-mxfp8: modelopt NVFP4
+  # (group_size 16) in the hf_quant_config exclude_modules format, same family as
+  # gptq-hle-0717/0714: NVFP4 routed experts on all 57 MoE layers (3-59) with
+  # static calibrated input_scales; excluded (MXFP8/bf16) attn, shared_experts,
+  # gates, norms, layers 0-2, mtp, lm_head/embed/vision. No routed-expert
+  # exclusions -> serves coherently with NO patch. Downloaded to /data/huggingface
+  # (WekaFS; the compose file same-path-mounts /data like /scratch).
+  - name: gptq-hle-0721-allexp
+    model_path: /data/huggingface/Minimax-M3-0721-GPTQ-HLE-ALL-EXP-mxfp8
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+
+  # gptq-hle-0721-allexp with all 21888 NVFP4 input_scale tensors forced to 1.0
+  # (unit activation scaling A/B, like the 0717/skip21 inscale1 variants). Built
+  # via scripts/build_inscale1.py; weights otherwise identical. No patch.
+  - name: gptq-hle-0721-allexp-inscale1
+    model_path: /data/huggingface/Minimax-M3-0721-GPTQ-HLE-ALL-EXP-mxfp8-inscale1
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+
+  # gptq-hle-0721-allexp-inscale1 with alt3x6's skip pattern: routed experts of 21
+  # layers [3,4,5,12,13,14,21,22,23,30,31,32,39,40,41,48,49,50,57,58,59] switched
+  # FP4(NVFP4) -> MXFP8 (from 0602); other 36 layers keep 0721's NVFP4 (input_scale=1.0).
+  # Excluded MXFP8 experts -> REQUIRES the excluded-MoE patch. Built via build_0721_skip21.py.
+  - name: gptq-hle-0721-allexp-skip21
+    model_path: /data/huggingface/Minimax-M3-0721-GPTQ-HLE-ALL-EXP-mxfp8-inscale1-skip21
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # 0722 full-swebench: skip-family checkpoint (NVFP4 on 36 MoE layers, MXFP8
+  # experts on the alt3x6 21-layer set), coherent hf_quant_config exclude_modules.
+  - name: swebench-0722
+    model_path: /data/huggingface/Minimax-M3-0722-full-swebench
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # 0722 full-swebench with every NVFP4 input_scale forced to 1.0 (unit scaling).
+  - name: swebench-0722-inscale1
+    model_path: /data/huggingface/Minimax-M3-0722-full-swebench-inscale1
+    image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:de-minimax-m3-721a615d-x86-jheo
+    tp: 4
+    extra_args: --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --moe-runner-backend flashinfer_trtllm --fp8-gemm-backend deep_gemm --page-size 128 --disable-cuda-graph --skip-server-warmup --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+    env:
+      SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+      TORCHDYNAMO_DISABLE: 1
+    patches:
+      - patches/minimax-m3-fp4-excluded-moe-mxfp8.py
+
+  # nvidia/MiniMax-M3-NVFP4: modelopt MIXED_PRECISION -> sglang detects w4afp8
+  # (cutlass W4A8 EP-MoE path, NOT flashinfer_trtllm). Would serve with
+  # --quantization w4afp8 on the mxfp8 image (dea4bd032 ships the w4afp8 kernels);
+  # no excluded-MoE patch (exclude_modules lists only gates).
+  # - name: nvfp4
+  #   model_path: nvidia/MiniMax-M3-NVFP4
+  #   image: 598726163780.dkr.ecr.us-west-2.amazonaws.com/smg:smg-minimax-m3-6877b267-tgl-de-minimax-m3-dea4bd032-b200-flashinfer0612-base
+  #   tp: 4
+  #   extra_args: --quantization w4afp8 --kv-cache-dtype bfloat16 --attention-backend flashinfer --mm-attention-backend flashinfer_cudnn --fp8-gemm-backend deep_gemm --disable-cuda-graph --chunked-prefill-size 2048 --context-length 262144 --mem-fraction-static 0.75 --max-running-requests 64 --trust-remote-code
+  #   env:
+  #     SGLANG_MINIMAX_SPARSE_DECODE_BACKEND: trtllm
+  #     TORCHDYNAMO_DISABLE: 1
+
+ingest:
+  # PG-19 long-book corpus (raw text — no chat template). Each book is tokenized
+  # and scored teacher-forced as one fixed-length chunk. Same reference/candidates
+  # as minimax-m3-eval.yaml, only the input corpus differs.
+  source: emozilla/pg19          # HF dataset id (parquet mirror; deepmind/pg19 is
+                                 # script-based and unsupported by datasets>=5)
+  format: pg19
+  split: test                    # PG-19 test split = 100 held-out books
+  text_field: text
+  require_finish_reason: null     # raw text has no stop condition — keep all
+  max_prompts: 100                # all 100 test books
+  max_score_tokens: 32768         # 32k-token chunk per book (long-context stress)
+
+scoring:
+  top_logprobs_num: auto          # no generation_config.json -> resolves to 40
+  concurrency: 1                  # all-position scoring is memory-heavy; keep 1-2
+  score_chunk_size: 0
+
+metrics:
+  bucket_size: 4096
+
+runtime:
+  # TP=4: reference and the candidates share GPUs 4-7 and run one at a time
+  # (sequential staging), each on its own port.
+  ref:
+    gpus: [4,5,6,7]
+    port: 38095
+  candidates:
+    nvfp4-alt3x6:
+      gpus: [4,5,6,7]
+      port: 38096
+    # gptq-nvfp4:
+    #   gpus: [4,5,6,7]
+    #   port: 38097
+    gptq-nvfp4-0714:
+      gpus: [4,5,6,7]
+      port: 38098
+    mxfp8skip21:
+      gpus: [4,5,6,7]
+      port: 38099
+    mxfp8skip21-inscale1:
+      gpus: [4,5,6,7]
+      port: 38100
+    mxfp8fill:
+      gpus: [4,5,6,7]
+      port: 38101
+    gptq-hle-0717:
+      gpus: [4,5,6,7]
+      port: 38102
+    gptq-hle-0717-skip21:
+      gpus: [4,5,6,7]
+      port: 38103
+    gptq-hle-0721-allexp:
+      gpus: [4,5,6,7]
+      port: 38104
+    gptq-hle-0721-allexp-inscale1:
+      gpus: [4,5,6,7]
+      port: 38115
+    gptq-hle-0721-allexp-skip21:
+      gpus: [4,5,6,7]
+      port: 38116
+    swebench-0722:
+      gpus: [4,5,6,7]
+      port: 38107
+    swebench-0722-inscale1:
+      gpus: [4,5,6,7]
+      port: 38108
+    # nvfp4:
+    #   gpus: [4,5,6,7]
+    #   port: 38106

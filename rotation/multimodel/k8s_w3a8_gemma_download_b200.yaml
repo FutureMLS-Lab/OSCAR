@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-gemma-download-v1
+  namespace: charlie
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: download
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_ENABLE_HF_TRANSFER, value: "1"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              python3 - <<'PY'
+              from huggingface_hub import snapshot_download
+              path = snapshot_download("google/gemma-4-12B")
+              print("GEMMA_DOWNLOAD_READY", path, flush=True)
+              PY
+          resources:
+            requests: {cpu: "8", memory: 16Gi}
+            limits: {cpu: "16", memory: 32Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

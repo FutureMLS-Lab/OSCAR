@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-m3-download-sharded-b200-v1
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 8
+  parallelism: 8
+  backoffLimitPerIndex: 1
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: download
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /hf}
+            - {name: HF_HUB_ENABLE_HF_TRANSFER, value: "1"}
+            - {name: HF_XET_HIGH_PERFORMANCE, value: "1"}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              python3 - <<'PY'
+              import os
+              from huggingface_hub import hf_hub_download
+
+              index = int(os.environ["JOB_COMPLETION_INDEX"])
+              for shard in range(index + 1, 60, 8):
+                  filename = f"model-{shard:05d}-of-00059.safetensors"
+                  path = hf_hub_download(
+                      "MiniMaxAI/MiniMax-M3",
+                      filename,
+                      cache_dir="/hf",
+                  )
+                  print(f"DOWNLOADED={path}", flush=True)
+              if index == 0:
+                  for filename in (
+                      "model.safetensors.index.json",
+                      "config.json",
+                      "configuration_minimax_m3_vl.py",
+                  ):
+                      hf_hub_download(
+                          "MiniMaxAI/MiniMax-M3",
+                          filename,
+                          cache_dir="/hf",
+                      )
+              print(f"MINIMAX_M3_SHARD_GROUP_OK={index}", flush=True)
+              PY
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - {name: hf, mountPath: /hf}
+      volumes:
+        - name: hf
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc

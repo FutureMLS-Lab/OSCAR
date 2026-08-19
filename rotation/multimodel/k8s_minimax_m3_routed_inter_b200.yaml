@@ -1,0 +1,144 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-m3-routed-inter-b200-v2
+  namespace: charlie
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 2
+  activeDeadlineSeconds: 172800
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      priorityClassName: benchmark-high-priority
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: quality
+          image: lmsysorg/sglang:dev-cu13-minimax-m3
+          env:
+            - {name: HF_HOME, value: /hf}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: PYTHONPATH, value: /patch:/sgl-workspace/sglang/python}
+            - {name: MINIMAX_ROUTED_W3_QUANTIZER, value: /patch/w3a8_lut_sim.py}
+            - {name: MINIMAX_ROUTED_STATS_DIR, value: /shared/minimax-m3/routed-calibration}
+            - {name: MINIMAX_CPU_OFFLOAD_TIED_COMPAT, value: "1"}
+            - {name: MINIMAX_ROUTED_W3_METHOD, value: hadamard_gate_inter_gptq}
+            - {name: MINIMAX_ROUTED_B_SCALE_MODE, value: global_native_k64}
+            - {name: MINIMAX_ROUTED_MMA_K, value: "64"}
+            - {name: MINIMAX_ROUTED_INTER_ITERATIONS, value: "1"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              METHOD=hadamard_gate_inter_gptq
+              MODEL=/hf/models--MiniMaxAI--MiniMax-M3/snapshots/f0e1c1e04d40177e4673a22097036854f536e9c0
+              BASE=/shared/minimax-m3
+              LOG=$BASE/${METHOD}-quality-${HOSTNAME}.log
+              python3 - <<'PY'
+              import shutil
+              from pathlib import Path
+              shutil.rmtree(Path.home() / ".cache/minfer/fmha_sm100", ignore_errors=True)
+              from fmha_sm100 import jit
+              assert hasattr(jit.get_plan_fn(), "plan")
+              assert hasattr(jit.get_reduction_module(), "reduction")
+              jit.get_sparse_topk_module()
+              for pack_factor in (8,16):
+                  variant=jit.get_fmha_variant(jit._dlpack_dtype_code(__import__("torch").bfloat16),128,True,0,128,True,pack_factor)
+                  assert hasattr(variant,"run")
+              PY
+              python3 -m sglang.launch_server \
+                --model-path "$MODEL" \
+                --model-loader-extra-config '{"enable_multithread_load":false}' \
+                --weight-loader-drop-cache-after-load \
+                --trust-remote-code \
+                --tp 4 \
+                --cpu-offload-gb 64 \
+                --ep-size 4 \
+                --attention-backend fa4 \
+                --moe-runner-backend triton \
+                --page-size 128 \
+                --context-length 131200 \
+                --chunked-prefill-size 8192 \
+                --mem-fraction-static 0.80 \
+                --watchdog-timeout 3600 \
+                --disable-cuda-graph \
+                --skip-server-warmup \
+                --reasoning-parser auto \
+                --tool-call-parser auto \
+                --host 0.0.0.0 \
+                --port 30000 >"$LOG" 2>&1 &
+              SERVER_PID=$!
+              trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+              python3 - <<'PY'
+              import time,requests
+              for _ in range(14400):
+                  try:
+                      if requests.get("http://127.0.0.1:30000/model_info",timeout=2).ok: break
+                  except requests.RequestException: pass
+                  time.sleep(2)
+              else: raise TimeoutError("server not ready")
+              PY
+              SIZES=(8192 65536 131072)
+              BLOCK_COUNTS=(16 2 1)
+              KL_POSITIONS=(16 128 256)
+              LABELS=(8k 64k 128k)
+              for i in 0 1 2; do
+                SIZE=${SIZES[$i]}; COUNT=${BLOCK_COUNTS[$i]}
+                POSITIONS=${KL_POSITIONS[$i]}; LABEL=${LABELS[$i]}
+                RUN=$BASE/quality-paired-scales-v5/global_native_k64/$LABEL/$METHOD
+                NATIVE=$BASE/quality/$LABEL/native
+                BLOCKS=$BASE/blocks/wikitext2_test_${SIZE}.pt
+                test -s "$NATIVE/kl_reference.json"
+                mkdir -p "$RUN"
+                python3 /patch/wikitext2_ppl.py \
+                  --base-url http://127.0.0.1:30000 \
+                  --model "MiniMaxAI/MiniMax-M3:$METHOD" \
+                  --tokenizer-path "$MODEL" \
+                  --output "$RUN/ppl.json" \
+                  --blocks-path "$BLOCKS" \
+                  --block-size "$SIZE" \
+                  --max-blocks "$COUNT" \
+                  --timeout 7200
+                python3 /patch/wikitext2_kl_tail.py \
+                  --base-url http://127.0.0.1:30000 \
+                  --model "MiniMaxAI/MiniMax-M3:$METHOD" \
+                  --blocks-path "$BLOCKS" \
+                  --output "$RUN/kl.json" \
+                  --teacher-reference "$NATIVE/kl_reference.json" \
+                  --max-blocks "$COUNT" \
+                  --positions-per-block "$POSITIONS" \
+                  --workers 1 --timeout 7200
+              done
+              echo "MINIMAX_M3_INTER_OK=$METHOD"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "128"
+              memory: 1500Gi
+              nvidia.com/gpu: "4"
+          volumeMounts:
+            - {name: hf, mountPath: /hf}
+            - {name: patch, mountPath: /patch}
+            - {name: shm, mountPath: /dev/shm}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: hf
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc
+        - name: patch
+          configMap:
+            name: minimax-routed-w3-inter-v1
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

@@ -1,0 +1,127 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-m3-routed-calibration-b200-v1
+  namespace: charlie
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      priorityClassName: benchmark-high-priority
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: calibrate
+          image: lmsysorg/sglang:dev-cu13-minimax-m3
+          env:
+            - {name: HF_HOME, value: /hf}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - {name: PYTHONPATH, value: /patch:/sgl-workspace/sglang/python}
+            - {name: MINIMAX_ROUTED_W3_METHOD, value: ""}
+            - {name: MINIMAX_ROUTED_W3_QUANTIZER, value: /patch/w3a8_lut_sim.py}
+            - {name: MINIMAX_ROUTED_CALIBRATION_DIR, value: /shared/minimax-m3/routed-calibration}
+            - {name: MINIMAX_CPU_OFFLOAD_TIED_COMPAT, value: "1"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              MODEL=/hf/models--MiniMaxAI--MiniMax-M3/snapshots/f0e1c1e04d40177e4673a22097036854f536e9c0
+              BASE=/shared/minimax-m3
+              LOG=$BASE/calibration-${HOSTNAME}.log
+              rm -rf "$MINIMAX_ROUTED_CALIBRATION_DIR"
+              mkdir -p "$MINIMAX_ROUTED_CALIBRATION_DIR"
+              python3 - <<'PY'
+              import shutil
+              from pathlib import Path
+              shutil.rmtree(Path.home() / ".cache/minfer/fmha_sm100", ignore_errors=True)
+              from fmha_sm100 import jit
+              assert hasattr(jit.get_plan_fn(), "plan")
+              assert hasattr(jit.get_reduction_module(), "reduction")
+              jit.get_sparse_topk_module()
+              for pack_factor in (8,16):
+                  variant=jit.get_fmha_variant(jit._dlpack_dtype_code(__import__("torch").bfloat16),128,True,0,128,True,pack_factor)
+                  assert hasattr(variant,"run")
+              PY
+              python3 -m sglang.launch_server \
+                --model-path "$MODEL" \
+                --model-loader-extra-config '{"enable_multithread_load":false}' \
+                --weight-loader-drop-cache-after-load \
+                --trust-remote-code \
+                --tp 8 \
+                --ep-size 8 \
+                --attention-backend fa4 \
+                --moe-runner-backend triton \
+                --page-size 128 \
+                --context-length 2048 \
+                --chunked-prefill-size 1024 \
+                --mem-fraction-static 0.80 \
+                --watchdog-timeout 3600 \
+                --disable-cuda-graph \
+                --skip-server-warmup \
+                --reasoning-parser auto \
+                --tool-call-parser auto \
+                --host 0.0.0.0 \
+                --port 30000 >"$LOG" 2>&1 &
+              SERVER_PID=$!
+              trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+              python3 - <<'PY'
+              import time,requests
+              from datasets import load_dataset
+              from transformers import AutoTokenizer
+              for _ in range(7200):
+                  try:
+                      if requests.get("http://127.0.0.1:30000/model_info",timeout=2).ok: break
+                  except requests.RequestException: pass
+                  time.sleep(2)
+              else: raise TimeoutError("server not ready")
+              model="/hf/models--MiniMaxAI--MiniMax-M3/snapshots/f0e1c1e04d40177e4673a22097036854f536e9c0"
+              dataset=load_dataset("Salesforce/wikitext","wikitext-2-raw-v1",split="train",cache_dir="/shared/huggingface/datasets")
+              text="\\n\\n".join(dataset["text"])
+              ids=AutoTokenizer.from_pretrained(model,trust_remote_code=True)(text,add_special_tokens=False).input_ids[:512]
+              response=requests.post("http://127.0.0.1:30000/generate",json={"input_ids":ids,"sampling_params":{"max_new_tokens":1,"temperature":0}},timeout=7200)
+              response.raise_for_status()
+              print("CALIBRATION_REQUEST_OK",flush=True)
+              PY
+              for _ in $(seq 1 300); do
+                COUNT=$(python3 - <<'PY'
+              from pathlib import Path
+              print(len(list(Path("/shared/minimax-m3/routed-calibration").glob("ep*/layer*.pt"))))
+              PY
+              )
+                [[ "$COUNT" -eq 228 ]] && break
+                sleep 2
+              done
+              test "$COUNT" -eq 228
+              echo "MINIMAX_ROUTED_CALIBRATION_OK=$COUNT"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+              nvidia.com/gpu: "8"
+            limits:
+              cpu: "128"
+              memory: 1500Gi
+              nvidia.com/gpu: "8"
+          volumeMounts:
+            - {name: hf, mountPath: /hf}
+            - {name: patch, mountPath: /patch}
+            - {name: shm, mountPath: /dev/shm}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: hf
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc
+        - name: patch
+          configMap:
+            name: minimax-routed-w3-scripts
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

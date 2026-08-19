@@ -1,0 +1,115 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rubin-w3a8-best-rows-v2
+  namespace: charlie
+spec:
+  completionMode: Indexed
+  completions: 12
+  parallelism: 12
+  backoffLimitPerIndex: 1
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 259200
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate/w3a8
+              METHOD_INDEX=$((JOB_COMPLETION_INDEX / 6))
+              MODEL_INDEX=$(((JOB_COMPLETION_INDEX % 6) / 3))
+              CTX_INDEX=$((JOB_COMPLETION_INDEX % 3))
+              if [[ $METHOD_INDEX == 0 ]]; then
+                METHOD=gptq_hadamard_sensitivity_lm
+                RUN=gptq_hadamard_sensitivity_lm_d100_k32_mxfp8
+                METHOD_ARGS=(--b-scale-mode legacy_k32 --mma-k 32)
+              else
+                METHOD=inter_lloymax_gptq_hadamard
+                RUN=inter_lm_gptq_hadamard_r1_gnk64_mxfp8
+                METHOD_ARGS=(--b-scale-mode global_native_k64 --mma-k 64 --inter-gptq-iterations 1 --inter-gptq-tolerance 0 --inter-gptq-codebook-damp 0.0001)
+              fi
+              if [[ $MODEL_INDEX == 0 ]]; then
+                MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+                SLUG=qwen3-4b-thinking
+                ATTN=flash_attention_2
+                EVAL_ARGS=(--eval-chunk-size 4096)
+              else
+                MODELS=(/shared/huggingface/hub/models--google--gemma-4-12B/snapshots/*)
+                [[ ${#MODELS[@]} -eq 1 ]]
+                MODEL=${MODELS[0]}
+                SLUG=gemma4-12b
+                ATTN=sdpa
+                EVAL_ARGS=(--eval-chunk-size 4096)
+              fi
+              SIZES=(8192 65536 131072)
+              QUALDIRS=(quality quality64k quality128k)
+              COUNTS=(16 2 1)
+              POSITIONS=(16 128 256)
+              SIZE=${SIZES[$CTX_INDEX]}
+              QUALDIR=${QUALDIRS[$CTX_INDEX]}
+              COUNT=${COUNTS[$CTX_INDEX]}
+              POS=${POSITIONS[$CTX_INDEX]}
+              OUT=$ROOT/$QUALDIR/$SLUG/$RUN/ppl.json
+              [[ -s "$OUT" ]] && { echo "SKIP_EXISTS $OUT"; exit 0; }
+              REF=$ROOT/$QUALDIR/$SLUG/bf16_bf16/kl_reference.json
+              test -s "$REF"
+              mkdir -p "$(dirname "$OUT")"
+              python3 /scripts/w3a8_lut_sim.py \
+                --model-path "$MODEL" \
+                --weight-method "$METHOD" \
+                --activation mxfp8 \
+                "${METHOD_ARGS[@]}" \
+                --output "$OUT" \
+                --blocks-path "$ROOT/blocks/${SLUG}_${SIZE}.pt" \
+                --calibration-blocks-path "$ROOT/blocks/${SLUG}_train_${SIZE}.pt" \
+                --block-size "$SIZE" \
+                --max-blocks "$COUNT" \
+                --kl-reference "$REF" \
+                --kl-positions-per-block "$POS" \
+                --calibration-tokens 512 \
+                --gptq-damp-percent 0.1 \
+                --lm-iterations 8 \
+                --chunk-tiles 128 \
+                "${EVAL_ARGS[@]}" \
+                --attn-implementation "$ATTN" \
+                --trust-remote-code
+              python3 - "$OUT" "$METHOD" <<'PY'
+              import json, sys
+              r = json.load(open(sys.argv[1]))
+              assert r["weight_method"] == sys.argv[2]
+              assert r["kl50_samples"] == 256, r["kl50_samples"]
+              assert r["prod_kl_mean_nats"] is not None
+              print("BEST_ROWS_OK", sys.argv[2], r.get("block_size"),
+                    r["ppl"], r["kl50_mean_nats"], r["prod_kl_mean_nats"])
+              PY
+          resources:
+            requests:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 160Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-inter-gptq-v3
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

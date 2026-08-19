@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: w3a8-prodkl-smoke-v1
+  namespace: charlie
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: eval
+          image: lmsysorg/sglang@sha256:6d9594a421be244f2af29d726158ebffe9c3c2b3f39b5b89affd8150a106e187
+          env:
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_HUB_OFFLINE, value: "0"}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ROOT=/shared/oscar-int3-rubin-simulate/w3a8
+              MODEL=/shared/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea
+              OUT=$ROOT/prodkl-smoke-v1/result.json
+              REF=$ROOT/quality/qwen3-4b-thinking/bf16_bf16/kl_reference.json
+              test -s "$REF"
+              mkdir -p "$(dirname "$OUT")"
+              python3 /scripts/w3a8_lut_sim.py \
+                --model-path "$MODEL" \
+                --weight-method uniform \
+                --activation mxfp8 \
+                --b-scale-mode none \
+                --mma-k 64 \
+                --output "$OUT" \
+                --blocks-path "$ROOT/blocks/qwen3-4b-thinking_8192.pt" \
+                --block-size 8192 \
+                --max-blocks 2 \
+                --kl-reference "$REF" \
+                --attn-implementation flash_attention_2 \
+                --trust-remote-code
+              python3 - "$OUT" <<'PY'
+              import json, sys
+              r = json.load(open(sys.argv[1]))
+              assert r["prod_kl_samples"] == r["kl50_samples"] > 0
+              assert r["prod_kl_mean_nats"] is not None
+              assert r["prod_kl_mean_nats"] > 0.0
+              assert 0.0 <= r["prod_kl_ref_tail_mass_mean"] < 1.0
+              print("PRODKL_SMOKE_OK",
+                    "kl50", r["kl50_mean_nats"],
+                    "prod_kl", r["prod_kl_mean_nats"],
+                    "tail", r["prod_kl_ref_tail_mass_mean"],
+                    "samples", r["prod_kl_samples"])
+              PY
+          resources:
+            requests:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 160Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: script
+          configMap:
+            name: rubin-w3a8-inter-gptq-v2
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-data

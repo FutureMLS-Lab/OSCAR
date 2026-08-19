@@ -1,0 +1,162 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oscar-multimodel-calibration-v1
+  namespace: charlie
+  labels:
+    app: oscar-multimodel-k3v3
+    phase: calibration
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimit: 4
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: oscar-multimodel-k3v3
+        phase: calibration
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: calibrate
+          image: lmsysorg/sglang@sha256:00c53fe4c31bf22d7b37537f28bbdfd924c02de13cdfb4bff7378c9c34d75ab2
+          workingDir: /shared-work/oscar-int3-rubin-simulate/source/multimodel/CoQuant
+          env:
+            - {name: HOME, value: /tmp/charlie}
+            - {name: USER, value: charlie}
+            - {name: LOGNAME, value: charlie}
+            - {name: XDG_CACHE_HOME, value: /tmp/charlie/cache}
+            - {name: HF_HOME, value: /shared/huggingface}
+            - {name: HF_DATASETS_CACHE, value: /shared/huggingface/datasets}
+            - {name: TRANSFORMERS_CACHE, value: /shared/huggingface/hub}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: SGLANG_RMSNORM_NATIVE, value: "true"}
+            - {name: SGLANG_GEMMA4_RMSNORM_NATIVE, value: "true"}
+            - {name: FLASHINFER_WORKSPACE_BASE, value: /tmp/charlie}
+            - {name: TVM_FFI_CACHE_DIR, value: /tmp/charlie/tvm-ffi}
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "16"
+              memory: 96Gi
+            limits:
+              nvidia.com/gpu: "1"
+              cpu: "32"
+              memory: 192Gi
+          volumeMounts:
+            - {name: shared, mountPath: /shared-work}
+            - {name: hf, mountPath: /shared/huggingface}
+            - {name: shm, mountPath: /dev/shm}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              ROOT=/shared-work/oscar-int3-rubin-simulate
+              SRC=${ROOT}/source/multimodel/CoQuant
+              MODELS=(
+                /shared/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+                /shared/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+              )
+              SLUGS=(qwen3.5-35b-a3b gemma4-12b-it)
+              EXPECTED_LAYERS=(10 48)
+              HEAD_DIMS=(256 0)
+              INDEX=${JOB_COMPLETION_INDEX}
+              MODEL=${MODELS[$INDEX]}
+              SLUG=${SLUGS[$INDEX]}
+              EXPECTED=${EXPECTED_LAYERS[$INDEX]}
+              HEAD_DIM=${HEAD_DIMS[$INDEX]}
+              OUT=${ROOT}/multimodel/${SLUG}
+              DUMP=${OUT}/calibration/qkv
+              ROT=${OUT}/rotations
+              BOOKS=${OUT}/codebooks
+              if [[ -s "${BOOKS}/lloyd_max_v2.pt" && -s "${BOOKS}/oscar_lloyd_max_v2.pt" ]]; then
+                echo "reuse completed codebooks for ${SLUG}"
+                exit 0
+              fi
+              mkdir -p /tmp/charlie "${DUMP}" "${ROT}" "${BOOKS}"
+              export PYTHONPATH=${ROOT}/source/multimodel-calibration-runtime/python
+              export TRITON_CACHE_DIR=/tmp/triton-calibration
+              export SGLANG_DUMP_CALIBRATION_QKV=1
+              export SGLANG_DUMP_CALIBRATION_DIR=${DUMP}
+              export SGLANG_DUMP_CALIBRATION_TOKENS=30000
+              export SGLANG_DUMP_CALIBRATION_MIN_CHUNK_TOKENS=256
+              SERVER_LOG=${OUT}/calibration/server.log
+              RUNNER_LOG=${OUT}/calibration/runner.log
+              cleanup() {
+                if [[ -n "${SERVER_PID:-}" ]]; then
+                  kill -TERM "${SERVER_PID}" 2>/dev/null || true
+                  sleep 2
+                  kill -KILL "${SERVER_PID}" 2>/dev/null || true
+                fi
+              }
+              trap cleanup EXIT
+              python3 -m sglang.launch_server \
+                --model-path "${MODEL}" \
+                --tensor-parallel-size 1 \
+                --attention-backend triton \
+                --kv-cache-dtype bf16 \
+                --chunked-prefill-size 4096 \
+                --mem-fraction-static 0.75 \
+                --max-running-requests 1 \
+                --disable-radix-cache \
+                --disable-cuda-graph \
+                --disable-piecewise-cuda-graph \
+                --disable-overlap-schedule \
+                --host 127.0.0.1 \
+                --port 31857 \
+                --dist-init-addr 127.0.0.1:41857 \
+                --trust-remote-code >"${SERVER_LOG}" 2>&1 &
+              SERVER_PID=$!
+              for _ in $(seq 1 360); do
+                curl -fsS http://127.0.0.1:31857/health >/dev/null 2>&1 && break
+                kill -0 "${SERVER_PID}" 2>/dev/null || {
+                  python3 -c "from pathlib import Path; print('\\n'.join(Path('${SERVER_LOG}').read_text(errors='replace').splitlines()[-120:]))"
+                  exit 1
+                }
+                sleep 5
+              done
+              curl -fsS http://127.0.0.1:31857/health >/dev/null
+              python3 rotation/_eval_runner/dump_long_context_wikitext.py \
+                --model "${MODEL}" \
+                --base-url http://127.0.0.1:31857/v1 \
+                --target-tokens 32768 \
+                --dataset-config wikitext-103-raw-v1 \
+                --cache-dir /shared/huggingface/datasets \
+                --max-tokens 1 2>&1 | tee "${RUNNER_LOG}"
+              cleanup
+              unset SERVER_PID
+              shopt -s nullglob
+              LAYER_DIRS=("${DUMP}"/layer_*)
+              FOUND=${#LAYER_DIRS[@]}
+              [[ "${FOUND}" -eq "${EXPECTED}" ]] || {
+                echo "expected ${EXPECTED} attention layers, found ${FOUND}" >&2
+                exit 1
+              }
+              python3 rotation/compute_kv_rotation.py \
+                --dump-path "${DUMP}" \
+                --output-dir "${ROT}" \
+                --head-dim "${HEAD_DIM}" \
+                --chunk-id all \
+                --method qqt_sst \
+                --composition r_h_pbr
+              PY=python3 DUMP_PATH="${DUMP}" ROT_DIR="${ROT}" \
+                OUTPUT_DIR="${BOOKS}" HEAD_DIM="${HEAD_DIM}" FIT_DEVICE=cuda \
+                MAX_SAMPLES=500000 CALIBRATION_NAME=wikitext-103-raw-v1/train \
+                bash rotation/fit_offline_lutb_codebooks.sh
+              test -s "${BOOKS}/lloyd_max_v2.pt"
+              test -s "${BOOKS}/oscar_lloyd_max_v2.pt"
+      volumes:
+        - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+        - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
