@@ -284,12 +284,17 @@ class _Int2HPMixin:
             )
 
             # One launch on reused scratch: 2.6x the torch fake-quant on the full
-            # write path, bit-identical output. The returned tensor is a view into
-            # module scratch, which is fine because parent_setter copies it into
-            # the KV buffer before the next write.
+            # write path, bit-identical output. The result is a view into
+            # module-level scratch that the next call overwrites, so it must be
+            # copied out here. The MLA setter hands this straight to
+            # parent_setter with no intervening op, and the `.to(self.dtype)`
+            # below is a no-op whenever the kernel already returns the store
+            # dtype — so without this clone all 78 layers alias one buffer and
+            # every layer's c_kv is whatever the last layer wrote.
             _codes, _params, c_kv_q = quantize_dequantize_reuse(
                 c_kv, self._group_size, self._lloyd_max
             )
+            c_kv_q = c_kv_q.clone()
         else:
             c_kv_q = _fake_quant_int2_groupwise(c_kv, self._group_size, self._lloyd_max)
         c_kv_q = c_kv_q.to(torch.float32) if c_hp is not None else c_kv_q.to(self.dtype)
