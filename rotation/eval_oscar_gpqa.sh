@@ -141,6 +141,12 @@ SERVER_ARGS=(
     "${GROUP_SIZE_ARGS[@]}"
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
+    # Mixed-KV and the radix cache corrupt each other: a cached prefix is
+    # reused across requests after its KV was quantized and re-tiered, so
+    # later turns read tokens the tier boundaries no longer describe. It
+    # does not degrade gracefully -- generations fall into repetition loops
+    # that run to max_tokens, which reads as a low score rather than a bug.
+    --disable-radix-cache
     --enable-cache-report
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
     --host 127.0.0.1
