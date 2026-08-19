@@ -5,8 +5,12 @@ positional `k_pe`. Only `c_kv` is quantized; `k_pe` stays BF16. Per-head
 rotations do not apply here — there is nothing per-head to rotate.
 
 Rotation is `Rcov · P · Hblock` (covariance eigenvectors, bit-reversal
-permutation, per-group Hadamard) with **Lloyd-Max** on, group 128, sink 64 /
-recent 256 BF16.
+permutation, per-group Hadamard) with **Lloyd-Max** on, group 128.
+
+There is no BF16 sink/recent window on this path. `SGLANG_MIXED_KV_PREFIX_TOKENS`
+and `SGLANG_MIXED_KV_RECENT_TOKENS` are read only by `UnifiedInt2HPKVPool`;
+`NSAInt2HPKVPool` / `MLAInt2HPKVPool` quantize every latent token they are
+handed. Setting them here changes nothing.
 
 | Benchmark | BF16 | INT2 | Δ |
 |---|:---:|:---:|:---:|
@@ -55,16 +59,32 @@ rather than re-fit unless you are changing the recipe.
 ## Serving
 
 ```bash
-SGLANG_ENABLE_MIXED_KV_WINDOWS=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
-SGLANG_MIXED_KV_PREFIX_TOKENS=64 SGLANG_MIXED_KV_RECENT_TOKENS=256 \
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
 SGLANG_LLOYD_MAX=1 \
-SGLANG_OSCAR_MLA_ROTATION_DIR=<rotations-dir> \
+SGLANG_OSCAR_MLA_KV_ROTATION_PATH=<rotations-dir> \
+SGLANG_OSCAR_MLA_KV_GROUP_SIZE=128 \
 python -m sglang.launch_server --model-path zai-org/GLM-5.2-FP8 \
   --tensor-parallel-size 16 --nnodes 2 --node-rank <0|1> \
   --dist-init-addr <head>:20000 \
-  --kv-cache-dtype int2 --page-size 8 --disable-radix-cache \
+  --kv-cache-dtype bfloat16 --disable-radix-cache \
   --mem-fraction-static 0.85
 ```
+
+Three flags in that command are load-bearing and were each wrong in an earlier
+version of this file:
+
+* `SGLANG_OSCAR_MLA_KV_ROTATION_PATH` is the name the pool reads. It is also
+  what *creates* the pool — misspell it (this file said
+  `SGLANG_OSCAR_MLA_ROTATION_DIR`) and the server starts, serves, and scores
+  with a plain BF16 latent cache and no rotation at all.
+* `--kv-cache-dtype bfloat16`, not `int2`. `int2` aborts at argument validation
+  on a DSA model; the latent is fake-quantized into a float cache, so that
+  cache stays float. Leaving it at `auto` is worse than either: sglang picks
+  fp8_e4m3 on SM100+ and bfloat16 on Hopper and below, which silently changes
+  the method with the GPU generation. Pinning it is what makes a B200 run
+  comparable to the H100 numbers in the table above.
+* No `--page-size`. A DSA model forces 64; the 8 this file used to pass was
+  ignored.
 
 Set `SGLANG_OSCAR_MLA_KV_REAL_KERNEL=1` to use the packed-INT2 latent kernel
 instead of the fake-quant path: bit-identical packing, decode cosine 1.000000,

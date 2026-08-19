@@ -35,7 +35,9 @@ TP_SIZE="${TP_SIZE:-4}"
 GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
 PORT="${PORT:-31057}"
 DIST_PORT="${DIST_PORT:-41057}"
-MEM_FRAC="${MEM_FRAC:-0.8}"
+# Every other script in rotation/ spells this MEM_FRACTION_STATIC, so accept
+# that name too -- a caller that used it got the 0.8 default with no warning.
+MEM_FRAC="${MEM_FRAC:-${MEM_FRACTION_STATIC:-0.8}}"
 MAX_RUNNING="${MAX_RUNNING:-64}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 # V-rotation absorption folds R_v into o_proj. It assumes one rotation per
@@ -55,7 +57,15 @@ GROUP_SIZE="${GROUP_SIZE:-128}"
 if [[ -n "${MLA_ROT_PATH}" ]]; then
     # Arrays, not strings: an empty string still expands to one empty argv
     # entry, which sglang's argparse rejects as an unexpected positional.
-    KV_DTYPE_ARGS=()
+    #
+    # The MLA pool fake-quantizes into a normal float KV cache, so that cache's
+    # dtype is the dtype its rotations and dequantized latents live in -- and it
+    # otherwise follows the GPU generation, not the recipe: sglang gives a
+    # DeepSeek-DSA model fp8_e4m3 on SM100+ and bfloat16 on Hopper and below.
+    # The same eval then measures a different method per cluster (GLM-5.2-FP8
+    # scored 68.7 on H100 and 5.6 on B200). Pin it; set MLA_KV_CACHE_DTYPE to
+    # fp8_e4m3 deliberately if that is what you mean to measure.
+    KV_DTYPE_ARGS=(--kv-cache-dtype "${MLA_KV_CACHE_DTYPE:-bfloat16}")
     # --kv-cache-quant-group-size is only accepted alongside int2, and the MLA
     # pool takes its group size from SGLANG_OSCAR_MLA_KV_GROUP_SIZE instead.
     GROUP_SIZE_ARGS=()
