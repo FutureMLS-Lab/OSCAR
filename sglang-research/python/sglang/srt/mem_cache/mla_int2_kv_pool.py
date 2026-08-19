@@ -91,6 +91,19 @@ def _load_or_make_rotations(
             rotations[i] = torch.load(p, map_location="cpu").to(dtype=dtype, device=device).contiguous()
         else:
             rotations[i] = torch.eye(d, dtype=dtype, device=device)
+    # A rotation is only invertible by its transpose while it is orthogonal, and
+    # 2-bit latents amplify any drift instead of absorbing it. Report the drift
+    # of the first layer so a rotation that a dtype or a bad fit has quietly
+    # de-orthogonalized is visible in the log rather than in the score.
+    _r0 = rotations[start_layer].to(torch.float32)
+    logger.info(
+        "[MLAInt2] loaded %d rotations from %s in %s (layer %d |R R^T - I|max=%.2e)",
+        len(rotations),
+        rotation_path,
+        dtype,
+        start_layer,
+        (_r0 @ _r0.T - torch.eye(d, device=_r0.device)).abs().max().item(),
+    )
     return rotations
 
 
@@ -220,13 +233,37 @@ class _Int2HPMixin:
             )
         self._group_size = group_size
         self._lloyd_max = lloyd_max
+        # Rotations and latents must live in a dtype that can actually hold them,
+        # which is not always the pool's store dtype. sglang defaults a
+        # DeepSeek-DSA model's KV cache to fp8_e4m3 on SM100+ (bfloat16 only on
+        # Hopper and below), and a 512x512 orthogonal matrix has entries around
+        # 1/sqrt(512) = 0.044 -- below fp8_e4m3's smallest normal (0.0156), so
+        # about a quarter of them land in the subnormal range and lose most of
+        # their mantissa. The matrix stops being orthogonal, the inverse
+        # rotation stops inverting, and GLM-5.2-FP8 on B200 dropped to GPQA
+        # 5.6% with 82% of generations emitting no answer at all. Keep the
+        # store dtype whenever it is at least 16-bit float, so bf16/fp16 pools
+        # (every result measured so far) are bit-for-bit unchanged.
+        self._compute_dtype = (
+            self.dtype
+            if self.dtype
+            in (torch.float64, torch.float32, torch.bfloat16, torch.float16)
+            else torch.bfloat16
+        )
+        if self._compute_dtype != self.dtype:
+            logger.warning(
+                "[Int2HPKVPool] KV store dtype %s cannot hold rotations or "
+                "latents; rotating in %s instead",
+                self.dtype,
+                self._compute_dtype,
+            )
         self.rotations = _load_or_make_rotations(
             rotation_path,
             layer_num=self.layer_num,
             start_layer=self.start_layer,
             kv_lora_rank=self.kv_lora_rank,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self._compute_dtype,
         )
         # Precompute float32 rotations to avoid per-step dtype casting overhead.
         self.rotations_f32: Optional[Dict[int, torch.Tensor]] = (
@@ -266,6 +303,13 @@ class _Int2HPMixin:
         onto the top-k sensitive directions is kept in full precision and only
         the residual is quantized (OSCAR-for-latent mixed precision).
         """
+        # Never round an intermediate of the rotate/unrotate round trip to the
+        # pool's store dtype: on an fp8 KV cache that discards most of the
+        # mantissa mid-round-trip, and the caller's own dtype is what the parent
+        # setter expects anyway (the NSA/MLA write path takes the bf16 latent and
+        # does its own cast). Identical to the old behaviour on a bf16 pool,
+        # where the latent arrives in exactly the store dtype.
+        out_dtype = c_kv.dtype
         Uk = self.hp_subspaces.get(layer_id) if self.hp_subspaces is not None else None
         c_hp = None
         if Uk is not None:
@@ -297,12 +341,12 @@ class _Int2HPMixin:
             c_kv_q = c_kv_q.clone()
         else:
             c_kv_q = _fake_quant_int2_groupwise(c_kv, self._group_size, self._lloyd_max)
-        c_kv_q = c_kv_q.to(torch.float32) if c_hp is not None else c_kv_q.to(self.dtype)
+        c_kv_q = c_kv_q.to(torch.float32) if c_hp is not None else c_kv_q.to(out_dtype)
         if Rf is not None:
             c_kv_q = torch.matmul(c_kv_q.to(torch.float32), Rf.T)
         if c_hp is not None:
             c_kv_q = c_kv_q + c_hp          # add back the full-precision subspace
-        return c_kv_q.to(self.dtype)
+        return c_kv_q.to(out_dtype)
 
     def _maybe_dump_c_kv(self, layer_id: int, c_kv: torch.Tensor) -> None:
         if not self.dump_c_kv_dir:
@@ -344,6 +388,29 @@ class _Int2HPMixin:
             )
             self._dump_buffers.pop(layer_id)
 
+    def _log_write_path_once(self, setter_name: str, **dtypes) -> None:
+        """Name the write path and its dtypes once per pool.
+
+        Which of the two setters a model uses, and whether the tensors arriving
+        there are the store dtype or the model's compute dtype, decides whether
+        this pool quantizes anything meaningful. Both have already differed by
+        platform (fp8 KV cache on SM100+ vs bf16 below), and both failures were
+        silent -- they showed up as a score, not an exception.
+        """
+        if getattr(self, "_write_path_logged", False):
+            return
+        self._write_path_logged = True
+        logger.info(
+            "[Int2HPKVPool] write path=%s store_dtype=%s pool_dtype=%s "
+            "compute_dtype=%s nsa_fp8=%s %s",
+            setter_name,
+            getattr(self, "store_dtype", None),
+            self.dtype,
+            self._compute_dtype,
+            getattr(self, "nsa_kv_cache_store_fp8", None),
+            " ".join(f"{k}={v}" for k, v in dtypes.items()),
+        )
+
     def _int2_set_mla_kv_buffer(
         self,
         parent_setter,
@@ -354,6 +421,11 @@ class _Int2HPMixin:
     ):
         """Intercept MLA set_mla_kv_buffer: dump and/or fake-quant c_kv."""
         layer_id = layer.layer_id
+        self._log_write_path_once(
+            "set_mla_kv_buffer",
+            k_nope=cache_k_nope.dtype,
+            k_rope=cache_k_rope.dtype,
+        )
         self._maybe_dump_c_kv(layer_id, cache_k_nope)
         if self.rotations:  # only degrade quality when rotation is requested
             cache_k_nope = self._apply_fake_int2_c_kv(layer_id, cache_k_nope)
@@ -373,6 +445,7 @@ class _Int2HPMixin:
         c_kv = cache_k[..., :c_kv_dim]
         k_pe = cache_k[..., c_kv_dim:]
         layer_id = layer.layer_id
+        self._log_write_path_once("set_kv_buffer", cache_k=cache_k.dtype)
         self._maybe_dump_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
         if self.rotations:  # only degrade quality when rotation is requested
             c_kv_q = self._apply_fake_int2_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
