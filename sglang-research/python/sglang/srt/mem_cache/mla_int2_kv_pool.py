@@ -619,29 +619,42 @@ class _Int2HPMixin:
             self._demote_slots(layer_id, slots, valid)
             return
 
-        # Extend. Ranges are computed from the CPU-side extend bookkeeping
-        # (never graph-captured: attention and the KV write run eagerly even
-        # under piecewise capture), so only the gather index reaches the GPU.
+        # Extend. Only reachable when a request arrives with KV already
+        # resident that has now aged out -- a chunked prefill's earlier chunk
+        # or a reused prefix -- so it is usually empty. The range comes from
+        # the CPU-side extend bookkeeping, which makes it a *constant* if it
+        # were ever captured, so refuse under capture rather than bake in the
+        # slots of whichever batch happened to be captured.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            self._window_fallback("extend KV write inside a graph capture")
+            return
         prefix_cpu = meta["extend_prefix_lens_cpu"]
         ext_cpu = meta["extend_seq_lens_cpu"]
         if not prefix_cpu or not ext_cpu or req_pool_indices is None:
             return
-        batch_rows: list = []
-        cols: list = []
-        for i, (l0, ext) in enumerate(zip(prefix_cpu, ext_cpu)):
-            lo = max(P, int(l0) - R_win)
-            hi = min(int(l0), int(l0) + int(ext) - R_win)
-            for p in range(lo, hi):
-                batch_rows.append(i)
-                cols.append(p)
-        if not cols:
+        # Identical for every layer of the forward, and the Python range walk
+        # is O(recent_tokens * bs); build it once.
+        slots = meta.get("extend_demote_slots", False)
+        if slots is False:
+            batch_rows: list = []
+            cols: list = []
+            for i, (l0, ext) in enumerate(zip(prefix_cpu, ext_cpu)):
+                lo = max(P, int(l0) - R_win)
+                hi = min(int(l0), int(l0) + int(ext) - R_win)
+                batch_rows.extend([i] * max(hi - lo, 0))
+                cols.extend(range(lo, hi))
+            if cols:
+                dev = req_to_token.device
+                row_t = torch.tensor(batch_rows, dtype=torch.int64, device=dev)
+                col_t = torch.tensor(cols, dtype=torch.int64, device=dev)
+                slots = req_to_token[
+                    req_pool_indices.to(torch.int64)[row_t], col_t
+                ].to(torch.int64)
+            else:
+                slots = None
+            meta["extend_demote_slots"] = slots
+        if slots is None:
             return
-        dev = req_to_token.device
-        row_t = torch.tensor(batch_rows, dtype=torch.int64, device=dev)
-        col_t = torch.tensor(cols, dtype=torch.int64, device=dev)
-        slots = req_to_token[req_pool_indices.to(torch.int64)[row_t], col_t].to(
-            torch.int64
-        )
         self._demote_slots(
             layer_id, slots, torch.ones_like(slots, dtype=torch.bool)
         )
