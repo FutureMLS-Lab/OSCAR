@@ -1,18 +1,25 @@
 """BF16 sink + BF16 recent windows over the MLA/NSA shared latent.
 
-Four things need to hold, and each has already been a real bug in the
+What has to hold, most of it because it has already been a real bug in the
 neighbouring per-head pool:
 
-1. With both windows at 0 the pool is byte-for-byte the fake-quant pool it
+1. 64/256 is the default with no env vars set -- the floor, not an opt-in.
+2. With both windows at 0 the pool is byte-for-byte the fake-quant pool it
    was before the windows existed.
-2. A windowed row is the *input* row, not a re-quantized one, and ``k_pe``
+3. A windowed row is the *input* row, not a re-quantized one, and ``k_pe``
    is never touched in either tier.
-3. A row that leaves the recent window is quantized in place -- otherwise
+4. A row that leaves the recent window is quantized in place -- otherwise
    "recent 256" silently means "the whole generation stays BF16", which
    would read as a huge accuracy win that is really just BF16.
-4. A CUDA-graph padded decode replay -- stale ``req_pool_indices``, seq_lens
+5. The demote is *inside* the CUDA graph and resolves its target from the
+   static ``seq_lens`` at replay time, not at capture time.
+6. A CUDA-graph padded decode replay -- stale ``req_pool_indices``, seq_lens
    forced to the graph fill value -- must not write any live position. This
-   is the failure that cost the per-head pool 57 -> 28 on GPQA.
+   is the failure that cost the per-head pool 57 -> 28 on GPQA. Here the
+   masked-off entries land on KV slot 0, so the allocators are also checked
+   for still reserving it.
+7. The runtime auditor reports each of the two window faults when they are
+   injected, so a clean audit on a real run means something.
 
 Tiers are read off the data, not off the config, with the same
 ``mixed_kv_audit.latent_grid_error`` the runtime auditor uses -- so this also
