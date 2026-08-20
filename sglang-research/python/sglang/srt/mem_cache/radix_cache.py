@@ -24,7 +24,6 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import logging
-import math
 import sys
 import time
 from collections import defaultdict

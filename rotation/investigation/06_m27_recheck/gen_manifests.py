@@ -98,9 +98,15 @@ def base(arm, port):
 
 def probes():
     out = []
-    # Pair 1 -- the published server shape. cuda_graph_max_bs=1 captures ONLY
-    # bs=1, so any concurrency above 1 makes EVERY decode step a padded replay:
-    # maximum exposure, no ambiguity about whether the probe was exercised.
+    # Pair 1 -- the published server shape, and it is NOT an exposure test.
+    # CudaGraphRunner.can_run gates on `cuda_graph_bs <= self.max_bs`, so with
+    # cuda_graph_max_bs=1 a batch of 2+ cannot replay any graph at all: it runs
+    # EAGER, and padding only exists on replay. So this pair measures the
+    # opposite of what one might assume -- zero padded replays at any
+    # concurrency -- and doubles as the control that isolates the mechanism:
+    # tree_pre here is broken code at concurrency 4 with graphs effectively off,
+    # so if it comes back clean, the damage needs padding, not concurrency.
+    # (It also explains the published 115 vs 8 tok/s cliff: that was eager.)
     for tag, tree in (("pre", "tree_pre"), ("post", "tree_post_audit")):
         out.append(job(
             f"zz-m27-p1-{tag}-mbs1", "probe", tree,
@@ -112,16 +118,23 @@ def probes():
              "MIXED_KV_AUDIT": "1", "MIXED_KV_AUDIT_EVERY": "5",
              "SGLANG_MIXED_KV_AUDIT_PAGE0": "1"},
         ))
-    # Pair 2 -- the config every other model uses. 7 is absent from the
-    # capture list [1,2,4,8,12,16,24,32], so decode sits at a non-captured size
-    # while all 7 requests are alive.
+    # Pair 2 -- maximal exposure with CUDA graphs actually replaying.
+    #
+    # MAX_RUNNING and NUM_WORKERS must be DECOUPLED. get_batch_sizes_to_capture
+    # clamps the capture list to req_to_token_pool.size (= max-running-requests)
+    # and *appends* that value, so --max-running-requests 7 produced
+    # `Capture cuda graph bs [1, 2, 4, 7]` -- measured, first attempt -- which
+    # makes bs=7 a captured size and the probe blind for the whole steady-state
+    # phase. Server pool 32 -> capture [1,2,4,8,12,16,24,32]; client pinned at
+    # 7 -> every decode step is bs=7, not captured, padded up to 8. 100 %
+    # padded replays with graphs live.
     for tag, tree in (("pre", "tree_pre"), ("post", "tree_post_audit")):
         out.append(job(
             f"zz-m27-p2-{tag}-mbs32", "probe", tree,
             {**base(f"p2_{tag}_mbs32_c7", "31945" if tag == "pre" else "31947"),
              "TREE": f"/shared/zz-m27-recheck/{tree}",
              "KV": "int2", "DISABLE_RADIX": "0",
-             "CUDA_GRAPH_MAX_BS": "32", "MAX_RUNNING": "7", "NUM_WORKERS": "7",
+             "CUDA_GRAPH_MAX_BS": "32", "MAX_RUNNING": "32", "NUM_WORKERS": "7",
              "MAX_NEW_TOKENS": "8192", "NUM_EXAMPLES": "14",
              "MIXED_KV_AUDIT": "1", "MIXED_KV_AUDIT_EVERY": "5",
              "SGLANG_MIXED_KV_AUDIT_PAGE0": "1"},
@@ -137,21 +150,43 @@ def scored():
     # sampling entropy: simple_evals has no seed flag, temp=1.0 supplies it.
     for kv, radix, tag in (("int2", "0", "on"), ("int2", "1", "off"), ("bf16", "0", "bf16")):
         for s in (1, 2, 3):
-            # BF16 KV is ~8x larger per token; at 62 layers x 8 KV heads the
-            # pool holds ~180K tokens, so 16 concurrent 95K generations would
-            # thrash. Halve concurrency for BF16 and report it.
-            conc = "8" if kv == "bf16" else "16"
+            # Client concurrency is deliberately NOT a captured CUDA-graph
+            # batch size. With --max-running-requests 32 the capture list is
+            # [1,2,4,8,12,16,24,32]; driving 15 (INT2) or 7 (BF16) concurrent
+            # requests pins decode at a non-captured size, so essentially every
+            # decode step is a padded replay -- the arm can actually expose bug
+            # 1 rather than sitting on a captured size and proving nothing.
+            # BF16 gets 7 because its KV pool is only ~193K tokens (measured):
+            # 8x larger per token than INT2's ~1.29M.
+            conc = "7" if kv == "bf16" else "15"
             out.append(job(
                 f"zz-m27-{tag}-s{s}", "scored", "tree_post",
                 {**base(f"{tag}_s{s}", str(port)),
                  "TREE": "/shared/zz-m27-recheck/tree_post",
                  "KV": kv, "DISABLE_RADIX": radix,
                  "CUDA_GRAPH_MAX_BS": "32",
-                 "MAX_RUNNING": conc, "NUM_WORKERS": conc,
-                 "MAX_NEW_TOKENS": "95000",
+                 "MAX_RUNNING": "32", "NUM_WORKERS": conc,
+                 # 32768, not the recipe's 95000. The published GPQA 80.3 and
+                 # every historical M2.7 GPQA arm on disk used 32K; 95K is the
+                 # budget behind the SWE-bench/LCB numbers. Re-checking the
+                 # GPQA row at 95K would not be paired with the number under
+                 # test, and costs ~3x the wall clock. Truncation counts are
+                 # reported so a reader can see whether the budget binds
+                 # (historically ~12% of responses hit the 32K cap), and one
+                 # extra arm below repeats INT2 cache-ON at 95K to measure it.
+                 "MAX_NEW_TOKENS": "32768",
                  "MIXED_KV_AUDIT": "0"},
             ))
             port += 2
+    # One 95K arm so the budget effect is measured rather than assumed.
+    out.append(job(
+        "zz-m27-on-s1-95k", "scored", "tree_post",
+        {**base("on_s1_95k", str(port)),
+         "TREE": "/shared/zz-m27-recheck/tree_post",
+         "KV": "int2", "DISABLE_RADIX": "0", "CUDA_GRAPH_MAX_BS": "32",
+         "MAX_RUNNING": "32", "NUM_WORKERS": "15",
+         "MAX_NEW_TOKENS": "95000", "MIXED_KV_AUDIT": "0"},
+    ))
     return out
 
 

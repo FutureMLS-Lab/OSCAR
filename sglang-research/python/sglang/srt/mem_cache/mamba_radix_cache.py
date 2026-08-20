@@ -515,7 +515,17 @@ class MambaRadixCache(MixedKVPrefixMixin, BasePrefixCache):
             than the last node's value.
         """
         key = self._match_pre_processor(params)
-        if key is not None and self._mixed_kv_enabled and len(key) > 0:
+        # ``bypass_mixed_kv_cap=True`` is cache_unfinished_req's post-insert
+        # re-match, which asks for exactly the key it just inserted. Capping it
+        # lands the match inside that node, so _match_prefix_helper splits it
+        # and returns the deepest node that still carries a mamba value (the
+        # root), and the mamba assert downstream compares against None.
+        if (
+            key is not None
+            and self._mixed_kv_enabled
+            and len(key) > 0
+            and not params.bypass_mixed_kv_cap
+        ):
             cap = self._mixed_kv_tier_cap(len(key))
             if cap < len(key):
                 key = key[:cap]
@@ -573,6 +583,13 @@ class MambaRadixCache(MixedKVPrefixMixin, BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
+            # HP-recent slot ids are per-request and alias across requests, so
+            # they must never enter the tree -- the same trim cache_unfinished_req
+            # applies. mamba_last_track_seqlen is the last 256-boundary seq_len,
+            # so without this the inserted tail is almost always inside the live
+            # HP-recent window.
+            if self._mixed_kv_enabled and cache_len > 0:
+                cache_len = max(0, cache_len - self._mixed_kv_tail_to_drop(cache_len))
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -726,7 +743,15 @@ class MambaRadixCache(MixedKVPrefixMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                # We ask for exactly what we just inserted; the HP-recent tail
+                # was already dropped from ``cache_len`` above. Capping again
+                # here would return a shorter prefix than the insert, which
+                # both breaks the mamba-value assert below and would truncate
+                # the ``prefix_indices`` rebuild (leaking slot ids).
+                bypass_mixed_kv_cap=True,
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,

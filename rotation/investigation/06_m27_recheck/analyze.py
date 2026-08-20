@@ -8,10 +8,16 @@ M2.7 forced:
   in the server log instead of being hardcoded. M2.7's published config used
   ``--cuda-graph-max-bs 1`` (capture list ``[1]``), so a hardcoded
   ``{1,2,4,8,12}`` would have mislabelled the exposure completely.
-* M2.7 does not emit ``<think>`` tags in its API response at all, so an
-  "unclosed think" count of 0 is structural, not evidence. The column reports
-  how many responses contained any think tag so the metric can be read
-  honestly, and adds a repetition/runaway proxy that does not depend on tags.
+* The project-standard "unclosed ``<think>``" count is ``open > close``, and on
+  M2.7 that is **structurally always 0**: the opening tag lives in the chat
+  template, so the response contains only ``</think>``. Measured on the three
+  historical runs: ``has_open`` = 0/198 in all of them, ``has_close`` = 174 /
+  160 / 116. The metric that carries the same information here is
+  ``no_think_close`` -- responses that never closed their reasoning -- and it
+  tracks the answered-count almost exactly (24 vs 24 unanswered on the clean
+  arm, 82 vs 77 on the corrupted one). Both are reported; read
+  ``no_think_close``, and read it as *excess over the paired clean arm*, since
+  its floor is set by the token budget (24/198 at 32K with zero corruption).
 """
 import argparse
 import json
@@ -72,6 +78,7 @@ def main():
     io = d / "io_log.jsonl"
     if io.is_file():
         n = answered = unclosed = any_think = empty = repetitive = 0
+        no_close = 0
         cap_hits = 0
         max_tokens = None
         lens = []
@@ -91,6 +98,8 @@ def main():
                 answered += 1
             if THINK_OPEN.search(r) or THINK_CLOSE.search(r):
                 any_think += 1
+            if not THINK_CLOSE.search(r):
+                no_close += 1
             if len(THINK_OPEN.findall(r)) > len(THINK_CLOSE.findall(r)):
                 unclosed += 1
             if not r.strip():
@@ -106,7 +115,8 @@ def main():
         out["answered"] = answered
         out["max_tokens"] = max_tokens
         out["responses_with_think_tag"] = any_think
-        out["unclosed_think"] = unclosed
+        out["unclosed_think"] = unclosed          # open>close: always 0 on M2.7
+        out["no_think_close"] = no_close          # the metric that carries info
         out["empty_responses"] = empty
         out["repetitive_tail"] = repetitive
         out["runaway_unanswered_long"] = cap_hits
@@ -119,9 +129,22 @@ def main():
     if srv.is_file():
         new = cached = 0
         dec = Counter()
+        dec_graphed = Counter()
         graph = Counter()
         audit = Counter()
+        audit_serving = Counter()
         alloc_pages = set()
+        alloc_pages_serving = set()
+        # CUDA-graph *capture* runs warmup forwards with out_cache_loc filled
+        # with hp_global_offset (cuda_graph_runner.py:976), outside the capture
+        # region, so the auditor legitimately sees padded writes before the
+        # server serves anything -- 32 of them (8 per TP rank, the _report rate
+        # limit) on every arm, all at lines before the first Prefill. Gate on
+        # the first "Prefill batch" rather than "The server is fired up": the
+        # fired-up line is emitted by the launcher process, so on a multi-rank
+        # log it can land after the scheduler ranks have already started
+        # working, and gating on it silently dropped real serving-phase events.
+        serving = False
         captured = None
         head = []
         with srv.open(errors="replace") as f:
@@ -136,15 +159,27 @@ def main():
                 if dm:
                     dec[int(dm.group(1))] += 1
                     graph[dm.group(2)] += 1
+                    # Padding exists only on a graph *replay*. A non-captured
+                    # bs with `cuda graph: False` ran eager and padded nothing,
+                    # so the two must be counted jointly -- counting
+                    # non-captured sizes alone reported the --cuda-graph-max-bs
+                    # 1 arm as 99.5% padded when its true exposure is ZERO.
+                    dec_graphed[(int(dm.group(1)), dm.group(2))] += 1
+                if not serving and "Prefill batch" in line:
+                    serving = True
                 am = AUDIT.search(line)
                 if am:
                     audit[am.group(1)] += 1
+                    if serving:
+                        audit_serving[am.group(1)] += 1
                 hm = HP_ALLOC.search(line)
                 if hm:
                     for tok in hm.group(1).split(","):
                         tok = tok.strip()
                         if tok.isdigit():
                             alloc_pages.add(int(tok))
+                            if serving:
+                                alloc_pages_serving.add(int(tok))
                 if captured is None:
                     gm = GRAPH_BS.search(line)
                     if gm:
@@ -177,20 +212,35 @@ def main():
         out["decode_bs_hist"] = dict(sorted(dec.items()))
         out["decode_steps"] = sum(dec.values())
         out["decode_cuda_graph"] = dict(graph)
+        out["decode_steps_eager"] = graph.get("False", 0)
         if captured:
             cs = set(captured)
             nc = sum(c for bs, c in dec.items() if bs not in cs)
             out["decode_steps_noncaptured_bs"] = nc
-            out["padded_replay_fraction"] = (
-                round(nc / sum(dec.values()), 4) if dec else None
+            # The real exposure: replayed a graph at a size it was not captured
+            # at, so the runner padded and the padded locs went to HP-prefix 0.
+            padded = sum(
+                c for (bs, g), c in dec_graphed.items()
+                if g == "True" and bs not in cs
             )
-        out["audit_events"] = dict(audit)
-        out["decode_write_into_hp_prefix"] = audit.get("DECODE_WRITE_INTO_HP_PREFIX", 0)
-        out["kv_content_changed"] = audit.get("KV_CONTENT_CHANGED", 0)
+            out["decode_steps_padded_replay"] = padded
+            tot = sum(dec.values())
+            out["padded_replay_fraction"] = round(padded / tot, 4) if tot else None
+            out["noncaptured_but_eager"] = nc - padded
+        out["audit_events_all"] = dict(audit)
+        out["audit_events_serving"] = dict(audit_serving)
+        # Rate limited to _MAX_REPORTS=8 per kind in mixed_kv_audit._report, so
+        # these are "did it happen", not a census. Quantitative exposure comes
+        # from padded_replay_fraction above.
+        out["decode_write_into_hp_prefix"] = audit_serving.get(
+            "DECODE_WRITE_INTO_HP_PREFIX", 0
+        )
+        out["kv_content_changed"] = audit_serving.get("KV_CONTENT_CHANGED", 0)
         if alloc_pages:
             out["hp_prefix_alloc_min_page"] = min(alloc_pages)
             out["hp_prefix_page0_ever_allocated"] = 0 in alloc_pages
             out["hp_prefix_alloc_distinct_pages"] = len(alloc_pages)
+            out["hp_prefix_alloc_pages_sample"] = sorted(alloc_pages)[:12]
 
     if a.json:
         print(json.dumps(out, indent=2))

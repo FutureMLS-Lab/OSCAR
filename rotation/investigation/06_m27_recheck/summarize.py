@@ -73,7 +73,8 @@ def main():
         ("arm", 26), ("score", 8), ("answered", 9), ("responses", 5),
         ("cache_hit_rate", 8), ("cuda_graph_max_bs", 6),
         ("padded_replay_fraction", 8), ("garbled_head", 7),
-        ("repetitive_tail_n", 7), ("decode_write_into_hp_prefix", 8),
+        ("repetitive_tail_n", 7), ("no_think_close", 8),
+        ("decode_write_into_hp_prefix", 8),
         ("kv_content_changed", 8), ("hp_prefix_alloc_min_page", 8),
         ("mixed_kv_prefix_tokens", 6), ("mixed_kv_recent_tokens", 7),
         ("max_tokens", 8),
@@ -83,7 +84,8 @@ def main():
            "mixed_kv_prefix_tokens": "sink", "mixed_kv_recent_tokens": "recent",
            "cuda_graph_max_bs": "maxbs", "cache_hit_rate": "hitrate",
            "repetitive_tail_n": "reptail", "garbled_head": "garble",
-           "max_tokens": "budget", "responses": "n"}
+           "max_tokens": "budget", "responses": "n",
+           "no_think_close": "noclose"}
     print("  ".join(f"{hdr.get(c, c):<{w}}" for c, w in cols))
     print("  ".join("-" * w for _, w in cols))
     for r in rows:
