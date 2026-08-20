@@ -24,6 +24,7 @@ from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
     quantized_set_kv_int2_oscar_rotate_k_clip_triton,
     quantized_set_kv_int2_pretransformed_clip_triton,
 )
+from sglang.srt.mem_cache import mixed_kv_audit
 from sglang.srt.mem_cache.kv_quant_kernels import _get_num_scale_groups
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -292,6 +293,13 @@ class UnifiedInt2HPKVPool(KVCache):
             num_hp_prefix_slots = (
                 (num_hp_prefix_slots + self.N_Q - 1) // self.N_Q * self.N_Q
             )
+        if num_hp_prefix_slots > 0:
+            # One extra page: HP-prefix page 0 is reserved as the sink for
+            # CUDA-graph padded decode writes (the graph runner points padded
+            # ``out_cache_loc`` entries at ``hp_global_offset``). Adding it here
+            # keeps the *usable* shared-prefix capacity equal to what the
+            # operator asked for. See ``UnifiedInt2HPKVAllocator.clear``.
+            num_hp_prefix_slots += self.N_Q
         self.num_hp_prefix_slots = int(num_hp_prefix_slots)
         self.slab_size = self.hp_recent_ring_size  # back-compat alias
         self._hp_offset = self.num_quant_pages * self.N_Q
@@ -980,6 +988,23 @@ class UnifiedInt2HPKVPool(KVCache):
         v_rotation_absorbed = bool(getattr(layer, "oscar_v_rotation_absorbed", False))
 
         if is_decode:
+            if mixed_kv_audit.audit_enabled() and not (
+                loc.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                # A decode write must only ever land in this request's
+                # HP-recent ring slab, or in the reserved dummy page 0 that
+                # CUDA-graph padding aims at. Anything else in the shared
+                # HP-prefix pool is another request's (or the radix tree's)
+                # KV. The ``.any()`` host sync is why this cannot run during
+                # graph capture.
+                loc64 = loc.to(torch.int64)
+                bad = (loc64 >= self._hp_offset + self.N_Q) & (
+                    loc64 < self._hp_offset + self.num_hp_prefix_slots
+                )
+                if bool(bad.any()):
+                    mixed_kv_audit.report_decode_write_into_hp_prefix(
+                        loc[bad], int(loc.numel())
+                    )
             hp_local = loc.to(torch.int64) - self._hp_offset
             cache_k_hp, cache_v_hp = self._prepare_hp_kv_tensors(
                 layer_id,

@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache import mixed_kv_audit
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -746,6 +747,16 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
     )
 
     if plan is not None:
+        if mixed_kv_audit.audit_enabled():
+            mixed_kv_audit.audit_flush_plan(
+                plan,
+                flush_mask=flush_mask,
+                seq_lens=seq_lens_int32,
+                prefix_lens=prefix_lens_gpu,
+                req_pool_indices=req_pool_indices_int64,
+            )
+            mixed_kv_audit.audit_req_to_token(batch, kv_pool)
+            mixed_kv_audit.audit_kv_content(batch, kv_pool)
         # Free everything returned by the kernel in one call: flushed HP
         # slots (freed from HP tier) and unused quant slots from
         # non-flushing requests (whole pages, since per-request
@@ -1025,6 +1036,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     release_slab = getattr(kvcache, "release_req_slab", None)
     if release_slab is not None:
         release_slab(req.req_pool_idx)
+        mixed_kv_audit.audit_release(req.req_pool_idx)
 
     tree_cache.req_to_token_pool.free(req)
 

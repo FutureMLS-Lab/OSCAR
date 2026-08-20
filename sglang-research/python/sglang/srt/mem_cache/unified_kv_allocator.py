@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
+from sglang.srt.mem_cache import mixed_kv_audit
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -70,10 +71,18 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         self._hp_recent_offset = self._hp_offset + self.num_hp_prefix_slots
 
         # Scheduler-facing capacity = quant pool + HP-prefix pool, in slot
-        # units. Page 0 of the quant arena is reserved for padded writes.
+        # units. Page 0 of *each* arena is reserved for padded writes: the
+        # CUDA-graph runner points padded ``out_cache_loc`` entries at
+        # ``hp_global_offset``, and the mixed pool's decode path writes
+        # ``hp_buffer[loc - hp_offset]`` with no mask (masking is unsafe under
+        # graph capture), so every padded replay writes HP-prefix slot 0. If
+        # that page were allocatable the dummy token would overwrite whichever
+        # request -- or radix-tree node -- owns it. See ``clear``.
         if scheduler_size is None:
-            scheduler_size = (
-                (self.num_quant_pages - 1) * self.N_Q + self.num_hp_prefix_slots
+            scheduler_size = (self.num_quant_pages - 1) * self.N_Q + (
+                self.num_hp_prefix_slots - self.N_Q
+                if self.num_hp_prefix_slots > 0
+                else 0
             )
         super().__init__(
             int(scheduler_size), self.N_Q, dtype, device, kvcache, need_sort
@@ -101,9 +110,25 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
             1, self.num_quant_pages, dtype=torch.int64, device=self.device
         )
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
-        # HP-prefix: shared paged free list, all pages free initially.
+        # HP-prefix: shared paged free list. Page 0 is reserved as the dummy
+        # sink for CUDA-graph padded writes and is NEVER allocated.
+        #
+        # ``CudaGraphRunner.replay_prepare`` fills padded ``out_cache_loc``
+        # entries with ``hp_global_offset`` (= HP-prefix slot 0) and the mixed
+        # pool's decode path writes ``hp_buffer[loc - hp_offset]`` unmasked, so
+        # every replay with padding (i.e. every decode step whose batch size is
+        # not exactly a captured size) writes a dummy token's K/V into slot 0.
+        # While that page was allocatable, the dummy clobbered whichever
+        # request owned it -- and with the radix cache on, that page is
+        # typically part of the *shared* prefix node, so a single padded replay
+        # corrupted the cached prefix that every live request reads. The pool
+        # adds one extra page to the arena for this, so usable capacity is
+        # unchanged.
         self.hp_prefix_free_pages = torch.arange(
-            0, self.num_hp_prefix_pages, dtype=torch.int64, device=self.device
+            1 if self.num_hp_prefix_pages > 0 else 0,
+            self.num_hp_prefix_pages,
+            dtype=torch.int64,
+            device=self.device,
         )
         self.hp_prefix_release_pages = torch.empty(
             (0,), dtype=torch.int64, device=self.device
@@ -213,6 +238,10 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
 
         pages = self.hp_prefix_free_pages[:num_pages]
         self.hp_prefix_free_pages = self.hp_prefix_free_pages[num_pages:]
+        if mixed_kv_audit.audit_enabled():
+            mixed_kv_audit.audit_hp_prefix_pages(
+                "alloc", pages, extra=f"counts={per_req_counts[:8]}"
+            )
         # Each HP-prefix page contributes N_Q consecutive slots.
         # Layout: page p → local indices [p * N_Q, p * N_Q + N_Q).
         slots_local = (
@@ -336,6 +365,10 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
             if hp_prefix_index.numel() > 0:
                 local = hp_prefix_index - self._hp_offset
                 hp_pages = torch.unique((local // self.N_Q).to(torch.int64))
+                if mixed_kv_audit.audit_enabled():
+                    mixed_kv_audit.audit_hp_prefix_pages(
+                        "free", hp_pages, extra=f"n_slots={hp_prefix_index.numel()}"
+                    )
                 if self.need_sort:
                     self.hp_prefix_release_pages = torch.cat(
                         [hp_pages, self.hp_prefix_release_pages]

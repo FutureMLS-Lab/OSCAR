@@ -455,40 +455,25 @@ class RadixCache(BasePrefixCache):
             key = key[:page_aligned_len]
 
         # Mixed-KV: cap the match so positions in the request's HP-recent
-        # window are NEVER returned from cache. A full match would cover
-        # those positions with quant slots from a deeper inserter,
-        # breaking the HP-precision invariant for the recent window.
-        # Cacheable positions = [0, max(hp_prefix, len - hp_recent_overflow))
-        # — for very short requests where the post-prefix region is
-        # entirely HP-recent, only the HP-prefix portion is cacheable;
-        # for long requests, everything before the trailing HP-recent
-        # band is cacheable. Page-aligned to keep the radix tree happy.
+        # window are NEVER returned from cache. See
+        # :meth:`_mixed_kv_tier_cap` for the invariant and why it must hold
+        # for *every* consumer of a match length, internal ones included.
         #
-        # Internal callers (``cache_unfinished_req``'s post-insert
-        # sibling-coverage match) pass ``bypass_mixed_kv_cap=True``: that
-        # call needs the FULL match length to stay consistent with the
-        # ``cache_protected_len`` admission set. Capping it desyncs the
-        # ``prefix_indices`` reconstruction at line ~725 (Python slicing
-        # silently truncates ``new_indices[:cache_protected_len]`` when
-        # ``len(new_indices) < cache_protected_len``), which silently
-        # drops slot ids and leaks them (the leak detector flags it as
-        # ~32-slot per-request residue under stress).
+        # ``bypass_mixed_kv_cap=True`` (``cache_unfinished_req``'s post-insert
+        # sibling-coverage match) skips the cap here because that caller
+        # applies it itself, to its own key length, *before* clamping by the
+        # partial-quant-page cutoff and by what it just inserted — capping
+        # blindly there desyncs the ``prefix_indices`` reconstruction below
+        # (Python slicing silently truncates
+        # ``new_indices[:cache_protected_len]`` when the match came back
+        # shorter), which leaks slot ids.
         if (
             self._mixed_kv_enabled
             and len(key) > 0
             and not params.bypass_mixed_kv_cap
         ):
-            n = len(key)
-            cap = min(
-                n,
-                max(
-                    self._mixed_kv_hp_prefix_tokens,
-                    n - self._mixed_kv_match_cap_overhead,
-                ),
-            )
-            if self.page_size > 1:
-                cap = cap // self.page_size * self.page_size
-            if cap < n:
+            cap = self._mixed_kv_tier_cap(len(key))
+            if cap < len(key):
                 key = key[:cap]
 
         if len(key) == 0:
@@ -724,15 +709,30 @@ class RadixCache(BasePrefixCache):
                 kv_indices[protected_len:free_end]
             )
 
-        # For mixed-KV we match as deeply as it is safe to share. That is
-        # usually the FULL (untrimmed) key so ``cache_protected_len`` never
-        # regresses, but it must stop before a request-owned partial quant
-        # page; otherwise radix can retain the live slots while the request
-        # frees that page's slack later.
+        # For mixed-KV we match as deeply as it is safe to share. Three
+        # bounds, all required:
+        #
+        # 1. ``_mixed_kv_tier_cap``: never past this request's own HP-recent
+        #    start, or the tree serves at 2 bits what the request was supposed
+        #    to keep in BF16 (and the flush can never demote it). This is the
+        #    same cap admission gets; applying it here too is what keeps
+        #    ``cache_protected_len`` tier-stable. Without it a sibling (or, in
+        #    multi-turn, this request's own previous turn) covers the whole
+        #    prompt and pushes ``cache_protected_len`` above the HP-recent
+        #    start, wiping out the recent window.
+        # 2. the request-owned partial quant page cutoff; otherwise radix can
+        #    retain the live slots while the request frees that page's slack.
+        # 3. never below what we just inserted, so ``cache_protected_len`` is
+        #    monotonic and the ``prefix_indices`` rebuild below cannot silently
+        #    truncate (which would leak slot ids).
         match_len = len(keys)
+        tier_cap = self._mixed_kv_tier_cap(match_len)
+        if tier_cap < match_len:
+            match_len = tier_cap
         slack_insert_limit = self._mixed_kv_slack_insert_limit(req, match_len)
         if slack_insert_limit < match_len:
             match_len = slack_insert_limit
+        match_len = max(match_len, len(insert_keys))
         match_key = keys[:match_len]
         full_radix_key = RadixKey(match_key, req.extra_key, is_bigram=self.is_eagle)
         match_result = self.match_prefix(
@@ -913,6 +913,57 @@ class RadixCache(BasePrefixCache):
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
+
+    def _mixed_kv_tier_cap(self, key_len: int) -> int:
+        """Longest prefix of a ``key_len``-token sequence that may be shared.
+
+        Mixed-KV tiers a sequence as
+        ``[HP-prefix][quant][HP-recent ring]``. The HP-prefix pool is shared
+        and its slots are never rewritten, so that window is safe to hand to
+        another request. The HP-recent ring is not: it is the BF16 window that
+        carries the newest ``hp_recent`` tokens, it is allocated per request
+        (``_mixed_extend_layout_counts`` sizes it as
+        ``seq_len - max(prefix_len, seq_len - hp_recent)``), and the flush
+        demotes out of it from the request's own HP-recent start upward.
+
+        A match that reaches *into* that window is therefore not a cache hit,
+        it is a downgrade: every covered position is served from the tree as
+        packed INT2 instead of BF16, and ``_mixed_extend_layout_counts``
+        allocates a correspondingly shorter ring. The request decodes with
+        almost no high-precision recent window -- the one component 2-bit KV
+        quality depends on most. In the CPU model in
+        ``tests/test_mixed_kv_radix.py`` a 300-token request behind a
+        1400-token donor keeps 4 BF16 recent positions instead of 236.
+        (It is not memory corruption: those positions' ring slots are orphaned
+        at the same time the flush stops demoting them, so ring accounting
+        stays balanced. It is a silent, large quality regression.)
+        Single-turn evals barely notice -- their shared prefix is shorter than
+        ``hp_prefix`` -- but multi-turn hits it on every turn, because turn
+        N+1's prompt is almost entirely cached: Qwen3-8B BFCL 38.4 -> 14.6
+        with the cache on.
+
+        The cap therefore keeps every shared prefix at or below
+        ``max(hp_prefix, key_len - hp_recent - flush_overflow)``, i.e. strictly
+        below the HP-recent start the allocator will use
+        (``max(hp_prefix, seq_len - hp_recent)``, see
+        ``_mixed_extend_layout_counts``), page-aligned so the radix tree keeps
+        whole pages. For a short request whose whole post-prefix region is
+        HP-recent this degenerates to the HP-prefix window, which is still
+        shareable because those slots live in the shared HP-prefix pool and are
+        never demoted.
+        """
+        if not self._mixed_kv_enabled or key_len <= 0:
+            return key_len
+        cap = min(
+            key_len,
+            max(
+                self._mixed_kv_hp_prefix_tokens,
+                key_len - self._mixed_kv_match_cap_overhead,
+            ),
+        )
+        if self.page_size > 1:
+            cap = cap // self.page_size * self.page_size
+        return cap
 
     def _mixed_kv_tail_to_drop(self, committed_len: int) -> int:
         # HP-recent slot ids are per-request and must not enter the tree.

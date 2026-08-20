@@ -74,6 +74,17 @@ else
     GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
 fi
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
+# Prefix caching. Mixed-KV tiering and the radix cache used to corrupt each
+# other -- a cached prefix could reach into the borrowing request's HP-recent
+# window, whose ring slots are recycled -- so this eval pinned
+# --disable-radix-cache. The tier-stability cap in RadixCache.match_prefix now
+# keeps a cached prefix below every borrower's HP-recent start, so the cache is
+# on by default. Set DISABLE_RADIX=1 to get the old behavior (and to A/B it).
+if [[ "${DISABLE_RADIX:-0}" == "1" ]]; then
+    RADIX_ARGS=(--disable-radix-cache)
+else
+    RADIX_ARGS=()
+fi
 # Attention backends. FA3's int2 prefill asserts on sliding-window layers, so a
 # model with local attention (Gemma-4 has 40 such layers) must set both of these
 # to triton -- the int2 prefill path reads the global one, so overriding only
@@ -151,12 +162,7 @@ SERVER_ARGS=(
     "${GROUP_SIZE_ARGS[@]}"
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
-    # Mixed-KV and the radix cache corrupt each other: a cached prefix is
-    # reused across requests after its KV was quantized and re-tiered, so
-    # later turns read tokens the tier boundaries no longer describe. It
-    # does not degrade gracefully -- generations fall into repetition loops
-    # that run to max_tokens, which reads as a low score rather than a bug.
-    --disable-radix-cache
+    "${RADIX_ARGS[@]}"
     --enable-cache-report
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
     --host 127.0.0.1
@@ -183,6 +189,9 @@ SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
 SGLANG_MIXED_KV_RECENT_TOKENS=${SGLANG_MIXED_KV_RECENT_TOKENS:-256} \
 SGLANG_MIXED_KV_HP_DTYPE=bfloat16 \
 SGLANG_MIXED_KV_SCALE_DTYPE=float32 \
+SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS="${HP_PREFIX_POOL_TOKENS:-0}" \
+SGLANG_MIXED_KV_AUDIT="${MIXED_KV_AUDIT:-0}" \
+SGLANG_MIXED_KV_AUDIT_EVERY="${MIXED_KV_AUDIT_EVERY:-25}" \
 SGLANG_OSCAR_MLA_KV_ROTATION_PATH="${MLA_ROT_PATH:-}" \
 SGLANG_OSCAR_MLA_KV_GROUP_SIZE="${MLA_GROUP_SIZE:-128}" \
 SGLANG_OSCAR_K_ROTATION_PATH="${ROT_DIR}/${K_ROT_FILENAME:-k_rotation_qqt_r_h_pbr.pt}" \

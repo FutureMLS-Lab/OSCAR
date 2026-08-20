@@ -18,7 +18,11 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "sglang-research", "python"))
 os.chdir(ROOT)  # test_perhead_rotation.py inserts a relative sys.path entry
 
-MODULES = ["test_hybrid_layer_id_translation.py", "test_perhead_rotation.py"]
+MODULES = [
+    "test_hybrid_layer_id_translation.py",
+    "test_perhead_rotation.py",
+    "test_mixed_kv_radix.py",
+]
 
 failures = []
 for fname in MODULES:
