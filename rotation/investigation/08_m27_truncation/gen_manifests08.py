@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """charlie-ns Job manifests for the MiniMax-M2.7 INT2 truncation investigation.
 
-Three families, each answering one hypothesis about why INT2 truncates far more
+Six families, each answering one hypothesis about why INT2 truncates far more
 than BF16 (measured: INT2 caps 66-81/198 vs BF16 20-23/198 at a 32K budget).
 
 * ``budget``  -- the same INT2 and BF16 recipes at the model's own 95K budget.
@@ -20,7 +20,14 @@ than BF16 (measured: INT2 caps 66-81/198 vs BF16 20-23/198 at a 32K budget).
                  the calibration is not what is costing 21 points. Lloyd-Max is
                  the other inherited default that was never validated here.
 
-Usage: python3 gen_manifests08.py budget|window|bracket > out.yaml
+* ``bigwin``  -- 3-seed replication of this model's own `bigwindow` ablation
+                 (P=256 R=1024), the only prior config that moved GPQA.
+* ``sink``    -- HP-prefix sweep. At P=64 only 8% of an ~810-token GPQA
+                 question is BF16; Qwen3-8B needed P=512 for the same reason.
+* ``group``   -- quant group 64 vs the inherited 128, motivated by M2.7's
+                 partial RoPE (rotary_dim=64 of head_dim=128).
+
+Usage: python3 gen_manifests08.py budget|window|bracket|bigwin|sink|group
 """
 import sys
 
@@ -178,6 +185,31 @@ def bracket():
     return out
 
 
+def bigwin():
+    """Replicate the pre-existing `bigwindow` ablation properly: P=256, R=1024.
+
+    That configuration is the only thing in this model's own ablation history
+    that moved GPQA materially -- 66.16 against the 55.56 baseline, same clip,
+    same 32K budget, same cuda_graph_max_bs. But it was ONE seed, and this
+    model's seed spread is 8.6 pp (52.53 / 61.11 / 60.10), so +10.6 pp single
+    seed is barely outside noise and cannot be trusted as reported.
+
+    It also moved both windows at once, so it cannot say which one mattered.
+    The `window` and `sink` families here vary them one at a time; this family
+    reproduces the combination at 3 seeds so the comparison against the paired
+    BF16 arms is like-for-like.
+    """
+    out, port = [], 32200
+    for s in (1, 2, 3):
+        out.append(job(f"zz-m27-t-bw-s{s}", "bigwin", {
+            **base(f"t_bw_s{s}", port), "KV": "int2",
+            "NUM_WORKERS": CONC["int2"], "MAX_NEW_TOKENS": "32768",
+            "HP_PREFIX": "256", "HP_RECENT": "1024",
+            "HP_PREFIX_POOL_TOKENS": "32768"}))
+        port += 2
+    return out
+
+
 def sink():
     """HP-prefix (sink) sweep at 32K.
 
@@ -224,4 +256,4 @@ def group():
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "window"
     print("".join({"budget": budget, "window": window, "bracket": bracket,
-                   "sink": sink, "group": group}[which]()))
+                   "sink": sink, "group": group, "bigwin": bigwin}[which]()))
