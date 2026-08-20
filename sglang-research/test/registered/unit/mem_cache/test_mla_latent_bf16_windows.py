@@ -408,6 +408,116 @@ class TestMLALatentBF16Windows(unittest.TestCase):
             "the real request's demote did not happen",
         )
 
+    # -- 5. the demote has to live inside the graph ----------------------
+
+    def test_demote_replays_inside_a_cuda_graph(self):
+        """Capture the write, then replay it against changed seq_lens.
+
+        Decode is captured, so the demote is only real if it is *in* the
+        graph and reads its target from the static buffers at replay time. A
+        version that resolved the slot on the host would bake in whatever
+        position was current at capture and quantize that one row forever.
+        Capture also fails outright if any of this syncs, which is the other
+        thing worth knowing.
+        """
+        sink, recent = 64, 256
+        pool = self._make_pool(sink=sink, recent=recent)
+        bs = 4
+        L = 700
+
+        # Static graph inputs, exactly the tensors the graph runner reuses.
+        seq_lens = torch.ones(bs, dtype=torch.int32, device="cuda")
+        req_pool_indices = torch.zeros(bs, dtype=torch.int64, device="cuda")
+        out_cache_loc = torch.zeros(bs, dtype=torch.int64, device="cuda")
+        req_to_token = torch.zeros(8, 4096, dtype=torch.int32, device="cuda")
+        nope_in = torch.zeros(bs, 1, KV_LORA_RANK, dtype=torch.bfloat16, device="cuda")
+        rope_in = torch.zeros(bs, 1, ROPE_DIM, dtype=torch.bfloat16, device="cuda")
+
+        pool.note_forward_batch(
+            _Batch(
+                decode=True,
+                positions=seq_lens.to(torch.int64) - 1,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+            )
+        )
+        # Warm up on a side stream, then capture. seq_lens is still the graph
+        # fill value here, so every entry is an invalid demote aimed at the
+        # reserved slot 0 -- capture must not depend on that.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                pool.set_mla_kv_buffer(_Layer(0), out_cache_loc, nope_in, rope_in)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pool.set_mla_kv_buffer(_Layer(0), out_cache_loc, nope_in, rope_in)
+
+        # Now lay down a real request eagerly, the way a prefill would.
+        loc = self._slots(L)
+        req_to_token[0, :L] = loc.to(torch.int32)
+        nope = torch.randn(L, 1, KV_LORA_RANK, dtype=torch.bfloat16, device="cuda")
+        rope = torch.randn(L, 1, ROPE_DIM, dtype=torch.bfloat16, device="cuda")
+        pool.note_forward_batch(
+            _Batch(
+                decode=False,
+                positions=torch.arange(L, device="cuda"),
+                seq_lens=torch.tensor([L], dtype=torch.int32, device="cuda"),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64, device="cuda"),
+                req_to_token=req_to_token,
+                extend_seq_lens=torch.tensor([L], dtype=torch.int32, device="cuda"),
+                extend_seq_lens_cpu=[L],
+                extend_prefix_lens_cpu=[0],
+            )
+        )
+        pool.set_mla_kv_buffer(_Layer(0), loc, nope, rope)
+        buf = pool.get_key_buffer(0)
+        torch.cuda.synchronize()
+        before = buf.clone()
+
+        # Replay two decode steps by populating only the static buffers --
+        # no Python from the pool runs at all from here on.
+        from sglang.srt.mem_cache.mixed_kv_audit import LATENT_GRID_TOL
+
+        for step in range(2):
+            new_slot = (60 + step) * PAGE
+            req_to_token[0, L + step] = new_slot
+            seq_lens.fill_(1)                     # padded entries
+            seq_lens[0] = L + 1 + step
+            out_cache_loc.zero_()                 # padded entries -> slot 0
+            out_cache_loc[0] = new_slot
+            fresh = torch.randn(
+                1, 1, KV_LORA_RANK, dtype=torch.bfloat16, device="cuda"
+            )
+            nope_in.zero_()
+            nope_in[0] = fresh[0]
+            graph.replay()
+            torch.cuda.synchronize()
+
+            self.assertTrue(
+                torch.equal(buf[new_slot][..., :KV_LORA_RANK], fresh[0]),
+                f"step {step}: the replayed decode write was quantized",
+            )
+            demoted = L + step - recent
+            self.assertLess(
+                float(_grid_err(pool, buf[loc[demoted : demoted + 1]]).max()),
+                LATENT_GRID_TOL,
+                f"step {step}: the graph did not demote position {demoted} -- "
+                "the slot was resolved at capture time, not at replay time",
+            )
+            changed = (
+                (buf != before).any(dim=-1).any(dim=-1).nonzero().flatten().tolist()
+            )
+            expected = {0, new_slot} | {
+                int(loc[L + s - recent]) for s in range(step + 1)
+            } | {(60 + s) * PAGE for s in range(step + 1)}
+            self.assertTrue(
+                set(changed) <= expected,
+                f"step {step}: replay touched {sorted(set(changed) - expected)}",
+            )
+
     # -- the reserved sink is really reserved ----------------------------
 
     def test_allocators_never_hand_out_page_zero(self):
