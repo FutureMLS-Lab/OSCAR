@@ -1958,11 +1958,34 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
+        elif model_arch in ["KimiK3ForConditionalGeneration"]:
+            # Same treatment as the Qwen3.5 hybrids below, which take
+            # support_mamba_cache=True with extra_buffer=True and are measured
+            # working end to end under INT2 mixed-KV (3 seeds each on 4B and
+            # 35B-A3B, auditor clean at 100 % padded-replay exposure).
+            #
+            # K3 sat in the blanket-disable list, which made
+            # --disable-radix-cache unconditional and could not be overridden,
+            # so K3 was the one model in the sweep with no cache-ON arm at all.
+            # Nothing in MambaRadixCache is dimension-aware -- it keys on token
+            # indices and mamba state, not head dims -- so K3's asymmetric
+            # K=192 / V=128 expanded-MHA cache is not the reason it was
+            # excluded; it was simply never enabled.
+            #
+            # extra_buffer=True is required rather than optional here: INT2
+            # mixed-KV needs page_size == N_Q == 8, and MambaRadixCache v1
+            # asserts page_size == 1 unless extra_buffer is on.
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
+            )
         elif model_arch in [
             "KimiLinearForCausalLM",
-            "KimiK3ForConditionalGeneration",
             "BailingMoeV2_5ForCausalLM",
         ]:
+            # Left disabled: same family shape as K3, but no eval coverage here,
+            # and enabling untested archs is how a silent regression ships.
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
