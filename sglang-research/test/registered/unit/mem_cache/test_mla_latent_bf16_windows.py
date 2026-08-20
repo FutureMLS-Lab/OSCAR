@@ -21,6 +21,7 @@ wrong: the round trip *ends* with a dense un-rotation, so a quantized row
 looks like arbitrary floats until you rotate it back.
 """
 
+import contextlib
 import os
 import unittest
 
@@ -87,6 +88,31 @@ def _grid_err(pool, rows: torch.Tensor, layer_id: int = 0):
     from sglang.srt.mem_cache.mixed_kv_audit import latent_grid_error
 
     return latent_grid_error(pool, layer_id, rows)
+
+
+@contextlib.contextmanager
+def envs_audit_on():
+    """Turn the auditor on for the duration, at every step.
+
+    ``audit_enabled`` memoizes the env lookup on first call, so the cached
+    verdict has to be dropped on both sides of this.
+    """
+    from sglang.srt.mem_cache import mixed_kv_audit as audit
+
+    prev = {k: os.environ.get(k) for k in ("SGLANG_MIXED_KV_AUDIT",
+                                          "SGLANG_MIXED_KV_AUDIT_EVERY")}
+    os.environ["SGLANG_MIXED_KV_AUDIT"] = "1"
+    os.environ["SGLANG_MIXED_KV_AUDIT_EVERY"] = "1"
+    audit._ENABLED = None
+    try:
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        audit._ENABLED = None
 
 
 class TestMLALatentBF16Windows(unittest.TestCase):
@@ -516,6 +542,81 @@ class TestMLALatentBF16Windows(unittest.TestCase):
             self.assertTrue(
                 set(changed) <= expected,
                 f"step {step}: replay touched {sorted(set(changed) - expected)}",
+            )
+
+    # -- 6. the auditor can actually see a broken window -----------------
+
+    def test_auditor_is_silent_when_correct_and_loud_when_not(self):
+        """Zero audit events only means something if a real fault is caught.
+
+        So: audit a correctly tiered pool (must report nothing), then quantize
+        one row *inside* the recent window and one row that should have been
+        demoted back to BF16, and require a report for each. Without this the
+        clean audit on a real run is consistent with an auditor that never
+        looks at anything.
+        """
+        from sglang.srt.mem_cache import mixed_kv_audit as audit
+
+        sink, recent = 64, 256
+        pool = self._make_pool(sink=sink, recent=recent)
+        L = 900
+        loc = self._slots(L)
+        req_to_token = torch.zeros(4, 4096, dtype=torch.int32, device="cuda")
+        req_to_token[0, :L] = loc.to(torch.int32)
+        nope = torch.randn(L, 1, KV_LORA_RANK, dtype=torch.bfloat16, device="cuda")
+        rope = torch.randn(L, 1, ROPE_DIM, dtype=torch.bfloat16, device="cuda")
+        batch = _Batch(
+            decode=False,
+            positions=torch.arange(L, device="cuda"),
+            seq_lens=torch.tensor([L], dtype=torch.int32, device="cuda"),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device="cuda"),
+            req_to_token=req_to_token,
+            extend_seq_lens=torch.tensor([L], dtype=torch.int32, device="cuda"),
+            extend_seq_lens_cpu=[L],
+            extend_prefix_lens_cpu=[0],
+        )
+        pool.note_forward_batch(batch)
+        pool.set_mla_kv_buffer(_Layer(0), loc, nope, rope)
+
+        with envs_audit_on():
+            audit._reported.clear()
+            audit.audit_latent_windows(batch, pool)
+            self.assertEqual(
+                audit._reported, {}, f"clean pool reported {audit._reported}"
+            )
+
+            # Fault 1: a row inside the recent window got quantized.
+            buf = pool.get_key_buffer(0)
+            victim = loc[L - 1 : L]
+            buf[victim] = torch.cat(
+                [
+                    pool._apply_fake_int2_c_kv(0, buf[victim][..., :KV_LORA_RANK]),
+                    buf[victim][..., KV_LORA_RANK:],
+                ],
+                dim=-1,
+            )
+            audit._reported.clear()
+            audit.audit_latent_windows(batch, pool)
+            self.assertIn(
+                "LATENT_WINDOW_QUANTIZED",
+                audit._reported,
+                "auditor missed a quantized row inside the recent window",
+            )
+
+            # Fault 2: a row that should be INT2 was left in BF16 (what a
+            # recent window that never drains looks like).
+            stale = loc[L - recent - 1 : L - recent]
+            buf[stale] = torch.cat(
+                [torch.randn_like(buf[stale][..., :KV_LORA_RANK]),
+                 buf[stale][..., KV_LORA_RANK:]],
+                dim=-1,
+            )
+            audit._reported.clear()
+            audit.audit_latent_windows(batch, pool)
+            self.assertIn(
+                "LATENT_NOT_QUANTIZED",
+                audit._reported,
+                "auditor missed an un-demoted row outside both windows",
             )
 
     # -- the reserved sink is really reserved ----------------------------
