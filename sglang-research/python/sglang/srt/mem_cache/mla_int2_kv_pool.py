@@ -743,7 +743,14 @@ class _Int2HPMixin:
             self._dump_buffers.pop(layer_id)
 
     def _log_write_path_once(self, setter_name: str, **dtypes) -> None:
-        """Name the write path and its dtypes once per pool.
+        """Name the write path and its dtypes once per setter.
+
+        Once per *setter*, not once per pool: a model can reach the latent
+        through ``set_mla_kv_buffer`` on one forward mode and
+        ``set_kv_buffer`` on the other (GLM-5.2 on the triton MLA backend
+        logs the latter), and with a single flag the second one never
+        appeared -- so the log could not tell you whether the path you
+        reasoned about is the path that ran.
 
         Which of the two setters a model uses, and whether the tensors arriving
         there are the store dtype or the model's compute dtype, decides whether
@@ -751,13 +758,21 @@ class _Int2HPMixin:
         platform (fp8 KV cache on SM100+ vs bf16 below), and both failures were
         silent -- they showed up as a score, not an exception.
         """
-        if getattr(self, "_write_path_logged", False):
+        seen = getattr(self, "_write_paths_logged", None)
+        if seen is None:
+            seen = self._write_paths_logged = set()
+        if setter_name in seen:
             return
-        self._write_path_logged = True
+        seen.add(setter_name)
         logger.info(
-            "[Int2HPKVPool] write path=%s store_dtype=%s pool_dtype=%s "
+            "[Int2HPKVPool] write path=%s windows=%s store_dtype=%s pool_dtype=%s "
             "compute_dtype=%s nsa_fp8=%s %s",
             setter_name,
+            (
+                f"sink={self.hp_prefix_tokens}/recent={self.hp_recent_tokens}"
+                if self._latent_windows
+                else "off"
+            ),
             getattr(self, "store_dtype", None),
             self.dtype,
             self._compute_dtype,
