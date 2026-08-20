@@ -469,7 +469,19 @@ class _Int2HPMixin:
         }
 
     def _window_fallback(self, why: str) -> None:
-        """Log once and fall back to quantizing every token (old behaviour)."""
+        """Log once and fall back to quantizing every token (old behaviour).
+
+        Sticky for the rest of the forward: if the write path could not place
+        the windows, the demote must not run either. Demoting on a forward
+        whose rows were all quantized anyway is at best redundant, and on a
+        multi-token-per-request decode (spec verify, where positions are not
+        derivable from ``seq_lens``) it would advance the demote cursor by one
+        while the sequence advanced by several, leaving a BF16 tail that grows
+        without bound. Quantizing everything is the pre-window behaviour and
+        is always safe.
+        """
+        if self._fb_window_meta is not None:
+            self._fb_window_meta["fallback"] = True
         if not self._window_fallback_logged:
             self._window_fallback_logged = True
             logger.warning(
@@ -579,7 +591,7 @@ class _Int2HPMixin:
         if R_win <= 0:
             return
         meta = self._fb_window_meta
-        if meta is None or meta["req_to_token"] is None:
+        if meta is None or meta["req_to_token"] is None or meta.get("fallback"):
             return
         req_to_token = meta["req_to_token"]
         req_pool_indices = meta["req_pool_indices"]
