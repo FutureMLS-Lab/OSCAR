@@ -70,6 +70,21 @@ grep -n "hp_prefix_free_pages = torch.arange" -A3 \
   ${TREE}/sglang-research/python/sglang/srt/mem_cache/unified_kv_allocator.py
 
 # Preflight 3: weights complete (indexed shards all present), not "a dir exists".
+# The 214 GiB M2.7 download may still be in flight when this pod wins its GPUs,
+# so wait for it rather than failing -- but bounded, and it must end in the
+# verification below, never in a "looks like a dir" pass.
+for _ in $(seq 1 240); do
+  python3 - "$MODEL" >/dev/null 2>&1 <<'PY' && break
+import glob, json, os, sys
+p = sys.argv[1]
+want = set(json.load(open(os.path.join(p, "model.safetensors.index.json")))["weight_map"].values())
+have = {os.path.basename(f) for f in glob.glob(os.path.join(p, "*.safetensors"))}
+sys.exit(0 if not (want - have) else 1)
+PY
+  echo "[preflight] waiting for M2.7 weights ($(du -sh "$MODEL" 2>/dev/null | cut -f1) so far)"
+  sleep 60
+done
+
 python3 - "$MODEL" <<'PY' || exit 4
 import glob, json, os, sys
 p = sys.argv[1]

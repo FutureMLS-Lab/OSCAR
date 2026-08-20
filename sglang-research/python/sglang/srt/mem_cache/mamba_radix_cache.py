@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import MixedKVPrefixMixin
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -431,7 +432,7 @@ def _allocator_has_mixed_kv(allocator) -> bool:
     return bool(fn()) if fn is not None else False
 
 
-class MambaRadixCache(BasePrefixCache):
+class MambaRadixCache(MixedKVPrefixMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         # The allocator only has to page tokens for us, which every
         # ``BaseTokenToKVPoolAllocator`` does; naming two concrete subclasses
@@ -457,24 +458,15 @@ class MambaRadixCache(BasePrefixCache):
                 self.page_size == 1
             ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
 
-        # Mixed-KV tiers a sequence as [HP-prefix][quant][HP-recent ring]. Only
-        # the HP-prefix window may be shared across requests: the HP-recent
-        # ring is per-request BF16 storage that the flush demotes out of, so a
-        # match reaching into it silently serves those positions as packed INT2
-        # and leaves the borrower with almost no high-precision recent window
-        # (Qwen3-8B BFCL 38.4 -> 14.6 on multi-turn). ``RadixCache`` enforces
-        # that with ``_mixed_kv_tier_cap`` on every match and
-        # ``_mixed_kv_tail_to_drop`` on insert; this cache has neither, so
-        # allowing the combination would not crash -- it would quietly return
-        # bad numbers, which is strictly worse. Refuse it loudly instead.
-        if _allocator_has_mixed_kv(self.token_to_kv_pool_allocator):
-            raise NotImplementedError(
-                "MambaRadixCache does not implement the mixed-KV tier cap, so "
-                "prefix caching cannot be enabled for INT2 mixed-KV on a "
-                "mamba/linear-attention model. Run with --disable-radix-cache. "
-                "Porting _mixed_kv_tier_cap and _mixed_kv_tail_to_drop from "
-                "RadixCache is what this needs."
-            )
+        # Mixed-KV tiers a sequence as [HP-prefix][quant][HP-recent ring].
+        # Only the HP-prefix window may be shared: the HP-recent ring is
+        # per-request BF16 storage the flush demotes out of, so a match
+        # reaching into it silently serves those positions as packed INT2 and
+        # leaves the borrower with almost no high-precision recent window
+        # (Qwen3-8B BFCL 38.4 -> 14.6 on multi-turn). The cap and the
+        # insert-side tail trim come from MixedKVPrefixMixin so this cache and
+        # RadixCache cannot drift apart.
+        self._init_mixed_kv()
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -523,6 +515,10 @@ class MambaRadixCache(BasePrefixCache):
             than the last node's value.
         """
         key = self._match_pre_processor(params)
+        if key is not None and self._mixed_kv_enabled and len(key) > 0:
+            cap = self._mixed_kv_tier_cap(len(key))
+            if cap < len(key):
+                key = key[:cap]
         if key is None:
             return MatchResult(
                 device_indices=torch.empty(
@@ -661,6 +657,13 @@ class MambaRadixCache(BasePrefixCache):
         )
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
+
+        # HP-recent slot ids are per-request and alias across requests, so
+        # they must never enter the tree.
+        if self._mixed_kv_enabled and cache_len > 0:
+            cache_len -= self._mixed_kv_tail_to_drop(cache_len)
+            if cache_len <= 0:
+                return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
