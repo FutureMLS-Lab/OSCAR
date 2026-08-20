@@ -185,6 +185,34 @@ def bracket():
     return out
 
 
+def window2():
+    """Second window pass, driven by the first pass's result.
+
+    Measured at 32K with the calibrated rotation and P=64:
+        R=256   57.91  (n=3: 52.53 / 61.11 / 60.10)
+        R=512   57.58  (n=1)
+        R=1024  59.93  (n=3: 60.61 / 58.08 / 61.11)
+        R=2048  65.66  (n=1)
+
+    R=1024 is +2.0 on three seeds, which is inside this model's seed spread and
+    cannot be called a win. R=2048 is +7.8 but on one seed, and one seed is
+    exactly how the pre-existing `bigwindow` ablation overstated itself. So
+    R=2048 gets its two missing seeds, and R=4096 is added to say whether the
+    curve keeps climbing or 2048 was a lucky draw -- a monotone dose-response
+    over four window sizes is far harder to explain as noise than any single
+    arm, which is the argument this sweep has to be able to make.
+    """
+    out, port = [], 32220
+    for recent, seeds in ((2048, (2, 3)), (4096, (1, 2))):
+        for s in seeds:
+            out.append(job(f"zz-m27-t-w{recent}-s{s}", "window2", {
+                **base(f"t_w{recent}_s{s}", port), "KV": "int2",
+                "NUM_WORKERS": CONC["int2"], "MAX_NEW_TOKENS": "32768",
+                "HP_PREFIX": "64", "HP_RECENT": str(recent)}))
+            port += 2
+    return out
+
+
 def bigwin():
     """Replicate the pre-existing `bigwindow` ablation properly: P=256, R=1024.
 
@@ -256,4 +284,4 @@ def group():
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "window"
     print("".join({"budget": budget, "window": window, "bracket": bracket,
-                   "sink": sink, "group": group, "bigwin": bigwin}[which]()))
+                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2}[which]()))
