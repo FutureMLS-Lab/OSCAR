@@ -74,12 +74,18 @@ else
     GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
 fi
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
-# Prefix caching. Mixed-KV tiering and the radix cache used to corrupt each
-# other -- a cached prefix could reach into the borrowing request's HP-recent
-# window, whose ring slots are recycled -- so this eval pinned
-# --disable-radix-cache. The tier-stability cap in RadixCache.match_prefix now
-# keeps a cached prefix below every borrower's HP-recent start, so the cache is
-# on by default. Set DISABLE_RADIX=1 to get the old behavior (and to A/B it).
+# Prefix caching. This eval used to pin --disable-radix-cache because mixed-KV
+# tiering and the radix cache corrupted each other. Two causes, both fixed:
+#   * CUDA-graph padded decode writes landed in HP-prefix slot 0, which was
+#     allocatable -- and with the cache on that page is normally part of the
+#     *shared* prefix node, so one padded replay corrupted the prefix every
+#     live request reads. HP-prefix page 0 is now a reserved padding sink.
+#     (This was the big one: 27.78 vs 57.07 on Qwen3-30B-A3B GPQA-198.)
+#   * A cached prefix could reach into the borrower's BF16 HP-recent window,
+#     serving it at 2 bits; RadixCache._mixed_kv_tier_cap now bounds every
+#     match, internal ones included.
+# Cache on by default: 60.61 with 198/198 answered and a 17.1% token hit rate.
+# Set DISABLE_RADIX=1 for the old behavior (and to A/B it).
 if [[ "${DISABLE_RADIX:-0}" == "1" ]]; then
     RADIX_ARGS=(--disable-radix-cache)
 else
