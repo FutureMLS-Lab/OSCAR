@@ -33,6 +33,12 @@ The invariants, and why each one matters:
 5. **No quant slot id is shared by two requests outside their cached prefix.**
    Sharing inside ``[0, cache_protected_len)`` is exactly what the radix cache
    is for; sharing above it is a double-allocation.
+
+Cost: the flush-plan checks sync twice per decode step, and the ``req_to_token``
+scan (invariants 2-5) walks every live token in Python, so it is O(tokens in
+flight) every ``SGLANG_MIXED_KV_AUDIT_EVERY`` steps. On a GPQA-198 run at 32
+concurrency with the default 25 that cost ~1 minute of the ~13; raise the
+interval for long-context runs. Never leave it on for benchmarking.
 """
 
 from __future__ import annotations
