@@ -12,8 +12,9 @@ recent 256, on by default. That was not true until `NSAInt2HPKVPool` /
 `MLAInt2HPKVPool` learned to read `SGLANG_MIXED_KV_PREFIX_TOKENS` and
 `SGLANG_MIXED_KV_RECENT_TOKENS` — before that they quantized every latent
 token, including the attention sink and the newest ones, and this file told
-you setting those vars changed nothing. **Every number below predates the
-windows**, so read them as the no-window arm, not as the recipe.
+you setting those vars changed nothing. **Every number in the table below
+predates the windows** — read them as the no-window arm, not as the recipe;
+the next section has the windowed GPQA numbers.
 
 | Benchmark | BF16 | INT2 (no window) | Δ |
 |---|:---:|:---:|:---:|
@@ -21,6 +22,11 @@ windows**, so read them as the no-window arm, not as the recipe.
 | HumanEval (≤16K) | 91.5 ± 1.2 | 88.2 ± 1.5 | −3.3 |
 | AIME 2025 | 76.7 ± 3.3 | 75.6 ± 6.9 | −1.1 (n.s.) |
 | MATH500 | 94.8 ± 0.8 | 93.8 ± 0.3 | −1.0 |
+
+Only the GPQA row has been re-measured with the windows. The other three are
+short-generation benchmarks where truncation is not the binding constraint, so
+expect less from the windows there — but that is an expectation, not a
+measurement.
 
 **The −12.6 at 32K is truncation, not wrong answers.** On questions both arms
 answer, they pick the same option 97.1 % of the time; INT2 simply thinks 1.69×
@@ -31,9 +37,22 @@ The INT2 @64K cell is not measured.
 
 ## What the windows are worth here
 
-GPQA-Diamond, 40-question paired subset (`--num-examples 40`, seed 0, so the
-same 40 questions in every arm), B200 TP=8, CUDA graph on,
-`--kv-cache-dtype bfloat16`, Lloyd-Max on, 32K budget:
+Full GPQA-Diamond 198, B200 TP=8, CUDA graph on, `--kv-cache-dtype bfloat16`,
+Lloyd-Max on, 32K budget — the two arms differ only in the windows:
+
+| KV | answered | score | truncated | mean chars |
+|---|:---:|:---:|:---:|:---:|
+| INT2, no window | 140/198 | 65.15 | 29.3 % | 63 286 |
+| INT2, **sink 64 / recent 256** | 159/198 | **76.77** | **19.7 %** | 52 832 |
+
+**+11.6 points, and the truncation rate is what moved**: 29.3 % → 19.7 %, with
+the mean generation 17 % shorter. Paired against the no-window arm, 23
+questions are newly answered against 5 lost, and of the 135 both arms answer
+they agree on 126 (93 %) — single-seed at temperature 1.0, so some of that
+churn is sampling, not the windows.
+
+Same picture on the 40-question paired subset (`--num-examples 40`, seed 0, so
+the same 40 questions in every arm), which additionally has a BF16 control:
 
 | KV | answered | score | truncated | mean chars |
 |---|:---:|:---:|:---:|:---:|
@@ -42,19 +61,27 @@ same 40 questions in every arm), B200 TP=8, CUDA graph on,
 | INT2, sink 64 / recent 512 | 33/40 | 75.0 | 17.5 % | 46 223 |
 | BF16 | 36/40 | 90.0 | 10.0 % | 44 566 |
 
-Score here *is* the answered rate — every question either arm answered, it
-answered correctly — so the whole −15.0 no-window gap was truncation, and
-64/256 removes 5 of the 6 truncations that separated INT2 from BF16. Paired
-against the no-window arm: 30/30 identical answers on the questions both
-answered, 5 newly answered, **0 lost**, and the mean generation length drops
-to the BF16 value. The windows do not make the model answer differently; they
-stop it from over-thinking past the budget.
+Score on this subset *is* the answered rate — every question either arm
+answered, it answered correctly — so the whole −15.0 no-window gap was
+truncation, and 64/256 removes 5 of the 6 truncations that separated INT2 from
+BF16. Paired against the no-window arm: 30/30 identical answers on the
+questions both answered, 5 newly answered, **0 lost**, mean generation length
+down to the BF16 value. The windows do not make the model answer differently;
+they stop it from over-thinking past the budget.
 
 Recent 512 is *not* better here — it recovers some truncation (17.5 %) but not
 the score. Unlike Gemma-4, this model does not want a bigger recent window;
-take the 64/256 floor. Both numbers are single-seed on 40 questions
-(±6.8 pp at 1 SD on the score alone), which is why the truncation rate and
-the paired agreement, not the score, are what carry the conclusion.
+take the 64/256 floor. The 512 cell is single-seed on 40 questions
+(±6.8 pp at 1 SD on the score alone), so read it as "no evidence 512 helps",
+not as a measured regression.
+
+One asymmetry between the two tables: the window arms ran with the radix cache
+on and the no-window/BF16 arms with `--disable-radix-cache`, because the
+harness default flipped between them. Measured impact: the cache hit was
+exactly 64 tokens — one page, the shared instruction preamble — on 11 of 26
+prefill batches and 0 on the rest. Those tokens are inside the BF16 sink, so
+they are BF16 either way, and no generated token is ever cached. Prefill
+caching cannot change generation length, which is what truncation measures.
 
 ## Do not expect a better rotation to close it
 
