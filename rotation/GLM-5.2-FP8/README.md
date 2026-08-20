@@ -7,12 +7,15 @@ rotations do not apply here — there is nothing per-head to rotate.
 Rotation is `Rcov · P · Hblock` (covariance eigenvectors, bit-reversal
 permutation, per-group Hadamard) with **Lloyd-Max** on, group 128.
 
-There is no BF16 sink/recent window on this path. `SGLANG_MIXED_KV_PREFIX_TOKENS`
-and `SGLANG_MIXED_KV_RECENT_TOKENS` are read only by `UnifiedInt2HPKVPool`;
-`NSAInt2HPKVPool` / `MLAInt2HPKVPool` quantize every latent token they are
-handed. Setting them here changes nothing.
+The BF16 sink and recent windows apply here like everywhere else: sink 64,
+recent 256, on by default. That was not true until `NSAInt2HPKVPool` /
+`MLAInt2HPKVPool` learned to read `SGLANG_MIXED_KV_PREFIX_TOKENS` and
+`SGLANG_MIXED_KV_RECENT_TOKENS` — before that they quantized every latent
+token, including the attention sink and the newest ones, and this file told
+you setting those vars changed nothing. **Every number below predates the
+windows**, so read them as the no-window arm, not as the recipe.
 
-| Benchmark | BF16 | INT2 | Δ |
+| Benchmark | BF16 | INT2 (no window) | Δ |
 |---|:---:|:---:|:---:|
 | GPQA @32K | 81.3 ± 0.0 | 68.7 ± 1.8 | −12.6 |
 | HumanEval (≤16K) | 91.5 ± 1.2 | 88.2 ± 1.5 | −3.3 |
@@ -85,6 +88,23 @@ version of this file:
   comparable to the H100 numbers in the table above.
 * No `--page-size`. A DSA model forces 64; the 8 this file used to pass was
   ignored.
+
+The BF16 windows need no flag — 64/256 is the default the pool applies when
+`SGLANG_MIXED_KV_PREFIX_TOKENS` / `SGLANG_MIXED_KV_RECENT_TOKENS` are unset,
+because the two vars' own defaults are the per-head pool's older 32/128 and
+inheriting those would put this path below the floor. Raise the recent window
+for a model that needs more (Gemma-4 and Qwen3-8B use 512). Setting both to 0
+turns the windows off; the server logs a warning when you do, since that is an
+A/B arm and not a serving configuration. Confirm the line
+
+```
+[Int2HPKVPool] BF16 latent windows: sink=64 recent=256 ...
+```
+
+in the server log — its absence means the pool fell back to quantizing every
+latent token. `SGLANG_MIXED_KV_AUDIT=1` additionally checks each live
+request's tiers against the windows every 25 decode steps (it syncs the decode
+path — never leave it on for a timed run).
 
 Set `SGLANG_OSCAR_MLA_KV_REAL_KERNEL=1` to use the packed-INT2 latent kernel
 instead of the fake-quant path: bit-identical packing, decode cosine 1.000000,
