@@ -29,6 +29,33 @@ moving from a 32K to a 64K budget, which confirms the metric is budget-bound.
 Give this model a generous `max_tokens` before reading a regression into it.
 The INT2 @64K cell is not measured.
 
+## What the windows are worth here
+
+GPQA-Diamond, 40-question paired subset (`--num-examples 40`, seed 0, so the
+same 40 questions in every arm), B200 TP=8, CUDA graph on,
+`--kv-cache-dtype bfloat16`, Lloyd-Max on, 32K budget:
+
+| KV | answered | score | truncated | mean chars |
+|---|:---:|:---:|:---:|:---:|
+| INT2, no window | 30/40 | 75.0 | 25.0 % | 54 267 |
+| INT2, **sink 64 / recent 256** | 35/40 | **87.5** | **12.5 %** | 44 426 |
+| INT2, sink 64 / recent 512 | 33/40 | 75.0 | 17.5 % | 46 223 |
+| BF16 | 36/40 | 90.0 | 10.0 % | 44 566 |
+
+Score here *is* the answered rate — every question either arm answered, it
+answered correctly — so the whole −15.0 no-window gap was truncation, and
+64/256 removes 5 of the 6 truncations that separated INT2 from BF16. Paired
+against the no-window arm: 30/30 identical answers on the questions both
+answered, 5 newly answered, **0 lost**, and the mean generation length drops
+to the BF16 value. The windows do not make the model answer differently; they
+stop it from over-thinking past the budget.
+
+Recent 512 is *not* better here — it recovers some truncation (17.5 %) but not
+the score. Unlike Gemma-4, this model does not want a bigger recent window;
+take the 64/256 floor. Both numbers are single-seed on 40 questions
+(±6.8 pp at 1 SD on the score alone), which is why the truncation rate and
+the paired agreement, not the score, are what carry the conclusion.
+
 ## Do not expect a better rotation to close it
 
 Measured on a real `c_kv` dump (functional error, lower is better):
