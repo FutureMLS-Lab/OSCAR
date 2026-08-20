@@ -249,29 +249,64 @@ def audit_release(req_pool_idx: int) -> None:
     _content.pop(int(req_pool_idx), None)
 
 
+#: ``latent_grid_error`` below this means "this row is already on the INT2
+#: grid". A quantized row only misses the grid by bf16 storage rounding
+#: (~1e-2); an unquantized one sits between levels, i.e. near 0.5.
+LATENT_GRID_TOL = 0.25
+
+
+def latent_grid_error(kv_pool, layer_id: int, rows: torch.Tensor) -> torch.Tensor:
+    """Per-row evidence that a stored latent has been through INT2.
+
+    The MLA/NSA pool fake-quantizes into a float cache, so a token's tier is
+    not readable from its slot id the way it is in the unified pool -- every
+    row is BF16-shaped either way. It is readable from the row's *content*,
+    but only in the right basis: the round trip ends with a dense 512x512
+    un-rotation, so a quantized row looks like arbitrary floats in storage.
+    Rotate it back and each ``group_size`` block collapses onto 4 uniformly
+    spaced levels, because that is all 2 bits can hold -- for the Lloyd-Max
+    path too, whose dequant is also ``(q - zero) * scale``.
+
+    So: rotate, fit each group's min/max, and ask how far the values are from
+    integer level indices. ~0 means "already quantized", ~0.5 means "still
+    the bf16 value". Returns one number per row (the worst group).
+    """
+    rank = int(kv_pool.kv_lora_rank)
+    group = int(getattr(kv_pool, "_group_size", 128))
+    n = rows.shape[0]
+    x = rows[..., :rank].reshape(n, rank).to(torch.float32)
+    rotations = getattr(kv_pool, "rotations_f32", None)
+    R = rotations.get(layer_id) if rotations else None
+    if R is not None:
+        x = x @ R
+    g = x.reshape(-1, group)
+    lo = g.amin(dim=-1, keepdim=True)
+    hi = g.amax(dim=-1, keepdim=True)
+    scale = torch.where((hi - lo).abs() > 1e-8, (hi - lo) / 3.0, torch.ones_like(lo))
+    q = (g - lo) / scale
+    return (q - q.round()).abs().amax(dim=-1).reshape(n, -1).amax(dim=-1)
+
+
 def audit_latent_windows(batch, kv_pool) -> None:
     """Tier check for the MLA/NSA latent pool's BF16 sink + recent windows.
 
-    That pool fake-quantizes into a float cache, so a token's tier is not
-    readable from its slot id the way it is in the unified pool -- every row
-    is BF16-shaped either way. It *is* readable from the row's content: an
-    INT2 group of ``group_size`` latents can only hold 4 distinct values after
-    the round trip, while an untouched bf16 group holds ~``group_size``. So
-    counting distinct values per group tells us, for free and without a
-    reference, exactly which tier each live position is in.
-
     The invariant, for a request of length ``L`` with sink ``P`` / recent
-    ``R``: positions ``[0, P)`` and ``[L-R, L)`` are BF16 (many distinct
-    values), positions ``[P, L-R)`` are INT2 (<= 4 per group). A violation in
-    the middle band means the demote never ran (the window is really
-    "everything after the prompt stays BF16", which would inflate the score);
-    a violation in either window means the write path quantized a row it
-    should have skipped.
+    ``R``: positions ``[0, P)`` and ``[L-R, L)`` are BF16, positions
+    ``[P, L-R)`` are INT2. A violation in the middle band means the demote
+    never ran -- the "window" is really "everything after the prompt stays
+    BF16", which would inflate the score and read as a win. A violation in
+    either window means the write path quantized a row it should have
+    skipped. Tiers come from :func:`latent_grid_error`, so this needs no
+    reference copy of the latents.
     """
     global _step
     if not audit_enabled():
         return
     if not getattr(kv_pool, "latent_windows_enabled", lambda: False)():
+        return
+    if getattr(kv_pool, "hp_subspaces", None):
+        # The HP-subspace variant adds a full-precision component back after
+        # the round trip, so a quantized row is no longer on the grid.
         return
     _step += 1
     if _EVERY <= 0 or (_step % _EVERY) != 0:
@@ -279,9 +314,8 @@ def audit_latent_windows(batch, kv_pool) -> None:
 
     P = int(kv_pool.hp_prefix_tokens)
     R = int(kv_pool.hp_recent_tokens)
-    group = int(getattr(kv_pool, "_group_size", 128))
-    rank = int(kv_pool.kv_lora_rank)
-    buf = kv_pool.get_key_buffer(kv_pool.start_layer)
+    layer_id = int(kv_pool.start_layer)
+    buf = kv_pool.get_key_buffer(layer_id)
     rtt = batch.req_to_token_pool.req_to_token
     seq_lens = batch.seq_lens.tolist()
     req_pool_indices = batch.req_pool_indices.tolist()
@@ -292,8 +326,10 @@ def audit_latent_windows(batch, kv_pool) -> None:
         if seq_len <= 0:
             continue
         # One sample per band; a band that does not exist yet is skipped.
+        # ``seq_lens`` here is the length *before* this step's token, which is
+        # exactly the length the previous forward's demote worked to.
         probes = []
-        if P > 0 and seq_len > 0:
+        if P > 0:
             probes.append(("sink", 0, False))
         mid_lo, mid_hi = P, seq_len - R
         if mid_hi > mid_lo:
@@ -307,26 +343,22 @@ def audit_latent_windows(batch, kv_pool) -> None:
             [p for _, p, _ in probes], dtype=torch.int64, device=rtt.device
         )
         slots = rtt[rpi, pos_t].to(torch.int64)
-        rows = buf[slots][..., :rank].reshape(len(probes), -1, group).to(torch.float32)
-        # distinct values per group, max over the groups of a row
-        n_uniq = [
-            max(int(torch.unique(g).numel()) for g in row) for row in rows
-        ]
-        for (band, pos, want_quant), n in zip(probes, n_uniq):
-            if want_quant and n > 4:
+        errs = latent_grid_error(kv_pool, layer_id, buf[slots]).tolist()
+        for (band, pos, want_quant), err in zip(probes, errs):
+            if want_quant and err > LATENT_GRID_TOL:
                 _report(
                     "LATENT_NOT_QUANTIZED",
                     f"rpi={rpi} pos={pos} seq_len={seq_len} band={band} "
-                    f"distinct={n}>4 in a {group}-wide group (sink={P} "
+                    f"grid_err={err:.3f}>{LATENT_GRID_TOL} (sink={P} "
                     f"recent={R}) -> a token outside both BF16 windows was "
                     "never pushed through INT2; the recent window is not "
                     "draining",
                 )
-            elif (not want_quant) and n <= 4:
+            elif (not want_quant) and err <= LATENT_GRID_TOL:
                 _report(
                     "LATENT_WINDOW_QUANTIZED",
                     f"rpi={rpi} pos={pos} seq_len={seq_len} band={band} "
-                    f"distinct={n}<=4 in a {group}-wide group (sink={P} "
+                    f"grid_err={err:.3f}<={LATENT_GRID_TOL} (sink={P} "
                     f"recent={R}) -> a token inside a BF16 window was "
                     "quantized anyway",
                 )

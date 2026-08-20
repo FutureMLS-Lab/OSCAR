@@ -14,8 +14,11 @@ neighbouring per-head pool:
    forced to the graph fill value -- must not write any live position. This
    is the failure that cost the per-head pool 57 -> 28 on GPQA.
 
-Tiers are read off the data, not off the config: an INT2 group can only
-hold 4 distinct values after the round trip, a bf16 group holds ~group_size.
+Tiers are read off the data, not off the config, with the same
+``mixed_kv_audit.latent_grid_error`` the runtime auditor uses -- so this also
+pins the detector down, which matters because the naive version of it is
+wrong: the round trip *ends* with a dense un-rotation, so a quantized row
+looks like arbitrary floats until you rotate it back.
 """
 
 import unittest
@@ -79,12 +82,10 @@ class _Batch:
         self.extend_prefix_lens_cpu = extend_prefix_lens_cpu
 
 
-def _distinct_per_group(rows: torch.Tensor) -> list:
-    """Max distinct values over the ``GROUP``-wide groups of each row."""
-    g = rows[..., :KV_LORA_RANK].reshape(rows.shape[0], -1, GROUP).to(torch.float32)
-    return [
-        max(int(torch.unique(grp).numel()) for grp in row) for row in g
-    ]
+def _grid_err(pool, rows: torch.Tensor, layer_id: int = 0):
+    from sglang.srt.mem_cache.mixed_kv_audit import latent_grid_error
+
+    return latent_grid_error(pool, layer_id, rows)
 
 
 class TestMLALatentBF16Windows(unittest.TestCase):
@@ -231,16 +232,27 @@ class TestMLALatentBF16Windows(unittest.TestCase):
             torch.equal(mid[:, :, :KV_LORA_RANK], nope[sink : L - recent]),
             "middle rows were left in BF16",
         )
-        self.assertTrue(
-            max(_distinct_per_group(mid)) <= 4,
-            f"middle band is not INT2: {max(_distinct_per_group(mid))} distinct",
+        # Same tier detector the runtime auditor uses, and the separation it
+        # relies on: quantized rows sit on the 4-level grid, bf16 rows do not.
+        from sglang.srt.mem_cache.mixed_kv_audit import LATENT_GRID_TOL
+
+        e_mid = _grid_err(pool, mid)
+        e_sink = _grid_err(pool, stored[:sink])
+        e_recent = _grid_err(pool, stored[L - recent :])
+        print(
+            f"\n[grid_err] quant max={e_mid.max():.4f}  "
+            f"sink min={e_sink.min():.4f}  recent min={e_recent.min():.4f}  "
+            f"tol={LATENT_GRID_TOL}"
         )
-        self.assertTrue(
-            min(_distinct_per_group(stored[:sink])) > 4, "sink band looks quantized"
+        self.assertLess(
+            float(e_mid.max()),
+            LATENT_GRID_TOL,
+            "middle band is not on the INT2 grid",
         )
-        self.assertTrue(
-            min(_distinct_per_group(stored[L - recent :])) > 4,
-            "recent band looks quantized",
+        self.assertGreater(
+            float(min(e_sink.min(), e_recent.min())),
+            LATENT_GRID_TOL,
+            "a BF16 window row looks quantized",
         )
 
         # Decode: each step must demote exactly position L-1-recent and leave
@@ -275,16 +287,20 @@ class TestMLALatentBF16Windows(unittest.TestCase):
                 f"step {step}: decode write was quantized",
             )
             demoted = new_pos - recent
-            self.assertTrue(
-                max(_distinct_per_group(buf[loc[demoted : demoted + 1]])) <= 4,
+            self.assertLess(
+                float(_grid_err(pool, buf[loc[demoted : demoted + 1]]).max()),
+                LATENT_GRID_TOL,
                 f"step {step}: position {demoted} left the recent window "
                 "without being quantized",
             )
-            # everything strictly newer than the demote point is still BF16
-            still_bf16 = buf[loc[demoted + 1 : L]]
+            # everything strictly newer than the demote point is still BF16,
+            # byte-for-byte the prefill input
             self.assertTrue(
-                min(_distinct_per_group(still_bf16)) > 4,
-                f"step {step}: a position inside the recent window was quantized",
+                torch.equal(
+                    buf[loc[demoted + 1 : L]][..., :KV_LORA_RANK],
+                    nope[demoted + 1 : L],
+                ),
+                f"step {step}: a position inside the recent window changed",
             )
             self.assertTrue(
                 torch.equal(
