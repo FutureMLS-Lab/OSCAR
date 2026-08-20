@@ -16,6 +16,19 @@ Memory footprint is unchanged from BF16.
 
 Used for OSCAR INT2 latent KV experiments on GLM-5.1-FP8 / DeepseekV2
 style MLA models (and the NSA-classified ``GlmMoeDsaForCausalLM``).
+
+BF16 windows
+------------
+``SGLANG_MIXED_KV_PREFIX_TOKENS`` / ``SGLANG_MIXED_KV_RECENT_TOKENS`` carve
+the same two BF16 windows that ``UnifiedInt2HPKVPool`` gives a per-head
+model — a sink of the first ``P`` positions and a ring of the last ``R``
+positions of every sequence — out of the shared latent. Because this pool
+fake-quantizes into a plain float cache, a "window" is not a second arena:
+every token already owns a BF16 row, so a windowed token is simply one that
+was never pushed through the INT2 round trip. A token *leaving* the recent
+window is re-read from its own row and quantized in place, which is what
+keeps the window a window instead of "the whole generation stays BF16".
+See :meth:`_Int2HPMixin._init_latent_windows`.
 """
 
 from __future__ import annotations
@@ -279,6 +292,7 @@ class _Int2HPMixin:
             device=self.device,
             dtype=self.dtype,
         )
+        self._init_latent_windows()
         self.dump_c_kv_dir = dump_c_kv_dir
         self.dump_max_tokens_per_layer = dump_max_tokens_per_layer
         self._dump_counts: Dict[int, int] = {}
@@ -291,6 +305,298 @@ class _Int2HPMixin:
                 dump_c_kv_dir,
             )
             atexit.register(self.flush_dumps)
+
+    # ── BF16 sink + BF16 recent windows ─────────────────────────────────────
+
+    def _init_latent_windows(self) -> None:
+        """Set up the BF16 sink / BF16 recent windows over the shared latent.
+
+        Same two knobs as ``UnifiedInt2HPKVPool``
+        (``SGLANG_MIXED_KV_PREFIX_TOKENS`` = sink ``P``,
+        ``SGLANG_MIXED_KV_RECENT_TOKENS`` = recent ``R``), same meaning:
+        positions ``[0, P)`` and ``[L-R, L)`` of a length-``L`` sequence are
+        served in BF16, ``[P, L-R)`` at 2 bits. They are read here so the
+        documented "sink 64 / recent 256" recipe finally applies to an
+        MLA/NSA model — until now only the per-head pool read them, and a
+        ``GlmMoeDsaForCausalLM`` quantized every latent token.
+
+        What differs from the unified pool is *where the BF16 lives*, and it
+        matters for one specific hazard. The unified pool needs a second
+        arena with its own slot-id namespace, because its quant tier really
+        is 2 bits wide; a decode write there lands at
+        ``hp_buffer[loc - hp_global_offset]`` unmasked (masking is unsafe
+        under graph capture), so its page 0 has to be reserved as the sink
+        for CUDA-graph padded replays. This pool fake-quantizes into an
+        ordinary float cache: a windowed token keeps the very row it already
+        owns, no offset is subtracted from any ``loc``, and the current-token
+        write is still the stock parent setter. The only new write is the
+        in-place demote, whose target comes from ``req_to_token`` and is
+        masked *inside* the indexing (a device-side predicate, not a host
+        boolean index) with masked-off entries pointed at KV slot 0 — the
+        slot both allocators already hold back for "writing dummy outputs
+        from padded tokens" and which ``req_to_token`` also yields for any
+        position a request has not written yet.
+
+        ``P = R = 0`` restores the previous behaviour exactly: every code
+        path below is skipped and the write path is statement-for-statement
+        what it was.
+        """
+        from sglang.srt.environ import envs
+
+        enabled = bool(envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get())
+        self.hp_prefix_tokens = int(envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()) if enabled else 0
+        self.hp_recent_tokens = int(envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()) if enabled else 0
+        self._fb_window_meta: Optional[dict] = None
+        self._window_fallback_logged = False
+        self._latent_windows = (
+            self.hp_prefix_tokens > 0 or self.hp_recent_tokens > 0
+        ) and bool(self.rotations)
+
+        # An fp8 NSA cache does not store the latent as floats at all -- the
+        # row is ``[nope_fp8(512) | per-block scales(16) | rope bytes]``, so
+        # neither "leave this row alone" nor "re-read and requantize this
+        # row" means what it means below. Refuse rather than silently
+        # corrupt; bf16 is the pinned recipe anyway (fp8 already destroys
+        # rotation orthogonality).
+        if self._latent_windows and (
+            getattr(self, "nsa_kv_cache_store_fp8", False)
+            or self.dtype
+            not in (torch.float64, torch.float32, torch.bfloat16, torch.float16)
+        ):
+            logger.warning(
+                "[Int2HPKVPool] BF16 latent windows need a float KV cache; "
+                "store dtype=%s nsa_fp8=%s -> windows disabled",
+                self.dtype,
+                getattr(self, "nsa_kv_cache_store_fp8", False),
+            )
+            self._latent_windows = False
+
+        if self._latent_windows:
+            logger.info(
+                "[Int2HPKVPool] BF16 latent windows: sink=%d recent=%d "
+                "(positions [0,%d) and [L-%d,L) skip the INT2 round trip; "
+                "a token leaving the recent window is quantized in place)",
+                self.hp_prefix_tokens,
+                self.hp_recent_tokens,
+                self.hp_prefix_tokens,
+                self.hp_recent_tokens,
+            )
+        elif self.rotations:
+            logger.info(
+                "[Int2HPKVPool] BF16 latent windows off (sink=%d recent=%d "
+                "enable_mixed_kv_windows=%s): every latent token is INT2",
+                self.hp_prefix_tokens,
+                self.hp_recent_tokens,
+                enabled,
+            )
+
+    def latent_windows_enabled(self) -> bool:
+        """True when the BF16 sink / recent windows are active.
+
+        Deliberately *not* named ``mixed_kv_enabled``: that name routes the
+        scheduler into ``_alloc_for_decode_mixed``, which only the unified
+        two-arena pool can serve, and makes the CUDA-graph runner aim padded
+        ``out_cache_loc`` at ``hp_global_offset``. This pool wants neither.
+        """
+        return bool(getattr(self, "_latent_windows", False))
+
+    def note_forward_batch(self, forward_batch) -> None:
+        """Stash the per-forward metadata the windows need.
+
+        Called once per forward (and once per CUDA-graph capture) from the
+        two places a ``ForwardBatch`` is built. Nothing here is consumed
+        outside the same forward's ``set_*_kv_buffer`` calls, and under
+        CUDA-graph capture the tensors recorded are the graph's own static
+        buffers, so the ops built on them replay correctly.
+        """
+        if not getattr(self, "_latent_windows", False):
+            return
+        try:
+            is_decode = bool(forward_batch.forward_mode.is_decode_or_idle())
+        except Exception:
+            self._fb_window_meta = None
+            return
+        req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+        self._fb_window_meta = {
+            "is_decode": is_decode,
+            "positions": forward_batch.positions,
+            "seq_lens": forward_batch.seq_lens,
+            "req_pool_indices": forward_batch.req_pool_indices,
+            "req_to_token": (
+                None if req_to_token_pool is None else req_to_token_pool.req_to_token
+            ),
+            "extend_seq_lens": getattr(forward_batch, "extend_seq_lens", None),
+            "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
+            "extend_prefix_lens_cpu": getattr(
+                forward_batch, "extend_prefix_lens_cpu", None
+            ),
+        }
+
+    def _window_fallback(self, why: str) -> None:
+        """Log once and fall back to quantizing every token (old behaviour)."""
+        if not self._window_fallback_logged:
+            self._window_fallback_logged = True
+            logger.warning(
+                "[Int2HPKVPool] BF16 latent windows inactive for this forward "
+                "(%s); quantizing every latent token instead",
+                why,
+            )
+
+    def _latent_window_keep(self, n_tokens: int):
+        """Which of the ``n_tokens`` rows being written must stay BF16.
+
+        Returns ``(keep_all, keep_mask)``. ``keep_all`` short-circuits the
+        common decode case: the token just generated is by definition the
+        newest, so with ``R >= 1`` a decode write is never quantized.
+        ``keep_mask`` is a ``[n_tokens]`` bool tensor otherwise, or ``None``
+        to mean "quantize everything" (the pre-window behaviour).
+        """
+        meta = self._fb_window_meta
+        if meta is None:
+            self._window_fallback("no ForwardBatch metadata")
+            return False, None
+        P, R = self.hp_prefix_tokens, self.hp_recent_tokens
+
+        if meta["is_decode"]:
+            seq_lens = meta["seq_lens"]
+            if seq_lens is None or seq_lens.numel() != n_tokens:
+                # Multi-token-per-request decode (spec verify): one position
+                # per row is no longer derivable from seq_lens alone.
+                self._window_fallback(
+                    f"decode wrote {n_tokens} rows for {0 if seq_lens is None else seq_lens.numel()} requests"
+                )
+                return False, None
+            if R >= 1:
+                return True, None
+            pos = seq_lens.to(torch.int64) - 1
+            return False, pos < P
+
+        positions = meta["positions"]
+        extend_seq_lens = meta["extend_seq_lens"]
+        if (
+            positions is None
+            or extend_seq_lens is None
+            or positions.numel() != n_tokens
+            or meta["seq_lens"] is None
+        ):
+            self._window_fallback("extend without per-token positions")
+            return False, None
+        # ``output_size`` keeps repeat_interleave off the host: without it the
+        # output shape depends on the values of ``extend_seq_lens`` and torch
+        # has to sync to learn it.
+        tok_seq_len = torch.repeat_interleave(
+            meta["seq_lens"].to(torch.int64),
+            extend_seq_lens.to(torch.int64),
+            output_size=n_tokens,
+        )
+        pos = positions.to(torch.int64)
+        return False, (pos < P) | (pos >= tok_seq_len - R)
+
+    def _windowed_fake_int2(self, layer_id: int, c_kv: torch.Tensor) -> torch.Tensor:
+        """``_apply_fake_int2_c_kv`` on the rows outside the BF16 windows."""
+        keep_all, keep = self._latent_window_keep(c_kv.shape[0])
+        if keep_all:
+            return c_kv
+        c_kv_q = self._apply_fake_int2_c_kv(layer_id, c_kv)
+        if keep is None:
+            return c_kv_q
+        return torch.where(
+            keep.reshape(-1, *([1] * (c_kv.dim() - 1))), c_kv, c_kv_q.to(c_kv.dtype)
+        )
+
+    def _demote_slots(self, layer_id: int, slots: torch.Tensor, valid: torch.Tensor) -> None:
+        """Push the latents already stored at ``slots`` through INT2 in place.
+
+        ``slots`` must already be a legal index for every entry (masked-off
+        entries point at the reserved padded slot 0); ``valid`` decides which
+        ones actually change. Masked-off rows are written back byte-for-byte
+        as read, so a padded graph replay whose stale request index resolves
+        to slot 0 is a no-op instead of a second writer.
+        """
+        buf = self.get_key_buffer(layer_id)
+        R = self.kv_lora_rank
+        # Advanced indexing gathers into a fresh tensor, so ``rows`` is a copy
+        # and the read-modify-write below cannot alias the pool.
+        rows = buf[slots]                            # [n, 1, kv_cache_dim]
+        c = rows[..., :R]
+        c_q = self._apply_fake_int2_c_kv(layer_id, c.reshape(-1, R)).reshape(c.shape)
+        rows[..., :R] = torch.where(
+            valid.reshape(-1, *([1] * (c.dim() - 1))), c_q.to(rows.dtype), c
+        )
+        # k_pe rides along untouched: it is written back exactly as it was
+        # read. Rewriting the whole row avoids a masked strided scatter into a
+        # partial last dimension, which is what makes this one plain
+        # ``index_put_`` and therefore safe to capture.
+        buf[slots] = rows
+
+    def _demote_aged_latents(self, layer_id: int) -> None:
+        """Quantize every latent that has just fallen out of the recent window.
+
+        After a forward that grew a request from ``L0`` to ``L`` tokens,
+        positions ``[P, L-R)`` must be INT2. Positions written in this very
+        forward were decided at write time; the ones that were resident and
+        BF16 and have now aged out are ``[max(P, L0-R), min(L0, L-R))`` --
+        exactly one position per request per decode step, and non-empty
+        during extend only for a chunked prefill or a reused prefix.
+        """
+        R_win = self.hp_recent_tokens
+        if R_win <= 0:
+            return
+        meta = self._fb_window_meta
+        if meta is None or meta["req_to_token"] is None:
+            return
+        req_to_token = meta["req_to_token"]
+        req_pool_indices = meta["req_pool_indices"]
+        P = self.hp_prefix_tokens
+
+        if meta["is_decode"]:
+            seq_lens = meta["seq_lens"]
+            if (
+                seq_lens is None
+                or req_pool_indices is None
+                or seq_lens.numel() != req_pool_indices.numel()
+                or seq_lens.numel() == 0
+            ):
+                return
+            # L = seq_lens (decode seq_lens already counts the new token),
+            # L0 = L-1, so the aged-out set is the single position L-1-R.
+            demote_pos = seq_lens.to(torch.int64) - 1 - R_win
+            valid = demote_pos >= P
+            req_rows = req_pool_indices.to(torch.int64)
+            slots = req_to_token[req_rows, demote_pos.clamp(min=0)].to(torch.int64)
+            # Padded graph replays keep a stale req_pool_indices but get
+            # seq_lens = the graph fill value, so they land here as invalid;
+            # send them at the reserved slot 0 rather than a live row.
+            slots = torch.where(valid, slots, torch.zeros_like(slots))
+            self._demote_slots(layer_id, slots, valid)
+            return
+
+        # Extend. Ranges are computed from the CPU-side extend bookkeeping
+        # (never graph-captured: attention and the KV write run eagerly even
+        # under piecewise capture), so only the gather index reaches the GPU.
+        prefix_cpu = meta["extend_prefix_lens_cpu"]
+        ext_cpu = meta["extend_seq_lens_cpu"]
+        if not prefix_cpu or not ext_cpu or req_pool_indices is None:
+            return
+        batch_rows: list = []
+        cols: list = []
+        for i, (l0, ext) in enumerate(zip(prefix_cpu, ext_cpu)):
+            lo = max(P, int(l0) - R_win)
+            hi = min(int(l0), int(l0) + int(ext) - R_win)
+            for p in range(lo, hi):
+                batch_rows.append(i)
+                cols.append(p)
+        if not cols:
+            return
+        dev = req_to_token.device
+        row_t = torch.tensor(batch_rows, dtype=torch.int64, device=dev)
+        col_t = torch.tensor(cols, dtype=torch.int64, device=dev)
+        slots = req_to_token[req_pool_indices.to(torch.int64)[row_t], col_t].to(
+            torch.int64
+        )
+        self._demote_slots(
+            layer_id, slots, torch.ones_like(slots, dtype=torch.bool)
+        )
 
     def _apply_fake_int2_c_kv(
         self,
@@ -427,9 +733,13 @@ class _Int2HPMixin:
             k_rope=cache_k_rope.dtype,
         )
         self._maybe_dump_c_kv(layer_id, cache_k_nope)
-        if self.rotations:  # only degrade quality when rotation is requested
+        if self._latent_windows:
+            cache_k_nope = self._windowed_fake_int2(layer_id, cache_k_nope)
+        elif self.rotations:  # only degrade quality when rotation is requested
             cache_k_nope = self._apply_fake_int2_c_kv(layer_id, cache_k_nope)
         parent_setter(layer, loc, cache_k_nope, cache_k_rope)
+        if self._latent_windows:
+            self._demote_aged_latents(layer_id)
 
     def _int2_set_kv_buffer(
         self,
@@ -447,10 +757,17 @@ class _Int2HPMixin:
         layer_id = layer.layer_id
         self._log_write_path_once("set_kv_buffer", cache_k=cache_k.dtype)
         self._maybe_dump_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
-        if self.rotations:  # only degrade quality when rotation is requested
+        if self._latent_windows:
+            c_kv_q = self._windowed_fake_int2(
+                layer_id, c_kv.reshape(-1, c_kv_dim)
+            )
+            cache_k = torch.cat([c_kv_q.reshape(c_kv.shape), k_pe], dim=-1)
+        elif self.rotations:  # only degrade quality when rotation is requested
             c_kv_q = self._apply_fake_int2_c_kv(layer_id, c_kv.reshape(-1, c_kv_dim))
             cache_k = torch.cat([c_kv_q.reshape(c_kv.shape), k_pe], dim=-1)
         parent_setter(layer, loc, cache_k, cache_v)
+        if self._latent_windows:
+            self._demote_aged_latents(layer_id)
 
 
 # ── pool classes ─────────────────────────────────────────────────────────────

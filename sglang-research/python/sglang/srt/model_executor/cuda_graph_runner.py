@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    notify_kv_pool_of_forward_batch,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
@@ -1014,6 +1015,11 @@ class CudaGraphRunner:
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
+
+        # A position-dependent KV pool has to see the *graph's* static
+        # seq_lens / req_pool_indices tensors, because the ops it builds on
+        # them are what gets captured and replayed.
+        notify_kv_pool_of_forward_batch(forward_batch)
 
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

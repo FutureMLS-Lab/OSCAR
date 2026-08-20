@@ -947,6 +947,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if _is_mixed_kv_enabled(batch):
         return _alloc_for_decode_mixed(batch, token_per_req)
 
+    # The MLA/NSA latent pool tiers inside one float arena, so it never routes
+    # through _alloc_for_decode_mixed and needs its own audit hook. No-op
+    # unless SGLANG_MIXED_KV_AUDIT=1 and that pool has its windows on.
+    if mixed_kv_audit.audit_enabled():
+        mixed_kv_audit.audit_latent_windows(
+            batch, batch.token_to_kv_pool_allocator.get_kvcache()
+        )
+
     bs = batch.seq_lens.shape[0]
 
     if batch.tree_cache.page_size == 1:

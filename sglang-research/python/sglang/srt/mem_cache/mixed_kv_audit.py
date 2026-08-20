@@ -249,6 +249,89 @@ def audit_release(req_pool_idx: int) -> None:
     _content.pop(int(req_pool_idx), None)
 
 
+def audit_latent_windows(batch, kv_pool) -> None:
+    """Tier check for the MLA/NSA latent pool's BF16 sink + recent windows.
+
+    That pool fake-quantizes into a float cache, so a token's tier is not
+    readable from its slot id the way it is in the unified pool -- every row
+    is BF16-shaped either way. It *is* readable from the row's content: an
+    INT2 group of ``group_size`` latents can only hold 4 distinct values after
+    the round trip, while an untouched bf16 group holds ~``group_size``. So
+    counting distinct values per group tells us, for free and without a
+    reference, exactly which tier each live position is in.
+
+    The invariant, for a request of length ``L`` with sink ``P`` / recent
+    ``R``: positions ``[0, P)`` and ``[L-R, L)`` are BF16 (many distinct
+    values), positions ``[P, L-R)`` are INT2 (<= 4 per group). A violation in
+    the middle band means the demote never ran (the window is really
+    "everything after the prompt stays BF16", which would inflate the score);
+    a violation in either window means the write path quantized a row it
+    should have skipped.
+    """
+    global _step
+    if not audit_enabled():
+        return
+    if not getattr(kv_pool, "latent_windows_enabled", lambda: False)():
+        return
+    _step += 1
+    if _EVERY <= 0 or (_step % _EVERY) != 0:
+        return
+
+    P = int(kv_pool.hp_prefix_tokens)
+    R = int(kv_pool.hp_recent_tokens)
+    group = int(getattr(kv_pool, "_group_size", 128))
+    rank = int(kv_pool.kv_lora_rank)
+    buf = kv_pool.get_key_buffer(kv_pool.start_layer)
+    rtt = batch.req_to_token_pool.req_to_token
+    seq_lens = batch.seq_lens.tolist()
+    req_pool_indices = batch.req_pool_indices.tolist()
+
+    for i in range(len(req_pool_indices)):
+        seq_len = int(seq_lens[i])
+        rpi = int(req_pool_indices[i])
+        if seq_len <= 0:
+            continue
+        # One sample per band; a band that does not exist yet is skipped.
+        probes = []
+        if P > 0 and seq_len > 0:
+            probes.append(("sink", 0, False))
+        mid_lo, mid_hi = P, seq_len - R
+        if mid_hi > mid_lo:
+            probes.append(("quant", (mid_lo + mid_hi) // 2, True))
+            probes.append(("quant_edge", mid_hi - 1, True))
+        if R > 0 and seq_len - 1 >= max(P, seq_len - R):
+            probes.append(("recent", seq_len - 1, False))
+        if not probes:
+            continue
+        pos_t = torch.tensor(
+            [p for _, p, _ in probes], dtype=torch.int64, device=rtt.device
+        )
+        slots = rtt[rpi, pos_t].to(torch.int64)
+        rows = buf[slots][..., :rank].reshape(len(probes), -1, group).to(torch.float32)
+        # distinct values per group, max over the groups of a row
+        n_uniq = [
+            max(int(torch.unique(g).numel()) for g in row) for row in rows
+        ]
+        for (band, pos, want_quant), n in zip(probes, n_uniq):
+            if want_quant and n > 4:
+                _report(
+                    "LATENT_NOT_QUANTIZED",
+                    f"rpi={rpi} pos={pos} seq_len={seq_len} band={band} "
+                    f"distinct={n}>4 in a {group}-wide group (sink={P} "
+                    f"recent={R}) -> a token outside both BF16 windows was "
+                    "never pushed through INT2; the recent window is not "
+                    "draining",
+                )
+            elif (not want_quant) and n <= 4:
+                _report(
+                    "LATENT_WINDOW_QUANTIZED",
+                    f"rpi={rpi} pos={pos} seq_len={seq_len} band={band} "
+                    f"distinct={n}<=4 in a {group}-wide group (sink={P} "
+                    f"recent={R}) -> a token inside a BF16 window was "
+                    "quantized anyway",
+                )
+
+
 def audit_req_to_token(batch, kv_pool) -> None:
     """Invariants 2-5, read off ``req_to_token`` for every live request."""
     global _step
