@@ -21,6 +21,7 @@ wrong: the round trip *ends* with a dense un-rotation, so a quantized row
 looks like arbitrary floats until you rotate it back.
 """
 
+import os
 import unittest
 
 import torch
@@ -97,35 +98,35 @@ class TestMLALatentBF16Windows(unittest.TestCase):
     # -- construction ----------------------------------------------------
 
     @staticmethod
-    def _make_pool(sink: int, recent: int):
+    def _build_pool():
+        from sglang.srt.mem_cache.mla_int2_kv_pool import NSAInt2HPKVPool
+
+        return NSAInt2HPKVPool(
+            size=POOL_TOKENS,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=ROPE_DIM,
+            layer_num=LAYERS,
+            device="cuda",
+            kv_cache_dim=KV_LORA_RANK + ROPE_DIM,
+            enable_memory_saver=False,
+            start_layer=0,
+            end_layer=LAYERS - 1,
+            index_head_dim=128,
+            rotation_path="hadamard",
+            group_size=GROUP,
+        )
+
+    @classmethod
+    def _make_pool(cls, sink: int, recent: int):
         """Build a pool with the windows configured through the real env vars."""
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.override(
-            bool(sink or recent)
-        ), envs.SGLANG_MIXED_KV_PREFIX_TOKENS.override(
+        with envs.SGLANG_MIXED_KV_PREFIX_TOKENS.override(
             sink
-        ), envs.SGLANG_MIXED_KV_RECENT_TOKENS.override(
-            recent
-        ):
-            from sglang.srt.mem_cache.mla_int2_kv_pool import NSAInt2HPKVPool
-
-            return NSAInt2HPKVPool(
-                size=POOL_TOKENS,
-                page_size=PAGE,
-                dtype=torch.bfloat16,
-                kv_lora_rank=KV_LORA_RANK,
-                qk_rope_head_dim=ROPE_DIM,
-                layer_num=LAYERS,
-                device="cuda",
-                kv_cache_dim=KV_LORA_RANK + ROPE_DIM,
-                enable_memory_saver=False,
-                start_layer=0,
-                end_layer=LAYERS - 1,
-                index_head_dim=128,
-                rotation_path="hadamard",
-                group_size=GROUP,
-            )
+        ), envs.SGLANG_MIXED_KV_RECENT_TOKENS.override(recent):
+            return cls._build_pool()
 
     @staticmethod
     def _slots(n: int, first_page: int = 1) -> torch.Tensor:
@@ -134,6 +135,37 @@ class TestMLALatentBF16Windows(unittest.TestCase):
         return torch.arange(
             first_page * PAGE, first_page * PAGE + n, dtype=torch.int64, device="cuda"
         )
+
+    # -- 0. the floor is the default -------------------------------------
+
+    def test_windows_default_to_the_int2_floor(self):
+        """No env vars set must still mean sink 64 / recent 256.
+
+        The two vars' own defaults are the per-head pool's older 32/128, and
+        a latent pool that inherited those would sit below the floor every
+        other INT2 KV config holds to. Opt-in is also not an option: it is
+        how this pool ended up 2-bitting the attention sink for every NSA
+        model in the first place.
+        """
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.mla_int2_kv_pool import (
+            DEFAULT_LATENT_RECENT_TOKENS,
+            DEFAULT_LATENT_SINK_TOKENS,
+        )
+
+        for name in (
+            "SGLANG_MIXED_KV_PREFIX_TOKENS",
+            "SGLANG_MIXED_KV_RECENT_TOKENS",
+            "SGLANG_ENABLE_MIXED_KV_WINDOWS",
+        ):
+            os.environ.pop(name, None)
+        self.assertFalse(envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set())
+
+        pool = self._build_pool()
+        self.assertTrue(pool.latent_windows_enabled())
+        self.assertEqual(pool.hp_prefix_tokens, DEFAULT_LATENT_SINK_TOKENS)
+        self.assertEqual(pool.hp_recent_tokens, DEFAULT_LATENT_RECENT_TOKENS)
+        self.assertEqual((pool.hp_prefix_tokens, pool.hp_recent_tokens), (64, 256))
 
     # -- 1. disabled == the pool as it was -------------------------------
 

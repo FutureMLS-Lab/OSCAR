@@ -19,16 +19,20 @@ style MLA models (and the NSA-classified ``GlmMoeDsaForCausalLM``).
 
 BF16 windows
 ------------
-``SGLANG_MIXED_KV_PREFIX_TOKENS`` / ``SGLANG_MIXED_KV_RECENT_TOKENS`` carve
-the same two BF16 windows that ``UnifiedInt2HPKVPool`` gives a per-head
-model — a sink of the first ``P`` positions and a ring of the last ``R``
-positions of every sequence — out of the shared latent. Because this pool
-fake-quantizes into a plain float cache, a "window" is not a second arena:
-every token already owns a BF16 row, so a windowed token is simply one that
-was never pushed through the INT2 round trip. A token *leaving* the recent
-window is re-read from its own row and quantized in place, which is what
-keeps the window a window instead of "the whole generation stays BF16".
-See :meth:`_Int2HPMixin._init_latent_windows`.
+The same two BF16 windows ``UnifiedInt2HPKVPool`` gives a per-head model — a
+sink of the first ``P`` positions and a ring of the last ``R`` positions of
+every sequence — carved out of the shared latent, and on by default at the
+project floor of 64/256 (``SGLANG_MIXED_KV_PREFIX_TOKENS`` /
+``SGLANG_MIXED_KV_RECENT_TOKENS`` to raise them). No INT2 KV configuration
+2-bits the attention sink or the newest tokens; this pool used to, which made
+every NSA/MLA model the exception.
+
+Because this pool fake-quantizes into a plain float cache, a "window" is not
+a second arena: every token already owns a BF16 row, so a windowed token is
+simply one that was never pushed through the INT2 round trip. A token
+*leaving* the recent window is re-read from its own row and quantized in
+place, which is what keeps the window a window instead of "the whole
+generation stays BF16". See :meth:`_Int2HPMixin._init_latent_windows`.
 """
 
 from __future__ import annotations
@@ -52,6 +56,16 @@ _LM_THRESHOLDS = (-0.9810652732849121, 0.0, 0.9810652732849121)
 _LM_CENTROIDS = (-1.5095585584640503, -0.4527800381183624, 0.4527800381183624, 1.5095585584640503)
 _LM_SPAN = _LM_CENTROIDS[3] - _LM_CENTROIDS[0]   # ≈ 3.019
 _LM_RATIO = 1.16   # empirical scale to keep uniform dequant stable in-context
+
+# ── BF16 window floor ───────────────────────────────────────────────────────
+# Every INT2 KV configuration keeps the attention-sink tokens at the start of
+# the sequence and the newest tokens in BF16; 2-bit'ing either degrades
+# generation. 64/256 is the floor, not a tuning knob -- models that need more
+# raise the recent window (Gemma-4 and Qwen3-8B use 512). These are the
+# defaults for the latent path because the env vars' own defaults (32/128) are
+# the per-head pool's older, lower pair.
+DEFAULT_LATENT_SINK_TOKENS = 64
+DEFAULT_LATENT_RECENT_TOKENS = 256
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -315,10 +329,14 @@ class _Int2HPMixin:
         (``SGLANG_MIXED_KV_PREFIX_TOKENS`` = sink ``P``,
         ``SGLANG_MIXED_KV_RECENT_TOKENS`` = recent ``R``), same meaning:
         positions ``[0, P)`` and ``[L-R, L)`` of a length-``L`` sequence are
-        served in BF16, ``[P, L-R)`` at 2 bits. They are read here so the
-        documented "sink 64 / recent 256" recipe finally applies to an
-        MLA/NSA model — until now only the per-head pool read them, and a
-        ``GlmMoeDsaForCausalLM`` quantized every latent token.
+        served in BF16, ``[P, L-R)`` at 2 bits.
+
+        This is the INT2 floor, not a tuning option: no INT2 KV config
+        2-bits the attention sink or the newest tokens. Until now only the
+        per-head pool read those two vars, so a ``GlmMoeDsaForCausalLM``
+        routed to this pool quantized every latent token and was the one
+        model in the project below the floor. Hence 64/256 by default here
+        rather than opt-in.
 
         What differs from the unified pool is *where the BF16 lives*, and it
         matters for one specific hazard. The unified pool needs a second
@@ -337,15 +355,30 @@ class _Int2HPMixin:
         from padded tokens" and which ``req_to_token`` also yields for any
         position a request has not written yet.
 
-        ``P = R = 0`` restores the previous behaviour exactly: every code
-        path below is skipped and the write path is statement-for-statement
-        what it was.
+        ``SGLANG_MIXED_KV_PREFIX_TOKENS=0 SGLANG_MIXED_KV_RECENT_TOKENS=0``
+        restores the previous behaviour exactly -- every code path below is
+        skipped and the write path is statement-for-statement what it was --
+        which is what makes the no-window arm A/B-able, not a supported
+        serving configuration.
         """
         from sglang.srt.environ import envs
 
-        enabled = bool(envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get())
-        self.hp_prefix_tokens = int(envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()) if enabled else 0
-        self.hp_recent_tokens = int(envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()) if enabled else 0
+        # On by default at the project-wide floor. Every INT2 KV config keeps
+        # the attention sink and the newest tokens out of 2 bits; a model that
+        # needs more raises the recent window (Gemma-4 and Qwen3-8B use 512),
+        # nobody goes below 64/256. The two env vars' own defaults are the
+        # per-head pool's older 32/128, so read them only when the operator
+        # actually set them rather than inheriting a below-floor value.
+        self.hp_prefix_tokens = (
+            int(envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get())
+            if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+            else DEFAULT_LATENT_SINK_TOKENS
+        )
+        self.hp_recent_tokens = (
+            int(envs.SGLANG_MIXED_KV_RECENT_TOKENS.get())
+            if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+            else DEFAULT_LATENT_RECENT_TOKENS
+        )
         self._fb_window_meta: Optional[dict] = None
         self._window_fallback_logged = False
         self._latent_windows = (
@@ -382,12 +415,15 @@ class _Int2HPMixin:
                 self.hp_recent_tokens,
             )
         elif self.rotations:
-            logger.info(
-                "[Int2HPKVPool] BF16 latent windows off (sink=%d recent=%d "
-                "enable_mixed_kv_windows=%s): every latent token is INT2",
+            logger.warning(
+                "[Int2HPKVPool] BF16 latent windows OFF (sink=%d recent=%d): "
+                "every latent token is INT2, including the attention sink and "
+                "the newest tokens. Below the %d/%d floor every other INT2 KV "
+                "config holds to -- only do this to A/B the windows",
                 self.hp_prefix_tokens,
                 self.hp_recent_tokens,
-                enabled,
+                DEFAULT_LATENT_SINK_TOKENS,
+                DEFAULT_LATENT_RECENT_TOKENS,
             )
 
     def latent_windows_enabled(self) -> bool:
