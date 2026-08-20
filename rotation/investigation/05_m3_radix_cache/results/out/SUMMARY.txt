@@ -1,0 +1,118 @@
+==============================================================================
+ARM aud
+  disable_radix_cache          False
+  kv_cache_dtype               int2
+  dtype                        bfloat16
+  page_size                    8
+  cuda_graph_max_bs            8
+  max_running_requests         16
+  context_length               40960
+  tp_size                      16
+  nnodes                       2
+  mixed_kv_line                fied mixed KV (int2): prefix=64 recent=256 flush_interval=8 num_quant_pages=423192 N_Q=8 hp_dtype=bfloat16 scale_dtype=float32 max_total_num_tokens=3385528 max_req_slots=16 hp_prefix_pool_tokens=16384
+  rotation_lines               [' from /shared/zhongzhu/m3radix/OSCAR/rotation/MiniMax-M3/rotations/k_rotation_hadamard.pt for layers [0, 60) head_dim=128 dtype=torch.bfloat16']
+  kv_cache_line                [2026-08-20 11:07:46 TP6] KV Cache is allocated. #tokens: 20600, K size: 7.86 GB, V size: 7.86 GB
+  cache_hit_rate               0.1607
+  prefill_cached_tokens        1656
+  prefill_new_tokens           8648
+  decode_cuda_graph            {'False': 103, 'True': 50}
+  decode_samples_padded_bs     52
+  decode_bs_hist               {2: 12, 3: 7, 4: 9, 5: 6, 6: 9, 7: 3, 8: 4, 9: 7, 10: 20, 12: 76}
+  audit_events                 {'HP_PREFIX_ALLOC pages=[1] counts=[8]': 8, 'HP_PREFIX_FREE pages=[1] n_slots=8 <- unified_kv_allocator.py': 8, 'HP_PREFIX_ALLOC pages=[1, 2, 3, 4, 5, 6, 7, 8] counts=[64]': 8, 'HP_PREFIX_ALLOC pages=[9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24] counts=[64, 64, 64, 64, 64, 64, 64, 64]': 8, 'HP_PREFIX_FREE pages=[9, 10, 11, 12, 13, 14, 15, 16] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[17, 18, 19, 20, 21, 22, 23, 24] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[25, 26, 27, 28, 29, 30, 31, 32] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[33, 34, 35, 36, 37, 38, 39, 40] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[41, 42, 43, 44, 45, 46, 47, 48] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[49, 50, 51, 52, 53, 54, 55, 56] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[57, 58, 59, 60, 61, 62, 63, 64] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[65, 66, 67, 68, 69, 70, 71, 72] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[73, 74, 75, 76, 77, 78, 79, 80] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[81, 82, 83, 84, 85, 86, 87, 88] n_slots=64 <- unified_kv_allocator.py': 8, 'HP_PREFIX_FREE pages=[89, 90, 91, 92, 93, 94, 95, 96] n_slots=64 <- unified_kv_allocator.py': 8}
+  decode_write_into_hp_prefix  0
+  audit_samples                ['[2026-08-20 11:08:37 TP3] [mixed-kv-audit] HP_PREFIX_ALLOC pages=[1] counts=[8]', '[2026-08-20 11:08:37 TP4] [mixed-kv-audit] HP_PREFIX_ALLOC pages=[1] counts=[8]', '[2026-08-20 11:08:37 TP0] [mixed-kv-audit] HP_PREFIX_ALLOC pages=[1] counts=[8]', '[2026-08-20 11:08:37 TP5] [mixed-kv-audit] HP_PREFIX_ALLOC pages=[1] counts=[8]', '[2026-08-20 11:08:37 TP1] [mixed-kv-audit] HP_PREFIX_ALLOC pages=[1] counts=[8]', '[2026-08-20 11:08:37 TP6] [mixed-kv-audit] HP_PREFIX_ALLOC pages=[1] counts=[8]']
+  scores_pp                    [45.83]
+  score_mean                   45.83
+  pod_wall_s                   2515
+     seed0 score=0.4583333333333333 n=24 answered=11 unclosed=11 runaway=13 empty=0 elapsed=602s finish={'length': 13, 'stop': 11}
+==============================================================================
+ARM bf16
+  disable_radix_cache          False
+  kv_cache_dtype               bfloat16
+  dtype                        bfloat16
+  page_size                    1
+  cuda_graph_max_bs            8
+  max_running_requests         16
+  context_length               40960
+  tp_size                      16
+  nnodes                       2
+  kv_cache_line                [2026-08-20 11:42:41 TP2] KV Cache is allocated. #tokens: 528989, K size: 7.57 GB, V size: 7.57 GB
+  cache_hit_rate               0.5192
+  prefill_cached_tokens        127988
+  prefill_new_tokens           118539
+  decode_cuda_graph            {'True': 17616}
+  decode_samples_padded_bs     258
+  decode_bs_hist               {1: 819, 2: 377, 3: 177, 4: 24, 5: 9, 6: 30, 7: 42, 8: 16138}
+  audit_events                 {}
+  decode_write_into_hp_prefix  0
+  audit_samples                []
+  scores_pp                    [86.87, 84.85, 88.38]
+  score_mean                   86.7
+  score_sd_pp                  1.77
+  score_sem_pp                 1.02
+  pod_wall_s                   25286
+     seed0 score=0.8686868686868687 n=198 answered=184 unclosed=17 runaway=19 empty=0 elapsed=7830s finish={'length': 19, 'stop': 179}
+     seed1 score=0.8484848484848485 n=198 answered=179 unclosed=21 runaway=21 empty=0 elapsed=7740s finish={'length': 21, 'stop': 177}
+     seed2 score=0.8838383838383839 n=198 answered=185 unclosed=15 runaway=16 empty=0 elapsed=7301s finish={'length': 16, 'stop': 182}
+==============================================================================
+ARM off
+  disable_radix_cache          True
+  kv_cache_dtype               int2
+  dtype                        bfloat16
+  page_size                    8
+  cuda_graph_max_bs            8
+  max_running_requests         16
+  context_length               40960
+  tp_size                      16
+  nnodes                       2
+  mixed_kv_line                fied mixed KV (int2): prefix=64 recent=256 flush_interval=8 num_quant_pages=423192 N_Q=8 hp_dtype=bfloat16 scale_dtype=float32 max_total_num_tokens=3385528 max_req_slots=16 hp_prefix_pool_tokens=16384
+  rotation_lines               [' from /shared/zhongzhu/m3radix/OSCAR/rotation/MiniMax-M3/rotations/k_rotation_hadamard.pt for layers [0, 60) head_dim=128 dtype=torch.bfloat16']
+  kv_cache_line                [2026-08-20 11:00:42 TP3] KV Cache is allocated. #tokens: 20600, K size: 7.86 GB, V size: 7.86 GB
+  cache_hit_rate               0.0
+  prefill_cached_tokens        0
+  prefill_new_tokens           248488
+  decode_cuda_graph            {'True': 18129}
+  decode_samples_padded_bs     415
+  decode_bs_hist               {1: 514, 2: 451, 3: 292, 4: 131, 5: 43, 6: 14, 7: 66, 8: 16618}
+  audit_events                 {}
+  decode_write_into_hp_prefix  0
+  audit_samples                []
+  scores_pp                    [86.36, 86.36, 84.34]
+  score_mean                   85.69
+  score_sd_pp                  1.17
+  score_sem_pp                 0.67
+  pod_wall_s                   18497
+     seed0 score=0.8636363636363636 n=198 answered=180 unclosed=21 runaway=24 empty=0 elapsed=5475s finish={'length': 24, 'stop': 174}
+     seed1 score=0.8636363636363636 n=198 answered=180 unclosed=19 runaway=19 empty=0 elapsed=5386s finish={'length': 19, 'stop': 179}
+     seed2 score=0.8434343434343434 n=198 answered=178 unclosed=24 runaway=26 empty=0 elapsed=5836s finish={'length': 26, 'stop': 172}
+==============================================================================
+ARM on
+  disable_radix_cache          False
+  kv_cache_dtype               int2
+  dtype                        bfloat16
+  page_size                    8
+  cuda_graph_max_bs            8
+  max_running_requests         16
+  context_length               40960
+  tp_size                      16
+  nnodes                       2
+  mixed_kv_line                fied mixed KV (int2): prefix=64 recent=256 flush_interval=8 num_quant_pages=423192 N_Q=8 hp_dtype=bfloat16 scale_dtype=float32 max_total_num_tokens=3385528 max_req_slots=16 hp_prefix_pool_tokens=16384
+  rotation_lines               [' from /shared/zhongzhu/m3radix/OSCAR/rotation/MiniMax-M3/rotations/k_rotation_hadamard.pt for layers [0, 60) head_dim=128 dtype=torch.bfloat16']
+  kv_cache_line                [2026-08-20 11:05:43 TP2] KV Cache is allocated. #tokens: 20600, K size: 7.86 GB, V size: 7.86 GB
+  cache_hit_rate               0.3395
+  prefill_cached_tokens        84368
+  prefill_new_tokens           164112
+  decode_cuda_graph            {'True': 18200}
+  decode_samples_padded_bs     247
+  decode_bs_hist               {1: 824, 2: 673, 3: 135, 4: 80, 5: 36, 6: 10, 7: 66, 8: 16376}
+  audit_events                 {}
+  decode_write_into_hp_prefix  0
+  audit_samples                []
+  scores_pp                    [86.36, 84.85, 87.88]
+  score_mean                   86.36
+  score_sd_pp                  1.52
+  score_sem_pp                 0.87
+  pod_wall_s                   19167
+     seed0 score=0.8636363636363636 n=198 answered=180 unclosed=21 runaway=21 empty=0 elapsed=5468s finish={'length': 21, 'stop': 177}
+     seed1 score=0.8484848484848485 n=198 answered=179 unclosed=27 runaway=27 empty=0 elapsed=5983s finish={'length': 27, 'stop': 171}
+     seed2 score=0.8787878787878788 n=198 answered=181 unclosed=21 runaway=22 empty=0 elapsed=5612s finish={'length': 22, 'stop': 176}

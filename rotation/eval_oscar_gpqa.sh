@@ -107,7 +107,11 @@ if [[ "${NNODES}" -gt 1 ]]; then
     [[ -n "${DIST_ADDR}" ]] || { echo "[eval-oscar] NNODES>1 needs DIST_ADDR=<head-ip>:<port>" >&2; exit 1; }
     MULTINODE_ARGS=(--nnodes "${NNODES}" --node-rank "${NODE_RANK}" --dist-init-addr "${DIST_ADDR}")
 else
-    MULTINODE_ARGS=()
+    # Only single-node gets the loopback rendezvous. argparse is last-wins,
+    # so emitting this after MULTINODE_ARGS made loopback beat the real head
+    # address and NNODES>1 could never rendezvous -- the documented
+    # multi-node support for MiniMax-M3 / GLM-5.2 could not work at all.
+    MULTINODE_ARGS=(--dist-init-addr "127.0.0.1:${DIST_PORT}")
 fi
 NUM_WORKERS="${NUM_WORKERS:-32}"
 N_REPEATS="${N_REPEATS:-1}"
@@ -173,7 +177,6 @@ SERVER_ARGS=(
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
     --host 127.0.0.1
     --port "${PORT}"
-    --dist-init-addr "127.0.0.1:${DIST_PORT}"
     --trust-remote-code
 )
 if [[ -n "${REASONING_PARSER:-}" ]]; then
@@ -218,7 +221,10 @@ if [[ "${NODE_RANK}" != "0" ]]; then
     wait "${SERVER_PID}"
     exit 0
 fi
-for _ in $(seq 1 240); do
+# 400B-class models at TP=16 spend ~1220 s just loading weights, so the old
+# fixed 240x5s = 20 min ceiling killed them mid-load.
+HEALTH_WAIT_STEPS="${HEALTH_WAIT_STEPS:-240}"
+for _ in $(seq 1 "${HEALTH_WAIT_STEPS}"); do
     if curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
         echo "[eval-oscar] server ready"
         break
