@@ -438,7 +438,7 @@ def test_protected_len_stays_below_hp_recent_start():
     sim.admit("long", _prompt(3, 1400))          # donates a deep prefix
     sim.admit("mid", _prompt(3, 700))            # borrows across the boundary
     sim.admit("short", _prompt(3, 300))
-    for r in sim_reqs(sim):
+    for r in sim._admitted:
         recent_start = max(HP_PREFIX, r.seq_len - HP_RECENT)
         assert r.cache_protected_len <= recent_start, (
             f"rid={r.rid} cache_protected_len={r.cache_protected_len} > "
@@ -446,9 +446,6 @@ def test_protected_len_stays_below_hp_recent_start():
             "demoted and are served from the tree at 2 bits"
         )
 
-
-def sim_reqs(sim):
-    return getattr(sim, "_admitted", [])
 
 
 def test_shared_prefix_does_not_corrupt_kv():
@@ -476,10 +473,7 @@ def test_long_prompt_prefix_reuse_is_consistent():
 def test_no_ring_slot_enters_the_tree():
     """HP-recent ids are per-request and recycled; they must never be cached."""
     sim = _run([_prompt(4, 300), _prompt(5, 300)], gen_tokens=300)
-    values = sim.tree.all_values_flatten().tolist() if _tree_nonempty(sim) else []
+    has_nodes = len(sim.tree.root_node.children) > 0
+    values = sim.tree.all_values_flatten().tolist() if has_nodes else []
     bad = [int(v) for v in values if int(v) >= HP_RECENT_BASE]
     assert not bad, f"HP-recent ring slots reachable from the radix tree: {bad[:8]}"
-
-
-def _tree_nonempty(sim):
-    return len(sim.tree.root_node.children) > 0
