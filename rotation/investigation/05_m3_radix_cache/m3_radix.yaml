@@ -1,0 +1,866 @@
+# MiniMax-M3 GPQA-Diamond 198, CUDA graph ON. Four arms:
+#   on   INT2 OSCAR mixed-KV, prefix (radix) cache ON,  3 seeds
+#   off  INT2 OSCAR mixed-KV, prefix cache OFF (control), 3 seeds
+#   bf16 plain BF16 KV, prefix cache ON (paired reference), 3 seeds
+#   aud  INT2, cache ON, SGLANG_MIXED_KV_AUDIT=1, short, never scored
+#
+# cluster charlie (research-common H100), ns charlie, 2 nodes x 8 H100 per arm,
+# TP=16, hostNetwork + IB, code pinned at 4b06c0593e.
+# No node pins: charlie is contended and a pinned pod would wait on one node
+# forever. nodeAffinity only excludes research-common-h100-117, which is a
+# known bad node for INT2 output.
+apiVersion: v1
+kind: Service
+metadata:
+  name: m3rx-on-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  clusterIP: null
+  selector:
+    app: m3rx-on
+    role: head
+  ports:
+  - name: dist
+    port: 41801
+    targetPort: 41801
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-on-head
+  namespace: charlie
+  labels:
+    app: m3rx-on
+    role: head
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-on
+        role: head
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: head
+        - name: ARM
+          value: 'on'
+        - name: PORT
+          value: '31801'
+        - name: DIST_PORT
+          value: '41801'
+        - name: MASTER_SVC
+          value: m3rx-on-master
+        - name: DISABLE_RADIX
+          value: '0'
+        - name: KV_MODE
+          value: int2
+        - name: NUM_WORKERS
+          value: '8'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: SEEDS
+          value: 0 1 2
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-on-worker
+  namespace: charlie
+  labels:
+    app: m3rx-on
+    role: worker
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-on
+        role: worker
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: worker
+        - name: ARM
+          value: 'on'
+        - name: PORT
+          value: '31811'
+        - name: DIST_PORT
+          value: '41801'
+        - name: MASTER_SVC
+          value: m3rx-on-master
+        - name: DISABLE_RADIX
+          value: '0'
+        - name: KV_MODE
+          value: int2
+        - name: NUM_WORKERS
+          value: '8'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: SEEDS
+          value: 0 1 2
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: m3rx-off-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  clusterIP: null
+  selector:
+    app: m3rx-off
+    role: head
+  ports:
+  - name: dist
+    port: 41802
+    targetPort: 41802
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-off-head
+  namespace: charlie
+  labels:
+    app: m3rx-off
+    role: head
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-off
+        role: head
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: head
+        - name: ARM
+          value: 'off'
+        - name: PORT
+          value: '31802'
+        - name: DIST_PORT
+          value: '41802'
+        - name: MASTER_SVC
+          value: m3rx-off-master
+        - name: DISABLE_RADIX
+          value: '1'
+        - name: KV_MODE
+          value: int2
+        - name: NUM_WORKERS
+          value: '8'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: SEEDS
+          value: 0 1 2
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-off-worker
+  namespace: charlie
+  labels:
+    app: m3rx-off
+    role: worker
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-off
+        role: worker
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: worker
+        - name: ARM
+          value: 'off'
+        - name: PORT
+          value: '31812'
+        - name: DIST_PORT
+          value: '41802'
+        - name: MASTER_SVC
+          value: m3rx-off-master
+        - name: DISABLE_RADIX
+          value: '1'
+        - name: KV_MODE
+          value: int2
+        - name: NUM_WORKERS
+          value: '8'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: SEEDS
+          value: 0 1 2
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: m3rx-bf16-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  clusterIP: null
+  selector:
+    app: m3rx-bf16
+    role: head
+  ports:
+  - name: dist
+    port: 41804
+    targetPort: 41804
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-bf16-head
+  namespace: charlie
+  labels:
+    app: m3rx-bf16
+    role: head
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-bf16
+        role: head
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: head
+        - name: ARM
+          value: bf16
+        - name: PORT
+          value: '31804'
+        - name: DIST_PORT
+          value: '41804'
+        - name: MASTER_SVC
+          value: m3rx-bf16-master
+        - name: DISABLE_RADIX
+          value: '0'
+        - name: KV_MODE
+          value: bf16
+        - name: NUM_WORKERS
+          value: '8'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: SEEDS
+          value: 0 1 2
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-bf16-worker
+  namespace: charlie
+  labels:
+    app: m3rx-bf16
+    role: worker
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-bf16
+        role: worker
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: worker
+        - name: ARM
+          value: bf16
+        - name: PORT
+          value: '31814'
+        - name: DIST_PORT
+          value: '41804'
+        - name: MASTER_SVC
+          value: m3rx-bf16-master
+        - name: DISABLE_RADIX
+          value: '0'
+        - name: KV_MODE
+          value: bf16
+        - name: NUM_WORKERS
+          value: '8'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: SEEDS
+          value: 0 1 2
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: m3rx-aud-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  clusterIP: null
+  selector:
+    app: m3rx-aud
+    role: head
+  ports:
+  - name: dist
+    port: 41803
+    targetPort: 41803
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-aud-head
+  namespace: charlie
+  labels:
+    app: m3rx-aud
+    role: head
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-aud
+        role: head
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: head
+        - name: ARM
+          value: aud
+        - name: PORT
+          value: '31803'
+        - name: DIST_PORT
+          value: '41803'
+        - name: MASTER_SVC
+          value: m3rx-aud-master
+        - name: DISABLE_RADIX
+          value: '0'
+        - name: KV_MODE
+          value: int2
+        - name: NUM_WORKERS
+          value: '12'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: MIXED_KV_AUDIT
+          value: '1'
+        - name: MIXED_KV_AUDIT_EVERY
+          value: '5'
+        - name: NUM_EXAMPLES
+          value: '24'
+        - name: MAX_NEW_TOKENS
+          value: '3072'
+        - name: SEEDS
+          value: '0'
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m3rx-aud-worker
+  namespace: charlie
+  labels:
+    app: m3rx-aud
+    role: worker
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: m3rx-aud
+        role: worker
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zhongzhu/m3radix/run_arm.sh
+        env:
+        - name: ROLE
+          value: worker
+        - name: ARM
+          value: aud
+        - name: PORT
+          value: '31813'
+        - name: DIST_PORT
+          value: '41803'
+        - name: MASTER_SVC
+          value: m3rx-aud-master
+        - name: DISABLE_RADIX
+          value: '0'
+        - name: KV_MODE
+          value: int2
+        - name: NUM_WORKERS
+          value: '12'
+        - name: CGBS
+          value: '8'
+        - name: MAX_RUNNING
+          value: '16'
+        - name: MIXED_KV_AUDIT
+          value: '1'
+        - name: MIXED_KV_AUDIT_EVERY
+          value: '5'
+        - name: NUM_EXAMPLES
+          value: '24'
+        - name: MAX_NEW_TOKENS
+          value: '3072'
+        - name: SEEDS
+          value: '0'
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi

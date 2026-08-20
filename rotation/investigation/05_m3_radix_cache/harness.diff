@@ -1,0 +1,75 @@
+--- ../../eval_oscar_gpqa.sh	2026-08-20 08:54:15.016712122 +0000
++++ /tmp/claude-1000/-home-admin-CoQuant--RUD-hybridmodel-testing-work/7e201c91-7fa1-4470-ab61-3f2e1fb59389/scratchpad/h.sh	2026-08-20 10:29:42.025061332 +0000
+@@ -69,6 +69,10 @@
+     # --kv-cache-quant-group-size is only accepted alongside int2, and the MLA
+     # pool takes its group size from SGLANG_OSCAR_MLA_KV_GROUP_SIZE instead.
+     GROUP_SIZE_ARGS=()
++elif [[ "${KV_MODE:-int2}" == "bf16" ]]; then
++    # Paired same-session BF16 reference arm: no int2, no mixed-KV tiering.
++    KV_DTYPE_ARGS=(--kv-cache-dtype bfloat16)
++    GROUP_SIZE_ARGS=()
+ else
+     KV_DTYPE_ARGS=(--kv-cache-dtype int2)
+     GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
+@@ -218,7 +222,7 @@
+     wait "${SERVER_PID}"
+     exit 0
+ fi
+-for _ in $(seq 1 240); do
++for _ in $(seq 1 "${HEALTH_WAIT_STEPS:-240}"); do
+     if curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+         echo "[eval-oscar] server ready"
+         break
+@@ -232,7 +236,7 @@
+ done
+ 
+ if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+-    echo "[eval-oscar] server not ready after 20 min"
++    echo "[eval-oscar] server not ready after $(( ${HEALTH_WAIT_STEPS:-240} * 5 / 60 )) min"
+     tail -100 "${LOG_SERVER}" || true
+     exit 1
+ fi
+@@ -254,18 +258,28 @@
+ fi
+ 
+ RUNNER="${REPO_ROOT}/rotation/_eval_runner/run_simple_eval.py"
+-python "${RUNNER}" \
+-    --task gpqa \
+-    --model "${MODEL}" \
+-    --base-url "http://127.0.0.1:${PORT}/v1" \
+-    --max-tokens "${MAX_NEW_TOKENS}" \
+-    --temperature "${TEMPERATURE:-1.0}" \
+-    --top-p "${TOP_P:-0.95}" \
+-    --top-k "${TOP_K:-40}" \
+-    --n-repeats "${N_REPEATS}" \
+-    --num-threads "${NUM_WORKERS:-32}" \
+-    ${NUM_EXAMPLES:+--num-examples ${NUM_EXAMPLES}} \
+-    --output-dir "${RUN_DIR}" \
+-    2>&1 | tee "${LOG_RUNNER}"
+-echo "[eval-oscar] done. score:"
+-grep -iE "gpqa/score|gpqa/chars" "${RUN_DIR}/eval.log" | tail -10 || true
++for _SEED in ${SEEDS:-__none__}; do
++    if [[ "${_SEED}" == "__none__" ]]; then
++        _OUT="${RUN_DIR}"; _SEED_ARG=()
++    else
++        _OUT="${RUN_DIR}/seed${_SEED}"; _SEED_ARG=(--seed "${_SEED}")
++        mkdir -p "${_OUT}"
++    fi
++    echo "[eval-oscar] === seed=${_SEED} -> ${_OUT} ==="
++    python "${RUNNER}" \
++        --task gpqa \
++        --model "${MODEL}" \
++        --base-url "http://127.0.0.1:${PORT}/v1" \
++        --max-tokens "${MAX_NEW_TOKENS}" \
++        --temperature "${TEMPERATURE:-1.0}" \
++        --top-p "${TOP_P:-0.95}" \
++        --top-k "${TOP_K:-40}" \
++        --n-repeats "${N_REPEATS}" \
++        --num-threads "${NUM_WORKERS:-32}" \
++        "${_SEED_ARG[@]}" \
++        ${NUM_EXAMPLES:+--num-examples ${NUM_EXAMPLES}} \
++        --output-dir "${_OUT}" \
++        2>&1 | tee "${_OUT}/runner.log"
++    echo "[eval-oscar] done seed=${_SEED}. score:"
++    grep -iE "gpqa/score|gpqa/chars" "${_OUT}/eval.log" | tail -10 || true
++done

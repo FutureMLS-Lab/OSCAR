@@ -30,6 +30,7 @@ from numpy import float64
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
@@ -420,11 +421,30 @@ class LRUList:
                 raise Exception(msg)
 
 
+def _allocator_has_mixed_kv(allocator) -> bool:
+    """True when this allocator's pool is an INT2 mixed-KV pool."""
+    if allocator is None:
+        return False
+    kvc_getter = getattr(allocator, "get_kvcache", None)
+    kvc = kvc_getter() if kvc_getter is not None else None
+    fn = getattr(kvc, "mixed_kv_enabled", None) if kvc is not None else None
+    return bool(fn()) if fn is not None else False
+
+
 class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
+        # The allocator only has to page tokens for us, which every
+        # ``BaseTokenToKVPoolAllocator`` does; naming two concrete subclasses
+        # here rejected ``UnifiedInt2HPKVAllocator`` (a sibling, not a
+        # subclass) with a bare ``AssertionError`` at scheduler init, on every
+        # TP rank, before a single token -- which reads as a crash rather than
+        # as "this cache does not support that allocator".
         assert isinstance(
-            params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
-        ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+            params.token_to_kv_pool_allocator, BaseTokenToKVPoolAllocator
+        ), (
+            "MambaRadixCache needs a BaseTokenToKVPoolAllocator, got "
+            f"{type(params.token_to_kv_pool_allocator).__name__}"
+        )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
@@ -436,6 +456,25 @@ class MambaRadixCache(BasePrefixCache):
             assert (
                 self.page_size == 1
             ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
+
+        # Mixed-KV tiers a sequence as [HP-prefix][quant][HP-recent ring]. Only
+        # the HP-prefix window may be shared across requests: the HP-recent
+        # ring is per-request BF16 storage that the flush demotes out of, so a
+        # match reaching into it silently serves those positions as packed INT2
+        # and leaves the borrower with almost no high-precision recent window
+        # (Qwen3-8B BFCL 38.4 -> 14.6 on multi-turn). ``RadixCache`` enforces
+        # that with ``_mixed_kv_tier_cap`` on every match and
+        # ``_mixed_kv_tail_to_drop`` on insert; this cache has neither, so
+        # allowing the combination would not crash -- it would quietly return
+        # bad numbers, which is strictly worse. Refuse it loudly instead.
+        if _allocator_has_mixed_kv(self.token_to_kv_pool_allocator):
+            raise NotImplementedError(
+                "MambaRadixCache does not implement the mixed-KV tier cap, so "
+                "prefix caching cannot be enabled for INT2 mixed-KV on a "
+                "mamba/linear-attention model. Run with --disable-radix-cache. "
+                "Porting _mixed_kv_tier_cap and _mixed_kv_tail_to_drop from "
+                "RadixCache is what this needs."
+            )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
