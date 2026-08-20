@@ -79,11 +79,16 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         # that page were allocatable the dummy token would overwrite whichever
         # request -- or radix-tree node -- owns it. See ``clear``.
         if scheduler_size is None:
-            scheduler_size = (self.num_quant_pages - 1) * self.N_Q + (
-                self.num_hp_prefix_slots - self.N_Q
-                if self.num_hp_prefix_slots > 0
-                else 0
-            )
+            scheduler_size = (
+                self.num_quant_pages - 1
+            ) * self.N_Q + self.num_hp_prefix_slots
+        if self.num_hp_prefix_slots > 0:
+            # Callers size the scheduler against the whole arena; the sink page
+            # is never allocatable, so it is not capacity. Subtracting it here
+            # (rather than at every caller) keeps ``available_size()`` and
+            # ``self.size`` in agreement, which the idle memory-leak check
+            # asserts on.
+            scheduler_size -= self.N_Q
         super().__init__(
             int(scheduler_size), self.N_Q, dtype, device, kvcache, need_sort
         )
