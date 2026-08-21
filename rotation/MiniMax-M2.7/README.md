@@ -15,21 +15,23 @@ rotation, same 64/256 windows, **identical** client concurrency 15, varying only
 `--cuda-graph-max-bs`, compared question-by-question over the same ~69 GPQA
 items, 3 seeds:
 
-| arm | decode path | correct (matched subset) | capped | length |
+| arm | decode path | correct (matched ~88) | capped | length |
 |---|---|---|---|---|
-| max-bs 32 | 100% padded graph replay | 38 / 38 / 40 | 26 / 20 / 22 | 1.0× |
-| max-bs 1 | 100% eager, 0 padded | **56 / 57 / 56** | **6 / 5 / 6** | 0.63–0.73× |
+| max-bs 32 | 100% padded graph replay | 46 / 48 / 52 | 38 / 28 / 29 | 1.0× |
+| max-bs 1 | 100% eager, 0 padded | **69 / 74 / 71** | **12 / 8 / 10** | 0.61–0.86× |
 
-The 2×2 is 19–20 gains against 1–3 losses in every seed (McNemar p < 0.001).
-Eager decode recovers INT2 to roughly BF16 parity on the matched subset.
+The 2×2 is 23–27 gains against 1–4 losses in every seed (McNemar p ≪ 0.001).
+Eager INT2 reaches ~80% on the matched subset against BF16's 78.96% on the full
+198 — parity. For reference the max-bs 32 arms scored 51.01 / 54.04 / 52.53 on
+the full 198, reproducing the recipe baseline band.
 
 Caveat on that subset: the eager arms run ~3× slower (that is the cost of never
-replaying a graph), so this was read while they were mid-flight, over the ~69
-questions both arms had finished. Those are the *shorter* questions, so the
-absolute levels are inflated for both arms — 38/69 and 56/69 are not full-198
-scores. The comparison itself is sound because it is the same question set in
-both arms, and the effect is 3/3 seeds with a 20-vs-2 asymmetry. Full-198
-numbers should replace these when the eager arms finish. So the
+replaying a graph), so this was read while they were mid-flight, over the ~88
+questions both arms had finished. Those are the *shorter* questions, so absolute
+levels are inflated for both arms — these are not full-198 scores. The
+comparison is sound because it is the same question set in both arms, 3/3 seeds,
+with a 25-vs-2 asymmetry. Full-198 eager numbers should replace them when those
+arms finish. So the
 big INT2 deficit below is **predominantly a CUDA-graph-replay defect, not 2-bit
 quality**, and it reconciles the good historical numbers — SWE-bench 70.8, LCB
 v6 68.4, AIME25 90.0 and GPQA 80.3 all ran max-bs 1 and single-stream, i.e.
@@ -146,6 +148,10 @@ Measured, so that nobody re-spends the GPU hours:
   positional subspace does carry more logit signal), but it costs ~9 bits/element
   on K against 2 — a 4.5× increase — so it is a diagnostic, not a fix. See
   `investigation/08_m27_truncation/rope_subspace_error.py`.
+  Confirmed end-to-end: a block-diagonal 64+64 K rotation fitted per block from
+  the same dump scores **49.49** (51.01 / 49.49 / 47.98) against the
+  same-session 64/256 control's **52.53** (51.01 / 54.04 / 52.53) — −3.04 pp,
+  the sign the offline logit metric predicted.
 
 ## Two settings that are not optional
 
