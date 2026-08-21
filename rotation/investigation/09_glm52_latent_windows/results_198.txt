@@ -1,0 +1,122 @@
+# GLM-5.2-FP8 GPQA-Diamond 198, b200 TP=8, 32K, single seed, 2026-08-21
+# arms: /shared/gpqa_glm52_{bf16_198,int2_bf16kv,win64_256_full}
+
+               arm  score score_n answered truncatedtruncated_pctacc_given_answered trunc_min_chars trunc_shorttrunc_loop_tail mean_chars
+              bf16  82.32     163      169        29        14.65             96.45           83049           0              0    48339.1
+        int2_nowin  65.15     129      140        58        29.29             92.14           74965           0              0    63286.2
+    int2_win64_256  76.77     152      159        39         19.7              95.6           79819           0              0    52832.0
+
+=== PAIRED  A=bf16  B=int2_win64_256  paired=198 ===
+answered 2x2: both=155  A-only=14  B-only=4  neither=25
+both answered: 155  same letter: 150 (96.77%)
+  acc on both-answered: A=150/155=96.77%  B=149/155=96.13%
+correct 2x2 (all 198): A+B+=148 A+B-=15 A-B+=4 A-B-=31
+  A=163  B=152  B loses 15, gains 4, net -11 questions (-5.56 pp)
+  paired delta -5.56 +/- 2.20 pp (1 SE, single seed, from 19 discordant pairs)
+  of B's 15 losses: 13 B-truncated (86.67%), 2 B-answered-wrong
+  words(B)/words(A) on both-answered (155): p25=0.76 p50=1.13 p75=1.71
+  McNemar exact two-sided p = 0.01921 (discordant 15 vs 4)
+
+=== PAIRED  A=bf16  B=int2_nowin  paired=198 ===
+answered 2x2: both=139  A-only=30  B-only=1  neither=28
+both answered: 139  same letter: 131 (94.24%)
+  acc on both-answered: A=134/139=96.40%  B=128/139=92.09%
+correct 2x2 (all 198): A+B+=128 A+B-=35 A-B+=1 A-B-=34
+  A=163  B=129  B loses 35, gains 1, net -34 questions (-17.17 pp)
+  paired delta -17.17 +/- 3.03 pp (1 SE, single seed, from 36 discordant pairs)
+  of B's 35 losses: 29 B-truncated (82.86%), 6 B-answered-wrong
+  words(B)/words(A) on both-answered (139): p25=1.02 p50=1.73 p75=2.68
+  McNemar exact two-sided p = 1.077e-09 (discordant 35 vs 1)
+
+=== PAIRED  A=int2_nowin  B=int2_win64_256  paired=198 ===
+answered 2x2: both=135  A-only=5  B-only=24  neither=34
+both answered: 135  same letter: 125 (92.59%)
+  acc on both-answered: A=124/135=91.85%  B=129/135=95.56%
+correct 2x2 (all 198): A+B+=122 A+B-=7 A-B+=30 A-B-=39
+  A=129  B=152  B loses 7, gains 30, net +23 questions (+11.62 pp)
+  paired delta +11.62 +/- 3.07 pp (1 SE, single seed, from 37 discordant pairs)
+  of B's 7 losses: 5 B-truncated (71.43%), 2 B-answered-wrong
+  words(B)/words(A) on both-answered (135): p25=0.46 p50=0.69 p75=1.06
+  McNemar exact two-sided p = 0.0001911 (discordant 7 vs 30)
+[
+  {
+    "arm": "bf16",
+    "n": 198,
+    "score_n": 163,
+    "score": 82.32,
+    "answered": 169,
+    "answered_pct": 85.35,
+    "truncated": 29,
+    "truncated_pct": 14.65,
+    "acc_given_answered": 96.45,
+    "trunc_min_chars": 83049,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 48339.1,
+    "median_chars_answered": 24787
+  },
+  {
+    "arm": "int2_nowin",
+    "n": 198,
+    "score_n": 129,
+    "score": 65.15,
+    "answered": 140,
+    "answered_pct": 70.71,
+    "truncated": 58,
+    "truncated_pct": 29.29,
+    "acc_given_answered": 92.14,
+    "trunc_min_chars": 74965,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 63286.2,
+    "median_chars_answered": 37242
+  },
+  {
+    "arm": "int2_win64_256",
+    "n": 198,
+    "score_n": 152,
+    "score": 76.77,
+    "answered": 159,
+    "answered_pct": 80.3,
+    "truncated": 39,
+    "truncated_pct": 19.7,
+    "acc_given_answered": 95.6,
+    "trunc_min_chars": 79819,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 52832.0,
+    "median_chars_answered": 27530
+  }
+]
+
+=== TOKEN-CAP VERIFICATION (GLM-5.2 tokenizer, re-encoded responses) ===
+Confirms "unanswered" == "hit the 32768-token budget" rather than degenerating.
+Every unanswered response in all three arms lands at 32,760-32,776 tokens and
+none below 32,000; re-encode drift is why it is not exactly 32,768.
+
+  bf16_198        answered=169 unanswered=29  unanswered tok min=32765 p50=32768 max=32772  >=32700: 29/29
+  int2_bf16kv     answered=140 unanswered=58  unanswered tok min=32760 p50=32768 max=32776  >=32700: 58/58
+  win64_256_full  answered=159 unanswered=39  unanswered tok min=32765 p50=32768 max=32768  >=32700: 39/39
+
+Answered responses span 161-32,769 tokens (median 7,235 / 10,018 / 8,584), so the
+cap is not where normal responses live -- and 21/169, 24/140, 22/159 answered
+responses ALSO sit at the cap, i.e. "at cap" does not imply unanswered, but
+unanswered implies at cap with 100% precision on these arms.
+
+Every unanswered response also ends mid-word ("... Let's recall", "... Mn +",
+"... A2O5 +"), i.e. a hard cut in productive reasoning, not a refusal or a loop.
+
+=== SERVER-REPORTED CONFIG, read back per arm (label = what the server says) ===
+  arm             kv_cache_dtype  disable_radix  cuda_graph  max_total_num_tokens  rotation/windows
+  bf16_198        'bfloat16'      False          on, bs=32   645056                rotation_path .../glm52-rotations-none NOT FOUND -> no rotation; windows=off
+  int2_bf16kv     'bfloat16'      True  (!)      on, bs=32   645056                loaded 78 rotations, |RR^T-I|max=9.11e-04; NO windows= field (pre-window code)
+  win64_256_full  'bfloat16'      False          on, bs=32   645056                loaded 78 rotations, |RR^T-I|max=9.11e-04; windows=sink=64/recent=256
+
+max_total_num_tokens is IDENTICAL across arms (645,056): MLA INT2 is fake quant
+into a bf16 pool, so unlike MiniMax-M2.7 there is no KV-wall asymmetry to confound
+the comparison. Reported so the number stays interpretable, not because it varies.
+
+Caveats: (1) int2_bf16kv ran with radix cache OFF while the other two ran with it
+ON, and its write-path log lacks the windows= field entirely -- it is pre-window
+code, not windows-disabled-by-env. (2) No arm records SGLANG_LLOYD_MAX anywhere,
+so the archived arms' codebook setting is unrecoverable.

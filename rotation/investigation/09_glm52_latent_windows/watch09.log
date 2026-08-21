@@ -1,0 +1,10 @@
+2026-08-21T05:06:43Z watchdog start; jobs=zz-glm52-w256-r4 zz-glm52-w512-r4 zz-glm52-w1024-r4
+2026-08-21T05:06:44Z zz-glm52-w256-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:06:45Z zz-glm52-w512-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:06:46Z zz-glm52-w1024-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:11:47Z zz-glm52-w256-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:11:48Z zz-glm52-w512-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:11:49Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T05:16:50Z zz-glm52-w256-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:16:51Z zz-glm52-w512-r4: phase=Pending gate=blocked_by_head
+2026-08-21T05:16:52Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass

@@ -778,14 +778,25 @@ class _Int2HPMixin:
             return
         seen.add(setter_name)
         logger.info(
-            "[Int2HPKVPool] write path=%s windows=%s store_dtype=%s pool_dtype=%s "
-            "compute_dtype=%s nsa_fp8=%s %s",
+            "[Int2HPKVPool] write path=%s windows=%s group=%s lloyd_max=%s "
+            "store_dtype=%s pool_dtype=%s compute_dtype=%s nsa_fp8=%s %s",
             setter_name,
             (
                 f"sink={self.hp_prefix_tokens}/recent={self.hp_recent_tokens}"
                 if self._latent_windows
                 else "off"
             ),
+            # The codebook knobs decide which method the score belongs to, and
+            # nothing else logs them: SGLANG_LLOYD_MAX flips the buckets between
+            # uniform and MSE-optimal with no other observable trace, so an
+            # archived run's server.log could not say which of the two produced
+            # it. That is not hypothetical -- Lloyd-Max has been the difference
+            # between a win and a regression on other families in this project
+            # (it measurably hurt Gemma-4 and M3 long generations), so an arm
+            # whose LM setting cannot be read back cannot be compared to one
+            # whose can, and the pair has to be re-run to mean anything.
+            self._group_size,
+            self._lloyd_max,
             getattr(self, "store_dtype", None),
             self.dtype,
             self._compute_dtype,
