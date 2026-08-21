@@ -185,6 +185,95 @@ def bracket():
     return out
 
 
+def blockrot():
+    """End-to-end check of the partial-RoPE hypothesis: block-diagonal K rotation.
+
+    M2.7 is the only model here with partial RoPE (rotary_dim=64 of head_dim=128),
+    so one 128x128 rotation mixes the position-dependent dims 0-63 with the
+    static dims 64-127. The MLA precedent (GLM-5.2 keeps k_pe in BF16 and
+    quantizes only c_kv) says not to put the positional component through the
+    2-bit path. `fit_block_rotation.py` fits the same qqt objective and r_h_pbr
+    composition INDEPENDENTLY per 64-dim block, so the rotation cannot move
+    energy across the boundary. Bit budget, quant group and windows are
+    unchanged, so this isolates the block structure.
+
+    The offline diagnostic (rope_subspace_error.py) already predicts this LOSES,
+    and says why the premise fails:
+      rms_rope 1.566 vs rms_nope 1.579   -- the halves have the same magnitude,
+                                            so no shared scale is being swamped
+      relerr_rope 0.505 vs relerr_nope 0.488 -- error is spread evenly, not
+                                            concentrated in the positional half
+      logit error 0.319 full vs 0.361 block  -- block-diagonal is 13% WORSE
+    A full 128-dim Hadamard spreads outliers over 128 coordinates; two 64-dim
+    blocks spread them over 64 each, so constraining the rotation reduces the
+    incoherence processing OSCAR depends on. That also explains why quant group
+    64 measured worse (55.31 vs 57.91) -- same mechanism, same direction.
+
+    Run anyway at 3 seeds, because the offline metric is a logit-error proxy and
+    the claim under test is an end-to-end score. Only the 64/256 windows are
+    run: comparing against the 57.91 baseline is the clean single-variable test,
+    and spending six more arms to also pair it against 256/1024 is not
+    justifiable for a hypothesis the diagnostic already predicts will lose.
+    """
+    out, port = [], 32270
+    for s in (1, 2, 3):
+        out.append(job(f"zz-m27-t-blk-s{s}", "blockrot", {
+            **base(f"t_blk_s{s}", port), "KV": "int2",
+            "NUM_WORKERS": CONC["int2"], "MAX_NEW_TOKENS": "32768",
+            "HP_PREFIX": "64", "HP_RECENT": "256",
+            "K_ROT_FILENAME": "k_rotation_qqt_block64.pt"}))
+        port += 2
+    return out
+
+
+def graphbs():
+    """THE control that separates "2-bit quality" from "graph-replay defect".
+
+    Every scored INT2 arm in this investigation ran --cuda-graph-max-bs 32,
+    where essentially every decode step is a padded graph replay. Every
+    historical M2.7 number that looked good -- SWE-bench-verified 70.8,
+    LiveCodeBench v6 68.4, AIME25 90.0 -- ran --cuda-graph-max-bs 1, where
+    CudaGraphRunner.can_run gates on cuda_graph_bs <= max_bs so a batch of 2+
+    cannot replay at all and runs EAGER: zero padded replays. So "INT2 is
+    lossy on long generations" and "something is still wrong on the
+    graph-replay path" are perfectly confounded across everything measured so
+    far, and the allocator check cannot separate them -- page 0 being
+    unallocated rules out the one known padding bug, not a different one, and
+    the auditor's damage counter is known to read zero even on broken code.
+
+    SWE-bench and LCB are long-generation long-context tasks. If INT2 fell into
+    non-terminating loops past ~8.6K words as an intrinsic property, those
+    numbers could not exist. That is the contradiction this arm resolves.
+
+    Single variable. Both sides are run fresh here rather than reusing the
+    earlier 64/256 arms, so the comparison is same-session end to end.
+
+    Two things held deliberately constant, because varying them is how the
+    fictitious published +2.0 was produced:
+    * NUM_WORKERS is IDENTICAL (15) in both arms. Client concurrency and
+      cuda-graph-max-bs are separate knobs; the old wrapper forced concurrency
+      to 1 whenever max-bs was 1, which compared INT2 at concurrency 1 against
+      BF16 at concurrency 32.
+    * MAX_RUNNING stays 32 in both, so req_to_token_pool.size -- and therefore
+      the HP arena geometry and max_req_slots -- are identical. It also keeps
+      get_batch_sizes_to_capture from appending a different value to the
+      captured list in each arm.
+
+    Expect the max-bs 1 arm to be slow: at concurrency 15 every decode step
+    runs eager. That is the point of the arm, not a fault in it.
+    """
+    out, port = [], 32240
+    for mbs in (1, 32):
+        for s in (1, 2, 3):
+            env = {**base(f"t_mbs{mbs}_s{s}", port), "KV": "int2",
+                   "NUM_WORKERS": CONC["int2"], "MAX_NEW_TOKENS": "32768",
+                   "HP_PREFIX": "64", "HP_RECENT": "256"}
+            env["CUDA_GRAPH_MAX_BS"] = str(mbs)
+            out.append(job(f"zz-m27-t-mbs{mbs}-s{s}", "graphbs", env))
+            port += 2
+    return out
+
+
 def window2():
     """Second window pass, driven by the first pass's result.
 
@@ -284,4 +373,4 @@ def group():
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "window"
     print("".join({"budget": budget, "window": window, "bracket": bracket,
-                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2}[which]()))
+                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2, "graphbs": graphbs, "blockrot": blockrot}[which]()))
