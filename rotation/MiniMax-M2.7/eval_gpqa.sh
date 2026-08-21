@@ -26,36 +26,28 @@ export TP_SIZE="${TP_SIZE:-4}"
 export GROUP_SIZE="${GROUP_SIZE:-128}"
 export K_CLIP="${K_CLIP:-0.96}"
 export V_CLIP="${V_CLIP:-0.92}"
-export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
+# 12, not 32. The INT2 mixed-KV decode path is corrupted under CUDA graphs
+# captured at bs >= 16 on this model: measured healthy at concurrency 7 (padded),
+# 8 and 12, broken at 15 (pads to 16) and at 16 (captured, unpadded), and healthy
+# again at concurrency 15 with graphs off. So it is the captured graph size, not
+# padding. Capping at 12 keeps every captured size in the healthy range while
+# still batching, which beats falling back to eager. See README.
+export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-12}"
 export NAME="${NAME:-gpqa_oscar_minimax_m27}"
-# WARNING: CUDA_GRAPH_MAX_BS=32 above is currently UNSAFE for INT2 on this
-# model. Measured control, same session, same rotation, same 64/256 windows,
-# identical client concurrency 15, varying ONLY --cuda-graph-max-bs, matched
-# question-by-question over the same ~69 GPQA items, 3 seeds:
+# At matched concurrency INT2 KV is at PARITY with BF16 on GPQA here -- +6/+4/-4
+# correct over ~97 matched questions, 3 seeds, both arms at concurrency 7. The
+# -21.05 pp that the M2.7 re-check reported was two things compounding, neither
+# of them quantization: the bs>=16 graph defect above, and the fact that every
+# INT2 arm ran concurrency 15 while every BF16 arm ran concurrency 7.
 #
-#   max-bs 32 (100% padded graph replay)   38 / 38 / 40 correct
-#   max-bs 1  (100% eager, 0 padded)       56 / 57 / 56 correct
-#   2x2: eager gains 19-20 and loses 1-3   -> McNemar p < 0.001, 3/3 seeds
-#   capped 26/20/22 -> 6/5/6 ; generation length drops to 0.63-0.73x
-#
-# Eager decode recovers INT2 to roughly BF16 parity on the matched subset, so
-# the large INT2 deficit measured at max-bs 32 is predominantly a defect on the
-# CUDA-graph replay path, NOT 2-bit quality. This also reconciles the good
-# historical numbers -- SWE-bench 70.8, LCB v6 68.4, AIME25 90.0, GPQA 80.3 all
-# ran max-bs 1 and single-stream, i.e. never on the broken path.
-#
-# It is NOT the known page-0 padding bug; that is fixed here (page 0 reserved,
-# hp_prefix_page0_ever_allocated false, min allocated page 1) and the pre-fix
-# twin still shows page 0. Something else on the replay path is wrong.
-#
-# Until that is root-caused, serve INT2 with CUDA_GRAPH_MAX_BS=1, and do not
-# read any max-bs 32 INT2 number as a quantization result.
+# So: never compare arms at different concurrency on this model. That asymmetry
+# is what produced the fictitious published +2.0, and it produced the -21.05
+# just as easily in the other direction.
 #
 # Windows stay at the validated 64/256. Raising them to 256/1024 measured
-# +7.75 pp (57.91 -> 65.66, 3 seeds) -- but that was measured entirely at
-# max-bs 32, so it is most likely masking the replay defect rather than fixing
-# a quality problem, and it costs 2.79 -> 3.65 bits/element amortized. Do not
-# adopt it as a recipe on that evidence.
+# +7.75 pp -- but entirely at concurrency 15, inside the defect, where a bigger
+# BF16 window simply exposes less KV to the corruption. It is masking, not
+# fixing, and it costs 2.79 -> 3.65 bits/element. Do not adopt it.
 export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-64}"
 export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-256}"
 # M2.7 is a long-thinking model, so generation still needs a budget. Note its

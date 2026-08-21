@@ -29,17 +29,27 @@ Two things compounding, neither of them quantization:
 1. **A batch-size-dependent defect on the INT2 CUDA-graph replay path.**
    Measured at max-bs 32 with everything else fixed:
 
-   | client concurrency | replay | result |
-   |---|---|---|
-   | 7 (pads to 8) | padded | **healthy**, ~80% |
-   | 8 | captured, unpadded | **healthy**, ~81% |
-   | 15 (pads to 16) | padded | **broken**, ~54% |
-   | 15, `--cuda-graph-max-bs 1` | eager, no replay | **healthy**, ~80% |
+   | client concurrency | decode batch | replay | result |
+   |---|---|---|---|
+   | 7 | pads to 8 | padded | **healthy** |
+   | 8 | 8 | captured | **healthy** |
+   | 12 | 12 | captured | **healthy** |
+   | 15 | pads to 16 | padded | **broken** |
+   | 16 | 16 | captured | **broken** |
+   | 15, `--cuda-graph-max-bs 1` | 15 | eager, no replay | **healthy** |
 
-   Note concurrency 7 is *padded* and healthy, so padding is **not** the
-   trigger — the earlier conclusion that it was is withdrawn. The trigger is
-   concurrent batch size under graph replay: fine at ≤8, broken by 15, and the
-   same batch size is fine when graphs are off.
+   Padding is **not** the trigger: concurrency 7 is padded and healthy, and
+   concurrency 16 is unpadded and broken. (An earlier revision of this file
+   blamed padded replay; that is withdrawn.) The trigger is the *captured graph
+   size*: everything at batch ≤12 is fine, both batch-15-padded-to-16 and
+   batch-16 are broken, and batch 15 is fine when graphs are off entirely.
+   Given the capture list `[1,2,4,8,12,16,24,32]`, **the graphs captured at
+   bs ≥ 16 are the defective ones.**
+
+   The concurrency-12 and -16 arms behind this were still mid-flight when read
+   (50–82 matched questions), so treat the exact threshold as provisional; the
+   concurrency-12-vs-15 asymmetry is 22 gains against 3 losses, and
+   concurrency 16 tracks concurrency 15 within a couple of items.
 
 2. **The comparison itself was asymmetric.** Every INT2 arm ran concurrency 15
    (the broken regime) and every BF16 arm ran concurrency 7 (the healthy one) —
@@ -47,14 +57,26 @@ Two things compounding, neither of them quantization:
    structurally the same mistake that produced the fictitious published +2.0,
    pointing the other way.
 
-**So: serve and evaluate INT2 at concurrency ≤8, or with
-`--cuda-graph-max-bs 1`. Never compare arms at different concurrency on this
-model.** The defect is not root-caused; the leading suspect is the split-count
-logic, which is batch-size dependent, is baked per captured size under a graph
-while eager recomputes it each step, and has twice before caused INT2 accuracy
-collapse here (`triton_kv_splits=64` dropped GPQA 64→41; int2 decode was found
-under-split at low batch). It is **not** the known page-0 padding bug, which is
-fixed in this tree and verified by the allocator signal.
+**So: serve and evaluate INT2 with `--cuda-graph-max-bs 12` (or lower), or with
+`--cuda-graph-max-bs 1`, and never compare arms at different concurrency on this
+model.** Capping max-bs at 12 keeps every captured graph in the healthy range
+while still batching, which is strictly better than falling back to eager.
+
+Not root-caused. Where to look, given the defect is specific to graphs captured
+at bs ≥ 16 and absent in eager at the same batch size: anything sized or
+computed per captured batch size in the mixed-KV int2 decode path — the
+stage-1/stage-2 split counts (`SGLANG_MIXED_KV_HP_MAX_SPLITS`, `max_kv_splits`)
+and the `mixed_logits` / `mixed_lse` scratch buffers indexed by
+`[bs, heads, splits]`. Split counts are the leading suspect on prior form: they
+are batch-size dependent, are fixed per captured size under a graph while eager
+recomputes them every step, and have twice caused INT2 accuracy collapse here
+(`triton_kv_splits=64` dropped GPQA 64→41; int2 decode was separately found
+under-split at low batch, with a note that adaptive splits are what avoid
+empty-split NaNs).
+
+It is **not** the known page-0 padding bug, which is fixed in this tree and
+verified by the allocator signal — and note the mixed-KV auditor's damage
+counter is useless for this, since it reads zero even on known-broken code.
 
 Everything below was measured at concurrency 15 — i.e. inside the defect — and
 is retained only as a record of its size.
