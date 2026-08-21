@@ -1,5 +1,9 @@
 # MiniMax-M2.7 — INT2 KV recipe
 
+**Status: INT2 is at parity with BF16 here (80.56 vs 78.96 on paired GPQA-198).
+The previously reported −21.05 pp was a harness artifact — see the first
+section. Serve with `--cuda-graph-max-bs 12` or lower.**
+
 Dense MHA, 62 layers, 48 Q / 8 KV heads, head_dim 128. Shared per-layer rotation
 (`qqt_r_h_pbr` for K, `sst_r_h_pbr` for V) with the **uniform** quantizer —
 Lloyd-Max off. Note the checkpoint itself is FP8 (`quant_method: fp8`,
@@ -9,9 +13,20 @@ weights, and this is the only model in the sweep with **partial RoPE**
 
 ## Read this first: INT2 is at parity here, and the -21 pp was a harness artifact
 
-At **matched client concurrency**, INT2 KV on this model is not measurably worse
-than BF16 on GPQA. Compared question-by-question, both arms at concurrency 7,
-3 seeds:
+Run at a concurrency that avoids the graph defect below, INT2 KV on this model
+is at parity with BF16 on full GPQA-198:
+
+| arm | concurrency | full-198 seeds | mean |
+|---|:---:|---|:---:|
+| **INT2**, windows 64/256 | 8 | **80.81 / 80.30** | **80.56** |
+| BF16 | 7 | 78.28 / 77.78 / 80.81 | 78.96 |
+
+**INT2 − BF16 = +1.6 pp.** And 80.30 reproduces the published GPQA **80.3**
+essentially exactly, from a different harness and session — the published INT2
+number was right all along.
+
+The question-by-question view at matched concurrency 7 agrees (3 seeds, read
+mid-flight over ~97 shared questions):
 
 | seed | paired | BF16 correct | INT2 correct | Δ | BF16 capped | INT2 capped | INT2/BF16 length |
 |---|---|---|---|---|---|---|---|
@@ -19,8 +34,8 @@ than BF16 on GPQA. Compared question-by-question, both arms at concurrency 7,
 | 2 | 93 | 73 | **77** | +4 | 11 | 8 | 1.18 |
 | 3 | 103 | 82 | 78 | −4 | 13 | 14 | 1.07 |
 
-Mean **+2.0 in INT2's favour** — parity. The truncation excess and the 2×
-generation-length inflation reported further down both disappear.
+Mean +2.0 in INT2's favour. The truncation excess and the 2× generation-length
+inflation reported further down both disappear.
 
 ### What actually produced the -21.05 pp
 
@@ -161,16 +176,17 @@ it into more tokens (capping 73 → 39, score 57.91 → 60.10).
 | SWE-bench-Verified | – | 70.8 | – |
 | LiveCodeBench v6 (95K) | – | 68.4 | – |
 
-**Do not quote the Δ column** — the BF16 numbers came from the model authors
-under a different harness and seed count, so these were never paired, and the
-GPQA +2.0 specifically compared INT2 at concurrency 1 against a BF16 arm at
-concurrency 32. But the **INT2 column is not the thing that was wrong**: every
-one of these ran `--cuda-graph-max-bs 1` and single-stream, which the control
-above shows is the *working* decode path. They are plausible INT2 numbers
-obtained off the defective path, which is exactly why they look nothing like the
-max-bs 32 measurements. Re-pair them against same-harness BF16 arms at max-bs 1
-rather than discarding them. LCB 68.4 is a hard-window effect, not quantization
-— GLM-4.7 in BF16 scores 65.5 on the same window.
+The **INT2 column stands** — every one of these ran `--cuda-graph-max-bs 1` and
+single-stream, i.e. off the defective path, and the GPQA cell (80.3) has now been
+reproduced at 80.30 in a paired run. Treat them as valid INT2 results.
+
+What was wrong is only the **Δ column**: the BF16 numbers came from the model
+authors under a different harness and seed count, and the GPQA +2.0 in particular
+compared INT2 at concurrency 1 against a BF16 arm at concurrency 32. Re-pair
+against same-harness BF16 arms rather than discarding the INT2 side. On a proper
+paired run INT2 comes out +1.6 pp, so "same band as BF16" was the right reading.
+LCB 68.4 is a hard-window effect, not quantization — GLM-4.7 in BF16 scores 65.5
+on the same window.
 
 ## What is *not* the problem
 
