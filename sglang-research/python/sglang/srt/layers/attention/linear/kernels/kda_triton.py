@@ -59,6 +59,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         return chunk_kda(
@@ -71,4 +72,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
+            return_intermediate_states=return_intermediate_states,
         )

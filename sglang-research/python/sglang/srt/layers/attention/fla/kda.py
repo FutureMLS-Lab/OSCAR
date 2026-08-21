@@ -8,7 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    CHUNK_SIZE,
+    chunk_gated_delta_rule_fwd_h,
+)
 from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.fused_norm_gate import layer_norm_gated_fwd
@@ -860,8 +863,13 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
+    return_intermediate_states: bool = False,
 ):
-    chunk_size = 64
+    # Must stay equal to fla.chunk_delta_h.CHUNK_SIZE: the prefix-cache index
+    # math in MambaAttnBackendBase._init_track_{conv,ssm}_indices assumes the
+    # kernel chunked on exactly that grid, so a mismatch would cache a state
+    # taken at the wrong boundary -- silently, with no shape error.
+    chunk_size = CHUNK_SIZE
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
 
     # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
@@ -897,7 +905,14 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
     )
-    del Aqk, v_new, h
+    del Aqk, v_new
+    if return_intermediate_states:
+        # `h` holds the per-chunk recurrent states the prefix cache needs.  It
+        # is the same tensor GDN returns from chunk_gated_delta_rule (both come
+        # from chunk_gated_delta_rule_fwd_h, shape [B, NT, H, V, K]), so
+        # MambaAttnBackendBase._track_mamba_state_extend consumes it unchanged.
+        return o, h
+    del h
     return o
 
 
@@ -912,6 +927,7 @@ def chunk_kda(
     initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    return_intermediate_states: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -921,7 +937,9 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o = chunk_kda_fwd(
+    # Returns `o` alone by default so every existing caller is unaffected, and
+    # `(o, h)` only when the prefix cache actually needs the chunk states.
+    return chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -931,8 +949,8 @@ def chunk_kda(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        return_intermediate_states=return_intermediate_states,
     )
-    return o
 
 
 @triton.autotune(
