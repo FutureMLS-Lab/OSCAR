@@ -17,7 +17,17 @@ Same code, same session, 3 seeds per arm, TP=4, CUDA graphs on
 |---|---|:---:|
 | BF16 | 78.28 / 77.78 / 80.81 | **78.96** |
 | INT2, windows 256/1024 (current default) | 63.13 / 67.68 / 66.16 | **65.66** |
+| INT2, windows 64/2048 | 65.66 / 65.66 / 65.66 | **65.66** |
+| INT2, windows 64/1024 | 60.61 / 58.08 / 61.11 | 59.93 |
 | INT2, windows 64/256 (old inherited floor) | 52.53 / 61.11 / 60.10 | 57.91 |
+
+Two different large-window configurations land on the same 65.66 mean, from
+opposite directions and with very different seed spreads (0.00 for 64/2048,
+4.55 for 256/1024), which is the main reason to believe ~65.7 is a real plateau
+for this lever rather than a lucky draw. Going further is not possible at this
+serving config: R=4096 OOMs at `mem-fraction-static 0.85` with
+`--max-running-requests 32`, because the HP arena would need ~11.6 GB per rank
+on top of the FP8 weights.
 
 **INT2 − BF16 = −13.3 pp** at the tuned windows, −21.05 pp at the old ones. This
 model is not near-lossless under INT2 KV, and the earlier table below claiming
@@ -78,13 +88,21 @@ Measured, so that nobody re-spends the GPU hours:
   model degenerates into repetition loops.
 - **Budget 95K generation tokens.** M2.7 is a long-thinking model; a smaller
   budget measures truncation, not accuracy. AIME and LCB above both use 95K.
-  Two cautions when using it. First, vary it in *both* arms — a 95K INT2 number
-  against a 32K BF16 number is not a comparison, and that asymmetry is where the
-  implausible published AIME +13.3 came from. Second, a bigger budget raises the
-  answered count without raising accuracy proportionally: INT2 at 95K answers
-  180/198 (BF16's count) but still scores ~60, because the responses the budget
-  rescues are disproportionately the ones INT2 gets wrong. Report the
-  full-denominator score, never accuracy conditioned on having answered.
+  But it must be varied in *both* arms, and doing so does **not** narrow the
+  INT2 gap — it widens it. Measured, windows 64/256:
+
+  | budget | BF16 | INT2 | Δ |
+  |---|:---:|:---:|:---:|
+  | 32K | 78.96 (3 seeds) | 57.91 (3 seeds) | −21.05 |
+  | 95K | ~85.5 (85.35 / 86.36 / 84.85) | 60.10 (1 seed) | ~−25.4 |
+
+  BF16 converts the extra budget into answers — it caps **0/198** at 95K
+  (against 22/198 at 32K) and answers 196–198/198. INT2 converts it into more
+  tokens: capping falls only 73 → 39, and the responses the budget rescues are
+  disproportionately ones it gets wrong, so answered rises 140 → 180 while the
+  score moves 57.91 → 60.10. A 95K INT2 number against a 32K BF16 number is the
+  asymmetry that produced the implausible published AIME +13.3. Always report
+  the full-denominator score, never accuracy conditioned on having answered.
 
 ## Steps
 
