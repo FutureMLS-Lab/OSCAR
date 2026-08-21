@@ -865,13 +865,39 @@ class TritonAttnBackend(AttentionBackend):
                     mixed_quant_kv_indptr = torch.zeros(
                         (bs + 1,), dtype=torch.int32, device=self.device
                     )
+                    # ``seq_lens_sum`` covers only the *real* requests, but the
+                    # scatter kernel below launches over the padded ``bs`` and
+                    # reads ``seq_lens[:bs]``. On a CUDA-graph replay whose
+                    # raw batch is smaller than the captured size, entries
+                    # ``raw_bs..bs-1`` are dummies still holding capture-time
+                    # ``seq_lens``, so their slot ids get written past the end
+                    # of these buffers and corrupt whatever follows.
+                    #
+                    # This is why the defect only appears for a real packed
+                    # INT2 pool under padded replay: the MLA/NSA latent pool
+                    # never builds these index buffers, and a run whose client
+                    # concurrency happens to equal a captured size has
+                    # ``raw_bs == bs`` and no dummies at all. On MiniMax-M2.7
+                    # at concurrency 15 against captured sizes
+                    # [1,2,4,8,12,16,24,32] every step pads, and the damage
+                    # accumulates over decode: 2x generation length, 3.3x
+                    # truncation, repetition loops, GPQA 78 -> 58.
+                    #
+                    # Size for the padded batch instead. The dummies' stale
+                    # lengths are bounded by the pool, so reserve the worst
+                    # case they can ask for rather than trusting their values.
+                    mixed_indices_capacity = int(forward_batch.seq_lens_sum)
+                    if bs > forward_batch.batch_size:
+                        mixed_indices_capacity += (
+                            bs - forward_batch.batch_size
+                        ) * int(self.max_context_len)
                     mixed_hp_kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum,
+                        mixed_indices_capacity,
                         dtype=torch.int64,
                         device=self.device,
                     )
                     mixed_quant_kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum,
+                        mixed_indices_capacity,
                         dtype=torch.int64,
                         device=self.device,
                     )
