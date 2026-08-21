@@ -220,6 +220,50 @@ def padding():
     return out
 
 
+def batchsize():
+    """Separate BATCH SIZE from PADDING as the trigger, at max-bs 32 throughout.
+
+    Where the evidence stands:
+      max-bs 1,  conc 15, eager, no replay        HEALTHY (~80% matched)
+      max-bs 32, conc 15, replay at bs 15 -> 16   BROKEN  (~54% matched)
+      max-bs 32, conc  7, replay at bs  7 ->  8   HEALTHY (~80%)
+      max-bs 32, conc  8, replay at bs  8 captured HEALTHY (~81%)
+
+    conc 7 is padded and healthy, so padding alone is not the trigger, which
+    kills the hypothesis the previous family was built to test. What separates
+    the broken arm from the healthy ones is the concurrent batch size: 15 versus
+    7-8.
+
+    conc 16 is the discriminator. 16 IS in the capture list
+    [1,2,4,8,12,16,24,32], so it replays UNPADDED at essentially the same batch
+    size as the broken arm:
+
+      healthy at conc 16 -> the trigger is padding *at large batch*, and small-
+                            batch padding is benign for some reason worth finding
+      broken  at conc 16 -> the trigger is batch size itself under replay, and
+                            padding is entirely innocent
+
+    conc 12 (also captured, mid-batch) brackets where the transition happens.
+
+    The leading mechanism to check either way is the split-count logic: this
+    project has twice seen INT2 accuracy collapse from split counts
+    (triton_kv_splits=64 dropped GPQA 64->41, and int2 decode was found
+    under-split at low batch), split counts are batch-size dependent, and under
+    a captured graph they are baked per captured size while eager recomputes
+    them every step -- which fits a defect that appears only under replay and
+    only at large batch.
+    """
+    out, port = [], 32330
+    for conc in (12, 16):
+        for s in (1, 2, 3):
+            out.append(job(f"zz-m27-t-b{conc}-s{s}", "batchsize", {
+                **base(f"t_b{conc}_s{s}", port), "KV": "int2",
+                "NUM_WORKERS": str(conc), "MAX_NEW_TOKENS": "32768",
+                "HP_PREFIX": "64", "HP_RECENT": "256"}))
+            port += 2
+    return out
+
+
 def blockrot():
     """End-to-end check of the partial-RoPE hypothesis: block-diagonal K rotation.
 
@@ -408,4 +452,4 @@ def group():
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "window"
     print("".join({"budget": budget, "window": window, "bracket": bracket,
-                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2, "graphbs": graphbs, "blockrot": blockrot, "padding": padding}[which]()))
+                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2, "graphbs": graphbs, "blockrot": blockrot, "padding": padding, "batchsize": batchsize}[which]()))

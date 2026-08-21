@@ -7,60 +7,98 @@ Lloyd-Max off. Note the checkpoint itself is FP8 (`quant_method: fp8`,
 weights, and this is the only model in the sweep with **partial RoPE**
 (`rotary_dim=64` of `head_dim=128`).
 
-## Read this first: max-bs 32 is broken for INT2 on this model
+## Read this first: INT2 is at parity here, and the -21 pp was a harness artifact
 
-Everything in the next section was measured at `--cuda-graph-max-bs 32`, and a
-later control showed that configuration is itself defective. Same session, same
-rotation, same 64/256 windows, **identical** client concurrency 15, varying only
-`--cuda-graph-max-bs`, compared question-by-question over the same ~69 GPQA
-items, 3 seeds:
+At **matched client concurrency**, INT2 KV on this model is not measurably worse
+than BF16 on GPQA. Compared question-by-question, both arms at concurrency 7,
+3 seeds:
+
+| seed | paired | BF16 correct | INT2 correct | Δ | BF16 capped | INT2 capped | INT2/BF16 length |
+|---|---|---|---|---|---|---|---|
+| 1 | 96 | 74 | **80** | +6 | 11 | 8 | 0.92 |
+| 2 | 93 | 73 | **77** | +4 | 11 | 8 | 1.18 |
+| 3 | 103 | 82 | 78 | −4 | 13 | 14 | 1.07 |
+
+Mean **+2.0 in INT2's favour** — parity. The truncation excess and the 2×
+generation-length inflation reported further down both disappear.
+
+### What actually produced the -21.05 pp
+
+Two things compounding, neither of them quantization:
+
+1. **A batch-size-dependent defect on the INT2 CUDA-graph replay path.**
+   Measured at max-bs 32 with everything else fixed:
+
+   | client concurrency | replay | result |
+   |---|---|---|
+   | 7 (pads to 8) | padded | **healthy**, ~80% |
+   | 8 | captured, unpadded | **healthy**, ~81% |
+   | 15 (pads to 16) | padded | **broken**, ~54% |
+   | 15, `--cuda-graph-max-bs 1` | eager, no replay | **healthy**, ~80% |
+
+   Note concurrency 7 is *padded* and healthy, so padding is **not** the
+   trigger — the earlier conclusion that it was is withdrawn. The trigger is
+   concurrent batch size under graph replay: fine at ≤8, broken by 15, and the
+   same batch size is fine when graphs are off.
+
+2. **The comparison itself was asymmetric.** Every INT2 arm ran concurrency 15
+   (the broken regime) and every BF16 arm ran concurrency 7 (the healthy one) —
+   an asymmetry inherited from investigation 06 for KV-pool-size reasons. That is
+   structurally the same mistake that produced the fictitious published +2.0,
+   pointing the other way.
+
+**So: serve and evaluate INT2 at concurrency ≤8, or with
+`--cuda-graph-max-bs 1`. Never compare arms at different concurrency on this
+model.** The defect is not root-caused; the leading suspect is the split-count
+logic, which is batch-size dependent, is baked per captured size under a graph
+while eager recomputes it each step, and has twice before caused INT2 accuracy
+collapse here (`triton_kv_splits=64` dropped GPQA 64→41; int2 decode was found
+under-split at low batch). It is **not** the known page-0 padding bug, which is
+fixed in this tree and verified by the allocator signal.
+
+Everything below was measured at concurrency 15 — i.e. inside the defect — and
+is retained only as a record of its size.
+
+## Superseded: the max-bs 32 / concurrency 15 measurements
+
+The graph-off control that first exposed the defect, same session, same rotation,
+same 64/256 windows, identical concurrency 15, varying only
+`--cuda-graph-max-bs`, matched over the same ~88 questions, 3 seeds:
 
 | arm | decode path | correct (matched ~88) | capped | length |
 |---|---|---|---|---|
-| max-bs 32 | 100% padded graph replay | 46 / 48 / 52 | 38 / 28 / 29 | 1.0× |
-| max-bs 1 | 100% eager, 0 padded | **69 / 74 / 71** | **12 / 8 / 10** | 0.61–0.86× |
+| max-bs 32 | graph replay | 46 / 48 / 52 | 38 / 28 / 29 | 1.0× |
+| max-bs 1 | eager, no replay | **69 / 74 / 71** | **12 / 8 / 10** | 0.61–0.86× |
 
-The 2×2 is 23–27 gains against 1–4 losses in every seed (McNemar p ≪ 0.001).
-Eager INT2 reaches ~80% on the matched subset against BF16's 78.96% on the full
-198 — parity. For reference the max-bs 32 arms scored 51.01 / 54.04 / 52.53 on
-the full 198, reproducing the recipe baseline band.
+23–27 gains against 1–4 losses per seed (McNemar p ≪ 0.001). The eager arms run
+~3× slower, so this was read mid-flight over the questions both arms had
+finished; those are the shorter ones, so the absolute levels are inflated for
+both arms and these are not full-198 scores. The comparison holds because it is
+the same question set on both sides. Full-198 for the max-bs 32 arms:
+51.01 / 54.04 / 52.53.
 
-Caveat on that subset: the eager arms run ~3× slower (that is the cost of never
-replaying a graph), so this was read while they were mid-flight, over the ~88
-questions both arms had finished. Those are the *shorter* questions, so absolute
-levels are inflated for both arms — these are not full-198 scores. The
-comparison is sound because it is the same question set in both arms, 3/3 seeds,
-with a 25-vs-2 asymmetry. Full-198 eager numbers should replace them when those
-arms finish. So the
-big INT2 deficit below is **predominantly a CUDA-graph-replay defect, not 2-bit
-quality**, and it reconciles the good historical numbers — SWE-bench 70.8, LCB
-v6 68.4, AIME25 90.0 and GPQA 80.3 all ran max-bs 1 and single-stream, i.e.
-never on the broken path.
+This also reconciles the historical numbers — SWE-bench 70.8, LCB v6 68.4,
+AIME25 90.0 and GPQA 80.3 all ran max-bs 1 and single-stream, i.e. never on the
+broken path, so they are plausible INT2 results rather than harness flukes.
 
-It is **not** the known page-0 padding bug: that is fixed here (page 0 reserved,
-`hp_prefix_page0_ever_allocated` false, minimum allocated page 1, while the
-pre-fix twin still shows page 0 at 85–100% padded replays). Something else on
-the replay path is wrong and is not yet root-caused.
-
-**Serve INT2 with `--cuda-graph-max-bs 1` until this is fixed, and do not read
-any max-bs 32 INT2 number on this model as a quantization result.**
-
-## Paired GPQA-198 at max-bs 32 — measured under the defect above
+## Superseded: window sweep, measured at concurrency 15
 
 Same code, same session, 3 seeds per arm, TP=4, CUDA graphs on
 (`--cuda-graph-max-bs 32`), 32K budget. From
 `investigation/08_m27_truncation`:
 
-| arm | seeds | mean |
-|---|---|:---:|
-| BF16 | 78.28 / 77.78 / 80.81 | **78.96** |
-| INT2, windows 256/1024 | 63.13 / 67.68 / 66.16 | 65.66 |
-| INT2, windows 64/2048 | 65.66 / 65.66 / 65.66 | 65.66 |
-| INT2, windows 64/1024 | 60.61 / 58.08 / 61.11 | 59.93 |
-| INT2, windows 64/256 (the recipe) | 52.53 / 61.11 / 60.10 | 57.91 |
+| arm | concurrency | seeds | mean |
+|---|:---:|---|:---:|
+| BF16 | **7** | 78.28 / 77.78 / 80.81 | **78.96** |
+| INT2, windows 256/1024 | 15 | 63.13 / 67.68 / 66.16 | 65.66 |
+| INT2, windows 64/2048 | 15 | 65.66 / 65.66 / 65.66 | 65.66 |
+| INT2, windows 64/1024 | 15 | 60.61 / 58.08 / 61.11 | 59.93 |
+| INT2, windows 64/256 (the recipe) | 15 | 52.53 / 61.11 / 60.10 | 57.91 |
 
-Read these as *the size of the replay defect at each window setting*, not as
-quantization results. The window sweep is a real, replicated ordering — and two
+The concurrency column is the point: the BF16 row is not comparable to any INT2
+row here, because BF16 ran at 7 and every INT2 row ran at 15. Read the INT2 rows
+against *each other* as the size of the replay defect at each window setting, and
+never against the BF16 row. The window sweep is a real, replicated ordering — and two
 large-window configurations land on the same 65.66 from opposite directions with
 seed spreads 0.00 (64/2048) and 4.55 (256/1024) — but since a bigger BF16 window
 simply exposes less KV to whatever the replay path corrupts, the most likely
