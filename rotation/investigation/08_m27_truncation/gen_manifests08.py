@@ -185,6 +185,41 @@ def bracket():
     return out
 
 
+def padding():
+    """Isolate PADDED replay from graph replay in general.
+
+    The max-bs 1 vs 32 control (family ``graphbs``) showed eager decode recovers
+    INT2 by ~18 correct answers out of ~69 paired questions, 3/3 seeds. But it
+    changes two things at once: graphs go from replaying-every-step to never
+    replaying, AND padding goes from 100% to 0%. Those are different bugs to fix.
+
+    This pair keeps CUDA graphs fully active in both arms and flips only whether
+    the decode batch size is one the graph was captured at. With
+    --max-running-requests 32 the capture list is [1,2,4,8,12,16,24,32]:
+
+      concurrency 8 -> bs 8 IS captured  -> graph replays, NOTHING padded
+      concurrency 7 -> bs 7 is NOT captured -> graph replays, padded to 8
+
+    If 8 looks like the eager arm and 7 looks like the broken arm, the defect is
+    specifically in padded replay and the search space is the padding fill-in.
+    If both look broken, padding is innocent and the problem is on the graph
+    path generally -- a much wider search. Either answer materially narrows the
+    work for whoever fixes it, which is why it is worth 6 arms.
+
+    Concurrency 7 vs 8 is the smallest change that flips padding status, so the
+    confound from batching differences is as small as it can be made.
+    """
+    out, port = [], 32300
+    for conc in (7, 8):
+        for s in (1, 2, 3):
+            out.append(job(f"zz-m27-t-c{conc}-s{s}", "padding", {
+                **base(f"t_c{conc}_s{s}", port), "KV": "int2",
+                "NUM_WORKERS": str(conc), "MAX_NEW_TOKENS": "32768",
+                "HP_PREFIX": "64", "HP_RECENT": "256"}))
+            port += 2
+    return out
+
+
 def blockrot():
     """End-to-end check of the partial-RoPE hypothesis: block-diagonal K rotation.
 
@@ -373,4 +408,4 @@ def group():
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "window"
     print("".join({"budget": budget, "window": window, "bracket": bracket,
-                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2, "graphbs": graphbs, "blockrot": blockrot}[which]()))
+                   "sink": sink, "group": group, "bigwin": bigwin, "window2": window2, "graphbs": graphbs, "blockrot": blockrot, "padding": padding}[which]()))

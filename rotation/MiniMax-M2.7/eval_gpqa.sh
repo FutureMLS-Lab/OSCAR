@@ -28,29 +28,36 @@ export K_CLIP="${K_CLIP:-0.96}"
 export V_CLIP="${V_CLIP:-0.92}"
 export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 export NAME="${NAME:-gpqa_oscar_minimax_m27}"
-# Mixed-KV windows. The project floor of 64/256 is WRONG for this model and was
-# never validated on it -- it was inherited. Paired GPQA-198 at 32K, 3 seeds
-# each, same code and same session (investigation/08_m27_truncation):
+# WARNING: CUDA_GRAPH_MAX_BS=32 above is currently UNSAFE for INT2 on this
+# model. Measured control, same session, same rotation, same 64/256 windows,
+# identical client concurrency 15, varying ONLY --cuda-graph-max-bs, matched
+# question-by-question over the same ~69 GPQA items, 3 seeds:
 #
-#   P=64   R=256   57.91   (52.53 / 61.11 / 60.10)   <- the inherited floor
-#   P=64   R=1024  59.93   (60.61 / 58.08 / 61.11)
-#   P=1024 R=256   58.76   (61.11 / 60.61 / 54.55)
-#   P=256  R=1024  65.66   (63.13 / 67.68 / 66.16)   <- this default
-#   BF16           78.96   (78.28 / 77.78 / 80.81)
+#   max-bs 32 (100% padded graph replay)   38 / 38 / 40 correct
+#   max-bs 1  (100% eager, 0 padded)       56 / 57 / 56 correct
+#   2x2: eager gains 19-20 and loses 1-3   -> McNemar p < 0.001, 3/3 seeds
+#   capped 26/20/22 -> 6/5/6 ; generation length drops to 0.63-0.73x
 #
-# The recent window is the lever and the sink is not: R 256->1024 at P=64 is
-# +2.0, P 64->1024 at R=256 is +0.9, but the two together are +7.75. P=64
-# R=2048 also reaches 65.66 (1 seed) and costs more BF16 slots than 256/1024
-# for the same score, so 256/1024 is the better operating point.
+# Eager decode recovers INT2 to roughly BF16 parity on the matched subset, so
+# the large INT2 deficit measured at max-bs 32 is predominantly a defect on the
+# CUDA-graph replay path, NOT 2-bit quality. This also reconciles the good
+# historical numbers -- SWE-bench 70.8, LCB v6 68.4, AIME25 90.0, GPQA 80.3 all
+# ran max-bs 1 and single-stream, i.e. never on the broken path.
 #
-# This is a real cost, not a free win: amortized over the measured ~15K-token
-# generation the quant tier goes 2.79 -> 3.65 bits/element, i.e. 4.4x
-# compression against BF16 instead of 5.7x.
+# It is NOT the known page-0 padding bug; that is fixed here (page 0 reserved,
+# hp_prefix_page0_ever_allocated false, min allocated page 1) and the pre-fix
+# twin still shows page 0. Something else on the replay path is wrong.
 #
-# It also does NOT close the gap -- 65.66 against BF16's 78.96 is still
-# -13.3 pp. See README for what that residual is.
-export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-256}"
-export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-1024}"
+# Until that is root-caused, serve INT2 with CUDA_GRAPH_MAX_BS=1, and do not
+# read any max-bs 32 INT2 number as a quantization result.
+#
+# Windows stay at the validated 64/256. Raising them to 256/1024 measured
+# +7.75 pp (57.91 -> 65.66, 3 seeds) -- but that was measured entirely at
+# max-bs 32, so it is most likely masking the replay defect rather than fixing
+# a quality problem, and it costs 2.79 -> 3.65 bits/element amortized. Do not
+# adopt it as a recipe on that evidence.
+export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-64}"
+export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-256}"
 # M2.7 is a long-thinking model, so generation still needs a budget. Note its
 # BF16 KV pool is 6.4x smaller than INT2's (201,769 vs 1,291,320 tokens
 # measured at the same mem-fraction), so a BF16 arm at a 95K budget holds only
