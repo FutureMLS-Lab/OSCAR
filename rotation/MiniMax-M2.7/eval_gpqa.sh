@@ -26,13 +26,21 @@ export TP_SIZE="${TP_SIZE:-4}"
 export GROUP_SIZE="${GROUP_SIZE:-128}"
 export K_CLIP="${K_CLIP:-0.96}"
 export V_CLIP="${V_CLIP:-0.92}"
-# 12, not 32. The INT2 mixed-KV decode path is corrupted under CUDA graphs
-# captured at bs >= 16 on this model: measured healthy at concurrency 7 (padded),
-# 8 and 12, broken at 15 (pads to 16) and at 16 (captured, unpadded), and healthy
-# again at concurrency 15 with graphs off. So it is the captured graph size, not
-# padding. Capping at 12 keeps every captured size in the healthy range while
-# still batching, which beats falling back to eager. See README.
-export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-12}"
+# The bs >= 16 defect this used to guard against was never about CUDA graphs.
+# It was `_decode_grouped_att_m_fwd_quant_int2` picking BLOCK_H = 4 at batch
+# >= 16, which cannot tile this model's kv_group_num = 6 (48 q heads / 8 KV
+# heads): q heads 6 and 7 then read KV head 0's cache for the whole INT2 tier.
+# Fixed in decode_attention.py::_safe_block_h. Graphs looked responsible only
+# because at client concurrency 15 the decode batch pads to 16, so turning
+# graphs off (which never pads) appeared to cure it.
+#
+# Note what capping at 12 actually did: `CudaGraphRunner.can_run` gates on
+# cuda_graph_bs <= max_bs, so it stops batches above 12 from *replaying*, not
+# from *existing*. At concurrency 16 the decode batch is still 16, now running
+# eagerly through the same kernel with the same BLOCK_H = 4 -- equally wrong
+# and ~5x slower (143 vs 700-800 tok/s measured here). It only ever helped
+# because every arm that used it also ran at concurrency <= 15.
+export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 export NAME="${NAME:-gpqa_oscar_minimax_m27}"
 # At matched concurrency INT2 KV is at PARITY with BF16 on GPQA here -- +6/+4/-4
 # correct over ~97 matched questions, 3 seeds, both arms at concurrency 7. The

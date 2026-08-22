@@ -2,7 +2,8 @@
 
 **Status: INT2 is at parity with BF16 here (80.56 vs 78.96 on paired GPQA-198).
 The previously reported −21.05 pp was a harness artifact — see the first
-section. Serve with `--cuda-graph-max-bs 12` or lower.**
+section. The batch-size defect that used to require `--cuda-graph-max-bs 12`
+is fixed (`decode_attention.py::_safe_block_h`); serve at any max-bs.**
 
 Dense MHA, 62 layers, 48 Q / 8 KV heads, head_dim 128. Shared per-layer rotation
 (`qqt_r_h_pbr` for K, `sst_r_h_pbr` for V) with the **uniform** quantizer —
@@ -13,8 +14,7 @@ weights, and this is the only model in the sweep with **partial RoPE**
 
 ## Read this first: INT2 is at parity here, and the -21 pp was a harness artifact
 
-Run at a concurrency that avoids the graph defect below, INT2 KV on this model
-is at parity with BF16 on full GPQA-198:
+INT2 KV on this model is at parity with BF16 on full GPQA-198:
 
 | arm | concurrency | full-198 seeds | mean |
 |---|:---:|---|:---:|
@@ -41,30 +41,42 @@ inflation reported further down both disappear.
 
 Two things compounding, neither of them quantization:
 
-1. **A batch-size-dependent defect on the INT2 CUDA-graph replay path.**
+1. **A batch-size-dependent defect in the grouped INT2 decode kernel.**
    Measured at max-bs 32 with everything else fixed:
 
-   | client concurrency | decode batch | replay | result |
-   |---|---|---|---|
-   | 7 | pads to 8 | padded | **healthy** |
-   | 8 | 8 | captured | **healthy** |
-   | 12 | 12 | captured | **healthy** |
-   | 15 | pads to 16 | padded | **broken** |
-   | 16 | 16 | captured | **broken** |
-   | 15, `--cuda-graph-max-bs 1` | 15 | eager, no replay | **healthy** |
+   | client concurrency | decode batch | replay | `BLOCK_H` | result |
+   |---|---|---|---|---|
+   | 7 | pads to 8 | padded | 8 | **healthy** |
+   | 8 | 8 | captured | 8 | **healthy** |
+   | 12 | 12 | captured | 8 | **healthy** |
+   | 15 | pads to 16 | padded | **4** | **broken** |
+   | 16 | 16 | captured | **4** | **broken** |
+   | 15, `--cuda-graph-max-bs 1` | 15 | eager, no replay | 8 | **healthy** |
 
-   Padding is **not** the trigger: concurrency 7 is padded and healthy, and
-   concurrency 16 is unpadded and broken. (An earlier revision of this file
-   blamed padded replay; that is withdrawn.) The trigger is the *captured graph
-   size*: everything at batch ≤12 is fine, both batch-15-padded-to-16 and
-   batch-16 are broken, and batch 15 is fine when graphs are off entirely.
-   Given the capture list `[1,2,4,8,12,16,24,32]`, **the graphs captured at
-   bs ≥ 16 are the defective ones.**
+   Neither padding nor CUDA graphs is the trigger, though both look like it.
+   `_decode_grouped_att_m_fwd_quant_int2` selects its head tile from the batch
+   size and drops `BLOCK_H` to 4 once batch >= 16. The kernel addresses heads
+   with a *flat* query index (`cur_head_id * VALID_BLOCK_H + arange(BLOCK_H)`)
+   but derives `cur_kv_head` from the block index, so a head block must lie
+   wholly inside one KV group. This model has `kv_group_num = 6` (48 Q / 8 KV),
+   which 4 does not divide: head block 1 covers q heads 4..7 while reporting
+   `cur_kv_head = 0`, so **q heads 6 and 7 read KV head 0's cache for the
+   entire INT2 tier** — 97% of the context. Nothing asserts and no NaN appears.
 
-   The concurrency-12 and -16 arms behind this were still mid-flight when read
-   (50–82 matched questions), so treat the exact threshold as provisional; the
-   concurrency-12-vs-15 asymmetry is 22 gains against 3 losses, and
-   concurrency 16 tracks concurrency 15 within a couple of items.
+   Against dense attention on this geometry: relative error 1.4e-3 at batch
+   <= 15, 1.3e-2 at batch >= 16, and 1.4e-3 everywhere after the fix. The
+   graph path was cleared three ways — the decode kernels replay
+   bit-identically to eager at every captured size, the metadata the replay
+   derives is bit-identical to the eager build, and an in-server graph-vs-eager
+   forward comparison at bs=16 reported `max|dlogit| = 0` with 16/16 argmax
+   agreement on all four TP ranks across 240 checks, inside a run that scored
+   66.7. Concurrency 15 was broken only because the decode batch pads to 16.
+
+   Single-variable arms (48 questions each, all at max-bs 32) excluded the rest:
+   BF16 KV at concurrency 16 scores 91.7 with 0 repetitive tails, so it is not
+   the model or the scheduler; `--disable-radix-cache` (54.2),
+   `--disable-overlap-schedule` (58.3) and `--cuda-graph-max-bs 16` (64.6) all
+   stay broken against the 62.5 baseline.
 
 2. **The comparison itself was asymmetric.** Every INT2 arm ran concurrency 15
    (the broken regime) and every BF16 arm ran concurrency 7 (the healthy one) —
@@ -72,22 +84,25 @@ Two things compounding, neither of them quantization:
    structurally the same mistake that produced the fictitious published +2.0,
    pointing the other way.
 
-**So: serve and evaluate INT2 with `--cuda-graph-max-bs 12` (or lower), or with
-`--cuda-graph-max-bs 1`, and never compare arms at different concurrency on this
-model.** Capping max-bs at 12 keeps every captured graph in the healthy range
-while still batching, which is strictly better than falling back to eager.
+**So: the kernel is fixed, `--cuda-graph-max-bs` no longer needs pinning, and
+you should still never compare arms at different concurrency on this model.**
+Note what capping at 12 actually did: `CudaGraphRunner.can_run` gates on
+`cuda_graph_bs <= max_bs`, so it stopped batches above 12 from *replaying*, not
+from *existing*. At concurrency 16 the decode batch was still 16, running
+eagerly through the same kernel with the same `BLOCK_H = 4` — equally wrong and
+~5x slower (143 vs 700-800 tok/s). It only ever helped because every arm that
+used it also ran at concurrency <= 15.
 
-Not root-caused. Where to look, given the defect is specific to graphs captured
-at bs ≥ 16 and absent in eager at the same batch size: anything sized or
-computed per captured batch size in the mixed-KV int2 decode path — the
-stage-1/stage-2 split counts (`SGLANG_MIXED_KV_HP_MAX_SPLITS`, `max_kv_splits`)
-and the `mixed_logits` / `mixed_lse` scratch buffers indexed by
-`[bs, heads, splits]`. Split counts are the leading suspect on prior form: they
-are batch-size dependent, are fixed per captured size under a graph while eager
-recomputes them every step, and have twice caused INT2 accuracy collapse here
-(`triton_kv_splits=64` dropped GPQA 64→41; int2 decode was separately found
-under-split at low batch, with a note that adaptive splits are what avoid
-empty-split NaNs).
+The published INT2 numbers here are unaffected: every one of them ran at
+concurrency 1, 7 or 8, i.e. decode batch <= 8, where `BLOCK_H` is 8 and the
+mapping is exact. What *was* measured inside the defect — the 256/1024 window
+ablation and everything else run at concurrency 15 — stays withdrawn.
+
+The same condition (`BLOCK_H < kv_group_num` and `kv_group_num % BLOCK_H != 0`)
+hits other geometries in the opposite direction, because `BLOCK_H` is 8 below
+batch 16 and 16 above it once `kv_group_num > 8`: **`kv_group_num` 9..15 is
+broken at batch < 16**. GLM-4.7-FP8 is 96 Q / 8 KV = 12 and lands there; see
+`rotation/investigation/10_m27_graphbs/affected_geometries.py`.
 
 It is **not** the known page-0 padding bug, which is fixed in this tree and
 verified by the allocator signal — and note the mixed-KV auditor's damage
