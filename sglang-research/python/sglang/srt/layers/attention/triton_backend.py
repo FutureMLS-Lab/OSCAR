@@ -865,39 +865,20 @@ class TritonAttnBackend(AttentionBackend):
                     mixed_quant_kv_indptr = torch.zeros(
                         (bs + 1,), dtype=torch.int32, device=self.device
                     )
-                    # ``seq_lens_sum`` covers only the *real* requests, but the
-                    # scatter kernel below launches over the padded ``bs`` and
-                    # reads ``seq_lens[:bs]``. On a CUDA-graph replay whose
-                    # raw batch is smaller than the captured size, entries
-                    # ``raw_bs..bs-1`` are dummies still holding capture-time
-                    # ``seq_lens``, so their slot ids get written past the end
-                    # of these buffers and corrupt whatever follows.
-                    #
-                    # This is why the defect only appears for a real packed
-                    # INT2 pool under padded replay: the MLA/NSA latent pool
-                    # never builds these index buffers, and a run whose client
-                    # concurrency happens to equal a captured size has
-                    # ``raw_bs == bs`` and no dummies at all. On MiniMax-M2.7
-                    # at concurrency 15 against captured sizes
-                    # [1,2,4,8,12,16,24,32] every step pads, and the damage
-                    # accumulates over decode: 2x generation length, 3.3x
-                    # truncation, repetition loops, GPQA 78 -> 58.
-                    #
-                    # Size for the padded batch instead. The dummies' stale
-                    # lengths are bounded by the pool, so reserve the worst
-                    # case they can ask for rather than trusting their values.
-                    mixed_indices_capacity = int(forward_batch.seq_lens_sum)
-                    if bs > forward_batch.batch_size:
-                        mixed_indices_capacity += (
-                            bs - forward_batch.batch_size
-                        ) * int(self.max_context_len)
+                    # This is the eager path, so ``bs`` is the real batch size
+                    # and ``seq_lens_sum`` bounds both tiers exactly: every
+                    # position is classified as either HP or quant, so
+                    # ``hp_total + quant_total == seq_lens_sum``. Padded
+                    # replays never come through here -- they go through
+                    # ``init_forward_metadata_replay_cuda_graph``, which writes
+                    # into the ``max_bs * max_context_len`` graph buffers.
                     mixed_hp_kv_indices = torch.empty(
-                        mixed_indices_capacity,
+                        forward_batch.seq_lens_sum,
                         dtype=torch.int64,
                         device=self.device,
                     )
                     mixed_quant_kv_indices = torch.empty(
-                        mixed_indices_capacity,
+                        forward_batch.seq_lens_sum,
                         dtype=torch.int64,
                         device=self.device,
                     )
