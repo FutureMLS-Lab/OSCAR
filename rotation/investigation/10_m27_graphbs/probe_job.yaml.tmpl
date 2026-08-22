@@ -1,0 +1,78 @@
+# 1-GPU job template for the two offline graph-vs-eager probes.
+#
+#   PROBE=kernel_graph_probe.py     replays the real INT2 mixed-KV decode
+#                                   kernels through sglang's capture order and
+#                                   shared scratch, eager vs graph, bs 1..32
+#   PROBE=metadata_graph_probe.py   diffs every tensor the decode path derives
+#                                   (indptr/indices/split counts/-inf prefill)
+#                                   between init_forward_metadata and
+#                                   init_forward_metadata_replay_cuda_graph
+#
+# Both need only torch+triton and the fork's python/ on PYTHONPATH; neither
+# loads a model. Fill PROBE_B64 with `base64 -w0 <probe>` and submit.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-graphprobe
+  namespace: charlie
+  labels: {app: zz-graphprobe}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: zz-graphprobe}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostIPC: true
+      priorityClassName: normal
+      schedulerName: volcano
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+      containers:
+      - name: probe
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        env:
+        - {name: PROBE_B64, value: "REPLACE_ME"}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        resources:
+          limits: {nvidia.com/gpu: "1"}
+          requests: {nvidia.com/gpu: "1"}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home-charlie, mountPath: /home/charlie}
+        - {name: scratch, mountPath: /tmp}
+        command: ["/bin/bash","-lc"]
+        args:
+        - |
+          set -uo pipefail
+          export CUDA_VISIBLE_DEVICES=$(ls /var/run/nvidia-container-devices | paste -sd,)
+          export HOME=/tmp/h XDG_CACHE_HOME=/tmp/xdg TMPDIR=/tmp
+          export TVM_FFI_CACHE_DIR=/tmp/tvmffi TORCH_EXTENSIONS_DIR=/tmp/torch_ext
+          export SGLANG_CACHE_DIR=/tmp/sglcache TRITON_CACHE_DIR=/tmp/triton
+          mkdir -p /tmp/h /tmp/xdg /tmp/tvmffi /tmp/torch_ext /tmp/sglcache /tmp/triton /tmp/tree
+          # /shared trees are shared and get `git checkout -f`d by other jobs
+          # while this one imports Python from them -- copy and pin.
+          cp -a /shared/zz-m27-recheck/tree_post/sglang-research /tmp/tree/ || exit 9
+          echo "$PROBE_B64" | base64 -d > /tmp/probe.py
+          source /home/charlie/miniconda3/etc/profile.d/conda.sh
+          conda activate oscar
+          export PYTHONPATH=/shared/charlie/py_extra
+          TREE=/tmp/tree python /tmp/probe.py
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}
+      - {name: scratch, emptyDir: {}}
