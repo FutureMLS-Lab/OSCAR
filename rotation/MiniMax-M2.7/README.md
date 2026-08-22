@@ -78,6 +78,18 @@ Two things compounding, neither of them quantization:
    `--disable-overlap-schedule` (58.3) and `--cuda-graph-max-bs 16` (64.6) all
    stay broken against the 62.5 baseline.
 
+   End-to-end after the fix, full GPQA-198 at **concurrency 16, max-bs 32**
+   (graphs on, 84-87% of decode steps replay the bs=16 graph):
+
+   | arm | score | answered | repetitive tails | median chars |
+   |---|:---:|:---:|:---:|:---:|
+   | broken tree, conc 16 | 53.54 / 55.56 | 135 / 141 | 27 / 19 | 61k / 62k |
+   | **fixed tree, conc 16** | **81.31 / 79.29 / 77.27** | 179 / 178 / 174 | **0 / 0 / 0** | 36k / 34k / 33k |
+   | reference: conc 8, either tree | 80.81 / 80.30 | 185 / 182 | 0 / 0 | 33k |
+
+   Mean 79.29 over three seeds, against 80.56 at concurrency 8 and 78.96 for
+   the paired BF16 arms -- concurrency is no longer a variable on this model.
+
 2. **The comparison itself was asymmetric.** Every INT2 arm ran concurrency 15
    (the broken regime) and every BF16 arm ran concurrency 7 (the healthy one) —
    an asymmetry inherited from investigation 06 for KV-pool-size reasons. That is
