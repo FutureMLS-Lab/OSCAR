@@ -56,7 +56,12 @@ if [[ "${MODE}" == "bf16" ]]; then
 elif [[ "${MODE}" == "calibrated" ]]; then
     : "${ROT_DIR:?ROT_DIR required for calibrated}"
     SERVER_ARGS=( "${COMMON_ARGS[@]}" --kv-cache-dtype int2 --kv-cache-quant-group-size 128
-        --prefill-attention-backend fa3 --decode-attention-backend triton --disable-radix-cache )
+        --prefill-attention-backend fa3 --decode-attention-backend triton
+        # Kept off here on purpose: this harness is the historical control that
+        # several published numbers were measured with, and changing it would
+        # silently make new runs incomparable to them. Everything else defaults
+        # the cache ON now that the two defects behind the old rule are fixed.
+        --disable-radix-cache )
     echo "[matrix:oscar] model=${MODEL} tp=${TP_SIZE} rot=${ROT_DIR} out=${OUT_BASE}"
     SGLANG_ENABLE_MIXED_KV_WINDOWS=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
       SGLANG_MIXED_KV_HP_MAX_SPLITS=8 SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-64}" \

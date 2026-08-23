@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Prefix caching is ON by default: the two defects that forced it off are
+# fixed, and cache-ON measured indistinguishable from cache-OFF across four
+# paired arms. Set DISABLE_RADIX=1 to turn it back off for an A/B.
 # Serve Qwen3-30B-A3B with INT2 KV + per-head rotations.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,5 +43,5 @@ env \
     --kv-cache-dtype int2 --kv-cache-quant-group-size 128 \
     --prefill-attention-backend fa3 --decode-attention-backend triton \
     --mem-fraction-static "${MEM_FRACTION_STATIC:-0.75}" \
-    --disable-radix-cache --trust-remote-code \
+    ${DISABLE_RADIX:+--disable-radix-cache} --trust-remote-code \
     --host 127.0.0.1 --port "${PORT}" "$@"

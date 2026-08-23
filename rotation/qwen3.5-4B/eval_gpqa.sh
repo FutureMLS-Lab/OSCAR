@@ -28,8 +28,18 @@ if [[ "${MODE}" == "hadamard" || "${MODE}" == "calibrated" ]]; then
     export V_ROT_FILENAME="v_rotation.pt"
     export SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP}"
     export SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP}"
-    export SGLANG_OSCAR_ABSORB_V_ROTATION=1
-    EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --disable-radix-cache"
+    # V-rotation absorption folds R_v into o_proj and assumes one rotation
+    # per layer, so it is invalid for per-head (format_version 2) files and
+    # was 0 in every measured arm. Overridable rather than hardcoded.
+    export SGLANG_OSCAR_ABSORB_V_ROTATION="${ABSORB_V:-0}"
+    # Prefix caching is ON by default now: the two defects that forced it off
+    # (CUDA-graph padding writing into HP-prefix page 0, and a cached prefix
+    # eating the borrower's BF16 HP-recent window) are fixed, and cache-ON
+    # measured indistinguishable from cache-OFF across four paired arms.
+    # Set DISABLE_RADIX=1 to A/B it. Note that on a mamba/linear-attention
+    # model --disable-radix-cache is not merely a downgrade: it raises
+    # ValueError together with --mamba-scheduler-strategy extra_buffer, which
+    # is what INT2 needs for page_size 8.
     export EXTRA_SERVER_ARGS
     export RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/_eval_gpqa_${MODE}}"
     exec bash "${SCRIPT_DIR}/../eval_oscar_gpqa.sh"

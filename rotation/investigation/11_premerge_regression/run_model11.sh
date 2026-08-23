@@ -153,18 +153,39 @@ for path in sys.argv[1:]:
     layers = o["layers"] if isinstance(o, dict) and "layers" in o else o
     items = sorted(layers.items(), key=lambda kv: str(kv[0]))
     rots = [v["rotation"] if isinstance(v, dict) else v for _, v in items]
-    worst, sms = 0.0, []
+    # A per-(layer, KV head) V2 rotation is [H, d, d]; `A.T` raises on a 3-D
+    # tensor in torch 2.x, so the original 2-D-only check REJECTED the real
+    # per-head format -- and the tempting workaround (fall back to the shared
+    # file) is exactly the silent-Hadamard failure this gate exists to prevent.
+    # Validate every head's matrix independently instead, and refuse anything
+    # that is neither 2-D nor 3-D rather than letting it through unchecked.
+    worst, sms, n_mats = 0.0, [], 0
     for R in rots:
         A = R.float()
-        I = torch.eye(A.shape[-1], dtype=A.dtype)
-        worst = max(worst, (A @ A.T - I).abs().max().item())
+        if A.dim() == 2:
+            blocks = [A]
+        elif A.dim() == 3:
+            blocks = [A[i] for i in range(A.shape[0])]
+        else:
+            raise AssertionError(
+                f"unexpected rotation ndim={A.dim()} shape={tuple(A.shape)} "
+                f"in {path} -- refusing to serve an unvalidated rotation")
+        for B in blocks:
+            assert B.shape[-1] == B.shape[-2], f"non-square block {tuple(B.shape)}"
+            I = torch.eye(B.shape[-1], dtype=B.dtype)
+            worst = max(worst, (B @ B.T - I).abs().max().item())
+            n_mats += 1
         a = A.abs()
         sms.append((a.std() / a.mean()).item())
     sm = sum(sms) / len(sms)
     fv = o.get("format_version") if isinstance(o, dict) else None
     print(f"[preflight] rotation {path.split('/')[-1]}: format_version={fv} "
           f"n_layers={len(rots)} shape={tuple(rots[0].shape)} "
+          f"matrices_checked={n_mats} "
           f"max|RRt-I|={worst:.3e} |entry|spread/mean={sm:.4f}")
+    if rots[0].dim() == 3 and fv not in (2, "2"):
+        print(f"[preflight] WARNING: 3-D rotation but format_version={fv!r}; "
+              f"per-head files should declare format_version 2")
     assert worst < 1e-3, f"NOT ORTHOGONAL ({worst:.3e})"
     # Hadamard: every |entry| identical -> spread/mean == 0 exactly.
     assert sm > 0.20, f"HADAMARD-LIKE spread/mean {sm:.4f} -- silent fallback"
