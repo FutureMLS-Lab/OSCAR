@@ -263,23 +263,48 @@ def main() -> None:
         print(f"{r['tag']:>10} {r['pool'] or '-':>13} {r['n_scored']:>8} "
               f"{r['nll']:>9.4f} {r['ppl']:>10.3f}")
 
+    # An absolute NLL threshold is the wrong test and the first run proved it:
+    # on the repeated passage BF16 scores 0.00242 and fake-quant 0.00243, so the
+    # corpus cannot resolve the quantization cost that GPQA measures at -2.02 pp.
+    # A threshold calibrated in absolute NLL would have called any packed result
+    # "agrees" -- including a genuinely broken one.
+    #
+    # The scale-free statistic is the ratio: fake-quant minus BF16 *is* the cost
+    # of quantizing, measured on this corpus with this rotation, so it is the
+    # natural unit for whatever packed adds on top. R below 1 means packed adds
+    # less than quantization itself; R of 5 means it adds five times more.
+    have = {"packed", "fakequant", "bf16"} <= set(by)
     if "packed" in by and "fakequant" in by:
         d = by["packed"]["nll"] - by["fakequant"]["nll"]
-        rel = by["packed"]["ppl"] / by["fakequant"]["ppl"] - 1.0
-        print(f"\npacked - fakequant: dNLL = {d:+.4f}  ({rel*100:+.2f}% PPL)")
-        # The whole point of the measurement is which branch this selects, so
-        # say it rather than leaving the reader to infer it.
-        if abs(d) < 0.005:
-            print("  -> read paths agree. The GPQA gap is NOT the read path's "
-                  "numerics; look at trajectory divergence, the window arena's "
-                  "hit rate under sampling, or prefill.")
-        else:
-            print("  -> the read path itself is degraded. This is the GPQA gap's "
-                  "mechanism and it is reproducible on one GPU.")
+        print(f"\npacked - fakequant: dNLL = {d:+.3e}")
     if "fakequant" in by and "bf16" in by:
-        print(f"fakequant - bf16:   dNLL = "
-              f"{by['fakequant']['nll'] - by['bf16']['nll']:+.4f}  "
-              f"(the quantization cost this rotation is expected to pay)")
+        q = by["fakequant"]["nll"] - by["bf16"]["nll"]
+        print(f"fakequant - bf16:   dNLL = {q:+.3e}  "
+              f"(the cost of quantizing at all -- the unit below)")
+    if have:
+        q = by["fakequant"]["nll"] - by["bf16"]["nll"]
+        d = by["packed"]["nll"] - by["fakequant"]["nll"]
+        if q <= 0:
+            print("\n  quantization measured as free or better on this corpus, "
+                  "so it gives no unit and no ratio can be formed. The corpus "
+                  "is too easy -- rerun with CORPUS=docs before concluding "
+                  "anything about packed.")
+        else:
+            r = d / q
+            print(f"\n  R = (packed - fakequant) / (fakequant - bf16) = {r:.2f}")
+            if q < 1e-4:
+                print(f"    CAUTION: the unit itself is {q:.1e}, far below the "
+                      "-2.02 pp this rotation costs on GPQA, so this corpus "
+                      "barely resolves quantization at all. Treat R as a "
+                      "direction, not a magnitude, and confirm with "
+                      "CORPUS=docs.")
+            if r > 0.5:
+                print("    -> packed adds real damage on top of quantization. "
+                      "The read path is implicated, not exonerated.")
+            else:
+                print("    -> packed adds little on top of quantization; look "
+                      "at trajectory divergence, the window arena's hit rate "
+                      "under sampling, or prefill.")
 
 
 if __name__ == "__main__":
