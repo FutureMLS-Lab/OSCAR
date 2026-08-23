@@ -77,7 +77,11 @@ def corpus() -> str:
         "survivable at all; keeping a small window in full precision covers the "
         "positions the rotation cannot rescue. "
     )
-    return para * (TARGET_TOKENS // 80 + 2)
+    # ~161 tokens per repetition, measured: the first run assumed 80 and built
+    # an 8,535-token prompt against an 8,192-token context, so all three arms
+    # died on the same HTTP 400 and the job measured nothing. Budget from the
+    # real rate and leave headroom.
+    return para * max(2, TARGET_TOKENS // 161)
 
 
 def launch(tag: str, env_over: dict) -> dict:
