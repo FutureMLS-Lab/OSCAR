@@ -651,39 +651,44 @@ class _PackedLatentMixin(_Int2HPMixin):
 
         P, W = self._win_p, self._win_r
         r2t = meta["req_to_token"]
-        want_total = 0
-        got_total = 0
-        # One request is enough to detect a broken tag and keeps this cheap
-        # enough to leave on; a per-request loop over a batch of 64 inside a
-        # decode step is not.
-        for i in range(min(1, int(req_idx.numel()))):
-            seq = int(seq_lens[i].item())
-            row = int(req_idx[i].item())
-            if seq <= 0:
-                continue
-            pos = torch.cat([
-                torch.arange(min(P, seq), device=r2t.device),
-                torch.arange(max(seq - W, P), seq, device=r2t.device),
-            ])
-            if pos.numel() == 0:
-                continue
-            slots = r2t[row, pos].to(torch.int64)
-            rows = self.hp_row_of_slot[slots].to(torch.int64)
-            ok = rows >= 0
-            owner = self.hp_owner_of_row[rows.clamp(min=0)]
-            ok = ok & (owner == slots.to(owner.dtype))
-            want_total += int(pos.numel())
-            got_total += int(ok.sum().item())
 
-        if want_total == 0:
+        # One request is enough to detect a broken tag, and a per-request loop
+        # over a batch of 64 inside a decode step is not something to leave on.
+        seq = int(seq_lens[0].item())
+        row = int(req_idx[0].item())
+
+        # Only audit once the ring has wrapped. Below P + W every position is
+        # still resident in its first ring row, so the tag is trivially right
+        # and says nothing -- and an unguarded `arange(max(seq - W, P), seq)`
+        # with seq < P has a start above its stop, which is a RuntimeError that
+        # took a server down rather than skipping a useless sample.
+        if seq <= P + W:
             return
+
+        pos = torch.cat([
+            torch.arange(P, device=r2t.device),
+            torch.arange(seq - W, seq, device=r2t.device),
+        ])
+        slots = r2t[row, pos].to(torch.int64)
+        rows = self.hp_row_of_slot[slots].to(torch.int64)
+        ok = rows >= 0
+        owner = self.hp_owner_of_row[rows.clamp(min=0)]
+        ok = ok & (owner == slots.to(owner.dtype))
+        # Split the two tiers: the sink is written once at prefill and must never
+        # be evicted, the recent ring is rewritten every step. A failure in one
+        # and not the other says which mechanism is wrong.
+        sink_ok = int(ok[:P].sum().item())
+        rec_ok = int(ok[P:].sum().item())
+        want_total = int(pos.numel())
+        got_total = sink_ok + rec_ok
         frac = got_total / want_total
         self._audit_worst = min(getattr(self, "_audit_worst", 1.0), frac)
         logger.info(
-            "[MLAPacked] arena audit%s seq_lens[0]=%d expected=%d accepted=%d "
-            "(%.1f%%, worst %.1f%%)",
-            f" {tag}" if tag else "", int(seq_lens[0].item()),
-            want_total, got_total, 100.0 * frac, 100.0 * self._audit_worst,
+            "[MLAPacked] arena audit%s seq=%d expected=%d accepted=%d "
+            "(%.1f%%, worst %.1f%%) sink %d/%d recent %d/%d",
+            f" {tag}" if tag else "", seq, want_total, got_total,
+            100.0 * frac, 100.0 * self._audit_worst,
+            sink_ok, P, rec_ok, W,
         )
 
 
