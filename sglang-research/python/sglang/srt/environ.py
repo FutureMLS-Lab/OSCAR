@@ -252,6 +252,7 @@ class Envs:
     # top of the output tile.
     SGLANG_OSCAR_MLA_PACKED_BLOCK_N = EnvInt(16)
     SGLANG_OSCAR_MLA_PACKED_WARPS = EnvInt(8)
+    SGLANG_OSCAR_MLA_PACKED_STAGES = EnvInt(1)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in

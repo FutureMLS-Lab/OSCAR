@@ -52,6 +52,21 @@ done
 echo "[job] exit=$rc"
 """
 
+KBENCH = _PROLOGUE + r"""
+export RUN_DIR=$R/__RUNDIR__; mkdir -p $RUN_DIR
+python3 -u $W/rotation/investigation/13_mla_packed_int2/bench_kernel.py 16 16 20000 \
+  2>&1 | tee $RUN_DIR/kbench.log
+echo "[job] exit=${PIPESTATUS[0]}"
+"""
+
+CAPACITY = _PROLOGUE + r"""
+export RUN_DIR=$R/__RUNDIR__; mkdir -p $RUN_DIR
+export OUT_DIR=$RUN_DIR HF_HUB_OFFLINE=1
+python3 -u $W/rotation/investigation/13_mla_packed_int2/bench_capacity.py \
+  2>&1 | tee $RUN_DIR/capacity.log
+echo "[job] exit=${PIPESTATUS[0]}"
+"""
+
 PROBE = _PROLOGUE + r"""
 export RUN_DIR=$R/__RUNDIR__; mkdir -p $RUN_DIR
 export OUT_DIR=$RUN_DIR
@@ -157,7 +172,7 @@ def emit(name, body, gpus, cpu, mem):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["unit", "probe", "smoke", "gpqa", "gpqa-fake"])
+    ap.add_argument("kind", choices=["unit", "probe", "kbench", "capacity", "smoke", "gpqa", "gpqa-fake"])
     ap.add_argument("--tag", default="a")
     ap.add_argument("--pin", default=PIN)
     ap.add_argument("--out", default=None)
@@ -167,6 +182,14 @@ def main() -> None:
         run = f"mlapacked_unit_{a.tag}"
         body = UNIT.replace("__PIN__", a.pin).replace("__RUNDIR__", run)
         doc = emit(f"zz-mlapk-unit-{a.tag}", body, 1, "8", "64Gi")
+    elif a.kind == "kbench":
+        run = f"mlapacked_kbench_{a.tag}"
+        body = KBENCH.replace("__PIN__", a.pin).replace("__RUNDIR__", run)
+        doc = emit(f"zz-mlapk-kbench-{a.tag}", body, 1, "16", "200Gi")
+    elif a.kind == "capacity":
+        run = f"mlapacked_capacity_{a.tag}"
+        body = CAPACITY.replace("__PIN__", a.pin).replace("__RUNDIR__", run)
+        doc = emit(f"zz-mlapk-cap-{a.tag}", body, 1, "16", "220Gi")
     elif a.kind == "probe":
         run = f"mlapacked_probe_{a.tag}"
         body = PROBE.replace("__PIN__", a.pin).replace("__RUNDIR__", run)

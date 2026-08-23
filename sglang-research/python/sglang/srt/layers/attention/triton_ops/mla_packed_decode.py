@@ -227,6 +227,8 @@ def packed_mla_decode_stage1(
     sm_scale_withk,
     logit_cap,
     block_n: int = 0,
+    num_warps: int = 0,
+    num_stages: int = 0,
 ):
     """``q`` is ``[batch, head, D+DPE]``; ``operands`` from ``packed_read_operands``."""
     codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
@@ -236,7 +238,8 @@ def packed_mla_decode_stage1(
     # register file -- the kernel still runs, but every spill is a round trip to
     # local memory, which is precisely the bandwidth this path exists to save.
     block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
-    num_warps = envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
+    num_warps = num_warps or envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
+    num_stages = num_stages or envs.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
     d_pe = rope.shape[-1]
     d = codes.shape[-1] * 4
     assert q.shape[-1] == d + d_pe, (q.shape, d, d_pe)
@@ -279,7 +282,7 @@ def packed_mla_decode_stage1(
         HAS_HP=has_hp,
         logit_cap=logit_cap,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
     )
 
 
