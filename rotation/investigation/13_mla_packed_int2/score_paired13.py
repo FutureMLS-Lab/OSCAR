@@ -84,7 +84,9 @@ def main() -> None:
     if len(sys.argv) < 4:
         print(__doc__)
         return
-    csv_path, *dirs = sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a != "--growth"]
+    growth = "--growth" in sys.argv
+    csv_path, *dirs = args
     correct_texts = set(key_from_csv(csv_path))
     arms = [(os.path.basename(d.rstrip("/")), load(d)) for d in dirs]
 
@@ -121,6 +123,26 @@ def main() -> None:
         se = 100.0 * ((b + c) ** 0.5) / n
         print(f"  {base} - {name}: delta {delta:+.2f} pp  paired SE +-{se:.2f} pp  "
               f"discordant {b}/{c}  exact p = {mcnemar_exact(b, c):.4f}")
+
+    if growth:
+        # Is the number still moving? Every wrong call in this investigation has
+        # been a partial-n signal read as a result -- 21/21 agreement that became
+        # -12.20 at 41, a 1/3 transparency gap that became 1/12, a +9.09 that was
+        # a code-pin confound. A delta resting on five discordant pairs needs to
+        # be shown settling, not just reported.
+        print("\n=== delta vs prefix size (has it settled?) ===")
+        print(f"{'n':>5}  " + "  ".join(f"{nm[:14]:>14}" for nm, _ in arms[1:])
+              + "   discordant")
+        step = max(10, len(usable) // 8)
+        for k in range(step, len(usable) + 1, step):
+            row, disc = [], []
+            for name, _ in arms[1:]:
+                a, b_ = res[base][:k], res[name][:k]
+                b = sum(1 for x, y in zip(a, b_) if x and not y)
+                c = sum(1 for x, y in zip(a, b_) if y and not x)
+                row.append(f"{100.0*(sum(a)-sum(b_))/k:>+13.2f}")
+                disc.append(f"{b}/{c}")
+            print(f"{k:>5}  " + "  ".join(row) + "   " + " ".join(disc))
 
     print("\nCAVEAT, and it is load-bearing: these are the ids that finished "
           "first, so the set is biased toward SHORT generations. INT2's cost in "
