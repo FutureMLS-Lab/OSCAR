@@ -121,11 +121,12 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
     return info
 
 
-def ask_one(prompt: str) -> str:
+def ask_one(prompt: str, max_new: int | None = None) -> str:
     body = json.dumps({
         "text": prompt,
         "sampling_params": {"temperature": 0.7, "top_p": 0.95,
-                            "max_new_tokens": MAX_NEW},
+                            "max_new_tokens": MAX_NEW if max_new is None
+                            else max_new},
     }).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{PORT}/generate", data=body,
@@ -161,6 +162,16 @@ def drive(p, log_path: str) -> dict:
         # read a prefix whose window rows belong to another.
         import threading
         outs = [None] * len(PROMPTS)
+
+        # Firing them all at once does NOT produce prefix sharing: they arrive
+        # together, so none can hit a cache the others have not written yet.
+        # A first run measured #cached-token max 5 over six requests sharing a
+        # ~55-token prefix and read 100% clean, which said nothing at all.
+        # Populate the cache with one request first, and let it FINISH so its
+        # req index is freed and handed to one of the concurrent batch -- the
+        # reclamation is the thing under test, not merely the hit.
+        warm = ask_one(PROMPTS[0], max_new=int(os.environ.get("WARM_NEW", "64")))
+        print(f"  [warmup] {str(warm)[:120]!r}", flush=True)
 
         def one(i, prompt):
             outs[i] = ask_one(prompt)
