@@ -83,6 +83,12 @@ from sglang.srt.mem_cache.mla_int2_kv_pool import _Int2HPMixin
 logger = logging.getLogger(__name__)
 
 
+def envs_selfcheck_budget() -> int:
+    from sglang.srt.environ import envs
+
+    return int(envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK_BUDGET.get())
+
+
 def packed_latent_bytes_per_token(kv_lora_rank: int, qk_rope_head_dim: int,
                                   group_size: int, param_dtype_bytes: int = 4) -> int:
     """Bytes one token of latent occupies per layer under packed storage.
@@ -199,13 +205,19 @@ class _PackedLatentMixin(_Int2HPMixin):
         # the warmup forward has already grown it to the largest decode shape.
         self._read_scratch: Optional[torch.Tensor] = None
         self._deq_scratch: Optional[torch.Tensor] = None
-        self._shadow: Optional[list] = None
-        if selfcheck:
-            self._shadow = [
-                torch.zeros((n_rows, R), dtype=self.dtype, device=self.device)
-                for _ in range(self.layer_num)
-            ]
-            self._selfcheck_reports = 0
+        # The self-check verifies each write immediately, against a reference
+        # computed from the values in hand. The obvious design -- shadow the
+        # whole pool with the BF16 fake-quant result -- is not available here
+        # and the reason is the point of the change: the packed pool is ~3x
+        # more rows than the BF16 one, so its shadow is ~157 GB and OOMs during
+        # construction. Verifying at the write covers every row that is ever
+        # read, because a row's packed bytes are written exactly once.
+        self._selfcheck = selfcheck
+        self._selfcheck_budget = (
+            envs_selfcheck_budget() if selfcheck else 0
+        )
+        self._selfcheck_worst = 0.0
+        self._selfcheck_n = 0
 
         bytes_tok = packed_latent_bytes_per_token(
             R, self.qk_rope_head_dim, group_size
@@ -401,16 +413,8 @@ class _PackedLatentMixin(_Int2HPMixin):
         else:
             self.hp_row_of_slot[loc64] = -1
 
-        if self._shadow is not None:
-            from sglang.QuantKernel.mla_latent_int2 import quantize_dequantize_reuse
-
-            _c, _p, deq = quantize_dequantize_reuse(
-                c, self._group_size, self._lloyd_max
-            )
-            ref = deq.to(self.dtype).clone()
-            if ring is not None:
-                ref = torch.where(keep.unsqueeze(-1), c.to(self.dtype), ref)
-            self._shadow[li][loc64] = ref
+        if self._selfcheck_budget > 0:
+            self._selfcheck_write(layer_id, loc64, c, keep)
 
     def set_kv_buffer(self, layer, loc, cache_k, cache_v):
         """NSA/triton write path: ``cache_k`` is ``[c_kv | k_pe]`` concatenated."""
@@ -489,28 +493,43 @@ class _PackedLatentMixin(_Int2HPMixin):
         )
         return out.view(n, 1, D)
 
-    def selfcheck_rows(self, layer_id: int, slots: torch.Tensor) -> Optional[dict]:
-        """Compare a materialized read against the BF16 fake-quant shadow.
+    def _selfcheck_write(self, layer_id: int, loc: torch.Tensor,
+                         c_rot: torch.Tensor, keep) -> None:
+        """Read back the rows just written and compare to the fake-quant value.
 
-        Returns ``None`` unless the shadow is on. The shadow stores exactly what
-        ``mla_int2_kv_pool`` would have put in its BF16 cache (rotated frame),
-        so a match is the equivalence statement: *the packed read path returns
-        the same latent the fake-quant path measured*.
+        This is the equivalence statement that makes a packed score comparable
+        to the fake-quant 80.30: for the same input latent, the packed store
+        plus the read path return what ``_fake_quant_int2_groupwise`` returns --
+        except on window rows, which must come back untouched.
+
+        It runs on a budget and then stops, so it covers the first few hundred
+        writes (every layer, both forward modes) rather than the whole run. A
+        divergence that only appears later would be missed; the claim is
+        "equivalent over the covered writes", not "equivalent for all time".
         """
-        if self._shadow is None:
-            return None
-        li = layer_id - self.start_layer
-        slots = slots.reshape(-1)
-        got = self.materialize_rows(layer_id, slots)[:, 0, : self.kv_lora_rank]
-        want = self._shadow[li][slots.to(torch.int64)]
+        from sglang.QuantKernel.mla_latent_int2 import quantize_dequantize_reuse
+
+        self._selfcheck_budget -= 1
+        self._selfcheck_n += 1
+        _c, _p, deq = quantize_dequantize_reuse(
+            c_rot, self._group_size, self._lloyd_max
+        )
+        want = deq.to(self.dtype)
+        if keep is not None:
+            want = torch.where(keep.unsqueeze(-1), c_rot.to(self.dtype), want)
+        got = self.materialize_rows(layer_id, loc)[:, 0, : self.kv_lora_rank]
         diff = (got.float() - want.float()).abs()
-        den = want.float().abs().max().clamp(min=1e-6)
-        return {
-            "layer": layer_id,
-            "n": int(slots.numel()),
-            "max_abs": float(diff.max()),
-            "rel": float(diff.max() / den),
-        }
+        rel = float(
+            diff.max() / want.float().abs().max().clamp(min=1e-6)
+        )
+        if rel > self._selfcheck_worst or self._selfcheck_budget == 0:
+            self._selfcheck_worst = max(self._selfcheck_worst, rel)
+            logger.info(
+                "[MLAPacked] selfcheck layer=%d rows=%d max_abs=%.3e rel=%.3e "
+                "worst_rel=%.3e over %d writes (budget left %d)",
+                layer_id, int(loc.numel()), float(diff.max()), rel,
+                self._selfcheck_worst, self._selfcheck_n, self._selfcheck_budget,
+            )
 
 
 class MLAPackedInt2KVPool(_PackedLatentMixin, MLATokenToKVPool):
