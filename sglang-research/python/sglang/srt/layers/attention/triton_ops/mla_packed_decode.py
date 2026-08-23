@@ -133,37 +133,26 @@ def _fwd_packed_mla_stage1(
             ).to(tl.int64)
 
             # ---- dequantize the latent for this block: [BLOCK_N, D] --------
-            # ``scale`` and ``zero`` are per *group*, i.e. NG values per row, not
-            # D. Loading them at [BLOCK_N, D] (which the address pattern lets you
-            # do, since it just repeats every GS) was 64 of the 72 KiB this
-            # kernel moved per block -- against the 18 KiB of the BF16 kernel it
-            # has to beat. Load them as [BLOCK_N] vectors instead, once per
-            # group, and broadcast along D by arithmetic: 4 loads of 64 B in
-            # place of two 32 KiB tiles, with the same values out.
-            #
-            # The code bytes stay on the [BLOCK_N, D] pattern. Each byte is still
-            # read four times (columns r, r+1, r+2, r+3 share byte r//4) but that
-            # is only 8 KiB per block and it is L1-served; removing it would mean
-            # a planar within-group pack, which buys 6 KiB at the cost of
-            # expanding a [BLOCK_N, GS/4] tile into a D-slice that Triton cannot
-            # index. Not worth it while the scales dominate.
             byte = tl.load(
                 Codes + kv_loc[:, None] * (D // 4) + (offs_d // 4)[None, :],
                 mask=n_ok[:, None],
                 other=0,
             ).to(tl.int32)
-            code = ((byte >> (2 * (offs_d % 4))[None, :]) & 0x3).to(tl.float32)
-            cv = tl.zeros([BLOCK_N, D], dtype=tl.float32)
-            for g in tl.static_range(NG):
-                sg = tl.load(Params + kv_loc * (2 * NG) + 2 * g,
-                             mask=n_ok, other=0.0)
-                zg = tl.load(Params + kv_loc * (2 * NG) + 2 * g + 1,
-                             mask=n_ok, other=0.0)
-                if LLOYD:
-                    vg = (code - zg[:, None]) * sg[:, None]
-                else:
-                    vg = code * sg[:, None] + zg[:, None]
-                cv = tl.where((gid == g)[None, :], vg, cv)
+            code = (byte >> (2 * (offs_d % 4))[None, :]) & 0x3
+            scale = tl.load(
+                Params + kv_loc[:, None] * (2 * NG) + (2 * gid)[None, :],
+                mask=n_ok[:, None],
+                other=0.0,
+            )
+            zero = tl.load(
+                Params + kv_loc[:, None] * (2 * NG) + (2 * gid + 1)[None, :],
+                mask=n_ok[:, None],
+                other=0.0,
+            )
+            if LLOYD:
+                cv = (code.to(tl.float32) - zero) * scale
+            else:
+                cv = code.to(tl.float32) * scale + zero
 
             # Narrow to the compute dtype immediately. The dequant chain is
             # elementwise-fused, so the fp32 code/scale/zero values never form a

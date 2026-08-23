@@ -158,10 +158,8 @@ def main() -> None:
     # four times) plus scale and zero as [BLOCK_N, D] fp32, where the unique
     # information is [BLOCK_N, D/4] bytes and 2 x [BLOCK_N] floats.
     for bn in (16, 32):
-        # codes on the [BLOCK_N, D] pattern (each byte read 4x) + scale and
-        # zero as [BLOCK_N] vectors, one pair per group.
-        moved = bn * R * 1 + bn * NG * 2 * 4
-        unique = bn * (R // 4) + bn * NG * 2 * 4
+        moved = bn * R * 1 + bn * R * 4 * 2
+        unique = bn * (R // 4) + bn * 2 * 4
         bf16 = bn * (R + ROPE) * 2
         print(f"  BLOCK_N={bn}: dequant path moves {moved/1024:.1f} KiB/block for "
               f"{unique/1024:.1f} KiB of information; BF16 moves {bf16/1024:.1f} KiB "
