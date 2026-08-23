@@ -142,12 +142,18 @@ def scrape(log_path: str) -> dict:
     tp = [float(x) for x in re.findall(r"gen throughput \(token/s\): ([0-9.]+)", t)]
     tp_s = sorted(tp)
     return {
+        # Two sources: the server_args echo, and the pool's own allocation
+        # line. The second is authoritative -- it is what the pool actually
+        # built -- and it is the one that survives a server that dies before
+        # the args echo.
         "max_total_num_tokens": one(r"max_total_num_tokens=(\d+)", int),
+        "pool_tokens": one(r"KV Cache is allocated\. #tokens: (\d+)", int),
         "kv_cache_dtype": one(r"kv_cache_dtype='([a-z0-9_]+)'"),
         "disable_radix_cache": one(r"disable_radix_cache=(\w+)"),
         "captured_bs": one(r"Capture cuda graph bs (\[[^\]]*\])"),
         "graph_true": g_true, "graph_false": g_false,
-        "kv_alloc": one(r"KV Cache is allocated\. #tokens: \d+, KV size: ([0-9.]+) GB"),
+        "kv_alloc_gb": one(r"KV Cache is allocated\. #tokens: \d+, KV size: ([0-9.]+) GB",
+                           float),
         "packed_line": one(r"(\[MLAPacked\] packed latent storage: [^\n]*)"),
         "write_path": one(r"(\[Int2HPKVPool\] write path=[^\n]*)"),
         "selfcheck": one(r"(\[MLAPacked\] selfcheck [^\n]*worst_rel=[^\n]*)"),
@@ -172,7 +178,7 @@ def main() -> None:
     print("\n================ RESULT ================")
     for r in results:
         print(f"\n--- {r['tag']} (packed={r['packed']}) ---")
-        for k in ("error", "max_total_num_tokens", "kv_alloc", "kv_cache_dtype",
+        for k in ("error", "pool_tokens", "max_total_num_tokens", "kv_alloc_gb", "kv_cache_dtype",
                   "disable_radix_cache", "captured_bs", "graph_true", "graph_false",
                   "cache_hit", "decode_tok_s_median", "wall_s", "packed_line",
                   "write_path", "selfcheck", "error_lines"):
@@ -180,10 +186,11 @@ def main() -> None:
                 print(f"  {k}: {r[k]}")
     a = next((r for r in results if not r["packed"]), None)
     b = next((r for r in results if r["packed"]), None)
-    if a and b and a.get("max_total_num_tokens") and b.get("max_total_num_tokens"):
-        ratio = b["max_total_num_tokens"] / a["max_total_num_tokens"]
-        print(f"\nPOOL: fake-quant {a['max_total_num_tokens']:,} -> "
-              f"packed {b['max_total_num_tokens']:,}  = {ratio:.2f}x")
+    ka = (a or {}).get("pool_tokens") or (a or {}).get("max_total_num_tokens")
+    kb = (b or {}).get("pool_tokens") or (b or {}).get("max_total_num_tokens")
+    if ka and kb:
+        ratio = kb / ka
+        print(f"\nPOOL: fake-quant {ka:,} -> packed {kb:,}  = {ratio:.2f}x")
         print("VERDICT:", "storage landed" if ratio > 1.5 else
               "STORAGE DID NOT CHANGE -- the pool is still BF16-sized")
     with open(os.path.join(OUT, "probe.json"), "w") as f:

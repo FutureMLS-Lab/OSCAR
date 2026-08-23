@@ -237,7 +237,13 @@ class _PackedLatentMixin(_Int2HPMixin):
             n_hp * R * 2 * self.layer_num / (1 << 30),
             group_size,
             lloyd_max,
+            selfcheck,
         )
+        # The parent constructor already logged an allocation line, but it ran
+        # before any of these buffers existed and therefore reported 0.00 GB.
+        # Restate it now that the numbers are real -- this line is the one a
+        # reader will use to decide whether the storage change landed.
+        self._finalize_allocation_log(self.size)
 
     # ── accounting ──────────────────────────────────────────────────────────
 
@@ -413,7 +419,13 @@ class _PackedLatentMixin(_Int2HPMixin):
         else:
             self.hp_row_of_slot[loc64] = -1
 
-        if self._selfcheck_budget > 0:
+        # The self-check reads a max back to the host, which is illegal inside a
+        # graph capture ("operation not permitted when stream is capturing") and
+        # would also bake a one-off comparison into the replayed graph. Skip it
+        # there; the same rows are re-verified on the next eager forward.
+        if self._selfcheck_budget > 0 and not (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        ):
             self._selfcheck_write(layer_id, loc64, c, keep)
 
     def set_kv_buffer(self, layer, loc, cache_k, cache_v):

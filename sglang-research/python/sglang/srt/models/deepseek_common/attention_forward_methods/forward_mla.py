@@ -462,7 +462,12 @@ class DeepseekMLAForwardMixin:
             # The fresh keys of this forward go to the kernel rotated too, so
             # they sit in the same frame as the cached rows they are
             # concatenated with; the pool rotates its own copy on the write.
-            _packed = _packed_latent_pool(forward_batch, self.attn_mqa.layer_id)
+            # Only the plain-concat branch above builds the q/k this needs; the
+            # aiter fused path writes the cache itself and has no `k` to rotate.
+            _packed = (
+                None if _use_aiter_gfx95
+                else _packed_latent_pool(forward_batch, self.attn_mqa.layer_id)
+            )
             if _packed is not None:
                 _lid = self.attn_mqa.layer_id
                 _packed.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k, k_nope)
