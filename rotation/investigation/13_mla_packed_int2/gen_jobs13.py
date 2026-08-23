@@ -52,6 +52,17 @@ done
 echo "[job] exit=$rc"
 """
 
+PROBE = _PROLOGUE + r"""
+export RUN_DIR=$R/__RUNDIR__; mkdir -p $RUN_DIR
+export OUT_DIR=$RUN_DIR
+# HF_HUB_OFFLINE: the weights are already in the PVC cache and a hub round trip
+# is the difference between "runs" and "runs if the network feels like it".
+export HF_HUB_OFFLINE=1
+python3 -u $W/rotation/investigation/13_mla_packed_int2/serve_probe.py \
+  2>&1 | tee $RUN_DIR/probe.log
+echo "[job] exit=${PIPESTATUS[0]}"
+"""
+
 GLM = _PROLOGUE + r"""
 export GPUS=$(seq -s, 0 7)
 # B200 is SM100; the NSA auto-backends are bypassed because the harness names
@@ -146,7 +157,7 @@ def emit(name, body, gpus, cpu, mem):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["unit", "smoke", "gpqa", "gpqa-fake"])
+    ap.add_argument("kind", choices=["unit", "probe", "smoke", "gpqa", "gpqa-fake"])
     ap.add_argument("--tag", default="a")
     ap.add_argument("--pin", default=PIN)
     ap.add_argument("--out", default=None)
@@ -156,6 +167,10 @@ def main() -> None:
         run = f"mlapacked_unit_{a.tag}"
         body = UNIT.replace("__PIN__", a.pin).replace("__RUNDIR__", run)
         doc = emit(f"zz-mlapk-unit-{a.tag}", body, 1, "8", "64Gi")
+    elif a.kind == "probe":
+        run = f"mlapacked_probe_{a.tag}"
+        body = PROBE.replace("__PIN__", a.pin).replace("__RUNDIR__", run)
+        doc = emit(f"zz-mlapk-probe-{a.tag}", body, 1, "16", "200Gi")
     else:
         packed = "0" if a.kind == "gpqa-fake" else "1"
         if a.kind == "smoke":
