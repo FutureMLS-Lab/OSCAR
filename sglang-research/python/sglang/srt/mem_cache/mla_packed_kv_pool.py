@@ -640,6 +640,42 @@ class _PackedLatentMixin(_Int2HPMixin):
         rel = float(
             diff.max() / want.float().abs().max().clamp(min=1e-6)
         )
+
+        # The above compares packed against **what packed intends to store** --
+        # both sides are in the rotated frame -- so it reads 0 even where packed
+        # and fake-quant genuinely differ. That is the wrong frame for the claim
+        # being made, which is "a packed score is comparable to the fake-quant
+        # score", and it is where a real difference would hide:
+        #
+        #   fake-quant, window row: the ORIGINAL value, never round-tripped.
+        #   packed,     window row: rotate -> bf16, then un-rotate on the output.
+        #
+        # So measure the window tier against the value fake-quant would have kept
+        # exactly. R is orthogonal, so un-rotating the stored row and comparing
+        # to the original latent is the end-to-end fidelity of that tier. If this
+        # is material, the fix (now that speed is explicitly secondary) is to hold
+        # the arena in fp32 rather than bf16; if it is at bf16 epsilon, the
+        # question is closed rather than assumed.
+        if keep is not None and bool(keep.any()):
+            R = self.latent_rotation(layer_id)
+            if R is not None:
+                k = keep.reshape(-1)
+                got_w = got[k].float()
+                orig_w = c_rot[k].float()          # rotated original, fp32
+                back = got_w @ R.to(torch.float32)  # only to report in-frame err
+                ref = orig_w @ R.to(torch.float32)
+                wdiff = (back - ref).abs().max()
+                wrel = float(wdiff / ref.abs().max().clamp(min=1e-6))
+                self._selfcheck_win_worst = max(
+                    getattr(self, "_selfcheck_win_worst", 0.0), wrel
+                )
+                if self._selfcheck_n == 1 or wrel >= self._selfcheck_win_worst:
+                    logger.info(
+                        "[MLAPacked] window-tier fidelity vs the value "
+                        "fake-quant keeps exactly: rows=%d rel=%.3e worst=%.3e "
+                        "(bf16 eps ~3.9e-03)",
+                        int(k.sum()), wrel, self._selfcheck_win_worst,
+                    )
         if (self._selfcheck_n == 1 or rel > self._selfcheck_worst
                 or self._selfcheck_budget == 0):
             self._selfcheck_worst = max(self._selfcheck_worst, rel)
