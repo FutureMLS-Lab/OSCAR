@@ -63,6 +63,15 @@ QUESTIONS = [
     "Explain why a 2-bit KV cache saves memory but can cost accuracy.",
     "Explain why an attention sink matters more than a middle token.",
     "Describe what a rotation does to outliers before quantization.",
+    "Explain why the newest tokens in a sequence are the most sensitive.",
+    "Give three reasons long-context serving is memory bound.",
+    "Explain the difference between a prefill and a decode step.",
+    "Why does grouped-query attention shrink the KV cache?",
+    "What goes wrong if the attention sink is quantized too coarsely?",
+    "Describe how a prefix cache decides that two requests share work.",
+    "Explain why quantization error in a key affects every other token.",
+    "What is the cost of storing a scale and zero per quantization group?",
+    "Why is the positional half of an MLA key left unquantized?",
 ]
 
 
@@ -98,6 +107,16 @@ def launch(tag: str, packed: bool) -> dict:
         "SGLANG_MIXED_KV_RECENT_TOKENS": "512",
         "SGLANG_OSCAR_MLA_KV_PACKED": "1" if packed else "0",
     })
+    if tag == "packed_nowin":
+        # Single variable against the "packed" arm. The candidate mechanism is
+        # that packed's BF16 window stores the *rotated* latent rounded to
+        # bf16, while fake-quant's window is the original value left untouched;
+        # a cold pass reads freshly-computed values and never sees that round
+        # trip, a cache hit reads nothing else. With the window off, both passes
+        # read the same INT2 codes, so if the window is the cause the
+        # divergence has to disappear here.
+        env["SGLANG_MIXED_KV_PREFIX_TOKENS"] = "0"
+        env["SGLANG_MIXED_KV_RECENT_TOKENS"] = "0"
     args = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", MODEL, "--trust-remote-code",
@@ -188,7 +207,8 @@ def drive(p, log_path: str) -> dict:
 
 def main() -> None:
     out = []
-    for tag, packed in (("fake", False), ("packed", True)):
+    for tag, packed in (("fake", False), ("packed", True),
+                        ("packed_nowin", True)):
         out.append(launch(tag, packed))
     os.makedirs(OUT, exist_ok=True)
     with open(os.path.join(OUT, "radix_transparency.json"), "w") as f:
