@@ -37,11 +37,23 @@ OUT = os.environ.get("OUT_DIR", "/tmp/probe")
 # tokens than the recent window is wide (512). 700 wraps it once; a GPQA answer
 # wraps it ~20 times, so MAX_NEW is a knob rather than a constant.
 MAX_NEW = int(os.environ.get("MAX_NEW", "700"))
-PROMPTS = [
-    "Explain in three sentences why a 2-bit KV cache saves memory but can cost accuracy.",
-    "Explain in three sentences why a 2-bit KV cache saves memory but can cost accuracy.",
+# A long shared prefix on purpose: the failure being hunted is a prefix-cache
+# hit whose BF16 window rows belong to a different request, so the requests have
+# to share a prefix long enough to cover the 64-token sink and then diverge.
+_SHARED = (
+    "You are a careful assistant. Answer precisely, show your reasoning, and "
+    "state any assumption you make rather than leaving it implicit. Prefer a "
+    "concrete example over an abstract restatement, and if a question has more "
+    "than one reasonable reading, say which one you took. "
+)
+PROMPTS = [_SHARED + q for q in (
+    "Explain why a 2-bit KV cache saves memory but can cost accuracy.",
+    "Explain why an attention sink matters more than a middle token.",
     "List the first eight prime numbers, then add them up and show the total.",
-]
+    "Describe what a rotation does to outliers before quantization.",
+    "Explain why the newest tokens in a sequence are the most sensitive.",
+    "Give three reasons long-context serving is memory bound.",
+)]
 
 
 def launch(tag: str, packed: bool, extra_env: dict) -> dict:
@@ -109,6 +121,22 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
     return info
 
 
+def ask_one(prompt: str) -> str:
+    body = json.dumps({
+        "text": prompt,
+        "sampling_params": {"temperature": 0.7, "top_p": 0.95,
+                            "max_new_tokens": MAX_NEW},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}/generate", data=body,
+        headers={"Content-Type": "application/json"})
+    try:
+        r = json.loads(urllib.request.urlopen(req, timeout=1800).read())
+        return r["text"] if isinstance(r, dict) else r[0]["text"]
+    except Exception as e:  # noqa: BLE001
+        return f"<<request failed: {e}>>"
+
+
 def drive(p, log_path: str) -> dict:
     deadline = time.time() + 1800
     while time.time() < deadline:
@@ -126,6 +154,26 @@ def drive(p, log_path: str) -> dict:
 
     outs = []
     t0 = time.time()
+    if os.environ.get("CONCURRENT", "0") == "1":
+        # Sequential requests cannot exercise prefix sharing across *different*
+        # req indices: a lone request gets its own index back and lands on the
+        # rows it wrote itself. Firing them together is what makes one request
+        # read a prefix whose window rows belong to another.
+        import threading
+        outs = [None] * len(PROMPTS)
+
+        def one(i, prompt):
+            outs[i] = ask_one(prompt)
+
+        ts = [threading.Thread(target=one, args=(i, p))
+              for i, p in enumerate(PROMPTS)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        for i, txt in enumerate(outs):
+            print(f"  [{i}] {str(txt)[:220]!r}", flush=True)
+        return {"wall_s": round(time.time() - t0, 1), "samples": outs}
     for i, prompt in enumerate(PROMPTS):
         body = json.dumps({
             "text": prompt,

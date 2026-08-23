@@ -58,12 +58,39 @@ also what makes prefix-cache reuse safe: a cached slot whose ring row has since
 been re-issued to another request fails the check and falls back to its packed
 row, rather than reading another sequence's latent.
 
-Known behavioural difference from the fake-quant pool, stated because it is a
-difference and not a bug: on a **prefix-cache hit** the reused tokens were never
-written through this forward, so their window rows are not in the ring and they
-are served from the packed tier. The fake-quant pool keeps a reused prefix's
-first ``P`` positions in BF16. Everything else -- every token a request writes
-itself -- is identical.
+**This addressing is incompatible with prefix sharing, and that is the whole
+accuracy gap.** The paragraph here used to call it "a difference and not a bug".
+Measured on GPQA against the fake-quant arm on matched ids: with the radix cache
+**on** the packed arm is **-12.20 pp** (70.73 vs 82.93); with it **off**, on a
+stable reference, **-2.38 pp** (80.95 vs 83.33, exact McNemar p = 1.0). The
+difference was the bug.
+
+The mechanism is that a window row belongs to *the request that wrote it*, while
+a slot can be read by *any* request that shares it:
+
+  * A (req 5) writes position p, so ``owner[ring(5, p)] = slotA``.
+  * B reuses A's prefix through the radix cache and never writes those slots, so
+    ``row_of_slot[slotA]`` still points at A's row and the owner check passes --
+    correctly, since it is the same token at the same position.
+  * C then takes over req index 5 and writes *its* position p to the same row.
+    Now ``owner`` names C's slot, B's check fails, and B's prefix silently drops
+    to the packed tier.
+
+So there is no corruption -- the owner tag does its job -- but under concurrency
+the req indices churn constantly, and every request served from the cache keeps
+losing its BF16 sink. A lone sequential request cannot show this: it gets its own
+req index back and lands on the very rows it wrote, which is why a single-request
+arena audit measures 100% accepted (sink 64/64, recent 512/512, 27 samples out to
+seq 5879) while the eval loses twelve points.
+
+Fixing it means window rows whose lifetime follows the **slot**, not the request
+-- what ``UnifiedInt2HPKVPool`` already does with an allocator-managed HP tier in
+the ``out_cache_loc`` namespace. Until then this pool requires
+``--disable-radix-cache``. Two cheaper-looking fixes do not work: range-checking
+the row against the reader's own arena region changes nothing (the owner check
+already rejects; the problem is that there is no BF16 left afterwards), and
+re-writing a reused prefix's window rows can only read the values back from the
+packed codes, which are already INT2.
 """
 
 from __future__ import annotations
@@ -107,6 +134,12 @@ def _tracing() -> bool:
         return bool(torch.compiler.is_compiling())
     except Exception:
         return False
+
+
+def envs_audit_all() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OSCAR_MLA_PACKED_AUDIT_ALL.get())
 
 
 def envs_selfcheck_budget() -> int:
@@ -652,10 +685,24 @@ class _PackedLatentMixin(_Int2HPMixin):
         P, W = self._win_p, self._win_r
         r2t = meta["req_to_token"]
 
-        # One request is enough to detect a broken tag, and a per-request loop
-        # over a batch of 64 inside a decode step is not something to leave on.
-        seq = int(seq_lens[0].item())
-        row = int(req_idx[0].item())
+        # Batch element 0 is enough to detect a *broken* tag, but not enough to
+        # detect the failure this is now hunting: an arena row reclaimed by
+        # another request that happens to hold the same req index. That victim
+        # is not necessarily element 0, and with sequential requests it cannot
+        # occur at all -- a lone request gets its own req index back and lands
+        # on the very rows it wrote, which is why the first clean audit (radix
+        # on, identical prompt, 100%) did not exercise the case.
+        n_audit = 1
+        if envs_audit_all():
+            n_audit = int(req_idx.numel())
+        for _i in range(n_audit):
+            self._audit_one(int(seq_lens[_i].item()), int(req_idx[_i].item()),
+                            meta, tag, _i)
+
+    def _audit_one(self, seq: int, row: int, meta: dict, tag: str,
+                   which: int) -> None:
+        P, W = self._win_p, self._win_r
+        r2t = meta["req_to_token"]
 
         # Only audit once the ring has wrapped. Below P + W every position is
         # still resident in its first ring row, so the tag is trivially right
@@ -684,9 +731,9 @@ class _PackedLatentMixin(_Int2HPMixin):
         frac = got_total / want_total
         self._audit_worst = min(getattr(self, "_audit_worst", 1.0), frac)
         logger.info(
-            "[MLAPacked] arena audit%s seq=%d expected=%d accepted=%d "
-            "(%.1f%%, worst %.1f%%) sink %d/%d recent %d/%d",
-            f" {tag}" if tag else "", seq, want_total, got_total,
+            "[MLAPacked] arena audit%s b=%d req=%d seq=%d expected=%d "
+            "accepted=%d (%.1f%%, worst %.1f%%) sink %d/%d recent %d/%d",
+            f" {tag}" if tag else "", which, row, seq, want_total, got_total,
             100.0 * frac, 100.0 * self._audit_worst,
             sink_ok, P, rec_ok, W,
         )
