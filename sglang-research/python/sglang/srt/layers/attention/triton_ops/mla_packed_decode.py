@@ -475,3 +475,241 @@ def _v_shape_proxy(ref: torch.Tensor, lv: int) -> torch.Tensor:
         t = torch.empty((0, 1, lv), dtype=ref.dtype, device=ref.device)
         _PROXY_CACHE[key] = t
     return t
+
+
+@triton.jit
+def _fwd_packed_mla_stage1_gf(
+    Q, Codes, Params, Rope,
+    sm_scale_withk, kv_indptr, kv_indices, Att_Out, Att_Lse, num_kv_splits,
+    stride_qbs, stride_qh, stride_mid_ob, stride_mid_oh, stride_mid_os,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    D: tl.constexpr,
+    DPE: tl.constexpr,
+    GS: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    LLOYD: tl.constexpr,
+    logit_cap: tl.constexpr,
+):
+    """Group-factored packed MLA stage-1: no full-width dequantized tile.
+
+    Five hypotheses about this kernel have been measured and all five refuted --
+    tiling, traffic, addressing, the dequant arithmetic (free: removing it
+    measures 1.00x) and the transpose. Two of them got *slower*, by 1.3x, in the
+    same way: replacing a direct wide ``tl.load`` with a constructed tile. That
+    is the pattern this kernel is built around.
+
+    Every refuted variant still ended at a **computed** ``[BLOCK_N, D]`` tile fed
+    to ``tl.dot``, and a computed tile has to be materialized through shared
+    memory where a loaded one can stream. That is also why BLOCK_N is stuck at
+    16 (32 is slower, 64 exhausts shared memory) while the BF16 kernel it must
+    beat runs 32-64 -- i.e. 2-4x fewer loop iterations for the same work.
+
+    So factor the dequant out of the dot instead of computing it before the dot.
+    With ``cv = code * s + z`` per group ``g``:
+
+        q . cv = sum_g [ s_g * sum_{d in g} q_d code_d  +  z_g * sum_{d in g} q_d ]
+
+    ``sum_{d in g} q_d`` is loop-invariant. What reaches ``tl.dot`` is the raw
+    code tile, converted to bf16 -- INT2 values 0..3 are exact in bf16 -- and the
+    scale/zero apply in the ``[BLOCK_H, BLOCK_N]`` domain, 256 elements instead
+    of 8192. Lloyd-Max is the same form: ``(code - z) * s = code*s - z*s``, so
+    ``A = s`` and ``B = -z*s``.
+
+    The value half factors the same way, per group:
+
+        acc[h, d in g] += sum_n (p_hn A_ng) code_nd  +  sum_n p_hn B_ng
+
+    which needs ``NG`` accumulators of ``[BLOCK_H, GS]`` -- the same registers as
+    one ``[BLOCK_H, D]``, since Triton cannot slice-assign a tile -- each stored
+    to its own slice of ``Att_Out``.
+
+    **No window arena.** Folding it in means reintroducing the full-width tile in
+    a branch the compiler must reserve registers for in every block, which is the
+    cost the arena-probe fix already had to remove once (1.54x). This entry point
+    exists to test whether the factoring is worth that work at all, so it is
+    reachable only from the benchmark with the arena off.
+    """
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_dpe = D + tl.arange(0, DPE)
+    offs_pe = tl.arange(0, DPE)
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    off_qpe = (
+        cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+    )
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    # NG accumulators rather than one [BLOCK_H, D]: same registers, but each is
+    # storable to its own D-slice, which a slice of a single tile is not.
+    accs = [tl.zeros([BLOCK_H, GS], dtype=tl.float32) for _ in range(NG)]
+
+    if split_kv_end > split_kv_start:
+        qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
+        # Per-group query tiles and their sums, both loop-invariant.
+        qgs = []
+        qsums = []
+        for g in range(NG):
+            offs_dg = g * GS + tl.arange(0, GS)
+            qg = tl.load(
+                Q + cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+                + offs_dg[None, :],
+                mask=mask_h[:, None],
+                other=0.0,
+            )
+            qgs.append(qg)
+            qsums.append(tl.sum(qg.to(tl.float32), 1))
+
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            n_ok = offs_n < split_kv_end
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_ok, other=0
+            ).to(tl.int64)
+
+            # Scale/zero: [BLOCK_N] per group, not [BLOCK_N, D].
+            As = []
+            Bs = []
+            for g in range(NG):
+                s_g = tl.load(Params + kv_loc * (2 * NG) + (2 * g),
+                              mask=n_ok, other=0.0)
+                z_g = tl.load(Params + kv_loc * (2 * NG) + (2 * g + 1),
+                              mask=n_ok, other=0.0)
+                if LLOYD:
+                    As.append(s_g)
+                    Bs.append(-z_g * s_g)
+                else:
+                    As.append(s_g)
+                    Bs.append(z_g)
+
+            # QK: dot against the RAW codes, one group at a time. The code tile
+            # comes straight from tl.load; nothing full-width is computed.
+            qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+            codes_g = []
+            for g in range(NG):
+                offs_dg = g * GS + tl.arange(0, GS)
+                byte_g = tl.load(
+                    Codes + kv_loc[None, :] * (D // 4) + (offs_dg // 4)[:, None],
+                    mask=n_ok[None, :],
+                    other=0,
+                ).to(tl.int32)
+                # [GS, BLOCK_N], the layout tl.dot(q_g, .) wants -- no transpose.
+                c_t = ((byte_g >> (2 * (offs_dg % 4))[:, None]) & 0x3).to(qpe.dtype)
+                codes_g.append(c_t)
+                qk += As[g][None, :] * tl.dot(qgs[g], c_t)
+                qk += Bs[g][None, :] * qsums[g][:, None]
+
+            kpe = tl.load(
+                Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
+                mask=n_ok[None, :],
+                other=0.0,
+            )
+            qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            qk *= sm_scale_withk
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+
+            # AV, per group: fold the scale into p, dot against the raw codes,
+            # and add the zero term as a per-(head, group) scalar.
+            for g in range(NG):
+                pa = (p * As[g][None, :]).to(qpe.dtype)
+                bterm = tl.sum(p * Bs[g][None, :], 1)
+                accs[g] = (
+                    accs[g] * re_scale[:, None]
+                    + tl.dot(pa, tl.trans(codes_g[g]))
+                    + bterm[:, None]
+                )
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        for g in range(NG):
+            offs_dg = g * GS + tl.arange(0, GS)
+            tl.store(
+                Att_Out
+                + cur_batch * stride_mid_ob
+                + cur_head[:, None] * stride_mid_oh
+                + split_kv_id * stride_mid_os
+                + offs_dg[None, :],
+                accs[g] / e_sum[:, None],
+                mask=mask_h[:, None],
+            )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // D
+        tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
+
+
+def packed_mla_decode_stage1_gf(
+    q, operands, att_out, att_lse, kv_indptr, kv_indices, num_kv_splits,
+    max_kv_splits, sm_scale_withk, logit_cap,
+    block_n: int = 0, num_warps: int = 0, num_stages: int = 0,
+):
+    """Launch the group-factored stage-1. Benchmark-only: no window arena."""
+    codes, params, rope, hp, _hp_row, _hp_owner, group_size, lloyd = operands
+    if hp is not None:
+        raise NotImplementedError(
+            "the group-factored kernel has no window-arena path; folding one in "
+            "reintroduces the full-width tile it exists to avoid, in a branch "
+            "the compiler must reserve for in every block"
+        )
+    d_pe = rope.shape[-1]
+    d = codes.shape[-1] * 4
+    n_groups = d // group_size
+    assert q.shape[-1] == d + d_pe, (q.shape, d, d_pe)
+
+    block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
+    num_warps = num_warps or envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
+    num_stages = num_stages or envs.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
+
+    batch, head_num = q.shape[0], q.shape[1]
+    kv_group_num = head_num
+    block_h = _safe_block_h(16, kv_group_num)
+    grid = (batch, triton.cdiv(head_num, min(block_h, kv_group_num)), max_kv_splits)
+
+    _fwd_packed_mla_stage1_gf[grid](
+        q, codes, params, rope,
+        sm_scale_withk, kv_indptr, kv_indices, att_out, att_lse, num_kv_splits,
+        q.stride(0), q.stride(1),
+        att_out.stride(0), att_out.stride(1), att_out.stride(2),
+        kv_group_num=kv_group_num,
+        q_head_num=head_num,
+        D=d, DPE=d_pe, GS=group_size, NG=n_groups,
+        BLOCK_N=block_n, BLOCK_H=block_h, MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        LLOYD=bool(lloyd), logit_cap=logit_cap,
+        num_warps=num_warps, num_stages=num_stages,
+    )

@@ -255,6 +255,55 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"  dual load failed: {type(e).__name__}: {e}")
 
+    # The group-factored kernel: the only variant that changes WHAT reaches
+    # tl.dot (a directly-loaded code tile) rather than how a computed tile is
+    # built. Compared with the arena off, because it has no arena path.
+    from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+        packed_mla_decode_stage1_gf,
+    )
+    try:
+        logits.zero_(); lse.zero_()
+        packed_mla_decode_stage1(
+            q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
+            max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1)
+        torch.cuda.synchronize()
+        ref_o2, ref_l2 = logits.clone(), lse.clone()
+        logits.zero_(); lse.zero_()
+        packed_mla_decode_stage1_gf(
+            q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
+            max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1)
+        torch.cuda.synchronize()
+        den2 = ref_o2.abs().max().clamp(min=1e-6)
+        rel2 = ((logits - ref_o2).abs().max() / den2).item()
+        dl2 = (lse - ref_l2).abs().max().item()
+        # Not bit-identical by construction: the factored form reassociates the
+        # sum, so this is a tolerance on a different summation order.
+        ok2 = rel2 < 2e-2
+        print(f"\ngroup-factored (arena OFF): rel max|dout| = {rel2:.3e}, "
+              f"max|dlse| = {dl2:.3e} -> "
+              f"{'AGREES' if ok2 else 'DIFFERS -- timing below is meaningless'}")
+        t_base2 = timeit(lambda: packed_mla_decode_stage1(
+            q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
+            max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1))
+        print(f"  computed-tile  {t_base2:.3f} ms ({base/t_base2:.2f}x BF16)")
+        for bn in (16, 32, 64):
+            try:
+                t_gf = timeit(lambda: packed_mla_decode_stage1_gf(
+                    q, ops_nohp, logits, lse, kv_indptr, kv_indices,
+                    num_splits, max_splits, sm, 0.0, block_n=bn,
+                    num_warps=8, num_stages=1))
+                # BLOCK_N is the whole point: if the computed tile was what
+                # capped it at 16, removing the tile should let it rise.
+                print(f"  factored BLOCK_N={bn:>2} {t_gf:.3f} ms "
+                      f"({base/t_gf:.2f}x BF16) -> {t_base2/t_gf:.2f}x over "
+                      f"the computed tile")
+            except Exception as e:  # noqa: BLE001
+                print(f"  factored BLOCK_N={bn:>2} - {type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:70]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"\ngroup-factored failed: {type(e).__name__}: "
+              f"{str(e).splitlines()[0][:200]}")
+
     # Head amortization. MLA shares one KV head across every query head, so
     # BLOCK_H is free to grow -- and growing it is the only lever that changes
     # the dequant-to-dot ratio rather than the constant in front of it. The cap
