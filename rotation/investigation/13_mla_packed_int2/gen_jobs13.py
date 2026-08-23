@@ -43,9 +43,13 @@ echo "[job] HEAD=$(git -C $W log --oneline -1)"
 
 UNIT = _PROLOGUE + r"""
 export RUN_DIR=$R/__RUNDIR__; mkdir -p $RUN_DIR
-python3 $W/rotation/investigation/13_mla_packed_int2/test_packed_latent.py \
-  2>&1 | tee $RUN_DIR/unit.log
-echo "[job] exit=${PIPESTATUS[0]}"
+rc=0
+for t in test_packed_latent test_packed_pool; do
+  echo "==== $t ===="
+  python3 $W/rotation/investigation/13_mla_packed_int2/$t.py 2>&1 | tee -a $RUN_DIR/unit.log
+  [ "${PIPESTATUS[0]}" = 0 ] || rc=1
+done
+echo "[job] exit=$rc"
 """
 
 GLM = _PROLOGUE + r"""
