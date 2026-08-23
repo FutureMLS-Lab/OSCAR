@@ -53,6 +53,9 @@ CTX = os.environ.get("CTX_LEN", "8192")
 # Long enough that most scored positions sit past the recent window (512) and
 # so are served from the quantized tier rather than the BF16 arena.
 TARGET_TOKENS = int(os.environ.get("TARGET_TOKENS", "4096"))
+# "repeat" = the fixed passage below (copy task, sharp on retrieval);
+# "docs" = non-repeating prose from the tree (restores dynamic range).
+CORPUS = os.environ.get("CORPUS", "repeat")
 
 
 def corpus() -> str:
@@ -81,7 +84,44 @@ def corpus() -> str:
     # an 8,535-token prompt against an 8,192-token context, so all three arms
     # died on the same HTTP 400 and the job measured nothing. Budget from the
     # real rate and leave headroom.
-    return para * max(2, TARGET_TOKENS // 161)
+    rep = para * max(2, TARGET_TOKENS // 161)
+    if CORPUS != "docs":
+        return rep
+
+    # The repeated passage measures BF16 at NLL 0.0024 -- the model is copying,
+    # which probes cache *retrieval* very sharply but leaves almost no dynamic
+    # range if the local n-gram statistics alone suffice. Non-repeating prose
+    # restores the range. Taken from markdown already in the tree rather than
+    # fetched: a network read is a way for two arms to score different text.
+    import glob
+    chunks = []
+    total = 0
+    root = os.environ.get(
+        "DOCS_ROOT",
+        os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                     "sglang-research", "docs"),
+    )
+    for path in sorted(glob.glob(os.path.join(root, "**", "*.md"),
+                                 recursive=True)):
+        try:
+            t = open(path, errors="ignore").read()
+        except Exception:  # noqa: BLE001
+            continue
+        # Prose only: code fences and tables are low-entropy in a way that
+        # mimics the repeated-passage problem this is meant to fix.
+        t = re.sub(r"```.*?```", " ", t, flags=re.S)
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) < 400:
+            continue
+        chunks.append(t)
+        total += len(t)
+        if total > TARGET_TOKENS * 5:
+            break
+    if not chunks:
+        print("  WARNING: no docs found, falling back to the repeated passage",
+              flush=True)
+        return rep
+    return " ".join(chunks)
 
 
 def launch(tag: str, env_over: dict) -> dict:
