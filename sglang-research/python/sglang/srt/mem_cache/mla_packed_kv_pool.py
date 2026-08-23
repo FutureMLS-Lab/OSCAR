@@ -1,0 +1,540 @@
+"""MLA / NSA latent KV pool with **real packed INT2 storage**.
+
+``mla_int2_kv_pool.py`` is the fake-quant pool: it rounds ``c_kv`` through INT2
+and writes the result back into an ordinary BF16 cache, which measures the
+accuracy of 2-bit latents but saves nothing -- ``max_total_num_tokens`` is
+identical to the BF16 arm's. This module is the storage version.
+
+Layout, per token per layer
+---------------------------
+=====================  =========  ===============================================
+buffer                 bytes      contents
+=====================  =========  ===============================================
+``c_codes``            R/4 = 128  packed 2-bit codes for the latent, 4 per byte
+``c_params``           8*NG = 32  (scale, zero) fp32 per quantization group
+``rope_buf``           2*P = 128  ``k_pe``, BF16, never quantized
+=====================  =========  ===============================================
+
+288 B against the BF16 pool's ``(512 + 64) * 2 = 1152``, a 4.0x reduction on the
+latent itself. ``k_pe`` staying BF16 is load-bearing, not an oversight: it is
+the positional half of the MLA key and 2-bit'ing it destroys the rope term.
+
+Rotated storage and where the rotation went
+-------------------------------------------
+The codes are stored in the *rotated* frame, because that is the frame the
+quantizer is calibrated for. The fake-quant pool could undo the rotation inline
+(it dequantized on the write path anyway); a storage pool cannot, and applying
+R^T to every row an attention kernel touches would cost more than the read.
+
+So the rotation is moved to the two ends, where it is free:
+
+    scores  q . c^T = q . (c' R^T)^T = (q R) . c'^T
+    output  sum_j p_j c_j = (sum_j p_j c'_j) R^T
+
+i.e. rotate the (already ``w_kc``-absorbed) query, and un-rotate the attention
+output before ``w_vc``. Both are ``[tokens, heads, 512] @ [512, 512]`` -- a
+rounding error next to the attention itself, and both fold into the projection
+weights outright as a later optimization. :meth:`rotate_latent` /
+:meth:`unrotate_output` are those two hooks.
+
+BF16 windows without a second allocator
+----------------------------------------
+The sink/recent windows (64/512 measured optimal for GLM-5.2, and non-monotone
+-- 1024 is *worse* than 256) cannot be "the row stays BF16" here, because rows
+are 288 bytes. They live in a separate arena, but unlike ``UnifiedInt2HPKVPool``
+this one needs no allocator, no free list and no scheduler support, because the
+window is **positional** and therefore statically addressable:
+
+    ring(req, pos) = 1 + req * (P + R) + (pos if pos < P else P + (pos-P) % R)
+
+One row per request per window position, assigned by arithmetic. Nothing is
+allocated at run time, so the whole thing is CUDA-graph safe.
+
+Ageing out is free as a consequence. Position ``L-1`` maps to the same ring row
+as ``L-1-R``, so writing the new token *is* the eviction of the one leaving the
+window. An ``owner`` tag per ring row records which pool slot last wrote it; a
+reader takes the BF16 row only when ``owner[ring[slot]] == slot``. That tag is
+also what makes prefix-cache reuse safe: a cached slot whose ring row has since
+been re-issued to another request fails the check and falls back to its packed
+row, rather than reading another sequence's latent.
+
+Known behavioural difference from the fake-quant pool, stated because it is a
+difference and not a bug: on a **prefix-cache hit** the reused tokens were never
+written through this forward, so their window rows are not in the ring and they
+are served from the packed tier. The fake-quant pool keeps a reused prefix's
+first ``P`` positions in BF16. Everything else -- every token a request writes
+itself -- is identical.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, Optional
+
+import torch
+
+from sglang.srt.mem_cache.memory_pool import (
+    GPU_MEMORY_TYPE_KV_CACHE,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
+from sglang.srt.mem_cache.mla_int2_kv_pool import _Int2HPMixin
+
+logger = logging.getLogger(__name__)
+
+
+def packed_latent_bytes_per_token(kv_lora_rank: int, qk_rope_head_dim: int,
+                                  group_size: int, param_dtype_bytes: int = 4) -> int:
+    """Bytes one token of latent occupies per layer under packed storage.
+
+    Kept next to the buffers it describes so the pool-size arithmetic in
+    ``pool_configurator`` and the allocation here cannot drift apart -- a
+    ``cell_size`` that disagrees with what the pool actually allocates either
+    wastes the difference or OOMs at the end of the pool.
+    """
+    n_groups = kv_lora_rank // group_size
+    return (
+        kv_lora_rank // 4                       # codes
+        + n_groups * 2 * param_dtype_bytes      # (scale, zero) per group
+        + qk_rope_head_dim * 2                  # k_pe, bf16
+    )
+
+
+class _PackedLatentMixin(_Int2HPMixin):
+    """Packed-storage latent, mixed into the MLA and NSA pools.
+
+    Reuses ``_Int2HPMixin`` for rotation loading, the window knobs and
+    ``note_forward_batch``; replaces the write path and adds the read path.
+    """
+
+    # ── construction ────────────────────────────────────────────────────────
+
+    def _init_packed(
+        self,
+        rotation_path: str,
+        group_size: int,
+        lloyd_max: bool,
+        max_reqs: int,
+        selfcheck: bool = False,
+    ) -> None:
+        # _init_int2 loads the rotations, resolves the compute dtype and reads
+        # the window knobs. The dump/HP-subspace features are fake-quant-only.
+        self._init_int2(
+            rotation_path,
+            group_size,
+            dump_c_kv_dir="",
+            dump_max_tokens_per_layer=0,
+            lloyd_max=lloyd_max,
+            hp_subspace_path="",
+        )
+        if not self.rotations:
+            raise ValueError(
+                "Packed MLA latent storage needs a rotation path: without one "
+                "there is no calibrated frame to quantize in, and the pool "
+                "would silently store 2-bit garbage."
+            )
+        if self.hp_subspaces:
+            raise NotImplementedError(
+                "SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH is a fake-quant-only "
+                "feature; it keeps a dense BF16 projection per token, which "
+                "packed storage has nowhere to put."
+            )
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"Packed MLA latent storage needs a >=16-bit float KV dtype for "
+                f"k_pe and the window arena; got {self.dtype}. Pin "
+                f"--kv-cache-dtype bfloat16 (sglang defaults a DSA model to "
+                f"fp8_e4m3 on SM100+, which also destroys the rotation)."
+            )
+
+        R = self.kv_lora_rank
+        self._n_groups = R // group_size
+        self._selfcheck = selfcheck
+        n_rows = self.size + self.page_size
+
+        P, W = self.hp_prefix_tokens, self.hp_recent_tokens
+        self._win_p, self._win_r = P, W
+        self._per_req_hp = P + W
+        self._max_reqs = max_reqs
+        # Ring row 0 is the dummy every masked-off write is aimed at, so the
+        # rings start at 1 -- otherwise request 0's sink position 0 would share
+        # a row with the padding sink and a padded graph replay could evict a
+        # live window entry.
+        n_hp = 1 + max_reqs * self._per_req_hp if self._latent_windows else 1
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.c_codes = [
+                torch.zeros((n_rows, R // 4), dtype=torch.uint8, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self.c_params = [
+                torch.zeros(
+                    (n_rows, self._n_groups * 2),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.rope_buf = [
+                torch.zeros(
+                    (n_rows, self.qk_rope_head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.hp_c = [
+                torch.zeros((n_hp, R), dtype=self.dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self.hp_row_of_slot = torch.full(
+                (n_rows,), -1, dtype=torch.int32, device=self.device
+            )
+            self.hp_owner_of_row = torch.full(
+                (n_hp,), -1, dtype=torch.int32, device=self.device
+            )
+
+        # Read scratch, grown on demand and reused across layers. Under graph
+        # capture the address must be stable, which it is: capture happens after
+        # the warmup forward has already grown it to the largest decode shape.
+        self._read_scratch: Optional[torch.Tensor] = None
+        self._deq_scratch: Optional[torch.Tensor] = None
+        self._shadow: Optional[list] = None
+        if selfcheck:
+            self._shadow = [
+                torch.zeros((n_rows, R), dtype=self.dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self._selfcheck_reports = 0
+
+        bytes_tok = packed_latent_bytes_per_token(
+            R, self.qk_rope_head_dim, group_size
+        )
+        logger.info(
+            "[MLAPacked] packed latent storage: %d B/token/layer (BF16 would be "
+            "%d B, %.2fx), rows=%d layers=%d, windows sink=%d/recent=%d over "
+            "%d ring rows (%.2f GB), group=%d lloyd_max=%s selfcheck=%s",
+            bytes_tok,
+            (R + self.qk_rope_head_dim) * 2,
+            (R + self.qk_rope_head_dim) * 2 / bytes_tok,
+            n_rows,
+            self.layer_num,
+            P if self._latent_windows else 0,
+            W if self._latent_windows else 0,
+            n_hp,
+            n_hp * R * 2 * self.layer_num / (1 << 30),
+            group_size,
+            lloyd_max,
+        )
+
+    # ── accounting ──────────────────────────────────────────────────────────
+
+    def get_kv_size_bytes(self):
+        # Called once from ``_finalize_allocation_log`` inside the *parent*
+        # constructor, i.e. before ``_init_packed`` has allocated anything --
+        # hence the getattr defaults rather than an attribute access that would
+        # turn a log line into a startup crash.
+        total = 0
+        for name in ("c_codes", "c_params", "rope_buf", "hp_c",
+                     "index_k_with_scale_buffer"):
+            for t in getattr(self, name, None) or ():
+                total += t.numel() * t.element_size()
+        for name in ("hp_row_of_slot", "hp_owner_of_row"):
+            t = getattr(self, name, None)
+            if t is not None:
+                total += t.numel() * t.element_size()
+        return total
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "packed MLA latent has three buffers per layer; disaggregation "
+            "would transfer only the codes and silently drop scales and k_pe"
+        )
+
+    # ── the buffers the stock MLA path expects, deliberately absent ─────────
+
+    def latent_row_dim(self) -> int:
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    def get_key_buffer(self, layer_id: int):
+        raise NotImplementedError(
+            "packed MLA latent has no BF16 kv_buffer to hand out. Readers must "
+            "go through materialize_rows() or the packed attention kernels; "
+            "returning a stand-in here would let a consumer read uninitialised "
+            "memory and score it."
+        )
+
+    def get_value_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id)
+
+    # ── rotation hooks used by the model's MLA forward ──────────────────────
+
+    def latent_rotation(self, layer_id: int) -> Optional[torch.Tensor]:
+        if not self.rotations:
+            return None
+        return self.rotations.get(layer_id)
+
+    def rotate_latent(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
+        """``x @ R`` -- the query side, and the fresh keys handed to a kernel."""
+        R = self.latent_rotation(layer_id)
+        if R is None:
+            return x
+        shp = x.shape
+        return torch.matmul(x.reshape(-1, shp[-1]), R.to(x.dtype)).view(shp)
+
+    def unrotate_output(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
+        """``x @ R^T`` -- the attention output, before ``w_vc``."""
+        R = self.latent_rotation(layer_id)
+        if R is None:
+            return x
+        shp = x.shape
+        return torch.matmul(x.reshape(-1, shp[-1]), R.to(x.dtype).T).view(shp)
+
+    # ── window addressing ───────────────────────────────────────────────────
+
+    def _ring_rows(self, n_tokens: int):
+        """``(ring_row, keep)`` for the ``n_tokens`` rows this forward writes.
+
+        Both are ``[n_tokens]`` int64/bool device tensors, or ``(None, None)``
+        when the windows cannot be placed for this forward (the pre-window
+        behaviour: everything is 2-bit, which is always safe).
+        """
+        if not self._latent_windows:
+            return None, None
+        meta = self._fb_window_meta
+        if meta is None or meta.get("fallback"):
+            return None, None
+        P, W = self._win_p, self._win_r
+        req_pool_indices = meta["req_pool_indices"]
+        if req_pool_indices is None:
+            return None, None
+
+        if meta["is_decode"]:
+            seq_lens = meta["seq_lens"]
+            if seq_lens is None or seq_lens.numel() != n_tokens:
+                self._window_fallback(
+                    f"decode wrote {n_tokens} rows for "
+                    f"{0 if seq_lens is None else seq_lens.numel()} requests"
+                )
+                return None, None
+            pos = seq_lens.to(torch.int64) - 1
+            req = req_pool_indices.to(torch.int64)
+            seq = seq_lens.to(torch.int64)
+        else:
+            positions = meta["positions"]
+            extend_seq_lens = meta["extend_seq_lens"]
+            if (
+                positions is None
+                or extend_seq_lens is None
+                or positions.numel() != n_tokens
+                or meta["seq_lens"] is None
+            ):
+                self._window_fallback("extend without per-token positions")
+                return None, None
+            ext = extend_seq_lens.to(torch.int64)
+            pos = positions.to(torch.int64)
+            seq = torch.repeat_interleave(
+                meta["seq_lens"].to(torch.int64), ext, output_size=n_tokens
+            )
+            req = torch.repeat_interleave(
+                req_pool_indices.to(torch.int64), ext, output_size=n_tokens
+            )
+
+        keep = (pos < P) | (pos >= seq - W)
+        # Requests past the ring arena would alias each other's windows; drop
+        # them to the packed tier rather than corrupt a neighbour. Sizing the
+        # arena from req_to_token_pool means this is unreachable in practice.
+        keep = keep & (req < self._max_reqs)
+        in_sink = pos < P
+        ring = 1 + req * self._per_req_hp + torch.where(
+            in_sink, pos, P + (pos - P).clamp(min=0) % max(W, 1)
+        )
+        ring = torch.where(keep, ring, torch.zeros_like(ring))
+        return ring, keep
+
+    # ── write path ──────────────────────────────────────────────────────────
+
+    def _packed_store(self, layer_id: int, loc: torch.Tensor,
+                      c_kv: torch.Tensor, k_pe: torch.Tensor) -> None:
+        """Rotate and pack ``c_kv`` into the pool at ``loc``.
+
+        The rotation lives here, on the write, so that *every* write site is
+        covered by construction -- the MHA prefill path reaches the pool through
+        ``_set_mla_kv_buffer`` and the MLA path through the attention layer's
+        ``save_kv_cache``, and a rotation applied at only one of them would give
+        a cache half in each frame with nothing to catch it. The read side
+        cancels it once, on the attention output.
+        """
+        from sglang.QuantKernel.mla_latent_int2 import scatter_pack_rows
+
+        li = layer_id - self.start_layer
+        R = self.kv_lora_rank
+        c = self.rotate_latent(layer_id, c_kv.reshape(-1, R).to(torch.float32))
+        pe = k_pe.reshape(-1, self.qk_rope_head_dim)
+        loc64 = loc.reshape(-1).to(torch.int64)
+
+        scatter_pack_rows(
+            c, loc64.to(torch.int32), self.c_codes[li], self.c_params[li],
+            self._group_size, self._lloyd_max,
+        )
+        self.rope_buf[li][loc64] = pe.to(self.dtype)
+
+        ring, keep = self._ring_rows(c.shape[0])
+        if ring is not None:
+            self.hp_c[li][ring] = c.to(self.dtype)
+            self.hp_owner_of_row[ring] = torch.where(
+                keep, loc64.to(torch.int32), torch.full_like(loc64, -1, dtype=torch.int32)
+            )
+            self.hp_row_of_slot[loc64] = torch.where(
+                keep, ring.to(torch.int32), torch.full_like(ring, -1, dtype=torch.int32)
+            )
+        else:
+            self.hp_row_of_slot[loc64] = -1
+
+        if self._shadow is not None:
+            from sglang.QuantKernel.mla_latent_int2 import quantize_dequantize_reuse
+
+            _c, _p, deq = quantize_dequantize_reuse(
+                c, self._group_size, self._lloyd_max
+            )
+            ref = deq.to(self.dtype).clone()
+            if ring is not None:
+                ref = torch.where(keep.unsqueeze(-1), c.to(self.dtype), ref)
+            self._shadow[li][loc64] = ref
+
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v):
+        """NSA/triton write path: ``cache_k`` is ``[c_kv | k_pe]`` concatenated."""
+        R = self.kv_lora_rank
+        self._log_write_path_once("set_kv_buffer(packed)", cache_k=cache_k.dtype)
+        self._packed_store(layer.layer_id, loc, cache_k[..., :R], cache_k[..., R:])
+
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+        self._log_write_path_once(
+            "set_mla_kv_buffer(packed)",
+            k_nope=cache_k_nope.dtype,
+            k_rope=cache_k_rope.dtype,
+        )
+        self._packed_store(layer.layer_id, loc, cache_k_nope, cache_k_rope)
+
+    # ── read path ───────────────────────────────────────────────────────────
+
+    def packed_read_operands(self, layer_id: int):
+        """Everything a packed attention kernel needs for one layer."""
+        li = layer_id - self.start_layer
+        return (
+            self.c_codes[li],
+            self.c_params[li],
+            self.rope_buf[li],
+            self.hp_c[li] if self._latent_windows else None,
+            self.hp_row_of_slot if self._latent_windows else None,
+            self.hp_owner_of_row if self._latent_windows else None,
+            self._group_size,
+            self._lloyd_max,
+        )
+
+    def materialize_rows(self, layer_id: int, slots: torch.Tensor,
+                         out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Dequantize ``slots`` into a dense ``[n, 1, R+rope]`` BF16 block.
+
+        This is the reference read: whatever a fused kernel does, it must agree
+        with this. It is also the production path for extend-with-prefix, where
+        the row set is small (the reused prefix) and a dense staging buffer is
+        cheaper than a second specialised kernel.
+        """
+        from sglang.QuantKernel.mla_latent_int2 import (
+            assemble_rows,
+            gather_dequant_rows,
+        )
+
+        li = layer_id - self.start_layer
+        R = self.kv_lora_rank
+        D = self.latent_row_dim()
+        slots = slots.reshape(-1)
+        n = slots.numel()
+        slots32 = slots.to(torch.int32)
+
+        if self._deq_scratch is None or self._deq_scratch.shape[0] < n:
+            self._deq_scratch = torch.empty(
+                (max(n, 1024), R), dtype=self.dtype, device=self.device
+            )
+        c_rot = self._deq_scratch[:n]
+        gather_dequant_rows(
+            slots32, self.c_codes[li], self.c_params[li], c_rot,
+            self._group_size, self._lloyd_max,
+        )
+        if out is None:
+            if self._read_scratch is None or self._read_scratch.shape[0] < n:
+                self._read_scratch = torch.empty(
+                    (max(n, 1024), 1, D), dtype=self.dtype, device=self.device
+                )
+            out = self._read_scratch[:n]
+        assemble_rows(
+            c_rot,
+            slots32,
+            self.rope_buf[li],
+            self.hp_c[li] if self._latent_windows else None,
+            self.hp_row_of_slot if self._latent_windows else None,
+            self.hp_owner_of_row if self._latent_windows else None,
+            out.view(n, D),
+        )
+        return out.view(n, 1, D)
+
+    def selfcheck_rows(self, layer_id: int, slots: torch.Tensor) -> Optional[dict]:
+        """Compare a materialized read against the BF16 fake-quant shadow.
+
+        Returns ``None`` unless the shadow is on. The shadow stores exactly what
+        ``mla_int2_kv_pool`` would have put in its BF16 cache (rotated frame),
+        so a match is the equivalence statement: *the packed read path returns
+        the same latent the fake-quant path measured*.
+        """
+        if self._shadow is None:
+            return None
+        li = layer_id - self.start_layer
+        slots = slots.reshape(-1)
+        got = self.materialize_rows(layer_id, slots)[:, 0, : self.kv_lora_rank]
+        want = self._shadow[li][slots.to(torch.int64)]
+        diff = (got.float() - want.float()).abs()
+        den = want.float().abs().max().clamp(min=1e-6)
+        return {
+            "layer": layer_id,
+            "n": int(slots.numel()),
+            "max_abs": float(diff.max()),
+            "rel": float(diff.max() / den),
+        }
+
+
+class MLAPackedInt2KVPool(_PackedLatentMixin, MLATokenToKVPool):
+    """Plain-MLA (DeepSeek-V2 style) pool with packed INT2 latent storage."""
+
+    def __init__(self, *args, rotation_path: str = "", group_size: int = 128,
+                 lloyd_max: bool = False, max_reqs: int = 64,
+                 selfcheck: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_packed(rotation_path, group_size, lloyd_max, max_reqs, selfcheck)
+
+    def _create_buffers(self):
+        # The BF16 latent cache this class replaces. Allocating it would defeat
+        # the entire point, so stand in with an empty list: everything that
+        # walked ``kv_buffer`` is overridden above and fails loudly otherwise.
+        self.kv_buffer = []
+
+
+class NSAPackedInt2KVPool(_PackedLatentMixin, NSATokenToKVPool):
+    """NSA/DSA pool (GLM-5.2) with packed INT2 latent storage.
+
+    The indexer's ``index_k_with_scale_buffer`` is untouched: it is a separate
+    fp8 buffer, it is what selects tokens rather than what attention reads, and
+    2-bit'ing the selector is a different experiment.
+    """
+
+    def __init__(self, *args, rotation_path: str = "", group_size: int = 128,
+                 lloyd_max: bool = False, max_reqs: int = 64,
+                 selfcheck: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_packed(rotation_path, group_size, lloyd_max, max_reqs, selfcheck)
+
+    def _create_buffers(self):
+        self.kv_buffer = []

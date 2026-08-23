@@ -30,6 +30,21 @@ from sglang.srt.utils import BumpAllocator
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
+def _packed_latent_pool(forward_batch, layer_id):
+    """The packed-INT2 latent pool, or ``None`` for every other pool.
+
+    Duck-typed on the two methods that define the contract so this file keeps
+    no import dependency on the OSCAR pools, and so nothing that merely looks
+    like an MLA pool can accidentally qualify.
+    """
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None or not hasattr(pool, "packed_read_operands"):
+        return None
+    if not hasattr(pool, "rotate_latent"):
+        return None
+    return pool
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
@@ -405,6 +420,7 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
+            _packed = None
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
@@ -435,6 +451,28 @@ class DeepseekMLAForwardMixin:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 
+            # Packed-INT2 latent: the cache holds the *rotated* latent, because
+            # that is the frame the quantizer is calibrated in and un-rotating
+            # every row a kernel touches would cost more than the read. Cancel
+            # it at the two ends instead, where it is a 512x512 matmul on the
+            # query and on the attention output rather than on the cache:
+            #
+            #     q . c^T = (q R) . (c R)^T          out = (sum p (c R)) R^T
+            #
+            # The fresh keys of this forward go to the kernel rotated too, so
+            # they sit in the same frame as the cached rows they are
+            # concatenated with; the pool rotates its own copy on the write.
+            _packed = _packed_latent_pool(forward_batch, self.attn_mqa.layer_id)
+            if _packed is not None:
+                _lid = self.attn_mqa.layer_id
+                _packed.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k, k_nope)
+                save_kv_cache = False
+                k_nope = _packed.rotate_latent(_lid, k_nope)
+                q = torch.cat(
+                    [_packed.rotate_latent(_lid, q_nope_out), q_pe], dim=-1
+                )
+                k = torch.cat([k_nope, k_pe], dim=-1)
+
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
@@ -447,6 +485,11 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+            if _packed is not None:
+                attn_output = _packed.unrotate_output(
+                    self.attn_mqa.layer_id,
+                    attn_output.view(-1, self.num_local_heads, self.kv_lora_rank),
+                )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:

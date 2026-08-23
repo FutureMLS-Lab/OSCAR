@@ -43,6 +43,47 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
+_PACKED_SELFCHECK_STATE = {"worst": 0.0, "n": 0}
+
+
+def _packed_selfcheck(pool, layer_id, kv_indices) -> None:
+    """Assert the packed read equals the BF16 fake-quant shadow.
+
+    This is the equivalence test that makes the packed arm comparable to the
+    published fake-quant number: the shadow holds exactly what
+    ``mla_int2_kv_pool`` would have written into its BF16 cache, so agreement
+    means the two paths are measuring the same latent. Enabled by
+    ``SGLANG_OSCAR_MLA_PACKED_SELFCHECK=1``; it doubles latent memory and syncs
+    the stream, so it is a smoke-run tool, not a serving option.
+    """
+    if kv_indices.numel() == 0:
+        return
+    rep = pool.selfcheck_rows(layer_id, kv_indices)
+    if rep is None:
+        return
+    st = _PACKED_SELFCHECK_STATE
+    st["n"] += 1
+    if rep["rel"] > st["worst"]:
+        st["worst"] = rep["rel"]
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "[MLAPacked] selfcheck layer=%d n=%d max_abs=%.3e rel=%.3e "
+            "(worst so far over %d checks)",
+            rep["layer"], rep["n"], rep["max_abs"], rep["rel"], st["n"],
+        )
+
+
+def _is_packed_mla_pool(pool) -> bool:
+    """True for the packed-INT2 latent pool (``mla_packed_kv_pool``).
+
+    Duck-typed rather than an isinstance import so this module keeps no
+    dependency on the OSCAR pool, and so a pool that only *partly* implements
+    the contract cannot half-qualify.
+    """
+    return hasattr(pool, "packed_read_operands") and hasattr(pool, "materialize_rows")
+
+
 @triton.jit
 def _count_mixed_hp_lens_kernel(
     req_to_token_ptr,       # int32 [num_req_slots, max_ctx]
@@ -313,12 +354,22 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
+            _pool = model_runner.token_to_kv_pool
+            # The packed MLA pool has no BF16 value buffer to measure -- reading
+            # one is exactly the mistake it refuses to serve -- so ask it for the
+            # width instead. Everything else keeps the buffer probe.
+            _v_dim = getattr(_pool, "kv_lora_rank", None) if _is_packed_mla_pool(
+                _pool
+            ) else None
             self.v_head_dim = getattr(
-                model_runner.token_to_kv_pool,
+                _pool,
                 "v_head_dim",
-                model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1],
+                _v_dim if _v_dim is not None else _pool.get_value_buffer(0).shape[-1],
             )
             self.swa_v_head_dim = None
+        self.packed_mla_pool = (
+            _is_packed_mla_pool(model_runner.token_to_kv_pool) and self.use_mla
+        )
         self.max_context_len = model_runner.model_config.context_len
         # ``mixed_kv_enabled()`` is True only for ``UnifiedInt2HPKVPool``
         # (SWAKVPool / MHA pools lack the method), so this gate already
@@ -2009,13 +2060,40 @@ class TritonAttnBackend(AttentionBackend):
                 need_v_inverse_override=need_v_inverse,
             )
 
+        if self.packed_mla_pool:
+            # Extend reads only the *reused prefix* rows (the tokens of this
+            # forward are passed in as k/v), so the row set is small and bounded
+            # by the radix hit, not by the context. Staging them dense costs one
+            # dequant pass and keeps a second specialised kernel -- and a second
+            # place to get head tiling wrong -- out of the tree. If a workload
+            # ever makes this the hot path, it is the same dequant the decode
+            # kernel already fuses.
+            pool = forward_batch.token_to_kv_pool
+            n_prefix = int(kv_indices.numel())
+            if n_prefix > 0:
+                if envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get():
+                    _packed_selfcheck(pool, layer.layer_id, kv_indices)
+                staged = pool.materialize_rows(layer.layer_id, kv_indices)
+                k_buffer = staged
+                v_buffer = staged[..., : pool.kv_lora_rank]
+                kv_indices = torch.arange(
+                    n_prefix, dtype=kv_indices.dtype, device=kv_indices.device
+                )
+            else:
+                d = pool.latent_row_dim()
+                k_buffer = torch.zeros((1, 1, d), dtype=q.dtype, device=q.device)
+                v_buffer = k_buffer[..., : pool.kv_lora_rank]
+        else:
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buffer,
+            v_buffer,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -2403,6 +2481,31 @@ class TritonAttnBackend(AttentionBackend):
                     )
             else:
                 o = apply_segmented_hadamard_transform(o)
+        elif self.packed_mla_pool:
+            # Packed-INT2 latent: dequantize inside the KV loop instead of
+            # loading a BF16 row that does not exist. 288 B/token read instead
+            # of 1152.
+            from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+                packed_mla_decode_fwd,
+            )
+
+            pool = forward_batch.token_to_kv_pool
+            packed_mla_decode_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                pool,
+                layer.layer_id,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling * k_descale,
+                logit_cap=logits_soft_cap,
+            )
+            if envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get():
+                _packed_selfcheck(pool, layer.layer_id, kv_indices)
         else:
             # Standard attention with dequantized or non-quantized KV cache
             self.decode_attention_fwd(

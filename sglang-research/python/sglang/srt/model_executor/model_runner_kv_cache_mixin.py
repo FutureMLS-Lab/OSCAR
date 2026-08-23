@@ -364,6 +364,50 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+        elif (
+            self.use_mla_backend
+            and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+            and envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
+        ):
+            # Real packed-INT2 latent storage. The fake-quant pools below round
+            # c_kv through INT2 and write the result back into a BF16 cache, so
+            # they measure accuracy at BF16 memory cost; this one stores the
+            # codes. Both branches exist on purpose -- the fake-quant arm is the
+            # accuracy reference the packed arm is paired against.
+            from sglang.srt.mem_cache.mla_packed_kv_pool import (
+                MLAPackedInt2KVPool,
+                NSAPackedInt2KVPool,
+            )
+
+            packed_kwargs = dict(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                # The window arena is addressed by req_pool_index, so it has to
+                # cover every index the request pool can hand out -- sizing it
+                # from max_running_requests instead would silently drop the
+                # windows for whichever requests landed above the cut.
+                max_reqs=self.req_to_token_pool.size,
+                selfcheck=envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get(),
+            )
+            if is_nsa_model:
+                self.token_to_kv_pool = NSAPackedInt2KVPool(
+                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    **packed_kwargs,
+                )
+            else:
+                self.token_to_kv_pool = MLAPackedInt2KVPool(**packed_kwargs)
         elif self.use_mla_backend and is_nsa_model and (
             envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
             or envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get()

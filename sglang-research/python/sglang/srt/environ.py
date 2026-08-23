@@ -229,6 +229,21 @@ class Envs:
     SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
     SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
     SGLANG_OSCAR_MLA_KV_REAL_KERNEL = EnvBool(False)
+    # Store the MLA/NSA latent as *packed* INT2 codes instead of fake-quantizing
+    # into a BF16 cache. This is the difference between a quality measurement
+    # and a deployment: with it on, ``c_kv`` occupies 2 bits/value plus group
+    # params (160 B/token/layer instead of 1024 B) and ``max_total_num_tokens``
+    # actually moves. ``k_pe`` stays BF16 -- MLA depends on the positional half
+    # being unquantized. Requires a rotation path (there is nothing to pack
+    # without one).
+    SGLANG_OSCAR_MLA_KV_PACKED = EnvBool(False)
+    # Shadow the packed latent with the BF16 fake-quant result and assert every
+    # materialized read matches it. Doubles latent memory; for smoke runs only.
+    SGLANG_OSCAR_MLA_PACKED_SELFCHECK = EnvBool(False)
+    # Number of BF16 window rows per request in the packed pool's HP arena.
+    # 0 = sink + recent (the two windows), which is the only correct value;
+    # exposed so the arena can be sized down for probes.
+    SGLANG_OSCAR_MLA_PACKED_HP_REQS = EnvInt(0)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in
