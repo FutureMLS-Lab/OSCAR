@@ -69,3 +69,175 @@
 2026-08-21T06:57:49Z zz-glm52-w256-r5: phase=Running gate=admit
 2026-08-21T06:57:50Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
 2026-08-21T06:57:51Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:02:52Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:02:54Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:02:55Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:07:56Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:07:57Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:07:58Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:12:59Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:13:00Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:13:01Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:18:02Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:18:03Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:18:04Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:23:05Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:23:06Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:23:07Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:28:08Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:28:09Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:28:10Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:33:11Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:33:12Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:33:13Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:38:15Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:38:16Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:38:17Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:43:18Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:43:19Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:43:20Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:48:21Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:48:22Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:48:23Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:53:25Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:53:27Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:53:28Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T07:58:29Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T07:58:30Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T07:58:32Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:03:33Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:03:34Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:03:35Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:08:36Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:08:37Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:08:38Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:13:39Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:13:40Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:13:41Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:18:42Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:18:43Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:18:44Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:23:45Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:23:46Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:23:47Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:28:48Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:28:49Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:28:50Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:33:51Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:33:52Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:33:53Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:38:54Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:38:56Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:38:57Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:43:58Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:43:59Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:44:00Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:49:02Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:49:04Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:49:05Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:54:07Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:54:08Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:54:10Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T08:59:11Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T08:59:12Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T08:59:13Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:04:15Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:04:16Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:04:17Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:09:18Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:09:19Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:09:20Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:14:21Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:14:22Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:14:23Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:19:24Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:19:25Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:19:26Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:24:27Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:24:28Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:24:29Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:29:30Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:29:31Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:29:32Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:34:33Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:34:34Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:34:35Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:39:36Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:39:37Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:39:38Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:44:39Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:44:40Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:44:41Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:49:42Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:49:43Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:49:44Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:54:45Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:54:46Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:54:47Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T09:59:48Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T09:59:49Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T09:59:49Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T10:04:50Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:04:51Z zz-glm52-w512-r4: phase=Running gate=admit_bypass
+2026-08-21T10:04:52Z zz-glm52-w1024-r4: phase=Running gate=admit_bypass
+2026-08-21T10:09:53Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:09:53Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:09:54Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:14:55Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:14:55Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:14:55Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:19:56Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:19:57Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:19:57Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:24:58Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:24:58Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:24:58Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:29:59Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:29:59Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:30:00Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:35:01Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:35:01Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:35:01Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:40:02Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:40:02Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:40:03Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:45:04Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:45:04Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:45:04Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:50:05Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:50:05Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:50:06Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T10:55:07Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T10:55:07Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T10:55:07Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:00:08Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:00:08Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:00:09Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:05:10Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:05:10Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:05:10Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:10:11Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:10:11Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:10:12Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:15:13Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:15:13Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:15:13Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:20:14Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:20:15Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:20:15Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:25:16Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:25:16Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:25:16Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:30:18Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:30:18Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:30:18Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:35:19Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:35:19Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:35:20Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:40:21Z zz-glm52-w256-r5: phase=Running gate=admit
+2026-08-21T11:40:21Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:40:21Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:45:22Z zz-glm52-w256-r5: COMPLETE
+2026-08-21T11:45:23Z zz-glm52-w512-r4: COMPLETE
+2026-08-21T11:45:24Z zz-glm52-w1024-r4: COMPLETE
+2026-08-21T11:45:24Z watchdog exit: no active jobs

@@ -220,19 +220,27 @@ def _real_kernel_enabled() -> bool:
     yet save memory -- the codes are unpacked straight back into the BF16 pool,
     because the MLA attention path has no INT2 read support.
     """
-    try:
-        from sglang.srt import environ as envs
-        return bool(envs.SGLANG_OSCAR_MLA_KV_REAL_KERNEL.get())
-    except Exception:
-        return False
+    # ``from sglang.srt import environ as envs`` binds the *module*, but the
+    # env descriptors live on the ``Envs`` class and the module defines no
+    # ``__getattr__`` -- so the attribute lookup raised AttributeError, the
+    # bare ``except`` swallowed it, and this returned False for every possible
+    # value of the variable including "1". The kernel was unreachable, not
+    # merely disabled, and every GLM-5.2 number in this branch came from
+    # ``_fake_quant_int2_groupwise``. Two sites used this idiom against 128
+    # files using the correct ``from sglang.srt.environ import envs``.
+    #
+    # The bare except is also gone: it existed to tolerate an import cycle,
+    # but it is exactly what hid this for the life of the flag. If the import
+    # ever does fail, failing loudly is the lesser harm.
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OSCAR_MLA_KV_REAL_KERNEL.get())
 
 
 def _quant_requested() -> bool:
-    try:
-        from sglang.srt import environ as envs
-        return bool(envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get())
-    except Exception:
-        return False
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get())
 
 
 # ── mixin ────────────────────────────────────────────────────────────────────

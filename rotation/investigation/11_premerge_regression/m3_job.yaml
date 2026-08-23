@@ -1,0 +1,186 @@
+# MiniMax-M3 pre-merge regression probe: one INT2 OSCAR arm, GPQA-diamond 24,
+# 2 nodes x 8 H100, TP=16, hostNetwork + IB, code pinned at afdcad68b7.
+# No node pins (charlie is contended); nodeAffinity only excludes the two
+# known-bad nodes: 117 corrupts INT2 output, 073 is driver-broken.
+apiVersion: v1
+kind: Service
+metadata:
+  name: zz-pm-m3-master
+  namespace: charlie
+spec:
+  type: ClusterIP
+  selector:
+    app: zz-pm-m3
+    role: head
+  ports:
+  - name: dist
+    port: 41811
+    targetPort: 41811
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-m3-head
+  namespace: charlie
+  labels:
+    app: zz-pm-m3
+    role: head
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: zz-pm-m3
+        role: head
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zz-premerge/runs/zz-pm-m3/m3_run_arm.sh
+        env:
+        - name: ROLE
+          value: head
+        - name: PORT
+          value: '31811'
+        - name: DIST_PORT
+          value: '41811'
+        - name: MASTER_SVC
+          value: zz-pm-m3-master
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-m3-worker
+  namespace: charlie
+  labels:
+    app: zz-pm-m3
+    role: worker
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: zz-pm-m3
+        role: worker
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: normal
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+              - key: node-group
+                operator: In
+                values:
+                - default
+      containers:
+      - name: eval
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -lc
+        - bash /shared/zz-premerge/runs/zz-pm-m3/m3_run_arm.sh
+        env:
+        - name: ROLE
+          value: worker
+        - name: PORT
+          value: '31811'
+        - name: DIST_PORT
+          value: '41811'
+        - name: MASTER_SVC
+          value: zz-pm-m3-master
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+            memory: 400Gi
+            cpu: '48'
+          requests:
+            nvidia.com/gpu: '8'
+            memory: 200Gi
+            cpu: '24'
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home-charlie
+          mountPath: /home/charlie
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: home-charlie
+        persistentVolumeClaim:
+          claimName: home-charlie-rwx
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi

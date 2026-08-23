@@ -112,20 +112,42 @@ questions both answered, 5 newly answered, **0 lost**, mean generation length
 down to the BF16 value. The windows do not make the model answer differently;
 they stop it from over-thinking past the budget.
 
-Recent 512 shows no gain on this subset — it recovers some truncation (17.5 %)
-but not the score. Read that as **"no evidence 512 helps"**, not as a measured
-regression: the cell is single-seed on 40 questions (±6.8 pp at 1 SD on the
-score alone), and per the warning above it cannot be compared against the
-198-question rows at all. Gemma-4, whose failure mode is the same
-over-thinking-into-the-cap, *did* want 64/512 (+4.6 AIME / +4.2 LCB over
-64/256), so "this model does not want a bigger window" is not yet established.
+Recent 512 shows no gain *on this subset* — and that turned out to be an
+artifact of the subset. **At full scope 512 is the best window measured**; see
+below. This is the concrete cost of reading a 40-question single-seed cell as a
+result: it pointed the opposite way from the truth on the one knob it was
+consulted about.
 
-**Being re-tested at n=198** (`rotation/investigation/09_glm52_latent_windows/`):
-recent 256 / 512 / 1024 at sink 64, one variable, LM=1, group 128, radix on, all
-three pinned to the same commit as the BF16 reference arm, with a 64/256 control
-arm so the family is internally valid. Until those land, 64/256 is the default
-because it is the only window setting measured at full scope, not because larger
-windows were ruled out.
+## Recent-window sweep at n=198 — the peak is 512, not 256, and not 1024
+
+`rotation/investigation/09_glm52_latent_windows/`. Sink fixed at 64, one
+variable, LM=1, group 128, radix on, all arms pinned to the same commit as the
+BF16 reference arm, each dumping its full environment to `$RUN_DIR/config.env`.
+
+| KV | answered | score | truncated | acc given answered | mean chars | vs BF16 (paired) |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| BF16 | 169/198 | **82.32** | 14.65 % | 96.45 % | 48 339 | — |
+| INT2, **sink 64 / recent 512** | 166/198 | **80.30** | **16.16 %** | 95.78 % | 53 171 | **−2.02 ± 2.14 pp, p = 0.48** |
+| INT2, sink 64 / recent 256 | 159/198 | 76.77 | 19.70 % | 95.60 % | 52 832 | −5.56 ± 2.20 pp, p = 0.019 |
+| INT2, sink 64 / recent 1024 | 157/198 | 75.76 | 20.71 % | 95.54 % | 54 919 | −6.57 ± 2.20 pp, p = 0.0044 |
+
+**64/512 is not statistically distinguishable from BF16** (McNemar p = 0.48 on
+18 discordant pairs) — the best GLM-5.2 INT2 result on this benchmark. And the
+window is **not monotone**: 1024 falls back to roughly the 256 level (512 → 1024
+is −4.55 ± 2.20 pp, p = 0.064). A bigger BF16 recent window is not automatically
+a better one, so this knob has to be swept rather than maximized.
+
+`acc given answered` sits at **95.5–96.5 % in all four arms** while the
+truncation rate moves 14.65 → 20.71 %. That is the whole mechanism in one row:
+the windows do not change how well the model answers, they change how often it
+finishes in budget. Note 1024 also has the *longest* mean generation and the
+*most* truncation — it makes the model ramble further without helping it land.
+
+**Do not treat the 512 peak as settled.** Single seed. 512 vs 256 is
++3.54 ± 2.31 pp (p = 0.19, not significant on its own); only 512-vs-1024 and
+512-vs-BF16 carry real signal, and the 256 cell here is still the *archived*
+arm (unknown Lloyd-Max, pre-pin code). A same-family 64/256 control arm is
+running to replace it; until then 256-vs-512 is suggestive, not measured.
 
 ### Which comparisons are clean, read back from each server log
 

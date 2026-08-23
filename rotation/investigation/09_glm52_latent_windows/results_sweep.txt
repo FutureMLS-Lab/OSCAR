@@ -1,0 +1,118 @@
+# GLM-5.2-FP8 recent-window sweep @ GPQA-198, b200 TP=8, 32K, single seed, LM=1, pin 7f0f986c0
+# w256_arch = ARCHIVED 64/256 (unknown LM, pre-pin code) -- w256_r5 control still running
+
+               arm  score score_n answered truncatedtruncated_pctacc_given_answered trunc_min_chars trunc_shorttrunc_loop_tail mean_chars
+              bf16  82.32     163      169        29        14.65             96.45           83049           0              0    48339.1
+         w256_arch  76.77     152      159        39         19.7              95.6           79819           0              0    52832.0
+              w512   80.3     159      166        32        16.16             95.78           82528           0              0    53171.3
+             w1024  75.76     150      157        41        20.71             95.54           79421           0              0    54919.0
+
+=== PAIRED  A=bf16  B=w512  paired=198 ===
+answered 2x2: both=160  A-only=9  B-only=6  neither=23
+both answered: 160  same letter: 156 (97.50%)
+  acc on both-answered: A=154/160=96.25%  B=154/160=96.25%
+correct 2x2 (all 198): A+B+=152 A+B-=11 A-B+=7 A-B-=28
+  A=163  B=159  B loses 11, gains 7, net -4 questions (-2.02 pp)
+  paired delta -2.02 +/- 2.14 pp (1 SE, single seed, from 18 discordant pairs)
+  of B's 11 losses: 9 B-truncated (81.82%), 2 B-answered-wrong
+  words(B)/words(A) on both-answered (160): p25=0.76 p50=1.16 p75=1.89
+  McNemar exact two-sided p = 0.4807 (discordant 11 vs 7)
+
+=== PAIRED  A=bf16  B=w1024  paired=198 ===
+answered 2x2: both=154  A-only=15  B-only=3  neither=26
+both answered: 154  same letter: 150 (97.40%)
+  acc on both-answered: A=150/154=97.40%  B=147/154=95.45%
+correct 2x2 (all 198): A+B+=147 A+B-=16 A-B+=3 A-B-=32
+  A=163  B=150  B loses 16, gains 3, net -13 questions (-6.57 pp)
+  paired delta -6.57 +/- 2.20 pp (1 SE, single seed, from 19 discordant pairs)
+  of B's 16 losses: 13 B-truncated (81.25%), 3 B-answered-wrong
+  words(B)/words(A) on both-answered (154): p25=0.67 p50=1.07 p75=1.81
+  McNemar exact two-sided p = 0.004425 (discordant 16 vs 3)
+
+=== PAIRED  A=w512  B=w1024  paired=198 ===
+answered 2x2: both=152  A-only=14  B-only=5  neither=27
+both answered: 152  same letter: 148 (97.37%)
+  acc on both-answered: A=148/152=97.37%  B=146/152=96.05%
+correct 2x2 (all 198): A+B+=145 A+B-=14 A-B+=5 A-B-=34
+  A=159  B=150  B loses 14, gains 5, net -9 questions (-4.55 pp)
+  paired delta -4.55 +/- 2.20 pp (1 SE, single seed, from 19 discordant pairs)
+  of B's 14 losses: 11 B-truncated (78.57%), 3 B-answered-wrong
+  words(B)/words(A) on both-answered (152): p25=0.64 p50=1.02 p75=1.45
+  McNemar exact two-sided p = 0.06357 (discordant 14 vs 5)
+
+=== PAIRED  A=w256_arch  B=w512  paired=198 ===
+answered 2x2: both=153  A-only=6  B-only=13  neither=26
+both answered: 153  same letter: 148 (96.73%)
+  acc on both-answered: A=146/153=95.42%  B=148/153=96.73%
+correct 2x2 (all 198): A+B+=145 A+B-=7 A-B+=14 A-B-=32
+  A=152  B=159  B loses 7, gains 14, net +7 questions (+3.54 pp)
+  paired delta +3.54 +/- 2.31 pp (1 SE, single seed, from 21 discordant pairs)
+  of B's 7 losses: 6 B-truncated (85.71%), 1 B-answered-wrong
+  words(B)/words(A) on both-answered (153): p25=0.75 p50=1.03 p75=1.58
+  McNemar exact two-sided p = 0.1892 (discordant 7 vs 14)
+[
+  {
+    "arm": "bf16",
+    "n": 198,
+    "score_n": 163,
+    "score": 82.32,
+    "answered": 169,
+    "answered_pct": 85.35,
+    "truncated": 29,
+    "truncated_pct": 14.65,
+    "acc_given_answered": 96.45,
+    "trunc_min_chars": 83049,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 48339.1,
+    "median_chars_answered": 24787
+  },
+  {
+    "arm": "w256_arch",
+    "n": 198,
+    "score_n": 152,
+    "score": 76.77,
+    "answered": 159,
+    "answered_pct": 80.3,
+    "truncated": 39,
+    "truncated_pct": 19.7,
+    "acc_given_answered": 95.6,
+    "trunc_min_chars": 79819,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 52832.0,
+    "median_chars_answered": 27530
+  },
+  {
+    "arm": "w512",
+    "n": 198,
+    "score_n": 159,
+    "score": 80.3,
+    "answered": 166,
+    "answered_pct": 83.84,
+    "truncated": 32,
+    "truncated_pct": 16.16,
+    "acc_given_answered": 95.78,
+    "trunc_min_chars": 82528,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 53171.3,
+    "median_chars_answered": 35450
+  },
+  {
+    "arm": "w1024",
+    "n": 198,
+    "score_n": 150,
+    "score": 75.76,
+    "answered": 157,
+    "answered_pct": 79.29,
+    "truncated": 41,
+    "truncated_pct": 20.71,
+    "acc_given_answered": 95.54,
+    "trunc_min_chars": 79421,
+    "trunc_short": 0,
+    "trunc_loop_tail": 0,
+    "mean_chars": 54919.0,
+    "median_chars_answered": 25129
+  }
+]

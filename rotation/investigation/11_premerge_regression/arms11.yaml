@@ -1,0 +1,176 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-m27-c16
+  namespace: charlie
+  labels: {app: zz-pm-m27, family: batch16}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: zz-pm-m27, family: batch16}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostIPC: true
+      priorityClassName: normal
+      schedulerName: volcano
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+                - research-common-h100-014.cloud.together.ai
+                - research-common-h100-064.cloud.together.ai
+                - research-common-h100-092.cloud.together.ai
+                - research-common-h100-099.cloud.together.ai
+                - research-common-h100-105.cloud.together.ai
+                - research-common-h100-122.cloud.together.ai
+                - research-common-h100-071.cloud.together.ai
+                - research-common-h100-057.cloud.together.ai
+                - research-common-h100-041.cloud.together.ai
+                - research-common-h100-080.cloud.together.ai
+                - research-common-h100-048.cloud.together.ai
+                - research-common-h100-055.cloud.together.ai
+                - research-common-h100-096.cloud.together.ai
+                - research-common-h100-116.cloud.together.ai
+                - research-common-h100-046.cloud.together.ai
+                - research-common-h100-090.cloud.together.ai
+      containers:
+      - name: arm
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        command: ["/bin/bash", "-lc"]
+        args: ["base64 -d /shared/zz-premerge/run_arm11.b64 > /tmp/run_arm11.sh && bash /tmp/run_arm11.sh"]
+        env:
+        - {name: ARM, value: "pm_m27_c16"}
+        - {name: PORT, value: "32700"}
+        - {name: ROOT, value: "/shared/zz-premerge"}
+        - {name: TREE, value: "/shared/zz-premerge/tree_m27"}
+        - {name: EXPECT_SHA, value: "afdcad68b771d312b0eae3d6edde5c08a3881f87"}
+        - {name: ISOLATE_TREE, value: "1"}
+        - {name: ROT_DIR_OVERRIDE, value: "/shared/zz-m27-recheck/rotations"}
+        - {name: K_ROT_FILENAME, value: "k_rotation_qqt_r_h_pbr.pt"}
+        - {name: V_ROT_FILENAME, value: "v_rotation_sst_r_h_pbr.pt"}
+        - {name: KV, value: "int2"}
+        - {name: TP_SIZE, value: "4"}
+        - {name: MEM_FRAC, value: "0.85"}
+        - {name: MAX_RUNNING, value: "32"}
+        - {name: CUDA_GRAPH_MAX_BS, value: "32"}
+        - {name: MAX_NEW_TOKENS, value: "8192"}
+        - {name: NUM_EXAMPLES, value: "24"}
+        - {name: DISABLE_RADIX, value: "0"}
+        - {name: HP_PREFIX, value: "64"}
+        - {name: HP_RECENT, value: "256"}
+        - {name: LLOYD_MAX, value: "0"}
+        - {name: ABSORB_V, value: "0"}
+        - {name: NUM_WORKERS, value: "16"}
+        resources:
+          limits: {nvidia.com/gpu: "4"}
+          requests: {nvidia.com/gpu: "4"}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home-charlie, mountPath: /home/charlie}
+        - {name: scratch, mountPath: /tmp}
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}
+      - {name: scratch, emptyDir: {}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-m27-c8
+  namespace: charlie
+  labels: {app: zz-pm-m27, family: batch8}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: zz-pm-m27, family: batch8}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostIPC: true
+      priorityClassName: normal
+      schedulerName: volcano
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+                - research-common-h100-014.cloud.together.ai
+                - research-common-h100-064.cloud.together.ai
+                - research-common-h100-092.cloud.together.ai
+                - research-common-h100-099.cloud.together.ai
+                - research-common-h100-105.cloud.together.ai
+                - research-common-h100-122.cloud.together.ai
+                - research-common-h100-071.cloud.together.ai
+                - research-common-h100-057.cloud.together.ai
+                - research-common-h100-041.cloud.together.ai
+                - research-common-h100-080.cloud.together.ai
+                - research-common-h100-048.cloud.together.ai
+                - research-common-h100-055.cloud.together.ai
+                - research-common-h100-096.cloud.together.ai
+                - research-common-h100-116.cloud.together.ai
+                - research-common-h100-046.cloud.together.ai
+                - research-common-h100-090.cloud.together.ai
+      containers:
+      - name: arm
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        command: ["/bin/bash", "-lc"]
+        args: ["base64 -d /shared/zz-premerge/run_arm11.b64 > /tmp/run_arm11.sh && bash /tmp/run_arm11.sh"]
+        env:
+        - {name: ARM, value: "pm_m27_c8"}
+        - {name: PORT, value: "32704"}
+        - {name: ROOT, value: "/shared/zz-premerge"}
+        - {name: TREE, value: "/shared/zz-premerge/tree_m27"}
+        - {name: EXPECT_SHA, value: "afdcad68b771d312b0eae3d6edde5c08a3881f87"}
+        - {name: ISOLATE_TREE, value: "1"}
+        - {name: ROT_DIR_OVERRIDE, value: "/shared/zz-m27-recheck/rotations"}
+        - {name: K_ROT_FILENAME, value: "k_rotation_qqt_r_h_pbr.pt"}
+        - {name: V_ROT_FILENAME, value: "v_rotation_sst_r_h_pbr.pt"}
+        - {name: KV, value: "int2"}
+        - {name: TP_SIZE, value: "4"}
+        - {name: MEM_FRAC, value: "0.85"}
+        - {name: MAX_RUNNING, value: "32"}
+        - {name: CUDA_GRAPH_MAX_BS, value: "32"}
+        - {name: MAX_NEW_TOKENS, value: "8192"}
+        - {name: NUM_EXAMPLES, value: "24"}
+        - {name: DISABLE_RADIX, value: "0"}
+        - {name: HP_PREFIX, value: "64"}
+        - {name: HP_RECENT, value: "256"}
+        - {name: LLOYD_MAX, value: "0"}
+        - {name: ABSORB_V, value: "0"}
+        - {name: NUM_WORKERS, value: "8"}
+        resources:
+          limits: {nvidia.com/gpu: "4"}
+          requests: {nvidia.com/gpu: "4"}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home-charlie, mountPath: /home/charlie}
+        - {name: scratch, mountPath: /tmp}
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home-charlie, persistentVolumeClaim: {claimName: home-charlie-rwx}}
+      - {name: scratch, emptyDir: {}}

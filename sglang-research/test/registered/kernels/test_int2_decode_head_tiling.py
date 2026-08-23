@@ -121,10 +121,27 @@ class Int2DecodeHeadTilingTest(unittest.TestCase):
         return (o.float() - ref).norm().item() / ref.norm().item()
 
     def test_matches_dense_reference_across_the_tile_heuristic_boundary(self):
-        """The heuristic switches BLOCK_H at batch 4 and again at batch 16."""
+        """The heuristic switches BLOCK_H at batch 4 and again at batch 16.
+
+        Two OPPOSITE regimes have to be covered, because the heuristic picks
+        BLOCK_H=4 below kv_group_num 9 and BLOCK_H=8/16 above it:
+
+            kv_group_num 5..7   BLOCK_H 4 at batch >= 16  -> breaks at LARGE batch
+            kv_group_num 9..15  BLOCK_H 8 at batch <  16  -> breaks at SMALL batch
+
+        The first regime is MiniMax-M2.7 (48Q/8KV at TP=4 = 6). The second is
+        GLM-4.7-FP8 (96Q/8KV = 12), and it is only reachable with **two or more
+        KV heads per rank**: with a single KV head every head block maps to
+        kv_head 0, which is also the only KV head, so the mis-mapping is masked
+        and reads correct data by accident. That is why the 12-group cases below
+        use num_kv_heads 2 and 8 rather than 1.
+        """
         _ensure_cuda()
-        # kv_group_num 5, 6 and 7 are the ones a BLOCK_H of 4 cannot tile.
-        for num_kv_heads, kv_group_num in ((2, 6), (4, 5), (4, 7), (2, 4), (2, 8)):
+        # kv_group_num 5, 6 and 7 are the ones a BLOCK_H of 4 cannot tile;
+        # 9..15 are the ones a BLOCK_H of 8 cannot tile; 4 and 8 are controls.
+        for num_kv_heads, kv_group_num in ((2, 6), (4, 5), (4, 7),
+                                           (2, 12), (8, 12), (2, 9), (2, 15),
+                                           (2, 4), (2, 8)):
             for bs in (2, 8, 15, 16, 20):
                 with self.subTest(kv_group_num=kv_group_num, bs=bs):
                     rel = self._run(bs, num_kv_heads, kv_group_num)
