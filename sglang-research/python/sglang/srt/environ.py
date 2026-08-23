@@ -259,6 +259,11 @@ class Envs:
     # it removes 128x-redundant address computation, which is the cost that
     # survived the bandwidth refutation. Off by default until A/B'd on hardware.
     SGLANG_OSCAR_MLA_PACKED_PARAM_BCAST = EnvBool(False)
+    # Read the packed codes twice, once per dot layout, instead of transposing
+    # one tile. The transpose is a shared-memory layout conversion; the second
+    # dequant is free (measured: removing the dequant entirely is 1.00x). Off by
+    # default until A/B'd on hardware.
+    SGLANG_OSCAR_MLA_PACKED_DUAL_LOAD = EnvBool(False)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in

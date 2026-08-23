@@ -208,6 +208,53 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"  ABLATE={lvl} failed: {type(e).__name__}: {e}")
 
+    # The transpose. ``tl.dot(q, tl.trans(cvq))`` converts a [BLOCK_N, D] tile's
+    # layout through shared memory; reading the codes a second time in the
+    # layout the dot wants removes that at the cost of a second dequant, which
+    # the ABLATE rows above just measured at zero. This is the only structural
+    # difference left between this kernel and the BF16 one it must beat: the
+    # BF16 kernel reads K and V separately and never transposes.
+    #
+    # Not expected to be bit-identical -- same values, but tl.dot over a
+    # differently-laid-out operand can reduce in a different order -- so this
+    # checks a tolerance rather than equality.
+    logits.zero_(); lse.zero_()
+    packed_mla_decode_stage1(
+        q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
+        sm, 0.0, block_n=16, num_warps=8, num_stages=1, dual_load=True)
+    torch.cuda.synchronize()
+    o_dl, l_dl = logits.clone(), lse.clone()
+    ref_o, ref_l = outs["gid"]
+    den = ref_o.abs().max().clamp(min=1e-6)
+    rel = ((o_dl - ref_o).abs().max() / den).item()
+    dl_ok = rel < 5e-3
+    print(f"\ndual-load: rel max|dout| = {rel:.3e}, max|dlse| = "
+          f"{(l_dl - ref_l).abs().max().item():.3e} -> "
+          f"{'AGREES' if dl_ok else 'DIFFERS -- do not trust the timing'}")
+    try:
+        t_dl = timeit(lambda: packed_mla_decode_stage1(
+            q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
+            sm, 0.0, block_n=16, num_warps=8, num_stages=1, dual_load=True,
+        ))
+        print(f"  transpose    {t_gid:.3f} ms ({base/t_gid:.2f}x BF16)")
+        print(f"  dual load    {t_dl:.3f} ms ({base/t_dl:.2f}x BF16)  "
+              f"-> {t_gid/t_dl:.2f}x over the transpose")
+        # BLOCK_N was tuned against a kernel that transposed; if the transpose
+        # was the constraint, the tile optimum moves with it.
+        for bn in (32, 64):
+            try:
+                t = timeit(lambda: packed_mla_decode_stage1(
+                    q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=8,
+                    num_stages=1, dual_load=True,
+                ))
+                print(f"  dual load BLOCK_N={bn} {t:.3f} ms ({base/t:.2f}x BF16)")
+            except Exception as e:  # noqa: BLE001
+                print(f"  dual load BLOCK_N={bn} - {type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:60]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  dual load failed: {type(e).__name__}: {e}")
+
     # Head amortization. MLA shares one KV head across every query head, so
     # BLOCK_H is free to grow -- and growing it is the only lever that changes
     # the dequant-to-dot ratio rather than the constant in front of it. The cap

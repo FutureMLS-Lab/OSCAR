@@ -1,0 +1,36 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-nll-a
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      priorityClassName: zz-k3-nopreempt
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: g
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc", "echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2NhcjsgVz0vd29yay9vc2NhcjsgUElOPWNjYWQxMzMzNGUKbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9Ci4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIFBZVEhPTlBBVEg9JFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbiBIRl9IVUJfT0ZGTElORT0xCmVjaG8gIltqb2JdIEhFQUQ9JChnaXQgLUMgJFcgbG9nIC0tb25lbGluZSAtMSkiCgpleHBvcnQgUlVOX0RJUj0kUi9tbGFwYWNrZWRfbmxsX2E7IG1rZGlyIC1wICRSVU5fRElSCmV4cG9ydCBPVVRfRElSPSRSVU5fRElSIE1FTV9GUkFDPTAuNzAgQ0hVTks9NTEyIFNLSVA9MTAyNCBUQVJHRVRfVE9LRU5TPTQwOTYKcHl0aG9uMyAtdSAkVy9yb3RhdGlvbi9pbnZlc3RpZ2F0aW9uLzEzX21sYV9wYWNrZWRfaW50Mi9yZWFkX3BhdGhfbmxsLnB5IFwKICAyPiYxIHwgdGVlICRSVU5fRElSL25sbC5sb2cKZWNobyAiW2pvYl0gZXhpdD0ke1BJUEVTVEFUVVNbMF19Igo= | base64 -d > /tmp/g.sh; bash /tmp/g.sh"]
+        env:
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: HOME, value: /tmp/h}
+        resources:
+          limits: {nvidia.com/gpu: "1"}
+          requests: {cpu: "16", memory: 200Gi, nvidia.com/gpu: "1"}
+        volumeMounts:
+        - {name: sh, mountPath: /shared}
+        - {name: hf, mountPath: /hf}
+        - {name: shm, mountPath: /dev/shm}
+        - {name: work, mountPath: /work}
+      volumes:
+      - {name: sh, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+      - {name: shm, emptyDir: {medium: Memory, sizeLimit: 200Gi}}
+      - {name: work, emptyDir: {sizeLimit: 20Gi}}

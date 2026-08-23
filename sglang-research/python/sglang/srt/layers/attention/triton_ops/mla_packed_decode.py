@@ -80,6 +80,7 @@ def _fwd_packed_mla_stage1(
     HAS_HP: tl.constexpr,
     PARAM_BCAST: tl.constexpr,
     ABLATE: tl.constexpr,
+    DUAL_LOAD: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -238,7 +239,55 @@ def _fwd_packed_mla_stage1(
                         other=0.0,
                     )
                     cvq = tl.where(use_hp[:, None], hpv.to(q.dtype), cvq)
-            qk = tl.dot(q, tl.trans(cvq))                      # [BLOCK_H, BLOCK_N]
+
+            if DUAL_LOAD:
+                # ``tl.trans`` of a [BLOCK_N, D] tile is a shared-memory layout
+                # conversion, and layout conversion is the one cost in this
+                # kernel that measurement has *not* exonerated. Four hypotheses
+                # have now been refuted here -- tiling (18-point grid), traffic
+                # (narrowing the bytes, 1.3x slower), addressing (register
+                # broadcast, bit-identical and 1.28x slower) and the dequant
+                # arithmetic itself (ABLATE=2 removes it and measures 1.00x) --
+                # and two of the four got *slower* specifically by replacing a
+                # direct wide load with a constructed tile.
+                #
+                # So the original trade is backwards. The docstring's reason for
+                # transposing was to avoid dequantizing twice; the ablation says
+                # dequantizing is free. Read the codes a second time in the
+                # layout the first dot wants, and delete the transpose. The rope
+                # load below has always done exactly this.
+                byte_t = tl.load(
+                    Codes + kv_loc[None, :] * (D // 4) + (offs_d // 4)[:, None],
+                    mask=n_ok[None, :],
+                    other=0,
+                ).to(tl.int32)
+                code_t = (byte_t >> (2 * (offs_d % 4))[:, None]) & 0x3
+                scale_t = tl.load(
+                    Params + kv_loc[None, :] * (2 * NG) + (2 * gid)[:, None],
+                    mask=n_ok[None, :],
+                    other=0.0,
+                )
+                zero_t = tl.load(
+                    Params + kv_loc[None, :] * (2 * NG) + (2 * gid + 1)[:, None],
+                    mask=n_ok[None, :],
+                    other=0.0,
+                )
+                if LLOYD:
+                    cv_t = (code_t.to(tl.float32) - zero_t) * scale_t
+                else:
+                    cv_t = code_t.to(tl.float32) * scale_t + zero_t
+                cvq_t = tl.where(n_ok[None, :], cv_t, 0.0).to(q.dtype)
+                if HAS_HP:
+                    if tl.max(use_hp.to(tl.int32)) > 0:
+                        hpv_t = tl.load(
+                            HP + rr[None, :] * D + offs_d[:, None],
+                            mask=use_hp[None, :],
+                            other=0.0,
+                        )
+                        cvq_t = tl.where(use_hp[None, :], hpv_t.to(q.dtype), cvq_t)
+                qk = tl.dot(q, cvq_t)                          # [BLOCK_H, BLOCK_N]
+            else:
+                qk = tl.dot(q, tl.trans(cvq))                  # [BLOCK_H, BLOCK_N]
 
             kpe = tl.load(
                 Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
@@ -295,6 +344,7 @@ def packed_mla_decode_stage1(
     param_bcast: bool | None = None,
     ablate: int = 0,
     block_h: int = 0,
+    dual_load: bool | None = None,
 ):
     """``q`` is ``[batch, head, D+DPE]``; ``operands`` from ``packed_read_operands``."""
     codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
@@ -320,6 +370,8 @@ def packed_mla_decode_stage1(
     # fold, so NG must be a power of two. Every shipped MLA config is (512/128
     # = 4), but a group size that does not divide D into a power of two falls
     # back to the gid-indexed load rather than failing to compile.
+    if dual_load is None:
+        dual_load = envs.SGLANG_OSCAR_MLA_PACKED_DUAL_LOAD.get()
     if param_bcast is None:
         param_bcast = envs.SGLANG_OSCAR_MLA_PACKED_PARAM_BCAST.get()
     param_bcast = bool(
@@ -359,6 +411,7 @@ def packed_mla_decode_stage1(
         HAS_HP=has_hp,
         PARAM_BCAST=param_bcast,
         ABLATE=int(ablate),
+        DUAL_LOAD=bool(dual_load),
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=num_stages,
