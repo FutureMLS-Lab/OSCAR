@@ -253,6 +253,12 @@ class Envs:
     SGLANG_OSCAR_MLA_PACKED_BLOCK_N = EnvInt(16)
     SGLANG_OSCAR_MLA_PACKED_WARPS = EnvInt(8)
     SGLANG_OSCAR_MLA_PACKED_STAGES = EnvInt(1)
+    # Expand the per-group scale/zero in registers instead of addressing them as
+    # a [BLOCK_N, D] tile through gid. Bit-identical -- the pack layout is
+    # d = g * GS + j, so the broadcast reproduces gid element for element -- and
+    # it removes 128x-redundant address computation, which is the cost that
+    # survived the bandwidth refutation. Off by default until A/B'd on hardware.
+    SGLANG_OSCAR_MLA_PACKED_PARAM_BCAST = EnvBool(False)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in

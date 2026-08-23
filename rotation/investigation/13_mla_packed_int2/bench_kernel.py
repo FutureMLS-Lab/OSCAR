@@ -153,17 +153,51 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"\nablation failed: {type(e).__name__}: {e}")
 
-    # Load amplification, which is the arithmetic behind the ratio above. Per KV
-    # block the dequant path moves codes as [BLOCK_N, D] uint8 (every byte read
-    # four times) plus scale and zero as [BLOCK_N, D] fp32, where the unique
-    # information is [BLOCK_N, D/4] bytes and 2 x [BLOCK_N] floats.
+    # Register-side expansion of the group scale/zero. Same arithmetic, same
+    # tiles, same dtypes -- only the addressing changes, so the outputs must
+    # match bit for bit and any time difference is address computation and load
+    # issue alone. Correctness is asserted before the timing is believed.
+    outs = {}
+    for tag, pb in (("gid", False), ("bcast", True)):
+        logits.zero_()
+        lse.zero_()
+        packed_mla_decode_stage1(
+            q, ops, logits, lse, kv_indptr, kv_indices,
+            num_splits, max_splits, sm, 0.0,
+            block_n=16, num_warps=8, num_stages=1, param_bcast=pb,
+        )
+        torch.cuda.synchronize()
+        outs[tag] = (logits.clone(), lse.clone())
+    d_o = (outs["gid"][0] - outs["bcast"][0]).abs().max().item()
+    d_l = (outs["gid"][1] - outs["bcast"][1]).abs().max().item()
+    identical = d_o == 0.0 and d_l == 0.0
+    print(f"\nparam broadcast: max|dout|={d_o:.3e} max|dlse|={d_l:.3e} "
+          f"-> {'BIT-IDENTICAL' if identical else 'DIFFERS -- do not trust the timing'}")
+    t_gid = timeit(lambda: packed_mla_decode_stage1(
+        q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
+        sm, 0.0, block_n=16, num_warps=8, num_stages=1, param_bcast=False,
+    ))
+    t_bc = timeit(lambda: packed_mla_decode_stage1(
+        q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
+        sm, 0.0, block_n=16, num_warps=8, num_stages=1, param_bcast=True,
+    ))
+    print(f"  gid-indexed  {t_gid:.3f} ms ({base/t_gid:.2f}x BF16)")
+    print(f"  broadcast    {t_bc:.3f} ms ({base/t_bc:.2f}x BF16)  "
+          f"-> {t_gid/t_bc:.2f}x over gid-indexed")
+
+    # Traffic accounting, kept because it was REFUTED and the refutation is the
+    # finding. Narrowing the bytes actually made the kernel 1.3x slower, so the
+    # amplification below is L1-served and is not the bound; what the broadcast
+    # arm above removes is the 128x-redundant *address computation* for the same
+    # bytes, which is a different cost.
     for bn in (16, 32):
         moved = bn * R * 1 + bn * R * 4 * 2
         unique = bn * (R // 4) + bn * 2 * 4
         bf16 = bn * (R + ROPE) * 2
         print(f"  BLOCK_N={bn}: dequant path moves {moved/1024:.1f} KiB/block for "
               f"{unique/1024:.1f} KiB of information; BF16 moves {bf16/1024:.1f} KiB "
-              f"-> {moved/bf16:.1f}x the traffic of the kernel it must beat")
+              f"-> {moved/bf16:.1f}x the traffic of the kernel it must beat "
+              f"(refuted as the bound)")
 
     if rows:
         rows.sort()

@@ -78,6 +78,7 @@ def _fwd_packed_mla_stage1(
     MIN_BLOCK_KV: tl.constexpr,
     LLOYD: tl.constexpr,
     HAS_HP: tl.constexpr,
+    PARAM_BCAST: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -139,16 +140,52 @@ def _fwd_packed_mla_stage1(
                 other=0,
             ).to(tl.int32)
             code = (byte >> (2 * (offs_d % 4))[None, :]) & 0x3
-            scale = tl.load(
-                Params + kv_loc[:, None] * (2 * NG) + (2 * gid)[None, :],
-                mask=n_ok[:, None],
-                other=0.0,
-            )
-            zero = tl.load(
-                Params + kv_loc[:, None] * (2 * NG) + (2 * gid + 1)[None, :],
-                mask=n_ok[:, None],
-                other=0.0,
-            )
+            if PARAM_BCAST:
+                # scale/zero are per (token, group): [BLOCK_N, NG] of unique
+                # values, 8 floats per token at NG=4. Addressing them as a
+                # [BLOCK_N, D] tile via ``gid`` asks the LSU to compute 8192
+                # addresses per tile to move 64 distinct floats -- 128x
+                # redundant. L1 serves the repeats, so this never showed up as
+                # DRAM traffic (and narrowing the *traffic* alone measured
+                # 1.3x SLOWER, which is what ruled out a bandwidth story);
+                # the cost is address computation and load issue.
+                #
+                # Loading the unique tile and expanding it in registers is
+                # exact rather than approximate: the pack layout is
+                # d = g * GS + j, so broadcasting [BLOCK_N, NG] over a trailing
+                # GS axis and folding that axis into D reproduces gid's mapping
+                # element for element. Output is bit-identical; only the
+                # address arithmetic goes away.
+                offs_g = tl.arange(0, NG)
+                s_ng = tl.load(
+                    Params + kv_loc[:, None] * (2 * NG) + (2 * offs_g)[None, :],
+                    mask=n_ok[:, None],
+                    other=0.0,
+                )
+                z_ng = tl.load(
+                    Params + kv_loc[:, None] * (2 * NG) + (2 * offs_g + 1)[None, :],
+                    mask=n_ok[:, None],
+                    other=0.0,
+                )
+                scale = tl.reshape(
+                    tl.broadcast_to(s_ng[:, :, None], (BLOCK_N, NG, GS)),
+                    (BLOCK_N, D),
+                )
+                zero = tl.reshape(
+                    tl.broadcast_to(z_ng[:, :, None], (BLOCK_N, NG, GS)),
+                    (BLOCK_N, D),
+                )
+            else:
+                scale = tl.load(
+                    Params + kv_loc[:, None] * (2 * NG) + (2 * gid)[None, :],
+                    mask=n_ok[:, None],
+                    other=0.0,
+                )
+                zero = tl.load(
+                    Params + kv_loc[:, None] * (2 * NG) + (2 * gid + 1)[None, :],
+                    mask=n_ok[:, None],
+                    other=0.0,
+                )
             if LLOYD:
                 cv = (code.to(tl.float32) - zero) * scale
             else:
@@ -237,6 +274,7 @@ def packed_mla_decode_stage1(
     block_n: int = 0,
     num_warps: int = 0,
     num_stages: int = 0,
+    param_bcast: bool | None = None,
 ):
     """``q`` is ``[batch, head, D+DPE]``; ``operands`` from ``packed_read_operands``."""
     codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
@@ -256,6 +294,17 @@ def packed_mla_decode_stage1(
     kv_group_num = head_num  # MLA: one KV head
     block_h = _safe_block_h(16, kv_group_num)
     grid = (batch, triton.cdiv(head_num, min(block_h, kv_group_num)), max_kv_splits)
+
+    n_groups = d // group_size
+    # The register-side expansion needs ``tl.arange(0, NG)`` and a trailing-axis
+    # fold, so NG must be a power of two. Every shipped MLA config is (512/128
+    # = 4), but a group size that does not divide D into a power of two falls
+    # back to the gid-indexed load rather than failing to compile.
+    if param_bcast is None:
+        param_bcast = envs.SGLANG_OSCAR_MLA_PACKED_PARAM_BCAST.get()
+    param_bcast = bool(
+        param_bcast and n_groups > 0 and (n_groups & (n_groups - 1)) == 0
+    )
 
     has_hp = hp is not None
     _fwd_packed_mla_stage1[grid](
@@ -282,12 +331,13 @@ def packed_mla_decode_stage1(
         D=d,
         DPE=d_pe,
         GS=group_size,
-        NG=d // group_size,
+        NG=n_groups,
         BLOCK_N=block_n,
         BLOCK_H=block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         LLOYD=bool(lloyd),
         HAS_HP=has_hp,
+        PARAM_BCAST=param_bcast,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=num_stages,
