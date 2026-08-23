@@ -33,6 +33,10 @@ MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V2-Lite")
 PORT = int(os.environ.get("PORT", "31331"))
 CTX = os.environ.get("CTX_LEN", "8192")
 OUT = os.environ.get("OUT_DIR", "/tmp/probe")
+# The window arena audit needs the ring to WRAP, which needs more generated
+# tokens than the recent window is wide (512). 700 wraps it once; a GPQA answer
+# wraps it ~20 times, so MAX_NEW is a knob rather than a constant.
+MAX_NEW = int(os.environ.get("MAX_NEW", "700"))
 PROMPTS = [
     "Explain in three sentences why a 2-bit KV cache saves memory but can cost accuracy.",
     "Explain in three sentences why a 2-bit KV cache saves memory but can cost accuracy.",
@@ -118,7 +122,7 @@ def drive(p, log_path: str) -> dict:
             "text": prompt,
             # Greedy makes every INT2 config produce the same whitespace soup,
             # so probe with real sampling params.
-            "sampling_params": {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": 700},
+            "sampling_params": {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": MAX_NEW},
         }).encode()
         req = urllib.request.Request(
             f"http://127.0.0.1:{PORT}/generate", data=body,
