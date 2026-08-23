@@ -326,8 +326,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
                     else 256
                 )
+                # ``mr.max_running_requests`` does not exist yet -- it is
+                # resolved *from* the pool size this call is computing, and its
+                # default estimate climbs with the pool, so a 3x bigger pool
+                # would silently ask for a 3x bigger window arena. Read the flag
+                # instead, and require it: an unpinned arena is either 60x too
+                # big or quietly leaves requests without windows.
+                max_reqs = mr.server_args.max_running_requests
+                if max_reqs is None:
+                    raise ValueError(
+                        "SGLANG_OSCAR_MLA_KV_PACKED needs --max-running-requests "
+                        "pinned: the BF16 window arena is sized per request slot "
+                        "and the default is derived from the pool size, which "
+                        "this branch changes."
+                    )
                 self._fixed_overhead_bytes = (
-                    (1 + mr.max_running_requests * (p + r))
+                    (1 + max_reqs * (p + r))
                     * model_config.kv_lora_rank
                     * 2
                     * num_layers

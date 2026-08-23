@@ -348,6 +348,12 @@ class _PackedLatentMixin(_Int2HPMixin):
         # them to the packed tier rather than corrupt a neighbour. Sizing the
         # arena from req_to_token_pool means this is unreachable in practice.
         keep = keep & (req < self._max_reqs)
+        # Slot 0 is the reserved dummy every padded row is aimed at (the paged
+        # allocator hands out page 1 upward), so a row landing there is a padded
+        # CUDA-graph replay. Its ``req_pool_indices`` entry is stale -- left over
+        # from whichever batch was captured -- and letting it write a ring row
+        # would knock a *live* request's sink out of the window on every replay.
+        keep = keep & (self._write_loc > 0)
         in_sink = pos < P
         ring = 1 + req * self._per_req_hp + torch.where(
             in_sink, pos, P + (pos - P).clamp(min=0) % max(W, 1)
@@ -382,6 +388,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         )
         self.rope_buf[li][loc64] = pe.to(self.dtype)
 
+        self._write_loc = loc64
         ring, keep = self._ring_rows(c.shape[0])
         if ring is not None:
             self.hp_c[li][ring] = c.to(self.dtype)

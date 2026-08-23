@@ -38,10 +38,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _MIN_BLOCK_KV,
     _decode_softmax_reducev_fwd,
     _safe_block_h,
+    tanh,
 )
 
 
@@ -168,9 +170,12 @@ def _fwd_packed_mla_stage1(
                     ).to(tl.float32)
                     cv = tl.where(use_hp[:, None], hpv, cv)
 
-            cv = tl.where(n_ok[:, None], cv, 0.0)
-            kt = tl.trans(cv.to(q.dtype))                      # [D, BLOCK_N]
-            qk = tl.dot(q, kt)
+            # Narrow to the compute dtype immediately. The dequant chain is
+            # elementwise-fused, so the fp32 code/scale/zero values never form a
+            # second full tile; ``cvq`` is the only [BLOCK_N, D] tile alive, the
+            # same one the BF16 kernel loads.
+            cvq = tl.where(n_ok[:, None], cv, 0.0).to(q.dtype)
+            qk = tl.dot(q, tl.trans(cvq))                      # [BLOCK_H, BLOCK_N]
 
             kpe = tl.load(
                 Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
@@ -181,7 +186,7 @@ def _fwd_packed_mla_stage1(
             qk *= sm_scale_withk
 
             if logit_cap > 0:
-                qk = logit_cap * tl.extra.cuda.libdevice.tanh(qk / logit_cap)
+                qk = logit_cap * tanh(qk / logit_cap)
 
             qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
 
@@ -189,7 +194,7 @@ def _fwd_packed_mla_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(cv.dtype), cv.to(q.dtype))
+            acc += tl.dot(p.to(cvq.dtype), cvq)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -221,10 +226,17 @@ def packed_mla_decode_stage1(
     max_kv_splits,
     sm_scale_withk,
     logit_cap,
-    block_n: int = 32,
+    block_n: int = 0,
 ):
     """``q`` is ``[batch, head, D+DPE]``; ``operands`` from ``packed_read_operands``."""
     codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
+    # BLOCK_N 16 / 8 warps rather than the BF16 kernel's 32 / 4. The dequant
+    # keeps three extra values live per element (the code byte and the group's
+    # scale and zero) on top of the output tile, and at 32x512 that is past the
+    # register file -- the kernel still runs, but every spill is a round trip to
+    # local memory, which is precisely the bandwidth this path exists to save.
+    block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
+    num_warps = envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
     d_pe = rope.shape[-1]
     d = codes.shape[-1] * 4
     assert q.shape[-1] == d + d_pe, (q.shape, d, d_pe)
@@ -266,8 +278,8 @@ def packed_mla_decode_stage1(
         LLOYD=bool(lloyd),
         HAS_HP=has_hp,
         logit_cap=logit_cap,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=1,
     )
 
 
@@ -310,7 +322,7 @@ def packed_mla_decode_fwd(
         attn_lse,
         q,
         o,
-        None,  # v_scale
+        1.0,  # v_scale: a scalar multiplier on the reduced output, not a tensor
         _v_shape_proxy(o, pool.kv_lora_rank),
         kv_indptr,
         num_kv_splits,

@@ -362,6 +362,7 @@ def _scatter_pack_kernel(
     # capture because the predicate is baked in at capture time.
     s = tl.where(slot >= 0, slot, 0).to(tl.int64)
 
+    nb: tl.constexpr = GS // 4
     for g in tl.static_range(NG):
         offs = g * GS + tl.arange(0, GS)
         x = tl.load(x_ptr + pid * D + offs).to(tl.float32)
@@ -383,7 +384,6 @@ def _scatter_pack_kernel(
             mean = 0.0
             std = 1.0
 
-        nb: tl.constexpr = GS // 4
         ob = tl.arange(0, nb)
         packed = tl.zeros([nb], dtype=tl.int32)
         for j in tl.static_range(4):

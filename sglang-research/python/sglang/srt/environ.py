@@ -244,6 +244,11 @@ class Envs:
     # 0 = sink + recent (the two windows), which is the only correct value;
     # exposed so the arena can be sized down for probes.
     SGLANG_OSCAR_MLA_PACKED_HP_REQS = EnvInt(0)
+    # Packed MLA decode kernel tiling. 16/8 rather than the BF16 kernel's 32/4
+    # because the dequant keeps the code byte and the group scale/zero live on
+    # top of the output tile.
+    SGLANG_OSCAR_MLA_PACKED_BLOCK_N = EnvInt(16)
+    SGLANG_OSCAR_MLA_PACKED_WARPS = EnvInt(8)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in

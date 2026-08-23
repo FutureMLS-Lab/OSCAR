@@ -192,7 +192,7 @@ def test_decode_kernel() -> None:
         q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits, sm, 0.0
     )
     _decode_softmax_reducev_fwd(
-        logits, lse, q, o, None,
+        logits, lse, q, o, 1.0,
         torch.empty((0, 1, R), dtype=o.dtype, device=o.device),
         kv_indptr, num_splits, max_splits,
     )
