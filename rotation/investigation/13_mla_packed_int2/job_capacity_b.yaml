@@ -1,0 +1,36 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-cap-b
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      priorityClassName: zz-k3-nopreempt
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: g
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc", "echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2NhcjsgVz0vd29yay9vc2NhcjsgUElOPTcyMDEzOGU2MjUKbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9CmNwIC1hICIkU1JDL3RoaXJkX3BhcnR5L3NpbXBsZV9ldmFscy8uIiAiJFcvdGhpcmRfcGFydHkvc2ltcGxlX2V2YWxzLyIgMj4vZGV2L251bGwgfHwgdHJ1ZQpmaW5kICIkVy90aGlyZF9wYXJ0eS9zaW1wbGVfZXZhbHMiIC1uYW1lIF9fcHljYWNoZV9fIC10eXBlIGQgLXBydW5lIC1leGVjIHJtIC1yZiB7fSArIDI+L2Rldi9udWxsCi4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIFBZVEhPTlBBVEg9JFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbgplY2hvICJbam9iXSBIRUFEPSQoZ2l0IC1DICRXIGxvZyAtLW9uZWxpbmUgLTEpIgoKZXhwb3J0IFJVTl9ESVI9JFIvbWxhcGFja2VkX2NhcGFjaXR5X2I7IG1rZGlyIC1wICRSVU5fRElSCmV4cG9ydCBPVVRfRElSPSRSVU5fRElSIEhGX0hVQl9PRkZMSU5FPTEKIyBTaG9ydCBwcm9tcHQsIGxvbmcgZ2VuZXJhdGlvbiwgbWFueSBzdHJlYW1zLiBUaGUgZmlyc3Qgc3dlZXAgdXNlZCBhCiMgNjAwMC10b2tlbiBwcm9tcHQgd2l0aCAxMjgtdG9rZW4gZ2VuZXJhdGlvbnMsIHdoaWNoIGlzIHByZWZpbGwtQ09NUFVURSBib3VuZDoKIyBib3RoIGFybXMgcGxhdGVhdWVkIGF0IH4yMiB0b2svcyB3aXRoIHplcm8gcmV0cmFjdHMgYW5kIHRoZSAzLjN4IHJlc2lkZW50LUtWCiMgYWR2YW50YWdlIGNvbnZlcnRlZCBpbnRvIG5vdGhpbmcuIEEgS1YtY2FwYWNpdHkgd2luIG5lZWRzIHRoZSBkZWNvZGUgc2lkZSB0bwojIGJlIHRoZSBib3R0bGVuZWNrLCB3aGljaCBpcyB0aGUgc2hhcGUgb2YgdGhlIGVhcmxpZXIgNEIgb3V0PTUxMiByZXN1bHQuCmV4cG9ydCBQUk9NUFRfVE9LPSIke1BST01QVF9UT0s6LTUxMn0iIEdFTl9UT0s9IiR7R0VOX1RPSzotMjA0OH0iCmV4cG9ydCBDT05DPSIke0NPTkM6LTgsMTYsMzIsNjQsMTI4fSIgQ1RYX1NXRUVQPSIke0NUWF9TV0VFUDotMjAwMCw2MDAwLDEyMDAwfSIKcHl0aG9uMyAtdSAkVy9yb3RhdGlvbi9pbnZlc3RpZ2F0aW9uLzEzX21sYV9wYWNrZWRfaW50Mi9iZW5jaF9jYXBhY2l0eS5weSBcCiAgMj4mMSB8IHRlZSAkUlVOX0RJUi9jYXBhY2l0eS5sb2cKZWNobyAiW2pvYl0gZXhpdD0ke1BJUEVTVEFUVVNbMF19Igo= | base64 -d > /tmp/g.sh; bash /tmp/g.sh"]
+        env:
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: HOME, value: /tmp/h}
+        resources:
+          limits: {nvidia.com/gpu: "1"}
+          requests: {cpu: "16", memory: 220Gi, nvidia.com/gpu: "1"}
+        volumeMounts:
+        - {name: sh, mountPath: /shared}
+        - {name: hf, mountPath: /hf}
+        - {name: shm, mountPath: /dev/shm}
+        - {name: work, mountPath: /work}
+      volumes:
+      - {name: sh, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: hf, persistentVolumeClaim: {claimName: hf-cache-pvc}}
+      - {name: shm, emptyDir: {medium: Memory, sizeLimit: 200Gi}}
+      - {name: work, emptyDir: {sizeLimit: 20Gi}}
