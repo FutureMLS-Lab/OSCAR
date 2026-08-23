@@ -111,6 +111,31 @@ Mamba / linear-attn models (Qwen3.5-4B, Qwen3.5-35B-A3B) need
 **raises ValueError together with `--disable-radix-cache`** -- so a cache-OFF
 control must use `no_buffer`.
 
+## What a missing rotation actually does (corrected 2026-08-23)
+
+The project shorthand "a missing rotation does not error, it serves at Hadamard
+quality" is **only true on the MLA path**. Verified in code:
+
+* **`UnifiedInt2HPKVPool`** (every dense/MoE/hybrid/SWA model in this sweep):
+  `load_oscar_rotations` in `mem_cache/memory_pool.py` calls `torch.load(path)`
+  with no existence check, and none of its five call sites wrap it in
+  `try/except`. A wrong `ROT_DIR` therefore raises `FileNotFoundError` and the
+  server dies. Loud, safe.
+* **`MLAInt2HPKVPool` / `NSAInt2HPKVPool`** (GLM-5.x, DeepSeek-V2):
+  `mla_int2_kv_pool.py:110` does
+  `if not os.path.isdir(rotation_path): logger.info(...); return None` — it
+  continues with **no rotation at all**, at INFO level. Worse, a *present*
+  directory that is missing an individual `layer_{i}.pt` substitutes
+  `torch.eye(d)` for that layer. That is where the folklore comes from, and it
+  is the same module whose `_real_kernel_enabled()` swallows `AttributeError`.
+
+So for the models in this sweep the real silent-Hadamard risk is **not** a
+missing file, it is a **present but under-calibrated** one — e.g. PLAN.md's
+30B dump that captured ~12 warmup tokens and fitted a rotation numerically
+indistinguishable from Hadamard without erroring. Validate content, not
+existence: `max|RR^T - I|` and `|entry|` spread/mean (Hadamard is exactly 0),
+per head for 3-D V2 files.
+
 ## Auditor caveat
 
 The mixed-KV auditor's damage counter is weak: it reads zero even on known-broken

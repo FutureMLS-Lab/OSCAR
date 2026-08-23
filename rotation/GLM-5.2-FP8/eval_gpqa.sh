@@ -16,6 +16,12 @@ export K_CLIP="${K_CLIP:-0.96}"
 export V_CLIP="${V_CLIP:-0.92}"
 export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 export LLOYD_MAX="${LLOYD_MAX:-1}"   # GLM-5.2 recipe uses Lloyd-Max
+# 64/512 is GLM-5.2's best measured window and the only one statistically
+# indistinguishable from BF16 (80.30, McNemar p=0.48). The shared launcher
+# defaults to 256, which reproduces the weaker archived arm (76.77, p=0.019).
+# The window is NON-MONOTONE -- 1024 falls back to 75.76 -- so do not assume
+# bigger is better if you override this.
+export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
 export NAME="${NAME:-gpqa_oscar_glm_5_2}"
 # MLA latent path: rotations are per-layer c_kv files, not k/v pairs.
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"

@@ -1,0 +1,107 @@
+# Pre-merge regression sweep, investigation/11 -- the Qwen3-30B-A3B (MoE) row.
+#
+#   zz-pm-q330b  Qwen3-30B-A3B  TP=2  PER-HEAD rotation (V2) + uniform (LM off)
+#
+# FILENAME TRAP. The published zoo names are k_rotation_perhead.pt /
+# v_rotation_perhead.pt; rotation/qwen3-30B-A3B/eval_gpqa.sh defaults to
+# k_perhead.pt / v_perhead.pt and the generic harness defaults to the *shared*
+# k_rotation_qqt_r_h_pbr.pt. A shared rotation does not error on this model, it
+# collapses it (GPQA 58.6 -> 43.9, HumanEval 89 -> 25.8, MATH500 92 -> 60.8,
+# AIME 66 -> 14). Both filenames are therefore passed explicitly below, and
+# run_model11.sh's preflight refuses a Hadamard-like (spread/mean <= 0.20) file.
+#
+# ABSORB_V=0 is mandatory: _absorb_v_dense folds R_v into qkv_proj with R_v.T,
+# which is invalid for a 3-D per-head rotation (the run crashes with a shape
+# error, and run_bench_matrix.sh once hardcoded ABSORB_V=1).
+#
+# TREE is a PRIVATE PINNED COPY of /shared/zz-premerge/tree, byte-identical and
+# at the same HEAD afdcad68b771d312b0eae3d6edde5c08a3881f87 with
+# _safe_block_h present (5 occurrences). It exists so that (a) a concurrent
+# session cannot git-checkout the tree out from under this run, and (b) the
+# per-head rotations and the FIXED run_model11.sh (whose gate validates each
+# head's matrix independently instead of doing A @ A.T on a 3-D tensor) live in
+# it without mutating the tree the other seven rows used. NOT
+# /shared/zz-m27-recheck/tree_{pre,post} -- both are 4b06c05, PRE-fix.
+#
+# Fixed probe protocol from investigation/11/CONTRACT.md, identical to the
+# seven rows already done: GPQA NUM_EXAMPLES=24, MAX_NEW_TOKENS=8192,
+# MAX_RUNNING=32, client concurrency (NUM_WORKERS) 16, radix cache ON,
+# CUDA_GRAPH_MAX_BS=32, temp 1.0 / top_p 0.95 / top_k 40, group 128,
+# clip .96/.92 (eval_gpqa.sh defaults), window 64/256.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-q330b
+  namespace: charlie
+  labels: {app: zz-premerge, family: moe-mha}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: zz-premerge, family: moe-mha}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostIPC: true
+      priorityClassName: normal
+      schedulerName: volcano
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                # 117 corrupts INT2 output; 073 is driver-broken.
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+      containers:
+      - name: arm
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        command: ["/bin/bash","-lc"]
+        args:
+        - bash /shared/zz-premerge/tree_q330b/rotation/investigation/11_premerge_regression/run_model11.sh
+        env:
+        - {name: ARM,               value: zz-pm-q330b}
+        - {name: MODEL_REPO,        value: models--Qwen--Qwen3-30B-A3B}
+        - {name: MODEL_DIR,         value: qwen3-30B-A3B}
+        # Empty ROT_SUBDIR -> ${TREE}/rotation/qwen3-30B-A3B/rotations, where the
+        # two zoo per-head files were staged byte-identical (12,597,631 B each,
+        # md5 31986097de6ae7313fae06055c362984 / 108ca2a9bd6c89902c83749aaa95e230).
+        - {name: K_ROT_FILENAME,    value: k_rotation_perhead.pt}
+        - {name: V_ROT_FILENAME,    value: v_rotation_perhead.pt}
+        - {name: TREE,              value: /shared/zz-premerge/tree_q330b}
+        - {name: TP_SIZE,           value: '2'}
+        - {name: LLOYD_MAX,         value: '0'}     # 30B-A3B recipe: uniform
+        - {name: HP_PREFIX,         value: '64'}
+        - {name: HP_RECENT,         value: '256'}
+        - {name: GROUP_SIZE,        value: '128'}
+        - {name: ABSORB_V,          value: '0'}     # mandatory for per-head
+        - {name: PORT,              value: '32400'}
+        - {name: NUM_EXAMPLES,      value: '24'}
+        - {name: MAX_NEW_TOKENS,    value: '8192'}
+        - {name: MAX_RUNNING,       value: '32'}
+        - {name: NUM_WORKERS,       value: '16'}    # client concurrency
+        - {name: CUDA_GRAPH_MAX_BS, value: '32'}
+        - {name: DISABLE_RADIX,     value: '0'}     # radix cache ON
+        - {name: MEM_FRAC,          value: '0.85'}
+        - {name: HOME,              value: /tmp/h}
+        - {name: HF_HOME,           value: /shared/huggingface}
+        - {name: PYTHONUNBUFFERED,  value: '1'}
+        resources:
+          limits: {nvidia.com/gpu: '2'}
+          requests: {cpu: '12', memory: 160Gi, nvidia.com/gpu: '2'}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home,   mountPath: /home/charlie}
+        - {name: scratch, mountPath: /tmp}
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home,   persistentVolumeClaim: {claimName: home-charlie-rwx}}
+      - {name: scratch, emptyDir: {}}

@@ -55,7 +55,11 @@ if [[ "${MODE}" == "int2" ]]; then
         SGLANG_OSCAR_V_ROTATION_PATH="${ROT_DIR}/v_rotation_sst_r_h_pbr.pt"
         SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP:-0.96}" SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP:-0.92}"
         SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-64}"
-        SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-256}"
+        # 512, not 256. Widening the BF16 recent window is one of only two
+        # levers that moved gemma-4 (PLAN.md: +4.6 AIME / +4.2 LCB over 256),
+        # and every published gemma INT2 number uses 512. A 256 default costs
+        # roughly 3 GPQA points silently -- no error, just a lower score.
+        SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
         SGLANG_MIXED_KV_HP_MAX_SPLITS=8 SGLANG_MIXED_KV_HP_DTYPE=bfloat16 SGLANG_MIXED_KV_SCALE_DTYPE=float32
         SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS="${SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS:-8192}"
         SGLANG_LLOYD_MAX="${SGLANG_LLOYD_MAX:-0}"

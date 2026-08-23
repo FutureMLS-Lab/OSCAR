@@ -1,0 +1,33 @@
+# zz-pm-q330b -- Qwen3-30B-A3B per-head (V2) row, evidence read from the LIVE server.log
+
+45:[2026-08-23 09:02:12 TP0] Loaded Oscar rotation from /tmp/tree/rotation/qwen3-30B-A3B/rotations/k_rotation_perhead.pt for layers [0, 48) head_dim=128 dtype=torch.bfloat16 [per-head: 4 kv heads]
+46:[2026-08-23 09:02:12 TP1] Loaded Oscar rotation from /tmp/tree/rotation/qwen3-30B-A3B/rotations/k_rotation_perhead.pt for layers [0, 48) head_dim=128 dtype=torch.bfloat16 [per-head: 4 kv heads]
+47:[2026-08-23 09:02:12 TP0] Loaded Oscar rotation from /tmp/tree/rotation/qwen3-30B-A3B/rotations/v_rotation_perhead.pt for layers [0, 48) head_dim=128 dtype=torch.bfloat16 [per-head: 4 kv heads]
+48:[2026-08-23 09:02:12 TP1] Loaded Oscar rotation from /tmp/tree/rotation/qwen3-30B-A3B/rotations/v_rotation_perhead.pt for layers [0, 48) head_dim=128 dtype=torch.bfloat16 [per-head: 4 kv heads]
+49:[2026-08-23 09:02:12 TP0] UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=0.9600 v_clip=0.9200 lloyd_max=False)
+50:[2026-08-23 09:02:12 TP1] UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=0.9600 v_clip=0.9200 lloyd_max=False)
+43:[2026-08-23 09:02:12 TP1] Enable unified mixed KV (int2): prefix=64 recent=256 flush_interval=8 num_quant_pages=654423 N_Q=8 hp_dtype=bfloat16 scale_dtype=float32 max_total_num_tokens=5235376 max_req_slots=32 hp_prefix_pool_tokens=32768
+44:[2026-08-23 09:02:12 TP0] Enable unified mixed KV (int2): prefix=64 recent=256 flush_interval=8 num_quant_pages=654423 N_Q=8 hp_dtype=bfloat16 scale_dtype=float32 max_total_num_tokens=5235376 max_req_slots=32 hp_prefix_pool_tokens=32768
+52:[2026-08-23 09:02:12 TP0] UnifiedInt2HPKVPool: HP arena reserves 1.89 GB (hp_prefix_pool_slots=32776, max_req_slots=32, recent_ring=263 = R=256 + N_Q-1=7, P=64, layers=48, head_num=2, head_dim+v_head_dim=256, hp_dtype=torch.bfloat16)
+55:[2026-08-23 09:02:12 TP1] UnifiedInt2HPKVPool: HP arena reserves 1.89 GB (hp_prefix_pool_slots=32776, max_req_slots=32, recent_ring=263 = R=256 + N_Q-1=7, P=64, layers=48, head_num=2, head_dim+v_head_dim=256, hp_dtype=torch.bfloat16)
+63:[2026-08-23 09:02:12 TP0] Capture cuda graph bs [1, 2, 4, 8, 12, 16, 24, 32]
+
+# server_args flags (extracted, not the whole line):
+cuda_graph_max_bs=32
+disable_radix_cache=False
+enable_cache_report=True
+kv_cache_dtype='int2', 
+max_running_requests=32
+tp_size=2
+
+# decode cuda-graph tally:
+cuda graph: True  = 332
+cuda graph: False = 0   (analyze.py: decode_steps=322, decode_cuda_graph={"True":322}, decode_steps_eager=0)
+
+# live server process env (SGLANG_OSCAR / LLOYD / MIXED_KV), captured while serving:
+SGLANG_OSCAR_ABSORB_V_ROTATION=0
+SGLANG_LLOYD_MAX=0
+SGLANG_OSCAR_K_ROTATION_PATH=/tmp/tree/rotation/qwen3-30B-A3B/rotations/k_rotation_perhead.pt
+SGLANG_OSCAR_V_ROTATION_PATH=/tmp/tree/rotation/qwen3-30B-A3B/rotations/v_rotation_perhead.pt
+SGLANG_OSCAR_K_CLIP_RATIO=0.96  SGLANG_OSCAR_V_CLIP_RATIO=0.92
+SGLANG_MIXED_KV_PREFIX_TOKENS=64  SGLANG_MIXED_KV_RECENT_TOKENS=256
