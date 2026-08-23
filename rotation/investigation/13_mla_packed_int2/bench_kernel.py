@@ -133,6 +133,38 @@ def main() -> None:
             msg = str(e).splitlines()[0][:70]
             print(f"{bn:>7} {w:>5} {st:>6} {'-':>9} {'-':>8}  {type(e).__name__}: {msg}")
 
+    # Ablation: the same kernel with HAS_HP off. The window-arena probe loads two
+    # [BLOCK_N] int32 vectors and then, behind a block-level tl.max, may load a
+    # [BLOCK_N, D] fp32 tile. Even when that branch is almost never taken the
+    # compiler must reserve registers for it, so the guard can cost occupancy
+    # everywhere to save bandwidth in the 2% of blocks that contain a window
+    # row. This says whether that trade is paying.
+    ops_nohp = ops[:3] + (None, None, None) + ops[6:]
+    try:
+        ms_nohp = timeit(lambda: packed_mla_decode_stage1(
+            q, ops_nohp, logits, lse, kv_indptr, kv_indices,
+            num_splits, max_splits, sm, 0.0,
+            block_n=16, num_warps=8, num_stages=1,
+        ))
+        cur16 = [r[0] for r in rows if r[1:] == (16, 8, 1)]
+        print(f"\nablation, window arena OFF (16/8/1): {ms_nohp:.3f} ms "
+              f"({base/ms_nohp:.2f}x BF16)"
+              + (f"; arena probe costs {cur16[0]/ms_nohp:.2f}x" if cur16 else ""))
+    except Exception as e:  # noqa: BLE001
+        print(f"\nablation failed: {type(e).__name__}: {e}")
+
+    # Load amplification, which is the arithmetic behind the ratio above. Per KV
+    # block the dequant path moves codes as [BLOCK_N, D] uint8 (every byte read
+    # four times) plus scale and zero as [BLOCK_N, D] fp32, where the unique
+    # information is [BLOCK_N, D/4] bytes and 2 x [BLOCK_N] floats.
+    for bn in (16, 32):
+        moved = bn * R * 1 + bn * R * 4 * 2
+        unique = bn * (R // 4) + bn * 2 * 4
+        bf16 = bn * (R + ROPE) * 2
+        print(f"  BLOCK_N={bn}: dequant path moves {moved/1024:.1f} KiB/block for "
+              f"{unique/1024:.1f} KiB of information; BF16 moves {bf16/1024:.1f} KiB "
+              f"-> {moved/bf16:.1f}x the traffic of the kernel it must beat")
+
     if rows:
         rows.sort()
         ms, bn, w, st = rows[0]
