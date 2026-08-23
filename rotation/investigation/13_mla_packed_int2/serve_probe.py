@@ -72,7 +72,16 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
         # Pinned, not defaulted: the window arena is sized per request slot and
         # the default is derived from the pool size, which this change moves.
         "--max-running-requests", "64",
-        "--cuda-graph-max-bs", "8",
+    ]
+    # Under CUDA graph *replay* the pool's Python does not execute at all -- the
+    # captured kernels do -- so any host-side audit or self-check inside the
+    # write path can only ever see eager forwards. The ring is still maintained
+    # (it is all captured torch ops), but auditing it requires eager decode.
+    if os.environ.get("DISABLE_CG", "0") == "1":
+        args += ["--disable-cuda-graph"]
+    else:
+        args += ["--cuda-graph-max-bs", os.environ.get("CG_MAX_BS", "8")]
+    args += [
         "--context-length", CTX,
         # DeepSeek-V2-Lite routes its attention layers through the piecewise
         # CUDA graph, i.e. through dynamo. GLM-5.2 is on the
