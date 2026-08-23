@@ -244,6 +244,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         )
         self._selfcheck_worst = 0.0
         self._selfcheck_n = 0
+        self._selfcheck_gate_logged = False
 
         bytes_tok = packed_latent_bytes_per_token(
             R, self.qk_rope_head_dim, group_size
@@ -458,6 +459,16 @@ class _PackedLatentMixin(_Int2HPMixin):
         # branch. sglang's flag is a plain Python global and traces fine.
         if self._selfcheck_budget > 0 and not _is_capturing() and not _tracing():
             self._selfcheck_write(layer_id, loc64, c, keep)
+        elif self._selfcheck and not self._selfcheck_gate_logged:
+            # The self-check silently never fired on two runs, and "it ran and
+            # matched perfectly" is indistinguishable from "it never ran" unless
+            # the gate says which. Report the three guard values once.
+            self._selfcheck_gate_logged = True
+            logger.warning(
+                "[MLAPacked] selfcheck requested but gated off: budget=%d "
+                "capturing=%s tracing=%s",
+                self._selfcheck_budget, _is_capturing(), _tracing(),
+            )
 
     def set_kv_buffer(self, layer, loc, cache_k, cache_v):
         """NSA/triton write path: ``cache_k`` is ``[c_kv | k_pe]`` concatenated."""
@@ -565,7 +576,8 @@ class _PackedLatentMixin(_Int2HPMixin):
         rel = float(
             diff.max() / want.float().abs().max().clamp(min=1e-6)
         )
-        if rel > self._selfcheck_worst or self._selfcheck_budget == 0:
+        if (self._selfcheck_n == 1 or rel > self._selfcheck_worst
+                or self._selfcheck_budget == 0):
             self._selfcheck_worst = max(self._selfcheck_worst, rel)
             logger.info(
                 "[MLAPacked] selfcheck layer=%d rows=%d max_abs=%.3e rel=%.3e "
