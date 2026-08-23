@@ -62,6 +62,13 @@ echo "[job] exit=${PIPESTATUS[0]}"
 CAPACITY = _PROLOGUE + r"""
 export RUN_DIR=$R/__RUNDIR__; mkdir -p $RUN_DIR
 export OUT_DIR=$RUN_DIR HF_HUB_OFFLINE=1
+# Short prompt, long generation, many streams. The first sweep used a
+# 6000-token prompt with 128-token generations, which is prefill-COMPUTE bound:
+# both arms plateaued at ~22 tok/s with zero retracts and the 3.3x resident-KV
+# advantage converted into nothing. A KV-capacity win needs the decode side to
+# be the bottleneck, which is the shape of the earlier 4B out=512 result.
+export PROMPT_TOK="${PROMPT_TOK:-512}" GEN_TOK="${GEN_TOK:-2048}"
+export CONC="${CONC:-8,16,32,64,128}" CTX_SWEEP="${CTX_SWEEP:-2000,6000,12000}"
 python3 -u $W/rotation/investigation/13_mla_packed_int2/bench_capacity.py \
   2>&1 | tee $RUN_DIR/capacity.log
 echo "[job] exit=${PIPESTATUS[0]}"
@@ -172,7 +179,7 @@ def emit(name, body, gpus, cpu, mem):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["unit", "probe", "kbench", "capacity", "smoke", "gpqa", "gpqa-fake"])
+    ap.add_argument("kind", choices=["unit", "probe", "kbench", "capacity", "smoke", "gpqa", "gpqa-fake", "gpqa-noradix"])
     ap.add_argument("--tag", default="a")
     ap.add_argument("--pin", default=PIN)
     ap.add_argument("--out", default=None)
@@ -207,8 +214,16 @@ def main() -> None:
             extra = "export NUM_EXAMPLES=8 MAX_NEW_TOKENS=2048"
             selfcheck, workers = "1", "4"
         else:
-            run = f"mlapacked_{'fake' if packed == '0' else 'gpqa'}_{a.tag}"
-            extra = ""
+            run = f"mlapacked_{a.kind.replace('gpqa-','').replace('gpqa','gpqa')}_{a.tag}"
+            # The decisive test for the -12.20 pp regression. GPQA's shared
+            # prefix is exactly 64 tokens = the sink width, so on a radix hit
+            # the WHOLE cached region is served from the packed tier here while
+            # both reference arms keep it BF16. Turning the cache off removes
+            # that difference and nothing else: if the gap collapses the sink is
+            # the cause, if it survives the sink is exonerated and the bf16
+            # end-rotations become the primary suspect.
+            extra = ("export DISABLE_RADIX=1"
+                     if a.kind == "gpqa-noradix" else "")
             # 16 workers is what the 80.30 / 82.32 reference arms ran at.
             # Concurrency selects which captured graph replays, so it is an
             # experimental variable and has to match, not be tuned.

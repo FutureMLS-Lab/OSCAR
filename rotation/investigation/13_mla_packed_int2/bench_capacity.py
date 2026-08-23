@@ -47,15 +47,28 @@ CONCURRENCY = [int(x) for x in os.environ.get("CONC", "8,16,32,64,96").split(","
 CTX_SWEEP = [int(x) for x in os.environ.get("CTX_SWEEP", "4000,8000,16000").split(",")]
 
 
+# Common short words, ~1 token each. The first version of this used synthetic
+# tokens like "w48211", which tokenize to 4-5 tokens apiece, so a request asked
+# for at "16000 tokens" actually carried 50-60K and was rejected outright by the
+# 32,768 context limit -- both arms returned 0/32 in 2.9 s and the ctx sweep
+# measured request rejection rather than pool capacity.
+_WORDS = ("time year people way day man thing woman life child world school "
+          "state family student group country problem hand part place case "
+          "week company system program question work government number night "
+          "point home water room mother area money story fact month lot right "
+          "study book eye job word business issue side kind head house service "
+          "friend father power hour game line end member law car city name").split()
+
+
 def make_prompt(n_tok: int, salt: int) -> str:
     """Distinct-per-request filler so the radix cache cannot collapse the sweep.
 
     A shared prefix would let both arms serve N requests out of one copy of the
     KV, which is the opposite of the pressure being measured.
     """
-    return f"Document {salt}. " + " ".join(
-        f"w{(salt * 7919 + i) % 50021}" for i in range(int(n_tok * 0.75))
-    ) + "\nSummarize the document above in one sentence."
+    n = len(_WORDS)
+    body = " ".join(_WORDS[(salt * 7919 + i) % n] for i in range(n_tok))
+    return f"Document {salt}. {body}\nSummarize the document above."
 
 
 def wait_healthy(p, log_path: str, timeout: int = 1800) -> bool:
@@ -74,6 +87,9 @@ def wait_healthy(p, log_path: str, timeout: int = 1800) -> bool:
     return False
 
 
+_ERRORS: list = []
+
+
 def one_request(prompt: str, gen: int) -> tuple[bool, int]:
     body = json.dumps({
         "text": prompt,
@@ -88,7 +104,8 @@ def one_request(prompt: str, gen: int) -> tuple[bool, int]:
         d = r if isinstance(r, dict) else r[0]
         n = (d.get("meta_info") or {}).get("completion_tokens") or gen
         return True, int(n)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        _ERRORS.append(f"{type(e).__name__}: {str(e)[:160]}")
         return False, 0
 
 
@@ -167,6 +184,14 @@ def sweep(tag: str, packed: bool) -> dict:
                 ok = sum(1 for o, _ in outs if o)
                 gen = sum(n for _, n in outs)
                 c = log_counters(log_path, mark)
+                if _ERRORS:
+                    # A failure is either a retract (capacity) or a rejection
+                    # (harness). Printing the text is what tells them apart --
+                    # the previous run's 0/32 in 2.9 s was rejection and got
+                    # reported as if it were a capacity limit.
+                    print(f"    request errors x{len(_ERRORS)}: {_ERRORS[0]}",
+                          flush=True)
+                    _ERRORS.clear()
                 row = {"concurrency": conc, "ok": ok, "of": conc,
                        "wall_s": round(el, 1),
                        "agg_out_tok_s": round(gen / max(el, 1e-9), 1),
@@ -189,6 +214,10 @@ def sweep(tag: str, packed: bool) -> dict:
                 ok = sum(1 for o, _ in outs if o)
                 gen = sum(n for _, n in outs)
                 c = log_counters(log_path, mark)
+                if _ERRORS:
+                    print(f"    request errors x{len(_ERRORS)}: {_ERRORS[0]}",
+                          flush=True)
+                    _ERRORS.clear()
                 row = {"ctx": ctx, "concurrency": conc, "ok": ok,
                        "wall_s": round(el, 1),
                        "agg_out_tok_s": round(gen / max(el, 1e-9), 1),
