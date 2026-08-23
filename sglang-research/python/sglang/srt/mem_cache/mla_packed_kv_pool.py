@@ -245,6 +245,21 @@ class _PackedLatentMixin(_Int2HPMixin):
         self._selfcheck_worst = 0.0
         self._selfcheck_n = 0
         self._selfcheck_gate_logged = False
+        # ``from sglang.srt.environ import envs`` -- importing the *module* as
+        # ``envs`` binds a module whose attributes are not the descriptors, and
+        # a bare except around it once turned every flag into False silently.
+        from sglang.srt.environ import envs as _envs
+
+        self._audit_budget = (
+            _envs.SGLANG_OSCAR_MLA_PACKED_AUDIT_BUDGET.get()
+            if _envs.SGLANG_OSCAR_MLA_PACKED_AUDIT.get()
+            else 0
+        )
+        self._audit_stride = max(
+            1, _envs.SGLANG_OSCAR_MLA_PACKED_AUDIT_STRIDE.get()
+        )
+        self._audit_every_n = 0
+        self._audit_worst = 1.0
 
         bytes_tok = packed_latent_bytes_per_token(
             R, self.qk_rope_head_dim, group_size
@@ -457,6 +472,22 @@ class _PackedLatentMixin(_Int2HPMixin):
         # through torch.compile (DeepSeek-V2-Lite does; GLM-5.2 is on the
         # piecewise-disabled list) it becomes a hard graph break rather than a
         # branch. sglang's flag is a plain Python global and traces fine.
+        # The arena audit reads a count back to the host, so it carries the same
+        # capture/trace restriction as the self-check. Unlike the self-check its
+        # budget is spent on *late* decode steps, not early writes: the tag it
+        # checks is only interesting after the ring has wrapped, which needs
+        # thousands of steps. Layer 0 only, or it fires once per layer per step.
+        if (
+            self._audit_budget > 0
+            and layer_id == self.start_layer
+            and not _is_capturing()
+            and not _tracing()
+        ):
+            self._audit_every_n += 1
+            if self._audit_every_n % self._audit_stride == 0:
+                self._audit_budget -= 1
+                self.audit_window_arena(f"step~{self._audit_every_n}")
+
         if self._selfcheck_budget > 0 and not _is_capturing() and not _tracing():
             self._selfcheck_write(layer_id, loc64, c, keep)
         elif self._selfcheck and not self._selfcheck_gate_logged:
@@ -585,6 +616,75 @@ class _PackedLatentMixin(_Int2HPMixin):
                 layer_id, int(loc.numel()), float(diff.max()), rel,
                 self._selfcheck_worst, self._selfcheck_n, self._selfcheck_budget,
             )
+
+    # ── arena audit ─────────────────────────────────────────────────────────
+
+    def audit_window_arena(self, tag: str = "") -> None:
+        """Count the BF16 window rows a *reader* would actually accept.
+
+        The write-side self-check and the teacher-forced NLL comparison both
+        clear the packed path, and the NLL run puts it at 5% of the cost of
+        quantizing at all -- on a corpus calibrated to reproduce the known
+        +2.7% PPL. But teacher forcing is one prefill: the ring is written once
+        and the ``owner`` tag, the wrap and the eviction are never exercised.
+        A GPQA answer is 10,000+ tokens, so the ring wraps ~20 times and every
+        decode step depends on that tag being right.
+
+        This audits the invariant a reader relies on, using only pool state:
+        for each live request, the positions that *should* be BF16 are
+        ``[0, P)`` and ``[seq-W, seq)``, so the count of slots satisfying
+        ``hp_row_of_slot[slot] >= 0 and hp_owner_of_row[row] == slot`` should be
+        ``min(P, seq) + min(W, max(seq-P, 0))``. Anything materially below that
+        means the window silently degraded to INT2 during decode, which is
+        exactly the shape of the observed loss: long generations, lower
+        accuracy-given-answered, never uniquely right.
+        """
+        if not self._latent_windows:
+            return
+        meta = self._fb_window_meta
+        if meta is None or meta.get("fallback") or meta["req_to_token"] is None:
+            return
+        seq_lens = meta["seq_lens"]
+        req_idx = meta["req_pool_indices"]
+        if seq_lens is None or req_idx is None or seq_lens.numel() == 0:
+            return
+
+        P, W = self._win_p, self._win_r
+        r2t = meta["req_to_token"]
+        want_total = 0
+        got_total = 0
+        # One request is enough to detect a broken tag and keeps this cheap
+        # enough to leave on; a per-request loop over a batch of 64 inside a
+        # decode step is not.
+        for i in range(min(1, int(req_idx.numel()))):
+            seq = int(seq_lens[i].item())
+            row = int(req_idx[i].item())
+            if seq <= 0:
+                continue
+            pos = torch.cat([
+                torch.arange(min(P, seq), device=r2t.device),
+                torch.arange(max(seq - W, P), seq, device=r2t.device),
+            ])
+            if pos.numel() == 0:
+                continue
+            slots = r2t[row, pos].to(torch.int64)
+            rows = self.hp_row_of_slot[slots].to(torch.int64)
+            ok = rows >= 0
+            owner = self.hp_owner_of_row[rows.clamp(min=0)]
+            ok = ok & (owner == slots.to(owner.dtype))
+            want_total += int(pos.numel())
+            got_total += int(ok.sum().item())
+
+        if want_total == 0:
+            return
+        frac = got_total / want_total
+        self._audit_worst = min(getattr(self, "_audit_worst", 1.0), frac)
+        logger.info(
+            "[MLAPacked] arena audit%s seq_lens[0]=%d expected=%d accepted=%d "
+            "(%.1f%%, worst %.1f%%)",
+            f" {tag}" if tag else "", int(seq_lens[0].item()),
+            want_total, got_total, 100.0 * frac, 100.0 * self._audit_worst,
+        )
 
 
 class MLAPackedInt2KVPool(_PackedLatentMixin, MLATokenToKVPool):

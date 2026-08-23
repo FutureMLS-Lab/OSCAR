@@ -264,6 +264,16 @@ class Envs:
     # dequant is free (measured: removing the dequant entirely is 1.00x). Off by
     # default until A/B'd on hardware.
     SGLANG_OSCAR_MLA_PACKED_DUAL_LOAD = EnvBool(False)
+    # Audit the BF16 window arena during *decode*. The write-side self-check and
+    # the teacher-forced NLL run both clear the packed read path, but teacher
+    # forcing is a single prefill: the ring's owner tag, wrap and eviction are
+    # never exercised. This counts, from pool state alone, how many of the slots
+    # that should be BF16 a reader would actually accept.
+    SGLANG_OSCAR_MLA_PACKED_AUDIT = EnvBool(False)
+    SGLANG_OSCAR_MLA_PACKED_AUDIT_BUDGET = EnvInt(80)
+    # Sample every Nth decode step: the tag only gets interesting after the ring
+    # has wrapped, which takes thousands of steps.
+    SGLANG_OSCAR_MLA_PACKED_AUDIT_STRIDE = EnvInt(200)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in
