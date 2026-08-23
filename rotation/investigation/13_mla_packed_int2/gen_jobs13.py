@@ -156,10 +156,13 @@ def main() -> None:
         packed = "0" if a.kind == "gpqa-fake" else "1"
         if a.kind == "smoke":
             run = f"mlapacked_smoke_{a.tag}"
-            # 12 questions is enough to exercise decode, a chunked-free prefill,
-            # graph replay at the client concurrency and a radix hit, while the
-            # self-check (which syncs the stream on every layer) is on.
-            extra = "export NUM_EXAMPLES=12 SELF=1"
+            # 8 questions x 2048 new tokens: enough to exercise prefill, graph
+            # replay at the client concurrency, a radix hit across questions,
+            # and -- the part that matters -- generations several times longer
+            # than the 512-token recent window, so tokens actually age out of
+            # the BF16 ring and are served from the packed tier. Not enough to
+            # score; scoring is the gpqa arm's job.
+            extra = "export NUM_EXAMPLES=8 MAX_NEW_TOKENS=2048"
             selfcheck, workers = "1", "4"
         else:
             run = f"mlapacked_{'fake' if packed == '0' else 'gpqa'}_{a.tag}"

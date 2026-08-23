@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-_PACKED_SELFCHECK_STATE = {"worst": 0.0, "n": 0}
+_PACKED_SELFCHECK_STATE = {"worst": 0.0, "n": 0, "budget": -1}
 
 
 def _packed_selfcheck(pool, layer_id, kv_indices) -> None:
@@ -56,21 +56,33 @@ def _packed_selfcheck(pool, layer_id, kv_indices) -> None:
     ``SGLANG_OSCAR_MLA_PACKED_SELFCHECK=1``; it doubles latent memory and syncs
     the stream, so it is a smoke-run tool, not a serving option.
     """
-    if kv_indices.numel() == 0:
+    st = _PACKED_SELFCHECK_STATE
+    if st["budget"] < 0:
+        st["budget"] = envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK_BUDGET.get()
+    # Spend a fixed budget and then stop. Every check materializes the row set
+    # again and syncs the stream to read the max, so leaving it on for a whole
+    # generation turns a 40-minute smoke into an overnight one -- and the first
+    # few hundred checks already cover every layer in both forward modes, which
+    # is the whole claim. The budget is spent, not sampled, so a mismatch that
+    # only appears late would be missed: this proves equivalence on the covered
+    # steps, not for all time.
+    if st["budget"] == 0 or kv_indices.numel() == 0:
         return
+    st["budget"] -= 1
     rep = pool.selfcheck_rows(layer_id, kv_indices)
     if rep is None:
+        st["budget"] = 0
         return
-    st = _PACKED_SELFCHECK_STATE
     st["n"] += 1
-    if rep["rel"] > st["worst"]:
-        st["worst"] = rep["rel"]
-        import logging as _logging
+    import logging as _logging
 
+    if rep["rel"] > st["worst"] or st["budget"] == 0:
+        st["worst"] = max(st["worst"], rep["rel"])
         _logging.getLogger(__name__).info(
-            "[MLAPacked] selfcheck layer=%d n=%d max_abs=%.3e rel=%.3e "
-            "(worst so far over %d checks)",
-            rep["layer"], rep["n"], rep["max_abs"], rep["rel"], st["n"],
+            "[MLAPacked] selfcheck layer=%d rows=%d max_abs=%.3e rel=%.3e "
+            "worst_rel=%.3e over %d checks (budget left %d)",
+            rep["layer"], rep["n"], rep["max_abs"], rep["rel"],
+            st["worst"], st["n"], st["budget"],
         )
 
 
@@ -369,6 +381,11 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         self.packed_mla_pool = (
             _is_packed_mla_pool(model_runner.token_to_kv_pool) and self.use_mla
+        )
+        # Read once: this is consulted per layer per decode step.
+        self.packed_selfcheck = (
+            self.packed_mla_pool
+            and envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get()
         )
         self.max_context_len = model_runner.model_config.context_len
         # ``mixed_kv_enabled()`` is True only for ``UnifiedInt2HPKVPool``
@@ -2071,7 +2088,7 @@ class TritonAttnBackend(AttentionBackend):
             pool = forward_batch.token_to_kv_pool
             n_prefix = int(kv_indices.numel())
             if n_prefix > 0:
-                if envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get():
+                if self.packed_selfcheck:
                     _packed_selfcheck(pool, layer.layer_id, kv_indices)
                 staged = pool.materialize_rows(layer.layer_id, kv_indices)
                 k_buffer = staged
@@ -2504,7 +2521,7 @@ class TritonAttnBackend(AttentionBackend):
                 layer.scaling * k_descale,
                 logit_cap=logits_soft_cap,
             )
-            if envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get():
+            if self.packed_selfcheck:
                 _packed_selfcheck(pool, layer.layer_id, kv_indices)
         else:
             # Standard attention with dequantized or non-quantized KV cache

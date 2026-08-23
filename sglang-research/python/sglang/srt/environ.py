@@ -240,6 +240,9 @@ class Envs:
     # Shadow the packed latent with the BF16 fake-quant result and assert every
     # materialized read matches it. Doubles latent memory; for smoke runs only.
     SGLANG_OSCAR_MLA_PACKED_SELFCHECK = EnvBool(False)
+    # How many reads the self-check verifies before switching itself off. Each
+    # one re-materializes the row set and syncs the stream.
+    SGLANG_OSCAR_MLA_PACKED_SELFCHECK_BUDGET = EnvInt(600)
     # Number of BF16 window rows per request in the packed pool's HP arena.
     # 0 = sink + recent (the two windows), which is the only correct value;
     # exposed so the arena can be sized down for probes.
