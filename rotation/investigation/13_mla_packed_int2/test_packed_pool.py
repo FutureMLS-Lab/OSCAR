@@ -115,7 +115,7 @@ def main() -> None:
     deq = _fake_quant_int2_groupwise(xf, GS, False).to(torch.bfloat16)
     want = deq.clone()
     win = [p for p in range(L) if p < P or p >= L - W]
-    want[win] = x.reshape(L, R)
+    want[win] = x.reshape(L, R)[win]
     bad = (got[:, :R].float() - want.float()).abs().max().item()
     check(
         "extend: sink+recent exact, middle dequantized",
