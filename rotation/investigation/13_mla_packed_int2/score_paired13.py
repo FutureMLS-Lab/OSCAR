@@ -66,7 +66,16 @@ def load(d: str) -> dict:
             p = r["messages"][0]["content"]
             m = ANSWER.search(r.get("response") or "")
             out[p] = {"letter": m.group(1).upper() if m else None,
-                      "answered": bool(m), "chars": len(r.get("response") or "")}
+                      "answered": bool(m), "chars": len(r.get("response") or ""),
+                      # Completion order. The growth curve needs a STABLE
+                      # ordering: sorting the matched ids by prompt text makes
+                      # "the first 60" a different set every time the run grows,
+                      # so the same n reported -3.33 one hour and -6.67 the next
+                      # purely from membership churn. Ordering by the base arm's
+                      # completion index makes the prefix monotone -- ids only
+                      # get appended -- which is what "has it settled as the run
+                      # progressed" actually means.
+                      "ord": len(out)}
     return out
 
 
@@ -94,7 +103,9 @@ def main() -> None:
     for _, m in arms[1:]:
         common &= set(m)
     scored = {p: correct_letter(p, correct_texts) for p in common}
-    usable = sorted(p for p, L in scored.items() if L)
+    base_m = arms[0][1]
+    usable = sorted((p for p, L in scored.items() if L),
+                    key=lambda p: base_m[p]["ord"])
     print(f"matched ids: {len(common)}   with a recoverable key: {len(usable)}"
           f"   (arm sizes {[len(m) for _, m in arms]})")
     if not usable:
@@ -130,7 +141,8 @@ def main() -> None:
         # -12.20 at 41, a 1/3 transparency gap that became 1/12, a +9.09 that was
         # a code-pin confound. A delta resting on five discordant pairs needs to
         # be shown settling, not just reported.
-        print("\n=== delta vs prefix size (has it settled?) ===")
+        print("\n=== delta vs prefix size, in the base arm's COMPLETION order "
+              "(has it settled?) ===")
         print(f"{'n':>5}  " + "  ".join(f"{nm[:14]:>14}" for nm, _ in arms[1:])
               + "   discordant")
         step = max(10, len(usable) // 8)
