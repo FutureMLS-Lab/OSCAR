@@ -95,6 +95,20 @@ def _is_capturing() -> bool:
     return bool(get_is_capture_mode())
 
 
+def _tracing() -> bool:
+    """True while dynamo is tracing this call.
+
+    The self-check syncs (it reads a max back to log it), and a sync is
+    untraceable: inside a compiled attention layer it is a hard graph break, not
+    a slow path. ``torch.compiler.is_compiling()`` is the one guard dynamo
+    specializes instead of breaking on.
+    """
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
+
+
 def envs_selfcheck_budget() -> int:
     from sglang.srt.environ import envs
 
@@ -442,7 +456,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         # through torch.compile (DeepSeek-V2-Lite does; GLM-5.2 is on the
         # piecewise-disabled list) it becomes a hard graph break rather than a
         # branch. sglang's flag is a plain Python global and traces fine.
-        if self._selfcheck_budget > 0 and not _is_capturing():
+        if self._selfcheck_budget > 0 and not _is_capturing() and not _tracing():
             self._selfcheck_write(layer_id, loc64, c, keep)
 
     def set_kv_buffer(self, layer, loc, cache_k, cache_v):

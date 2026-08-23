@@ -70,6 +70,11 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
         "--max-running-requests", "64",
         "--cuda-graph-max-bs", "8",
         "--context-length", CTX,
+        # DeepSeek-V2-Lite routes its attention layers through the piecewise
+        # CUDA graph, i.e. through dynamo. GLM-5.2 is on the
+        # piecewise-disabled arch list, so the probe matches it rather than
+        # measuring a compile path the target model never takes.
+        "--disable-piecewise-cuda-graph",
     ]
     print(f"\n=== {tag} (packed={packed}) ===", flush=True)
     with open(log_path, "w") as lf:
