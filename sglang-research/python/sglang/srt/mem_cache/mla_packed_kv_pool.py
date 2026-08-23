@@ -83,6 +83,18 @@ from sglang.srt.mem_cache.mla_int2_kv_pool import _Int2HPMixin
 logger = logging.getLogger(__name__)
 
 
+def _is_capturing() -> bool:
+    """Whether sglang is currently capturing a CUDA graph.
+
+    Deliberately not ``torch.cuda.is_current_stream_capturing()``: that is a
+    CUDA call and dynamo cannot trace it, so on a compiled attention layer it
+    is a graph break, not a branch.
+    """
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    return bool(get_is_capture_mode())
+
+
 def envs_selfcheck_budget() -> int:
     from sglang.srt.environ import envs
 
@@ -423,9 +435,14 @@ class _PackedLatentMixin(_Int2HPMixin):
         # graph capture ("operation not permitted when stream is capturing") and
         # would also bake a one-off comparison into the replayed graph. Skip it
         # there; the same rows are re-verified on the next eager forward.
-        if self._selfcheck_budget > 0 and not (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        ):
+        #
+        # Gate on sglang's own capture flag, not on
+        # ``torch.cuda.is_current_stream_capturing()``: the latter is a CUDA
+        # call that dynamo cannot trace, so on a model whose attention layers go
+        # through torch.compile (DeepSeek-V2-Lite does; GLM-5.2 is on the
+        # piecewise-disabled list) it becomes a hard graph break rather than a
+        # branch. sglang's flag is a plain Python global and traces fine.
+        if self._selfcheck_budget > 0 and not _is_capturing():
             self._selfcheck_write(layer_id, loc64, c, keep)
 
     def set_kv_buffer(self, layer, loc, cache_k, cache_v):
