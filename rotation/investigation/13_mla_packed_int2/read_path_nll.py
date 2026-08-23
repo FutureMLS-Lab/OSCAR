@@ -153,11 +153,20 @@ def launch(tag: str, env_over: dict) -> dict:
         "--context-length", CTX,
         "--chunked-prefill-size", str(CHUNK),
         "--disable-piecewise-cuda-graph",
-        # A prefix hit would serve scored positions from a previous arm's
-        # cached KV, which is the one thing that would make the arms share a
-        # read path instead of differing by one.
-        "--disable-radix-cache",
     ]
+    # RADIX=1 keeps the prefix cache ON and scores the SAME text twice. Pass 1
+    # is a cold prefill that writes every position itself; pass 2 is served from
+    # the cache, so its scored positions were written by a previous forward and
+    # are read back out of the pool rather than produced in this one.
+    #
+    # This is the test the arena audit could not be: the audit checks
+    # bookkeeping (is the BF16 row accepted), and it came back 100% clean on a
+    # run with real 57- and 292-token cache hits. What it cannot see is whether
+    # the cached-prefix *read* returns the right numbers. Packed loses 12.20 pp
+    # with the cache on and 2.38 pp with it off, so something in that path is
+    # wrong; if pass 2 degrades for packed and not for fake-quant, this is it.
+    if os.environ.get("RADIX", "0") != "1":
+        args += ["--disable-radix-cache"]
     print(f"\n=== {tag} ===", flush=True)
     with open(log_path, "w") as lf:
         p = subprocess.Popen(args, stdout=lf, stderr=subprocess.STDOUT, env=env,
@@ -209,10 +218,17 @@ def drive(p, log_path: str) -> dict:
     req = urllib.request.Request(
         f"http://127.0.0.1:{PORT}/generate", data=body,
         headers={"Content-Type": "application/json"})
-    try:
-        r = json.loads(urllib.request.urlopen(req, timeout=1800).read())
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"request failed: {e}"}
+    passes = 2 if os.environ.get("RADIX", "0") == "1" else 1
+    got = []
+    for _p in range(passes):
+        try:
+            rq = urllib.request.Request(
+                f"http://127.0.0.1:{PORT}/generate", data=body,
+                headers={"Content-Type": "application/json"})
+            got.append(json.loads(urllib.request.urlopen(rq, timeout=1800).read()))
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"request {_p} failed: {e}"}
+    r = got[0]
     if isinstance(r, list):
         r = r[0]
     lps = r.get("meta_info", {}).get("input_token_logprobs")
@@ -225,12 +241,21 @@ def drive(p, log_path: str) -> dict:
         return {"error": f"only {len(vals)} scored positions, need > SKIP={SKIP}"}
     kept = vals[SKIP:]
     nll = -sum(kept) / len(kept)
-    return {
+    out = {
         "n_positions": len(vals),
         "n_scored": len(kept),
         "nll": nll,
         "ppl": math.exp(nll),
     }
+    if len(got) > 1:
+        r2 = got[1][0] if isinstance(got[1], list) else got[1]
+        lp2 = r2.get("meta_info", {}).get("input_token_logprobs") or []
+        v2 = [e[0] for e in lp2 if e and e[0] is not None]
+        if len(v2) > SKIP:
+            k2 = v2[SKIP:]
+            out["nll_cached"] = -sum(k2) / len(k2)
+            out["d_cached"] = out["nll_cached"] - nll
+    return out
 
 
 def main() -> None:
@@ -260,8 +285,12 @@ def main() -> None:
                   f"{r['error']}")
             continue
         by[r["tag"]] = r
+        extra = ""
+        if "nll_cached" in r:
+            extra = (f"   cached-pass NLL {r['nll_cached']:.4f} "
+                     f"(delta {r['d_cached']:+.4f})")
         print(f"{r['tag']:>10} {r['pool'] or '-':>13} {r['n_scored']:>8} "
-              f"{r['nll']:>9.4f} {r['ppl']:>10.3f}")
+              f"{r['nll']:>9.4f} {r['ppl']:>10.3f}{extra}")
 
     # An absolute NLL threshold is the wrong test and the first run proved it:
     # on the repeated passage BF16 scores 0.00242 and fake-quant 0.00243, so the
@@ -281,6 +310,19 @@ def main() -> None:
         q = by["fakequant"]["nll"] - by["bf16"]["nll"]
         print(f"fakequant - bf16:   dNLL = {q:+.3e}  "
               f"(the cost of quantizing at all -- the unit below)")
+    if all("d_cached" in by.get(k, {}) for k in ("packed", "fakequant")):
+        dp, df = by["packed"]["d_cached"], by["fakequant"]["d_cached"]
+        print(f"\ncache-hit pass, degradation vs its own cold pass:")
+        print(f"  fakequant {df:+.4f}   packed {dp:+.4f}   "
+              f"packed excess {dp - df:+.4f}")
+        if dp - df > 0.01:
+            print("  -> the cached-prefix READ is where packed loses it. This "
+                  "is the -12.20 pp mechanism, on one GPU.")
+        else:
+            print("  -> the cached-prefix read is fine too. Neither the arena "
+                  "bookkeeping nor the cached read explains the radix gap; "
+                  "next suspects are scheduling/admission differences that "
+                  "the 2.9x larger pool induces, and CUDA graph under radix.")
     if have:
         q = by["fakequant"]["nll"] - by["bf16"]["nll"]
         d = by["packed"]["nll"] - by["fakequant"]["nll"]
