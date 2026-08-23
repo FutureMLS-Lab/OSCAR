@@ -79,6 +79,7 @@ def _fwd_packed_mla_stage1(
     LLOYD: tl.constexpr,
     HAS_HP: tl.constexpr,
     PARAM_BCAST: tl.constexpr,
+    ABLATE: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -140,7 +141,10 @@ def _fwd_packed_mla_stage1(
                 other=0,
             ).to(tl.int32)
             code = (byte >> (2 * (offs_d % 4))[None, :]) & 0x3
-            if PARAM_BCAST:
+            if ABLATE == 1:
+                scale = 0.0
+                zero = 0.0
+            elif PARAM_BCAST:
                 # scale/zero are per (token, group): [BLOCK_N, NG] of unique
                 # values, 8 floats per token at NG=4. Addressing them as a
                 # [BLOCK_N, D] tile via ``gid`` asks the LSU to compute 8192
@@ -186,7 +190,21 @@ def _fwd_packed_mla_stage1(
                     mask=n_ok[:, None],
                     other=0.0,
                 )
-            if LLOYD:
+            if ABLATE == 1:
+                # NUMERICALLY WRONG BY CONSTRUCTION -- a measurement device, not
+                # a serving path (``packed_mla_decode_stage1`` only reaches it
+                # from the benchmark, never from the pool). Drops the entire
+                # dequant: no scale/zero, no fp32 stage, code straight to the
+                # compute dtype. What remains is the byte load, the shift/mask,
+                # and the two dots, so the delta against ABLATE=0 is the cost of
+                # dequantizing -- the one quantity the tiling, traffic and
+                # addressing experiments all failed to move.
+                cv = code.to(q.dtype)
+            elif ABLATE == 2:
+                # Loads kept, arithmetic dropped: separates "reading scale/zero"
+                # from "applying them". ``* 0`` keeps the loads live against DCE.
+                cv = code.to(tl.float32) + (scale * 0.0) + (zero * 0.0)
+            elif LLOYD:
                 cv = (code.to(tl.float32) - zero) * scale
             else:
                 cv = code.to(tl.float32) * scale + zero
@@ -275,6 +293,8 @@ def packed_mla_decode_stage1(
     num_warps: int = 0,
     num_stages: int = 0,
     param_bcast: bool | None = None,
+    ablate: int = 0,
+    block_h: int = 0,
 ):
     """``q`` is ``[batch, head, D+DPE]``; ``operands`` from ``packed_read_operands``."""
     codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
@@ -292,7 +312,7 @@ def packed_mla_decode_stage1(
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = head_num  # MLA: one KV head
-    block_h = _safe_block_h(16, kv_group_num)
+    block_h = _safe_block_h(block_h or 16, kv_group_num)
     grid = (batch, triton.cdiv(head_num, min(block_h, kv_group_num)), max_kv_splits)
 
     n_groups = d // group_size
@@ -338,6 +358,7 @@ def packed_mla_decode_stage1(
         LLOYD=bool(lloyd),
         HAS_HP=has_hp,
         PARAM_BCAST=param_bcast,
+        ABLATE=int(ablate),
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=num_stages,

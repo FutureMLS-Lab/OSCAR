@@ -185,6 +185,49 @@ def main() -> None:
     print(f"  broadcast    {t_bc:.3f} ms ({base/t_bc:.2f}x BF16)  "
           f"-> {t_gid/t_bc:.2f}x over gid-indexed")
 
+    # What the dequant itself costs. Tiling, traffic and addressing have all been
+    # measured and all failed to move this kernel, so the remaining candidate is
+    # the per-element arithmetic: the dequant touches BLOCK_N x D elements while
+    # the two dots do BLOCK_H x BLOCK_N x D MACs on tensor cores, so the dequant
+    # is amortized over BLOCK_H query heads only. At BLOCK_H=16 an ALU op costs
+    # ~28 tensor-core MAC-equivalents, which predicts dequant ~5x the dot cost --
+    # close enough to the measured 5.5x to be worth testing directly.
+    #
+    # ABLATE=1 and 2 produce WRONG NUMBERS on purpose. They exist to attribute
+    # time, and the pool can never reach them.
+    for lvl, what in ((1, "no dequant at all (codes straight to bf16)"),
+                      (2, "scale/zero loaded but not applied")):
+        try:
+            t_ab = timeit(lambda: packed_mla_decode_stage1(
+                q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
+                max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1,
+                ablate=lvl,
+            ))
+            print(f"  ABLATE={lvl} {t_ab:.3f} ms ({base/t_ab:.2f}x BF16) "
+                  f"-> {t_gid/t_ab:.2f}x over the real path   [{what}]")
+        except Exception as e:  # noqa: BLE001
+            print(f"  ABLATE={lvl} failed: {type(e).__name__}: {e}")
+
+    # Head amortization. MLA shares one KV head across every query head, so
+    # BLOCK_H is free to grow -- and growing it is the only lever that changes
+    # the dequant-to-dot ratio rather than the constant in front of it. The cap
+    # is the [BLOCK_H, D] fp32 accumulator: at BLOCK_H=64, D=512 that is 128 KiB.
+    print(f"\nhead amortization (BLOCK_H, heads={heads}):")
+    for bh in (16, 32, 64, 128):
+        if bh > heads:
+            continue
+        try:
+            t_bh = timeit(lambda: packed_mla_decode_stage1(
+                q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
+                max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1,
+                block_h=bh,
+            ))
+            print(f"  BLOCK_H={bh:>3} {t_bh:.3f} ms ({base/t_bh:.2f}x BF16) "
+                  f"-> {t_gid/t_bh:.2f}x over BLOCK_H=16")
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).splitlines()[0][:70]
+            print(f"  BLOCK_H={bh:>3} - {type(e).__name__}: {msg}")
+
     # Traffic accounting, kept because it was REFUTED and the refutation is the
     # finding. Narrowing the bytes actually made the kernel 1.3x slower, so the
     # amplification below is L1-served and is not the bound; what the broadcast
