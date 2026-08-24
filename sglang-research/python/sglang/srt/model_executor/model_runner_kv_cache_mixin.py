@@ -581,17 +581,92 @@ class ModelRunnerKVCacheMixin:
                 # OSCAR-rotation KV cache as non-hybrid dense models. The
                 # outer HybridLinearKVPool keeps its layer-id remap for the
                 # full-attn-only allocation.
-                enable_mixed_kv_hybrid = (
-                    not self.use_mla_backend
-                    and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+                # Conditions common to both hybrid INT2 shapes. The per-head and
+                # latent variants then differ only in which rotation env they
+                # need and which pool class they build.
+                _mixed_kv_hybrid_base = (
+                    envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
                     and _attention_supports_mixed_kv(self.server_args)
                     and self.kv_cache_dtype == "int2"
                     and self.server_args.disaggregation_mode in (None, "null")
                     and self.server_args.speculative_algorithm is None
+                )
+                enable_mixed_kv_hybrid = (
+                    _mixed_kv_hybrid_base
+                    and not self.use_mla_backend
                     and envs.SGLANG_OSCAR_K_ROTATION_PATH.get() != ""
                     and envs.SGLANG_OSCAR_V_ROTATION_PATH.get() != ""
                 )
+                # Hybrid + MLA: a mambaish model whose full-attention layers are
+                # MLA. This used to be unreachable -- the per-head gate above
+                # required ``not use_mla_backend`` while the latent pool's own
+                # gate requires ``not mambaish_config`` -- so such a model could
+                # get INT2 only by declaring ``attention_arch = MHA`` and storing
+                # expanded per-head K/V. That override cost Kimi-K3 the latent
+                # compression entirely: its pool measured 264,168 tokens against
+                # GLM-5.2's 1,882,304, because expanded storage is
+                # (192+128) x 2bit x num_kv_heads per token instead of one 288 B
+                # latent shared across heads. Build the real latent pool instead.
+                enable_mixed_kv_hybrid_mla = (
+                    _mixed_kv_hybrid_base
+                    and self.use_mla_backend
+                    and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+                    and envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get() != ""
+                )
                 hybrid_full_kv_pool = None
+                if enable_mixed_kv_hybrid_mla:
+                    from sglang.srt.mem_cache.mla_packed_kv_pool import (
+                        MLAPackedInt2KVPool,
+                        NSAPackedInt2KVPool,
+                    )
+
+                    hybrid_packed_kwargs = dict(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        kv_lora_rank=self.model_config.kv_lora_rank,
+                        qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                        # Inner pool sees 0..N-1 after HybridLinearKVPool's remap,
+                        # so layer_num is the full-attn count and start_layer=0 --
+                        # the same convention UnifiedInt2HPKVPool uses below.
+                        layer_num=len(full_attention_layer_ids),
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=0,
+                        end_layer=len(full_attention_layer_ids),
+                        rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                        group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                        max_reqs=self.req_to_token_pool.size,
+                        selfcheck=envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get(),
+                        # Rotation files are keyed by GLOBAL layer id while the
+                        # inner pool is indexed locally; without this mapping
+                        # local layer 0 would load layer_0.pt for what is really
+                        # full-attn layer 3. Loading the wrong-but-valid rotation
+                        # does not raise -- it quantizes in the wrong frame.
+                        rotation_layer_ids=full_attention_layer_ids,
+                    )
+                    logger.info(
+                        "Enable hybrid mixed KV (packed INT2 MLA latent) for "
+                        "mambaish MLA model: full_attn_layers=%d kv_lora_rank=%d "
+                        "qk_rope_head_dim=%d group=%s",
+                        len(full_attention_layer_ids),
+                        self.model_config.kv_lora_rank,
+                        self.model_config.qk_rope_head_dim,
+                        envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                    )
+                    if is_nsa_model:
+                        hybrid_full_kv_pool = NSAPackedInt2KVPool(
+                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                            index_head_dim=get_nsa_index_head_dim(
+                                self.model_config.hf_config
+                            ),
+                            **hybrid_packed_kwargs,
+                        )
+                    else:
+                        hybrid_full_kv_pool = MLAPackedInt2KVPool(
+                            **hybrid_packed_kwargs
+                        )
                 if enable_mixed_kv_hybrid:
                     hp_window_tokens_h = (
                         envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()

@@ -96,7 +96,7 @@ packed codes, which are already INT2.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -181,6 +181,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         lloyd_max: bool,
         max_reqs: int,
         selfcheck: bool = False,
+        rotation_layer_ids: Optional[List[int]] = None,
     ) -> None:
         # _init_int2 loads the rotations, resolves the compute dtype and reads
         # the window knobs. The dump/HP-subspace features are fake-quant-only.
@@ -191,6 +192,7 @@ class _PackedLatentMixin(_Int2HPMixin):
             dump_max_tokens_per_layer=0,
             lloyd_max=lloyd_max,
             hp_subspace_path="",
+            rotation_layer_ids=rotation_layer_ids,
         )
         if not self.rotations:
             raise ValueError(
@@ -780,9 +782,11 @@ class MLAPackedInt2KVPool(_PackedLatentMixin, MLATokenToKVPool):
 
     def __init__(self, *args, rotation_path: str = "", group_size: int = 128,
                  lloyd_max: bool = False, max_reqs: int = 64,
-                 selfcheck: bool = False, **kwargs):
+                 selfcheck: bool = False,
+                 rotation_layer_ids: Optional[List[int]] = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self._init_packed(rotation_path, group_size, lloyd_max, max_reqs, selfcheck)
+        self._init_packed(rotation_path, group_size, lloyd_max, max_reqs,
+                          selfcheck, rotation_layer_ids)
 
     def _create_buffers(self):
         # The BF16 latent cache this class replaces. Allocating it would defeat
@@ -801,9 +805,11 @@ class NSAPackedInt2KVPool(_PackedLatentMixin, NSATokenToKVPool):
 
     def __init__(self, *args, rotation_path: str = "", group_size: int = 128,
                  lloyd_max: bool = False, max_reqs: int = 64,
-                 selfcheck: bool = False, **kwargs):
+                 selfcheck: bool = False,
+                 rotation_layer_ids: Optional[List[int]] = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self._init_packed(rotation_path, group_size, lloyd_max, max_reqs, selfcheck)
+        self._init_packed(rotation_path, group_size, lloyd_max, max_reqs,
+                          selfcheck, rotation_layer_ids)
 
     def _create_buffers(self):
         self.kv_buffer = []

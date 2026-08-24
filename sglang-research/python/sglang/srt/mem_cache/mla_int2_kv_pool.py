@@ -41,7 +41,7 @@ import atexit
 import logging
 import math
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -77,6 +77,7 @@ def _load_or_make_rotations(
     kv_lora_rank: int,
     device: str,
     dtype: torch.dtype,
+    rotation_layer_ids: Optional[List[int]] = None,
 ) -> Optional[Dict[int, torch.Tensor]]:
     """Load per-layer rotations from a directory or generate Hadamard.
 
@@ -86,6 +87,15 @@ def _load_or_make_rotations(
         orthogonal matrix shared across layers (no calibration data).
       * any existing directory → load ``layer_<i>.pt`` for ``i`` in the
         effective layer range; missing layers fall back to identity.
+
+    ``rotation_layer_ids`` exists for the **hybrid** case. A mambaish model's
+    full-attention layers are a sparse subset of the model's layers (e.g.
+    3, 7, 11, ...), and the inner pool behind ``HybridLinearKVPool`` is indexed
+    0..N-1 after the layer-id remap — so keying the file lookup off the local
+    index would load ``layer_0.pt`` for what is really layer 3. Pass the global
+    ids in full-attention order and local index ``j`` loads
+    ``layer_<rotation_layer_ids[j]>.pt``. ``UnifiedInt2HPKVPool`` already does
+    exactly this; this is the MLA-side equivalent.
     """
     if not rotation_path:
         return None
@@ -111,9 +121,20 @@ def _load_or_make_rotations(
         logger.info("[MLAInt2] rotation_path=%s not found — no rotation", rotation_path)
         return None
 
+    if rotation_layer_ids is not None and len(rotation_layer_ids) != layer_num:
+        raise ValueError(
+            f"rotation_layer_ids has {len(rotation_layer_ids)} entries but "
+            f"layer_num={layer_num}"
+        )
+
     rotations: Dict[int, torch.Tensor] = {}
-    for i in range(start_layer, start_layer + layer_num):
-        p = os.path.join(rotation_path, f"layer_{i}.pt")
+    for j in range(layer_num):
+        i = start_layer + j
+        # File id: the global layer for a hybrid inner pool, else the pool's own
+        # index. Getting this wrong loads a valid-but-wrong rotation, which does
+        # not raise -- it just quantizes in the wrong frame.
+        file_id = rotation_layer_ids[j] if rotation_layer_ids is not None else i
+        p = os.path.join(rotation_path, f"layer_{file_id}.pt")
         if os.path.exists(p):
             rotations[i] = torch.load(p, map_location="cpu").to(dtype=dtype, device=device).contiguous()
         else:
@@ -261,6 +282,7 @@ class _Int2HPMixin:
         dump_max_tokens_per_layer: int,
         lloyd_max: bool,
         hp_subspace_path: str = "",
+        rotation_layer_ids: Optional[List[int]] = None,
     ) -> None:
         if self.kv_lora_rank % group_size != 0:
             raise ValueError(
@@ -299,6 +321,7 @@ class _Int2HPMixin:
             kv_lora_rank=self.kv_lora_rank,
             device=self.device,
             dtype=self._compute_dtype,
+            rotation_layer_ids=rotation_layer_ids,
         )
         # Precompute float32 rotations to avoid per-step dtype casting overhead.
         self.rotations_f32: Optional[Dict[int, torch.Tensor]] = (
