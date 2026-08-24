@@ -531,19 +531,43 @@ class ModelConfig:
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif "KimiK3ForConditionalGeneration" in self.hf_config.architectures:
-            # Kimi-K3 retains MLA projection weights but stores expanded MHA K/V
-            # for its full-attention layers so the OSCAR packed-INT2 backend can
-            # quantize the cache. KDA recurrent state is managed separately.
-            self.head_dim = (
-                self.hf_text_config.qk_nope_head_dim
-                + self.hf_text_config.qk_rope_head_dim
-            )
-            self.v_head_dim = self.hf_text_config.v_head_dim
-            self.attention_arch = AttentionArch.MHA
+            # Kimi-K3 is MLA + KDA linear attention, and it is declared as such.
+            #
+            # It used to declare ``AttentionArch.MHA`` and store expanded
+            # per-head K/V (192/128) purely so the OSCAR packed-INT2 backend
+            # could reach it: the per-head hybrid gate required
+            # ``not use_mla_backend`` while the latent pool's gate requires
+            # ``not mambaish_config``, so a mambaish MLA model was excluded from
+            # both INT2 paths. That is fixed in model_runner_kv_cache_mixin, so
+            # the lie is no longer load-bearing -- and it was expensive: expanded
+            # storage costs (192+128) x 2bit x num_kv_heads per token against one
+            # 288 B latent shared across heads, which is why K3's pool measured
+            # 264,168 tokens where GLM-5.2's measured 1,882,304.
+            #
+            # ``SGLANG_OSCAR_K3_EXPANDED_MHA=1`` restores the old declaration,
+            # because the two differ in far more than the cache: head_dim moves
+            # 192 -> kv_lora_rank + qk_rope_head_dim, the attention takes the
+            # absorbed path, and the workarounds written for a non-power-of-two
+            # 192 (the unfused flush path, the 3-group quantization limit) stop
+            # applying. Keep the escape hatch until the MLA declaration has a
+            # scored K3 run behind it.
+            from sglang.srt.environ import envs as _envs
+
+            if _envs.SGLANG_OSCAR_K3_EXPANDED_MHA.get():
+                self.head_dim = (
+                    self.hf_text_config.qk_nope_head_dim
+                    + self.hf_text_config.qk_rope_head_dim
+                )
+                self.v_head_dim = self.hf_text_config.v_head_dim
+                self.attention_arch = AttentionArch.MHA
+                self.scaling = 1 / math.sqrt(self.head_dim)
+            else:
+                self.head_dim = 256
+                self.attention_arch = AttentionArch.MLA
+                self.v_head_dim = self.hf_text_config.v_head_dim
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
-            self.scaling = 1 / math.sqrt(self.head_dim)
         elif "KimiLinearForCausalLM" in self.hf_config.architectures:
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA

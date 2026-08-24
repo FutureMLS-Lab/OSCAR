@@ -278,6 +278,12 @@ class Envs:
     # an arena row reclaimed by whichever request now holds the same req index,
     # and that victim is not necessarily element 0.
     SGLANG_OSCAR_MLA_PACKED_AUDIT_ALL = EnvBool(False)
+    # Restore Kimi-K3's old ``attention_arch = MHA`` declaration (expanded
+    # per-head K/V 192/128). Kept as an escape hatch while the honest MLA
+    # declaration has no scored K3 run behind it; the two paths differ in
+    # head_dim, the absorbed-vs-expanded forward, and every workaround written
+    # for a non-power-of-two 192.
+    SGLANG_OSCAR_K3_EXPANDED_MHA = EnvBool(False)
     # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
     # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
     # latent directions (from the kv_b_proj Hessian). Their projection is kept in
