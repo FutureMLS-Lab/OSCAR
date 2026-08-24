@@ -634,8 +634,64 @@ class ModelRunnerKVCacheMixin:
                     and self.server_args.disaggregation_mode in (None, "null")
                     and self.server_args.speculative_algorithm is None
                 )
+                # Calibration dump for a hybrid MLA model. Fitting a latent
+                # rotation needs raw c_kv, and only the fake-quant pool can dump
+                # it -- the packed pool has no BF16 latent to write out and
+                # hardcodes an empty dump dir. Without this branch a mambaish MLA
+                # model can *run* packed INT2 but can never be *calibrated* for
+                # it, which is exactly Kimi-K3's position: its rotations under
+                # /shared/kimi-k3-rotations are per-head k/v matrices, not the
+                # per-layer 512x512 the latent path loads.
+                enable_hybrid_mla_dump = (
+                    self.use_mla_backend
+                    and envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get() != ""
+                )
                 hybrid_full_kv_pool = None
-                if enable_mixed_kv_hybrid_mla:
+                if enable_hybrid_mla_dump:
+                    from sglang.srt.mem_cache.mla_int2_kv_pool import (
+                        MLAInt2HPKVPool,
+                        NSAInt2HPKVPool,
+                    )
+
+                    dump_kwargs = dict(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        kv_lora_rank=self.model_config.kv_lora_rank,
+                        qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                        layer_num=len(full_attention_layer_ids),
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=0,
+                        end_layer=len(full_attention_layer_ids),
+                        rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                        group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        dump_c_kv_dir=envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                        dump_max_tokens_per_layer=(
+                            envs.SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS.get()
+                        ),
+                        lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                        # Dumps are keyed by the file id the fitter will emit, so
+                        # the same global-id mapping applies here.
+                        rotation_layer_ids=full_attention_layer_ids,
+                    )
+                    logger.info(
+                        "Enable hybrid MLA c_kv DUMP (fake-quant pool) for "
+                        "mambaish MLA model: full_attn_layers=%s dir=%s",
+                        full_attention_layer_ids,
+                        envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                    )
+                    if is_nsa_model:
+                        hybrid_full_kv_pool = NSAInt2HPKVPool(
+                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                            index_head_dim=get_nsa_index_head_dim(
+                                self.model_config.hf_config
+                            ),
+                            **dump_kwargs,
+                        )
+                    else:
+                        hybrid_full_kv_pool = MLAInt2HPKVPool(**dump_kwargs)
+                elif enable_mixed_kv_hybrid_mla:
                     from sglang.srt.mem_cache.mla_packed_kv_pool import (
                         MLAPackedInt2KVPool,
                         NSAPackedInt2KVPool,

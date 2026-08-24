@@ -902,11 +902,13 @@ class MLAInt2HPKVPool(_Int2HPMixin, MLATokenToKVPool):
         dump_max_tokens_per_layer: int = 8192,
         lloyd_max: bool = False,
         hp_subspace_path: str = "",
+        rotation_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._init_int2(rotation_path, group_size, dump_c_kv_dir,
-                        dump_max_tokens_per_layer, lloyd_max, hp_subspace_path)
+                        dump_max_tokens_per_layer, lloyd_max, hp_subspace_path,
+                        rotation_layer_ids)
 
     def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
         self._int2_set_mla_kv_buffer(
@@ -934,11 +936,13 @@ class NSAInt2HPKVPool(_Int2HPMixin, NSATokenToKVPool):
         dump_max_tokens_per_layer: int = 8192,
         lloyd_max: bool = False,
         hp_subspace_path: str = "",
+        rotation_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._init_int2(rotation_path, group_size, dump_c_kv_dir,
-                        dump_max_tokens_per_layer, lloyd_max, hp_subspace_path)
+                        dump_max_tokens_per_layer, lloyd_max, hp_subspace_path,
+                        rotation_layer_ids)
 
     def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
         self._int2_set_mla_kv_buffer(
