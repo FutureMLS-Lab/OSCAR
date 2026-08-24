@@ -552,6 +552,22 @@ class _PackedLatentMixin(_Int2HPMixin):
 
     # ── read path ───────────────────────────────────────────────────────────
 
+    def get_v_head_dim(self) -> int:
+        """Logical width of the attention "value" for this pool.
+
+        In MLA the value *is* the latent, so this is ``kv_lora_rank`` -- and it
+        cannot be measured off a buffer the way the MHA pools do it, because
+        there is no BF16 value buffer here; ``get_value_buffer`` is exactly the
+        call this pool refuses to serve.
+
+        Needed because ``triton_backend`` asks the pool directly for any model
+        with a linear-attention spec (``token_to_kv_pool.get_v_head_dim()``),
+        which raised ``AttributeError`` on every packed MLA pool reachable that
+        way. The non-hybrid path already special-cased this by reading
+        ``kv_lora_rank`` off the pool; this makes the accessor exist instead.
+        """
+        return self.kv_lora_rank
+
     def packed_read_operands(self, layer_id: int):
         """Everything a packed attention kernel needs for one layer."""
         li = layer_id - self.start_layer

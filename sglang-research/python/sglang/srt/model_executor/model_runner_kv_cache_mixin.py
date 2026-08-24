@@ -366,9 +366,20 @@ class ModelRunnerKVCacheMixin:
                 )
         elif (
             self.use_mla_backend
+            and not self.mambaish_config
             and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
             and envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
         ):
+            # ``not mambaish_config`` is load-bearing, not defensive. Without it
+            # this branch also swallowed hybrid linear-attention MLA models --
+            # they satisfy every other condition -- and handed them a *bare*
+            # MLAPackedInt2KVPool: no HybridLinearKVPool wrapper, so no mamba
+            # state pool and no full-attn layer-id remap, with layer_num set to
+            # every layer instead of the full-attention ones. It shadowed the
+            # hybrid branch below entirely, which is why that branch's log line
+            # never appeared on a Kimi-linear model while a pool reporting
+            # ``layers=8`` (all of them) did.
+            #
             # Real packed-INT2 latent storage. The fake-quant pools below round
             # c_kv through INT2 and write the result back into a BF16 cache, so
             # they measure accuracy at BF16 memory cost; this one stores the
