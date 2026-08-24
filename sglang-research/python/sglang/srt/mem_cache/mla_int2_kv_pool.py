@@ -339,6 +339,7 @@ class _Int2HPMixin:
         )
         self._init_latent_windows()
         self.dump_c_kv_dir = dump_c_kv_dir
+        self._rotation_layer_ids = rotation_layer_ids
         self.dump_max_tokens_per_layer = dump_max_tokens_per_layer
         self._dump_counts: Dict[int, int] = {}
         self._dump_buffers: Dict[int, list] = {}
@@ -746,6 +747,22 @@ class _Int2HPMixin:
             c_kv_q = c_kv_q + c_hp          # add back the full-precision subspace
         return c_kv_q.to(out_dtype)
 
+    def _dump_file_id(self, layer_id: int) -> int:
+        """Global layer id to name a dump after.
+
+        The loader resolves ``layer_<global>.pt`` through ``rotation_layer_ids``
+        for a hybrid inner pool, but the dump side never knew about that map and
+        wrote ``layer_<local>.pt``. Fitting those and loading them back would
+        silently pair layer 0's rotation with full-attention layer 3 -- no error,
+        just quantization in the wrong frame, which is the exact failure the
+        loader's own comment warns about. Both sides now use one mapping.
+        """
+        ids = getattr(self, "_rotation_layer_ids", None)
+        if not ids:
+            return layer_id
+        j = layer_id - self.start_layer
+        return ids[j] if 0 <= j < len(ids) else layer_id
+
     def _maybe_dump_c_kv(self, layer_id: int, c_kv: torch.Tensor) -> None:
         if not self.dump_c_kv_dir:
             return
@@ -762,7 +779,9 @@ class _Int2HPMixin:
         buf.append(chunk)
         self._dump_counts[layer_id] = count + n
         if self._dump_counts[layer_id] >= self.dump_max_tokens_per_layer:
-            path = os.path.join(self.dump_c_kv_dir, f"layer_{layer_id}.pt")
+            path = os.path.join(
+                self.dump_c_kv_dir, f"layer_{self._dump_file_id(layer_id)}.pt"
+            )
             torch.save(torch.cat(buf, dim=0), path)
             self._dump_buffers.pop(layer_id)
             logger.info(
