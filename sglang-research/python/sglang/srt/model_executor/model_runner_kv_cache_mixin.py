@@ -607,11 +607,21 @@ class ModelRunnerKVCacheMixin:
                 # GLM-5.2's 1,882,304, because expanded storage is
                 # (192+128) x 2bit x num_kv_heads per token instead of one 288 B
                 # latent shared across heads. Build the real latent pool instead.
+                # Deliberately NOT built on _mixed_kv_hybrid_base: the latent
+                # path is driven by its own env flags, not by
+                # ``--kv-cache-dtype int2``. Its storage dtype is the arena/rope
+                # dtype and must be a float -- MLATokenToKVPool raises
+                # "model_dtype is required for int2 kv cache" if handed the int2
+                # string, which is why eval_oscar_gpqa.sh pins bfloat16 for MLA.
+                # The condition list here must match
+                # pool_configurator._packed_mla_latent_enabled exactly, or the
+                # configurator sizes a pool the runner does not build.
                 enable_mixed_kv_hybrid_mla = (
-                    _mixed_kv_hybrid_base
-                    and self.use_mla_backend
+                    self.use_mla_backend
                     and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
                     and envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get() != ""
+                    and self.server_args.disaggregation_mode in (None, "null")
+                    and self.server_args.speculative_algorithm is None
                 )
                 hybrid_full_kv_pool = None
                 if enable_mixed_kv_hybrid_mla:
