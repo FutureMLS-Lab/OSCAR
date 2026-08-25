@@ -359,8 +359,13 @@ class _Int2HPMixin:
         self.dump_c_kv_dir = dump_c_kv_dir
         self._rotation_layer_ids = rotation_layer_ids
         self.dump_max_tokens_per_layer = dump_max_tokens_per_layer
+        # _dump_counts is tokens SEEN (not tokens held): the collector
+        # reservoir-samples, so it keeps observing after the buffer is full and
+        # the two numbers diverge. _dump_buffers holds the reservoir tensor
+        # itself, one per layer, capped at dump_max_tokens_per_layer rows.
         self._dump_counts: Dict[int, int] = {}
-        self._dump_buffers: Dict[int, list] = {}
+        self._dump_buffers: Dict[int, torch.Tensor] = {}
+        self._dump_snapshots: Dict[int, int] = {}
         if dump_c_kv_dir:
             os.makedirs(dump_c_kv_dir, exist_ok=True)
             logger.info(
@@ -793,27 +798,62 @@ class _Int2HPMixin:
         # did, and it took down a 35-minute weight load to find out.
         if _dump_is_capturing() or _dump_is_tracing():
             return
-        count = self._dump_counts.get(layer_id, 0)
-        if count >= self.dump_max_tokens_per_layer:
-            return
         # Normalize to 2D [tokens, kv_lora_rank]: GLM-5.2 emits c_kv with an
         # extra leading dim in some calls (3D) vs 2D in others, which made the
         # per-layer buffer mix ranks → torch.cat(dim=0) "got 3 and 2".
         c_kv = c_kv.reshape(-1, c_kv.shape[-1])
-        n = min(c_kv.shape[0], self.dump_max_tokens_per_layer - count)
-        chunk = c_kv[:n].detach().to(torch.float32).cpu()
-        buf = self._dump_buffers.setdefault(layer_id, [])
-        buf.append(chunk)
-        self._dump_counts[layer_id] = count + n
-        if self._dump_counts[layer_id] >= self.dump_max_tokens_per_layer:
+        chunk = c_kv.detach().to(torch.float32).cpu()
+        cap = self.dump_max_tokens_per_layer
+
+        # Reservoir-sample rather than take the first `cap` tokens. Stopping at
+        # `cap` means the calibration set is the opening few prompts of the run,
+        # and c_kv is NOT stationary across prompts: on K3 layer 11, fitting the
+        # rotation on 2048 contiguous tokens gave an out-of-sample rel-err of
+        # 0.4191, while 2048 tokens sampled at random from the same pool gave
+        # 0.3092 -- 26% better for free. Mean token norm is flat across the dump
+        # (9.40 -> 9.44), so the drift is directional, not magnitude: different
+        # prompts occupy different subspaces of the latent, and a prefix sees
+        # only a few of them. A reservoir gives a uniform sample over the whole
+        # run at the same memory cost.
+        seen = self._dump_counts.get(layer_id, 0)
+        res = self._dump_buffers.get(layer_id)
+        if res is None:
+            res = chunk[:0]
+        take = max(0, cap - res.shape[0])
+        if take:
+            res = torch.cat([res, chunk[:take]], dim=0)
+        rest = chunk[take:]
+        if rest.shape[0]:
+            # Algorithm R: the i-th token overall (0-based) survives with
+            # probability cap/(i+1), landing on a uniformly chosen slot.
+            pos = torch.arange(
+                seen + take, seen + take + rest.shape[0], dtype=torch.float64
+            )
+            slot = (torch.rand(rest.shape[0], dtype=torch.float64) * (pos + 1)).long()
+            hit = slot < cap
+            if hit.any():
+                res[slot[hit]] = rest[hit]
+        self._dump_buffers[layer_id] = res
+        self._dump_counts[layer_id] = seen + chunk.shape[0]
+
+        # The reservoir never "fills and finalises", so snapshot periodically:
+        # otherwise a SIGKILL loses the whole dump, and these runs are long
+        # enough that that has to be survivable. flush_dumps() writes the final.
+        every = max(cap, 1) * 4
+        if res.shape[0] >= cap and (
+            self._dump_counts[layer_id] // every
+            > self._dump_snapshots.get(layer_id, 0)
+        ):
+            self._dump_snapshots[layer_id] = self._dump_counts[layer_id] // every
             path = os.path.join(
                 self.dump_c_kv_dir, f"layer_{self._dump_file_id(layer_id)}.pt"
             )
-            torch.save(torch.cat(buf, dim=0), path)
-            self._dump_buffers.pop(layer_id)
+            torch.save(res, path)
             logger.info(
-                "[Int2HPKVPool] flushed layer %d c_kv dump (%d tokens) -> %s",
+                "[Int2HPKVPool] layer %d c_kv reservoir snapshot "
+                "(%d tokens held, %d seen) -> %s",
                 layer_id,
+                res.shape[0],
                 self._dump_counts[layer_id],
                 path,
             )
@@ -829,10 +869,15 @@ class _Int2HPMixin:
             path = os.path.join(
                 self.dump_c_kv_dir, f"layer_{self._dump_file_id(layer_id)}.pt"
             )
-            torch.save(torch.cat(buf, dim=0), path)
+            # `buf` is the reservoir tensor itself, not a list of chunks: the
+            # collector now replaces slots in place rather than appending, so
+            # torch.cat here would raise on a tensor.
+            torch.save(buf, path)
             logger.info(
-                "[Int2HPKVPool] flushed partial layer %d (%d tokens) -> %s",
+                "[Int2HPKVPool] flushed layer %d c_kv reservoir "
+                "(%d tokens held, %d seen) -> %s",
                 layer_id,
+                buf.shape[0],
                 self._dump_counts.get(layer_id, 0),
                 path,
             )
