@@ -2475,10 +2475,27 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
                 ns = self.forward_metadata.num_kv_splits
-                ns_quant = getattr(self.forward_metadata, "num_kv_splits_gf", None)
-                if ns_quant is None:
-                    ns_quant = torch.clamp(ns - 1, min=1)
-                # Stage 2 must read ns_quant + 1, NOT the original ns.
+                # Persistent buffers, filled IN PLACE.
+                #
+                # These are kernel arguments, and a CUDA graph captures the
+                # pointer it was given. Allocating them per call inside the
+                # captured region means replay reads whatever now lives at an
+                # address the allocator has since recycled -- which is
+                # consistent with a kernel that passes its equivalence gate
+                # eagerly at three shapes and still garbles in a captured
+                # server. Sizing from ns and reusing keeps one address alive
+                # for the graph's lifetime.
+                buf = getattr(self, "_gf_split_bufs", None)
+                if buf is None or buf[0].shape[0] < ns.shape[0]:
+                    buf = (
+                        torch.empty_like(ns),
+                        torch.empty_like(ns),
+                    )
+                    self._gf_split_bufs = buf
+                ns_quant, ns_merge = buf[0][: ns.shape[0]], buf[1][: ns.shape[0]]
+                torch.clamp(ns - 1, min=1, out=ns_quant)
+                torch.add(ns_quant, 1, out=ns_merge)
+                # ns_merge is ns_quant + 1, NOT the original ns.
                 #
                 # They agree whenever ns >= 2, but at ns == 1 the clamp keeps
                 # ns_quant at 1, so the packed pass writes split 0 and the
@@ -2489,7 +2506,6 @@ class TritonAttnBackend(AttentionBackend):
                 # why the live probe returned '!!!!!!' on 55-token prompts while
                 # the microbenchmark, run at 20000 tokens where ns is never 1,
                 # passed its equivalence gate.
-                ns_merge = ns_quant + 1
                 packed_mla_decode_gf_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     pool,
