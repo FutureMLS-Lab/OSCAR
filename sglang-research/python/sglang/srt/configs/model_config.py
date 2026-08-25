@@ -574,6 +574,36 @@ class ModelConfig:
                 self.head_dim = 256
                 self.attention_arch = AttentionArch.MLA
                 self.v_head_dim = self.hf_text_config.v_head_dim
+                # scaling MUST be set here, and it was not.
+                #
+                # The MHA branch above sets 1/sqrt(head_dim); the DeepSeek MLA
+                # branch sets 1/sqrt(qk_nope + qk_rope) and then applies the
+                # mscale correction for rope scaling; the sibling
+                # KimiLinearForCausalLM branch below does both. This branch set
+                # neither, so the absorbed path ran with whatever scaling was
+                # left over -- a softmax at the wrong temperature, which
+                # produces locally fluent and globally wrong text rather than
+                # anything that looks like a numerical fault. That matches what
+                # the BF16 latent control actually did: coherent prose,
+                # off-task, and never emitting a response section.
+                #
+                # Mirrors the KimiLinear sibling because it is the same family
+                # and the same rope configuration.
+                self.scaling = 1 / math.sqrt(
+                    self.hf_text_config.qk_nope_head_dim
+                    + self.hf_text_config.qk_rope_head_dim
+                )
+                _rs = getattr(self.hf_text_config, "rope_scaling", None)
+                if _rs:
+                    _rt = _rs.get("rope_type") or _rs.get("type") or "default"
+                    if _rt != "default":
+                        self.scaling = compute_mla_mscale_scaling(_rs, self.scaling)
+                logger.info(
+                    "K3 MLA latent: head_dim=%d v_head_dim=%d scaling=%.6f "
+                    "(rope_scaling=%s)",
+                    self.head_dim, self.v_head_dim, self.scaling,
+                    (_rs or {}).get("rope_type") or (_rs or {}).get("type"),
+                )
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
