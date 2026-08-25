@@ -157,6 +157,31 @@ def main() -> None:
             msg = _err(e)
             print(f"{bn:>7} {w:>5} {st:>6} {'-':>9} {'-':>8}  {type(e).__name__}: {msg}")
 
+    # Correctness at the SERVING default, not just speed.
+    #
+    # warps was changed from 8 to 4 on a 1.27x timing result. num_warps is a
+    # scheduling parameter and should not alter arithmetic, but "should not" is
+    # not a measurement, and changing a serving default on timing alone is the
+    # gap this file exists to close. Compare the new default against the old
+    # one on identical inputs.
+    try:
+        _o4 = torch.zeros_like(logits)
+        _l4 = torch.zeros_like(lse)
+        packed_mla_decode_stage1(q, ops, _o4, _l4, kv_indptr, kv_indices,
+                                 num_splits, max_splits, sm, 0.0,
+                                 block_n=16, num_warps=4, num_stages=1)
+        _o8 = torch.zeros_like(logits)
+        _l8 = torch.zeros_like(lse)
+        packed_mla_decode_stage1(q, ops, _o8, _l8, kv_indptr, kv_indices,
+                                 num_splits, max_splits, sm, 0.0,
+                                 block_n=16, num_warps=8, num_stages=1)
+        fin = torch.isfinite(_o4) & torch.isfinite(_o8)
+        dev = (_o4[fin] - _o8[fin]).abs().max().item() if fin.any() else float("nan")
+        print(f"\nserving-default correctness: warps=4 vs warps=8 maxdev={dev:.3e} "
+              f"{'IDENTICAL' if dev == 0 else 'OK (reduction order)' if dev < 1e-2 else 'DIVERGENT -- revert the default'}")
+    except Exception as e:  # noqa: BLE001
+        print(f"\nserving-default correctness check failed: {type(e).__name__}: {_err(e)}")
+
     # Ablation: the same kernel with HAS_HP off. The window-arena probe loads two
     # [BLOCK_N] int32 vectors and then, behind a block-level tl.max, may load a
     # [BLOCK_N, D] fp32 tile. Even when that branch is almost never taken the
