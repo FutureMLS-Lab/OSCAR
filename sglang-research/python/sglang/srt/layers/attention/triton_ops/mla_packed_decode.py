@@ -990,6 +990,26 @@ def packed_mla_decode_gf_fwd(
     """
     operands = pool.packed_read_operands(layer_id)
     has_hp = operands[3] is not None
+
+    # Neutralise every split slot stage 2 will read, before stage 1 writes.
+    #
+    # Stage 1 stores inside `if split_kv_end > split_kv_start`, so a split with
+    # no tokens is never written -- and attn_logits comes from torch.empty, so
+    # those slots hold whatever was there before. Stage 2 then merges
+    # uninitialised memory.
+    #
+    # This is why the group-factored path agreed at bs=8 (rel 7.8e-03) and was
+    # completely wrong at bs=1 (rel 1.0): with a fixed split count over a short
+    # early-decode sequence, most splits are empty, and at bs=1 nearly all of
+    # them are. The override path is not exposed to this because it does not
+    # borrow a slot, so its per-batch split count and its written slots line up.
+    #
+    # -1e30 is the same inert sentinel the kernels write for an empty split:
+    # stage 2's max ignores it and exp() underflows it to zero.
+    _ns = max_kv_splits + 1 if has_hp else max_kv_splits
+    attn_lse[:, :, :_ns].fill_(-1.0e30)
+    attn_logits[:, :, :_ns].zero_()
+
     if not getattr(pool, "_gf_entry_logged", False):
         # One line, unconditionally, the first time this path runs. The A/B
         # instrument produced nothing at all in eager mode and I could not tell
