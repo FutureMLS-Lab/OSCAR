@@ -546,6 +546,26 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
         P_TOK=P_TOK, R_TOK=R_TOK, BLOCK_N=32, BLOCK_H=bh, logit_cap=0.0,
         num_warps=4, num_stages=2,
     )
+    # Localise the fault before stage 2 can smear it. Two guesses have already
+    # been wrong here, so report WHICH tensor and WHICH split goes non-finite
+    # rather than reasoning about it: the packed splits and the window split
+    # are written by different kernels, and stage 2 mixes them, so a NaN in the
+    # merged output cannot say which side produced it.
+    for nm, t in (("stage1 att_out", lg2), ("stage1 att_lse", ls2)):
+        bad = ~_t.isfinite(t)
+        if bad.any():
+            per = [int(bad[:, :, k].sum()) for k in range(t.shape[2])]
+            print(f"  [diag] {nm}: {int(bad.sum())} non-finite; per split {per} "
+                  f"(splits 0..{ms - 1} = packed, split {ms} = window)")
+        else:
+            print(f"  [diag] {nm}: all finite")
+    # An all-excluded split legitimately has lse = -inf; that is not a fault,
+    # but stage 2 must not then see EVERY split as -inf for a row.
+    finite_lse = _t.isfinite(ls2).any(dim=2)
+    if not bool(finite_lse.all()):
+        print(f"  [diag] {int((~finite_lse).sum())} (batch, head) rows have "
+              f"NO finite split at all -- stage 2 will compute -inf minus -inf")
+
     _decode_softmax_reducev_fwd(lg2, ls2, q, o_new, 1.0,
                                 _v_shape_proxy(o_new, R), indptr, ns + 1, ms + 1)
 
