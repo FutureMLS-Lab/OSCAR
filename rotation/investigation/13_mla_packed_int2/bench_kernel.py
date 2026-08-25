@@ -601,6 +601,18 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # rather than reasoning about it: the packed splits and the window split
     # are written by different kernels, and stage 2 mixes them, so a NaN in the
     # merged output cannot say which side produced it.
+    # Print the actual per-split lse for one row. The fault tracks the SPLIT
+    # COUNT -- seq=100 matches at splits=1 and fails at splits=2 and 8, with
+    # everything else held fixed -- so what matters is what the extra slots
+    # contain, not how long the sequence is. A slot that is neither the
+    # sentinel nor a plausible lse is the bug; all-sentinel plus one real value
+    # would mean the merge itself is at fault.
+    _l0 = ls2[0, 0].tolist()
+    print(f"  [diag] lse[0,0,:] = "
+          f"{['SENT' if v <= -1e29 else round(v, 3) for v in _l0]}  "
+          f"(splits 0..{ms-1} packed, {ms} window)")
+    _o0 = [round(float(lg2[0, 0, k].abs().max()), 4) for k in range(ms + 1)]
+    print(f"  [diag] |att_out|max per split = {_o0}")
     for nm, t in (("stage1 att_out", lg2), ("stage1 att_lse", ls2)):
         bad = ~_t.isfinite(t)
         if bad.any():
