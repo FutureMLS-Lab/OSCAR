@@ -46,7 +46,27 @@ _SHARED = (
     "concrete example over an abstract restatement, and if a question has more "
     "than one reasonable reading, say which one you took. "
 )
-PROMPTS = [_SHARED + q for q in (
+# LONG_CTX pads every prompt to roughly this many tokens of filler.
+#
+# The group-factored kernel is 4.75x on stage-1 at seq=20000, and the default
+# prompts here are ~55 tokens plus a short generation -- a regime with almost no
+# KV to read, where the kernel is not the cost and an extra kernel launch for
+# the window pass dominates. Measuring speed there says nothing about the
+# change; it measures launch overhead. Padding moves the comparison into the
+# regime the optimisation targets.
+_FILL = ("The cache holds keys and values for every token processed so far, and "
+         "decoding reads all of them at each step. ") * 40
+
+
+def _pad(q: str) -> str:
+    n = int(os.environ.get("LONG_CTX", "0"))
+    if n <= 0:
+        return _SHARED + q
+    reps = max(1, n // 40)
+    return _SHARED + (_FILL * reps)[: n * 5] + "\n\n" + q
+
+
+PROMPTS = [_pad(q) for q in (
     "Explain why a 2-bit KV cache saves memory but can cost accuracy.",
     "Explain why an attention sink matters more than a middle token.",
     "List the first eight prime numbers, then add them up and show the total.",
