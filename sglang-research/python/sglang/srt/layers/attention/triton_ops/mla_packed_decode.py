@@ -990,6 +990,22 @@ def packed_mla_decode_gf_fwd(
     """
     operands = pool.packed_read_operands(layer_id)
     has_hp = operands[3] is not None
+    if not getattr(pool, "_gf_entry_logged", False):
+        # One line, unconditionally, the first time this path runs. The A/B
+        # instrument produced nothing at all in eager mode and I could not tell
+        # whether the check was being skipped or the branch was never entered
+        # -- those have opposite fixes, and guessing between them is how the
+        # last five hypotheses went wrong. This distinguishes them.
+        import logging as _lg
+
+        pool._gf_entry_logged = True
+        _lg.getLogger(__name__).info(
+            "[GF-ENTRY] group-factored decode is LIVE: layer=%s has_hp=%s "
+            "check_env=%s capturing=%s bs=%s max_splits=%s",
+            layer_id, has_hp,
+            envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get(),
+            _check_is_capturing(), q.shape[0], max_kv_splits,
+        )
     packed_mla_decode_stage1_gf(
         q, operands, attn_logits, attn_lse, kv_indptr, kv_indices,
         num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap,

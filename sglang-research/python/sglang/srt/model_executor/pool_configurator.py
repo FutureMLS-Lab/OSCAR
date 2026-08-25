@@ -181,11 +181,28 @@ def _packed_mla_latent_enabled(mr: ModelRunner) -> bool:
     """
     from sglang.srt.environ import envs
 
-    return (
+    base = (
         mr.use_mla_backend
         and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
         and bool(envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get())
     )
+    if not base:
+        return False
+    # The mambaish branch in model_runner_kv_cache_mixin additionally refuses
+    # speculative decoding and disaggregation, and this predicate did not. On
+    # an MLA + mambaish model with either enabled, the configurator sized the
+    # pool at 288 B/token while the router built a BF16 pool at 1152 -- a 4x
+    # under-size, which is the "runs the allocator off the end" case this
+    # docstring warns about rather than the harmless wasteful one.
+    #
+    # Non-mambaish MLA has no such conditions, so it keeps the plain predicate.
+    if getattr(mr, "mambaish_config", None):
+        sa = mr.server_args
+        return (
+            sa.disaggregation_mode in (None, "null")
+            and sa.speculative_algorithm is None
+        )
+    return True
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
