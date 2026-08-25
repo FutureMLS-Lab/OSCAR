@@ -21,6 +21,7 @@ Two things are measured:
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 
 import torch
@@ -105,9 +106,13 @@ def main() -> None:
           f"BF16 {bs*seq*(R+ROPE)*2/2**30:.2f} GiB, packed "
           f"{bs*seq*288/2**30:.2f} GiB per layer-step)\n")
 
+    SPLITS = int(os.environ.get("BENCH_SPLITS", "16"))
     ops, kv, q, kv_indptr, kv_indices, num_splits, max_splits, logits, lse = build(
-        bs, heads, seq
+        bs, heads, seq, max_splits=SPLITS
     )
+    print(f"kv splits = {SPLITS} (grid {bs}x{SPLITS} programs). The split sweep "
+          f"below shows BF16 is 1.5x faster at 16 than at 8, so every ratio in "
+          f"this file is against the baseline's OWN best setting, not its worst.")
     sm = 1.0 / (R + ROPE) ** 0.5
 
     base = timeit(lambda: _decode_grouped_att_m_fwd(
