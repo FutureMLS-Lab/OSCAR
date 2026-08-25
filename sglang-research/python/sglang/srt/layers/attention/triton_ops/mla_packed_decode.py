@@ -39,6 +39,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+
+# lse written for a split with no live tokens. Large enough that
+# exp(_EMPTY_SPLIT_LSE - anything_real) underflows to 0, finite so that
+# subtracting it from itself is 0 rather than NaN.
+_EMPTY_SPLIT_LSE = -1.0e30
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _MIN_BLOCK_KV,
     _decode_softmax_reducev_fwd,
@@ -722,12 +727,26 @@ def _fwd_packed_mla_stage1_gf(
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
         ) // D
-        # -inf lse makes stage 2 ignore an empty split instead of poisoning the
-        # merge; storing e_max + log(0) would be -inf too, but only because
-        # e_max happens to be -inf as well, which is not a property to rely on.
+        # An empty split gets a very negative FINITE lse, not -inf.
+        #
+        # -inf is the mathematically honest value and it is what broke this.
+        # Stage 2 seeds its running max at -inf, so if the FIRST split is also
+        # -inf it computes exp(-inf - (-inf)) = NaN on iteration 0 and the
+        # accumulator stays NaN however many finite splits follow. The
+        # per-split diagnostic showed exactly that: a -inf in split 7 of 8 is
+        # harmless (MATCH), a -inf in split 0 when it is the ONLY packed split
+        # poisons every output. Exclusion makes the all-empty case ordinary --
+        # the sink-prefix split is entirely window tokens.
+        #
+        # A finite sentinel merges correctly in both directions:
+        # max(SENTINEL, finite) = finite and exp(SENTINEL - finite) underflows
+        # to 0; and if every split is SENTINEL, exp(0) = 1 over zero-valued
+        # accumulators still yields 0 rather than NaN. Fixing this in stage 2
+        # instead would mean editing a kernel every model on this backend
+        # shares, to accommodate one pool.
         tl.store(
             Att_Lse + offs_mid_o_1,
-            tl.where(e_sum > 0, e_max + tl.log(safe), float("-inf")),
+            tl.where(e_sum > 0, e_max + tl.log(safe), _EMPTY_SPLIT_LSE),
             mask=mask_h,
         )
 
@@ -930,9 +949,13 @@ def _fwd_hp_window_stage1(
         + cur_head * stride_mid_oh
         + kv_splits * stride_mid_os
     ) // D
+    # Finite sentinel, same reason as the packed kernel: -inf in the first
+    # split stage 2 examines makes its seed max -inf too, and exp(-inf - -inf)
+    # is NaN.
     tl.store(
         Att_Lse + offs_mid_o_1,
-        tl.where(e_sum > 0, e_max + tl.log(e_sum), float("-inf")),
+        tl.where(e_sum > 0, e_max + tl.log(tl.where(e_sum > 0, e_sum, 1.0)),
+                 _EMPTY_SPLIT_LSE),
         mask=mask_h,
     )
 
