@@ -72,8 +72,12 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
             "SGLANG_OSCAR_MLA_KV_ROTATION_PATH": "hadamard",
             "SGLANG_OSCAR_MLA_KV_GROUP_SIZE": "128",
             "SGLANG_LLOYD_MAX": "1",
-            "SGLANG_MIXED_KV_PREFIX_TOKENS": "64",
-            "SGLANG_MIXED_KV_RECENT_TOKENS": "512",
+            # These are what actually gate the arena: the pool sets
+            # _latent_windows from (prefix > 0 or recent > 0), NOT from
+            # SGLANG_ENABLE_MIXED_KV_WINDOWS. Setting that flag to 0 left
+            # has_hp=True and the no-arena experiment silently did not run.
+            "SGLANG_MIXED_KV_PREFIX_TOKENS": os.environ.get("HP_PREFIX", "64"),
+            "SGLANG_MIXED_KV_RECENT_TOKENS": os.environ.get("HP_RECENT", "512"),
             "SGLANG_OSCAR_MLA_KV_PACKED": "1" if packed else "0",
         }
     )
