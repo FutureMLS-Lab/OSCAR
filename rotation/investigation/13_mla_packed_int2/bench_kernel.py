@@ -376,7 +376,8 @@ def main() -> None:
                 ln = torch.zeros_like(lse)
                 packed_mla_decode_stage1_gf(
                     q, ops_nohp, on, ln, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3)
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    wide_load=False)
                 ow = torch.zeros_like(logits)
                 lw = torch.zeros_like(lse)
                 kw = packed_mla_decode_stage1_gf(
@@ -386,9 +387,14 @@ def main() -> None:
                 fin = torch.isfinite(on) & torch.isfinite(ow)
                 dev = (on[fin] - ow[fin]).abs().max().item() if fin.any() else float("nan")
                 ok = dev < 1e-3
+                # wide_load=False explicitly: it now DEFAULTS to True, so
+                # omitting it here would time the wide kernel, label it
+                # "narrow", and report 1.00x -- a false refutation of the
+                # change, manufactured by the change itself.
                 t_n = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3))
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    wide_load=False))
                 t_w = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
                     max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,

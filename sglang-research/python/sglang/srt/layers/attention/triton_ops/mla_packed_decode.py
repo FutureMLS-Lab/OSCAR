@@ -687,9 +687,15 @@ def packed_mla_decode_stage1_gf(
     q, operands, att_out, att_lse, kv_indptr, kv_indices, num_kv_splits,
     max_kv_splits, sm_scale_withk, logit_cap,
     block_n: int = 0, num_warps: int = 0, num_stages: int = 0,
-    block_h: int = 0, wide_load: bool = False,
+    block_h: int = 0, wide_load: bool = True,
 ):
-    """Launch the group-factored stage-1. Benchmark-only: no window arena."""
+    """Launch the group-factored stage-1. Benchmark-only: no window arena.
+
+    ``wide_load`` defaults on: it is bit-identical (maxdev 0.00e+00, by
+    construction rather than by tolerance) and 1.51x at the 32/warps=4 tile this
+    launcher actually picks. It is 0.95x at 32/warps=8 only, which is not a
+    configuration anything selects.
+    """
     codes, params, rope, hp, _hp_row, _hp_owner, group_size, lloyd = operands
     if hp is not None:
         raise NotImplementedError(
