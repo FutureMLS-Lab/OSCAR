@@ -38,6 +38,17 @@ R, ROPE, GS = 512, 64, 128
 NG = R // GS
 
 
+
+
+def _err(e) -> str:
+    """Full first lines of an exception, not just line one.
+
+    A Triton CompilationError's first line is only "at LINE:COL:" -- the actual
+    message is on the lines after it. Truncating to splitlines()[0] printed a
+    location with no reason and cost a whole job round-trip to re-discover.
+    """
+    return str(e)[:600].replace("\n", " | ")
+
 def build(bs: int, heads: int, seq: int, windows: int = 576,
           max_splits: int = 8):
     dev = "cuda"
@@ -143,7 +154,7 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             # Report, do not skip: "this config does not compile" is part of the
             # grid, and silently dropping it makes the winner look unconstrained.
-            msg = str(e).splitlines()[0][:70]
+            msg = _err(e)
             print(f"{bn:>7} {w:>5} {st:>6} {'-':>9} {'-':>8}  {type(e).__name__}: {msg}")
 
     # Ablation: the same kernel with HAS_HP off. The window-arena probe loads two
@@ -264,7 +275,7 @@ def main() -> None:
                 print(f"  dual load BLOCK_N={bn} {t:.3f} ms ({base/t:.2f}x BF16)")
             except Exception as e:  # noqa: BLE001
                 print(f"  dual load BLOCK_N={bn} - {type(e).__name__}: "
-                      f"{str(e).splitlines()[0][:60]}")
+                      f"{_err(e)}")
     except Exception as e:  # noqa: BLE001
         print(f"  dual load failed: {type(e).__name__}: {e}")
 
@@ -287,7 +298,7 @@ def main() -> None:
             del o2, kv2, q2, lg2, ls2
             torch.cuda.empty_cache()
         except Exception as e:  # noqa: BLE001
-            print(f"{sp:>7} {'-':>9}  {type(e).__name__}: {str(e).splitlines()[0][:60]}")
+            print(f"{sp:>7} {'-':>9}  {type(e).__name__}: {_err(e)}")
 
     # The group-factored kernel: the only variant that changes WHAT reaches
     # tl.dot (a directly-loaded code tile) rather than how a computed tile is
@@ -364,7 +375,7 @@ def main() -> None:
                       f"the computed tile  [regs={regs} smem={shared}]")
             except Exception as e:  # noqa: BLE001
                 print(f"  factored BLOCK_N={bn:>3} warps={w:>2} BLOCK_H={bh:>2} - "
-                      f"{type(e).__name__}: {str(e).splitlines()[0][:60]}")
+                      f"{type(e).__name__}: {_err(e)}")
         for (bn, w), byh in seen_res.items():
             if len(byh) > 1 and len(set(byh.values())) == 1:
                 print(f"  !! BLOCK_H DID NOT REACH THE KERNEL at {bn}/{w}: "
@@ -415,7 +426,7 @@ def main() -> None:
                       f"  [regs={regs} smem={shared}]")
             except Exception as e:  # noqa: BLE001
                 print(f"  {bn:>3}/{w} wide - {type(e).__name__}: "
-                      f"{str(e).splitlines()[0][:90]}")
+                      f"{_err(e)}")
 
         # SKIP_HP: what arena-awareness costs the fast kernel.
         #
@@ -448,10 +459,10 @@ def main() -> None:
                       f"cost {t_skip/t_plain:.2f}x  (override path was 1.54x)")
             except Exception as e:  # noqa: BLE001
                 print(f"  {bn:>3}/{w} skip_hp - {type(e).__name__}: "
-                      f"{str(e).splitlines()[0][:90]}")
+                      f"{_err(e)}")
     except Exception as e:  # noqa: BLE001
         print(f"\ngroup-factored failed: {type(e).__name__}: "
-              f"{str(e).splitlines()[0][:200]}")
+              f"{_err(e)}")
 
     # Head amortization. MLA shares one KV head across every query head, so
     # BLOCK_H is free to grow -- and growing it is the only lever that changes
@@ -470,7 +481,7 @@ def main() -> None:
             print(f"  BLOCK_H={bh:>3} {t_bh:.3f} ms ({base/t_bh:.2f}x BF16) "
                   f"-> {t_gid/t_bh:.2f}x over BLOCK_H=16")
         except Exception as e:  # noqa: BLE001
-            msg = str(e).splitlines()[0][:70]
+            msg = _err(e)
             print(f"  BLOCK_H={bh:>3} - {type(e).__name__}: {msg}")
 
     # Traffic accounting, kept because it was REFUTED and the refutation is the
@@ -616,7 +627,7 @@ def _run_equivalence():
             two_pass_equivalence(**kw)
         except Exception as e:  # noqa: BLE001
             print(f"\ntwo-pass equivalence {kw} FAILED to run: "
-                  f"{type(e).__name__}: {str(e).splitlines()[0][:160]}")
+                  f"{type(e).__name__}: {_err(e)}")
 
 
 if __name__ == "__main__":

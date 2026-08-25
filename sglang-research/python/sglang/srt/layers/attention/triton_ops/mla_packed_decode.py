@@ -40,10 +40,12 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 
-# lse written for a split with no live tokens. Large enough that
-# exp(_EMPTY_SPLIT_LSE - anything_real) underflows to 0, finite so that
-# subtracting it from itself is 0 rather than NaN.
-_EMPTY_SPLIT_LSE = -1.0e30
+# lse written for a split with no live tokens is -1.0e30: large enough that
+# exp(sentinel - anything_real) underflows to 0, finite so that subtracting it
+# from itself is 0 rather than NaN. Inlined at both store sites rather than
+# named here -- this Triton will not resolve a module-level Python float used
+# as a tl.where operand inside a jit function, and the failure is a
+# CompilationError pointing at the store, not at the definition.
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _MIN_BLOCK_KV,
     _decode_softmax_reducev_fwd,
@@ -746,7 +748,7 @@ def _fwd_packed_mla_stage1_gf(
         # shares, to accommodate one pool.
         tl.store(
             Att_Lse + offs_mid_o_1,
-            tl.where(e_sum > 0, e_max + tl.log(safe), _EMPTY_SPLIT_LSE),
+            tl.where(e_sum > 0, e_max + tl.log(safe), -1.0e30),
             mask=mask_h,
         )
 
@@ -955,7 +957,7 @@ def _fwd_hp_window_stage1(
     tl.store(
         Att_Lse + offs_mid_o_1,
         tl.where(e_sum > 0, e_max + tl.log(tl.where(e_sum > 0, e_sum, 1.0)),
-                 _EMPTY_SPLIT_LSE),
+                 -1.0e30),
         mask=mask_h,
     )
 
