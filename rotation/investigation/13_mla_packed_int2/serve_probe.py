@@ -62,7 +62,13 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
     env = dict(os.environ)
     env.update(
         {
-            "SGLANG_ENABLE_MIXED_KV_WINDOWS": "1",
+            # Knob, not a constant: with windows OFF the pool has no arena, so
+            # the group-factored path has nothing to exclude and runs no window
+            # pass. That splits the remaining question in half -- if gf still
+            # garbles without an arena the base kernel is wrong on real data,
+            # and if it comes out clean the fault is the exclusion or the window
+            # pass, which is where the bs=1 evidence already points.
+            "SGLANG_ENABLE_MIXED_KV_WINDOWS": os.environ.get("WINDOWS", "1"),
             "SGLANG_OSCAR_MLA_KV_ROTATION_PATH": "hadamard",
             "SGLANG_OSCAR_MLA_KV_GROUP_SIZE": "128",
             "SGLANG_LLOYD_MAX": "1",
