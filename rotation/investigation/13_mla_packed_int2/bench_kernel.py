@@ -489,8 +489,90 @@ def main() -> None:
             print(f"speedup over the current default: {cur[0][0]/ms:.2f}x")
 
 
+def _run_equivalence():
+    try:
+        two_pass_equivalence()
+    except Exception as e:  # noqa: BLE001
+        print(f"\ntwo-pass equivalence FAILED to run: {type(e).__name__}: "
+              f"{str(e).splitlines()[0][:160]}")
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("needs a GPU")
         sys.exit(1)
     main()
+    _run_equivalence()
+
+
+def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
+    """Does exclude-plus-dense-window equal the production override kernel?
+
+    This is the gate on shipping the group-factored kernel, and it is a
+    correctness question, not a speed one: a split that drops tokens or counts
+    them twice is fast and wrong, and at 2 bits the difference hides easily
+    inside quantization noise. Compared after stage 2, on the final output,
+    because that is what the model consumes.
+    """
+    import torch as _t
+    from sglang.srt.layers.attention.triton_ops.decode_attention import (
+        _decode_softmax_reducev_fwd,
+    )
+    from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+        _fwd_hp_window_stage1,
+        _safe_block_h,
+        _v_shape_proxy,
+        packed_mla_decode_stage1,
+        packed_mla_decode_stage1_gf,
+    )
+    import triton as _tr
+
+    ops, kv, q, indptr, idx, ns, ms, lg, ls = build(bs, heads, seq,
+                                                    windows=windows,
+                                                    max_splits=splits)
+    sm = 1.0 / (R + 64) ** 0.5
+    P_TOK, R_TOK = 64, windows - 64
+
+    o_ref = _t.zeros((bs, heads, R), dtype=q.dtype, device=q.device)
+    packed_mla_decode_stage1(q, ops, lg, ls, indptr, idx, ns, ms, sm, 0.0)
+    _decode_softmax_reducev_fwd(lg, ls, q, o_ref, 1.0,
+                                _v_shape_proxy(o_ref, R), indptr, ns, ms)
+
+    # One spare split for the window partial.
+    lg2 = _t.zeros((bs, heads, ms + 1, R), dtype=_t.float32, device=q.device)
+    ls2 = _t.zeros((bs, heads, ms + 1), dtype=_t.float32, device=q.device)
+    o_new = _t.zeros_like(o_ref)
+    packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
+                                skip_hp=True)
+    bh = _safe_block_h(16, heads)
+    _fwd_hp_window_stage1[(bs, _tr.cdiv(heads, min(bh, heads)))](
+        q, ops[2], ops[3], ops[4], ops[5],
+        sm, indptr, idx, lg2, ls2, ns,
+        q.stride(0), q.stride(1),
+        lg2.stride(0), lg2.stride(1), lg2.stride(2),
+        kv_group_num=heads, q_head_num=heads, D=R, DPE=64,
+        P_TOK=P_TOK, R_TOK=R_TOK, BLOCK_N=32, BLOCK_H=bh, logit_cap=0.0,
+        num_warps=4, num_stages=2,
+    )
+    _decode_softmax_reducev_fwd(lg2, ls2, q, o_new, 1.0,
+                                _v_shape_proxy(o_new, R), indptr, ns + 1, ms + 1)
+
+    d = (o_ref.float() - o_new.float()).abs()
+    rel = (d.max() / o_ref.float().abs().max().clamp(min=1e-6)).item()
+    print(f"\ntwo-pass equivalence vs the production override kernel "
+          f"(bs={bs} seq={seq} window={windows}):")
+    print(f"  max|dref-dnew| = {d.max().item():.3e}   rel = {rel:.3e}   "
+          f"{'MATCH' if rel < 2e-2 else 'MISMATCH -- do not ship'}")
+    # A split that silently dropped the window would still look close, because
+    # the packed tier holds the same tokens at 2 bits. So check that the window
+    # actually contributed: zeroing the arena must CHANGE the answer.
+    ops_zero = (ops[0], ops[1], ops[2], _t.zeros_like(ops[3]), ops[4], ops[5],
+                ops[6], ops[7])
+    o_zero = _t.zeros_like(o_ref)
+    packed_mla_decode_stage1(q, ops_zero, lg, ls, indptr, idx, ns, ms, sm, 0.0)
+    _decode_softmax_reducev_fwd(lg, ls, q, o_zero, 1.0,
+                                _v_shape_proxy(o_zero, R), indptr, ns, ms)
+    sens = ((o_ref.float() - o_zero.float()).abs().max()
+            / o_ref.float().abs().max().clamp(min=1e-6)).item()
+    print(f"  arena sensitivity (zeroing it moves the reference) = {sens:.3e} "
+          f"{'ok, the window is load-bearing' if sens > 1e-3 else 'WARNING: the window barely matters here, so MATCH proves little'}")

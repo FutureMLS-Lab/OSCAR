@@ -763,3 +763,210 @@ def packed_mla_decode_stage1_gf(
         logit_cap=logit_cap,
         num_warps=num_warps, num_stages=num_stages,
     )
+
+
+@triton.jit
+def _fwd_hp_window_stage1(
+    Q, Rope, HP, HpRowOfSlot, HpOwnerOfRow,
+    sm_scale_withk, kv_indptr, kv_indices, Att_Out, Att_Lse, num_kv_splits,
+    stride_qbs, stride_qh, stride_mid_ob, stride_mid_oh, stride_mid_os,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    D: tl.constexpr,
+    DPE: tl.constexpr,
+    P_TOK: tl.constexpr,
+    R_TOK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    logit_cap: tl.constexpr,
+):
+    """Dense BF16 stage-1 over exactly the tokens the packed kernel excluded.
+
+    Complementary by construction, not by agreement: the packed kernel keeps a
+    token when ``not (r >= 0 and owner == slot)`` and this keeps it when
+    ``(r >= 0 and owner == slot)``, the identical predicate on the identical
+    slot. Union is every token, intersection is empty -- so no token is dropped
+    and none is counted twice, without the two kernels having to be kept in
+    sync by hand.
+
+    Only the window ranges are scanned: the arena is positional, covering
+    ``[0, P)`` and ``[seq - R, seq)``, so this is O(P + R) rather than O(seq).
+    A token inside those ranges whose owner tag fails was KEPT by the packed
+    kernel (prefix-cache reuse can re-issue a ring row to another request), and
+    the shared predicate means it is skipped here for the same reason.
+
+    The partial lands in split slot ``num_kv_splits[b]`` -- one past what the
+    packed kernel wrote -- and stage 2 merges it as an ordinary extra split.
+    Merging partial (acc, lse) across splits is what stage 2 already does.
+    """
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, D)
+    offs_dpe = D + tl.arange(0, DPE)
+    offs_pe = tl.arange(0, DPE)
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    qbase = cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, D], dtype=tl.float32)
+
+    q = tl.load(Q + qbase + offs_d[None, :], mask=mask_h[:, None], other=0.0)
+    qpe = tl.load(Q + qbase + offs_dpe[None, :], mask=mask_h[:, None], other=0.0)
+
+    # Two positional ranges: the sink prefix and the recent tail. Clamped so a
+    # sequence shorter than the window cannot make them overlap and
+    # double-count -- the tail starts no earlier than P_TOK.
+    tail_start = tl.maximum(cur_batch_seq_len - R_TOK, P_TOK)
+    n_window = tl.minimum(P_TOK, cur_batch_seq_len) + tl.maximum(
+        cur_batch_seq_len - tail_start, 0
+    )
+
+    for w in range(0, n_window, BLOCK_N):
+        idx = w + tl.arange(0, BLOCK_N)
+        in_prefix = idx < tl.minimum(P_TOK, cur_batch_seq_len)
+        offs_n = tl.where(
+            in_prefix,
+            idx,
+            tail_start + (idx - tl.minimum(P_TOK, cur_batch_seq_len)),
+        )
+        n_ok = (idx < n_window) & (offs_n < cur_batch_seq_len)
+        kv_loc = tl.load(
+            kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_ok, other=0
+        ).to(tl.int64)
+
+        r = tl.load(HpRowOfSlot + kv_loc, mask=n_ok, other=-1).to(tl.int32)
+        rr = tl.where(r >= 0, r, 0).to(tl.int64)
+        owner = tl.load(HpOwnerOfRow + rr, mask=n_ok, other=-1).to(tl.int32)
+        n_ok = n_ok & (r >= 0) & (owner == kv_loc.to(tl.int32))
+
+        cv = tl.load(
+            HP + rr[:, None] * D + offs_d[None, :], mask=n_ok[:, None], other=0.0
+        )
+        kpe = tl.load(
+            Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
+            mask=n_ok[None, :],
+            other=0.0,
+        )
+
+        qk = tl.dot(q, tl.trans(cv.to(q.dtype)))
+        qk += tl.dot(qpe, kpe.to(qpe.dtype))
+        qk *= sm_scale_withk
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+        qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
+
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        acc = acc * re_scale[:, None] + tl.dot(p.to(cv.dtype), cv)
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+
+    # Slot kv_splits, one past the packed kernel's last. An all-masked window
+    # leaves e_sum at 0 and e_max at -inf; storing lse = -inf makes stage 2's
+    # merge ignore this split rather than poison it with a NaN.
+    obase = (
+        cur_batch * stride_mid_ob
+        + cur_head[:, None] * stride_mid_oh
+        + kv_splits * stride_mid_os
+    )
+    tl.store(
+        Att_Out + obase + offs_d[None, :],
+        acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None],
+        mask=mask_h[:, None],
+    )
+    # The whole offset is divided by D, exactly as the packed kernel does it.
+    # Dividing each term separately is not the same expression -- integer
+    # division does not distribute -- and would silently address the wrong lse.
+    offs_mid_o_1 = (
+        cur_batch * stride_mid_ob
+        + cur_head * stride_mid_oh
+        + kv_splits * stride_mid_os
+    ) // D
+    tl.store(
+        Att_Lse + offs_mid_o_1,
+        tl.where(e_sum > 0, e_max + tl.log(e_sum), float("-inf")),
+        mask=mask_h,
+    )
+
+
+def packed_mla_decode_gf_fwd(
+    q, pool, layer_id, o, attn_logits, attn_lse, kv_indptr, kv_indices,
+    num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=0.0,
+    num_kv_splits_plus1=None,
+):
+    """Two-pass packed MLA decode: fast factored bulk + dense BF16 window.
+
+    The window arena is handled by EXCLUSION rather than override. The packed
+    kernel masks arena tokens out (two int lookups, measured 1.08x, against
+    1.54x for the override path it replaces) and the dense pass owns exactly
+    those tokens, writing one extra split that stage 2 merges.
+
+    Requires one spare split slot: attn_logits/attn_lse must have
+    max_kv_splits + 1 along the split axis, and stage 2 must be told
+    num_kv_splits + 1 so it reads the window partial. Passing the un-bumped
+    count would silently drop the BF16 window and quietly serve a
+    fully-quantized cache -- an accuracy regression with no error, so the
+    caller supplies the bumped tensor explicitly instead of this function
+    allocating one per step.
+    """
+    operands = pool.packed_read_operands(layer_id)
+    has_hp = operands[3] is not None
+    packed_mla_decode_stage1_gf(
+        q, operands, attn_logits, attn_lse, kv_indptr, kv_indices,
+        num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap,
+        skip_hp=has_hp,
+    )
+    if has_hp:
+        if num_kv_splits_plus1 is None:
+            raise ValueError(
+                "packed_mla_decode_gf_fwd needs num_kv_splits_plus1 when the "
+                "pool has a window arena: stage 2 must read one split past the "
+                "packed kernel's last, or the BF16 window is silently dropped."
+            )
+        _, _, rope, hp, hp_row, hp_owner, _, _ = operands
+        from sglang.srt.environ import envs as _envs
+
+        batch, head_num = q.shape[0], q.shape[1]
+        block_h = _safe_block_h(16, head_num)
+        _fwd_hp_window_stage1[
+            (batch, triton.cdiv(head_num, min(block_h, head_num)))
+        ](
+            q, rope, hp, hp_row, hp_owner,
+            sm_scale_withk, kv_indptr, kv_indices, attn_logits, attn_lse,
+            num_kv_splits,
+            q.stride(0), q.stride(1),
+            attn_logits.stride(0), attn_logits.stride(1), attn_logits.stride(2),
+            kv_group_num=head_num,
+            q_head_num=head_num,
+            D=pool.kv_lora_rank,
+            DPE=pool.qk_rope_head_dim,
+            P_TOK=_envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get(),
+            R_TOK=_envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
+            BLOCK_N=32,
+            BLOCK_H=block_h,
+            logit_cap=logit_cap,
+            num_warps=4,
+            num_stages=2,
+        )
+    _decode_softmax_reducev_fwd(
+        attn_logits, attn_lse, q, o, 1.0,
+        _v_shape_proxy(o, pool.kv_lora_rank),
+        kv_indptr,
+        num_kv_splits_plus1 if has_hp else num_kv_splits,
+        max_kv_splits + 1 if has_hp else max_kv_splits,
+    )
