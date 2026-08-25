@@ -260,7 +260,16 @@ class Envs:
     # because the dequant keeps the code byte and the group scale/zero live on
     # top of the output tile.
     SGLANG_OSCAR_MLA_PACKED_BLOCK_N = EnvInt(16)
-    SGLANG_OSCAR_MLA_PACKED_WARPS = EnvInt(8)
+    # 4, measured, not 8. Swept on the production computed-tile kernel at three
+    # batch sizes, seq 20000, BLOCK_N=16 stages=1:
+    #   bs=8   0.529 ms both        1.00x
+    #   bs=16  0.917 vs 1.161       1.27x
+    #   bs=32  1.811 vs 2.307       1.27x
+    # Never worse, 1.27x better wherever it differs. The 8 was chosen to avoid
+    # register spills and never benchmarked, so this is the first time the knob
+    # has had a measurement behind it -- and it applies to the kernel serving
+    # today, independent of the group-factored path.
+    SGLANG_OSCAR_MLA_PACKED_WARPS = EnvInt(4)
     SGLANG_OSCAR_MLA_PACKED_STAGES = EnvInt(1)
     # Expand the per-group scale/zero in registers instead of addressing them as
     # a [BLOCK_N, D] tile through gid. Bit-identical -- the pack layout is
