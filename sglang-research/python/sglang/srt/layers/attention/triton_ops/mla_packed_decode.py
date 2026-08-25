@@ -657,6 +657,7 @@ def packed_mla_decode_stage1_gf(
     q, operands, att_out, att_lse, kv_indptr, kv_indices, num_kv_splits,
     max_kv_splits, sm_scale_withk, logit_cap,
     block_n: int = 0, num_warps: int = 0, num_stages: int = 0,
+    block_h: int = 0,
 ):
     """Launch the group-factored stage-1. Benchmark-only: no window arena."""
     codes, params, rope, hp, _hp_row, _hp_owner, group_size, lloyd = operands
