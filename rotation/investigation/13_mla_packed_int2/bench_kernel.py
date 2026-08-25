@@ -647,6 +647,15 @@ def _run_equivalence():
         dict(bs=8, heads=16, seq=4096, windows=576, splits=8),
         dict(bs=8, heads=16, seq=256, windows=576, splits=1),
         dict(bs=4, heads=16, seq=600, windows=576, splits=2),
+        # The state the SERVER fails in, which this harness could not previously
+        # produce. GF-CHECK reported bs=1, seq around 100, num_kv_splits 8 --
+        # short sequence, most splits empty, window covering everything. The
+        # bench built uniform 20000-token sequences and so kept returning MATCH
+        # while the server garbled, and six wrong attributions came out of
+        # trusting it. A harness that cannot exhibit the failure cannot clear
+        # the code of it.
+        dict(bs=1, heads=16, seq=100, windows=576, splits=8),
+        dict(bs=2, heads=16, seq=140, windows=576, splits=8),
     ):
         try:
             two_pass_equivalence(**kw)
