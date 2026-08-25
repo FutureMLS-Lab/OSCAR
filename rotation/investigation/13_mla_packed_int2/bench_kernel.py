@@ -561,6 +561,18 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     sm = 1.0 / (R + 64) ** 0.5
     P_TOK, R_TOK = 64, windows - 64
 
+    # Neutralise BOTH arms' split buffers before either kernel runs.
+    #
+    # build() hands back torch.empty logits/lse, and stage 1 only stores into
+    # splits that hold tokens. At seq=100 with 8 splits only two are populated,
+    # so six carry uninitialised memory into stage 2 -- for the REFERENCE as
+    # much as for the path under test, and with different contents each. A
+    # mismatch measured that way says nothing about either kernel.
+    #
+    # This is the same fault already fixed in the in-server A/B and left
+    # standing here, which is why the short-sequence shapes only started
+    # failing once they were added: more empty splits, more contamination.
+    lg.zero_(); ls.fill_(-1.0e30)
     o_ref = _t.zeros((bs, heads, R), dtype=q.dtype, device=q.device)
     packed_mla_decode_stage1(q, ops, lg, ls, indptr, idx, ns, ms, sm, 0.0)
     _decode_softmax_reducev_fwd(lg, ls, q, o_ref, 1.0,
@@ -568,7 +580,9 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
 
     # One spare split for the window partial.
     lg2 = _t.zeros((bs, heads, ms + 1, R), dtype=_t.float32, device=q.device)
-    ls2 = _t.zeros((bs, heads, ms + 1), dtype=_t.float32, device=q.device)
+    # -1e30, not 0: an unwritten split with lse=0 is not ignored by stage 2's
+    # merge, it is weighted exp(0 - max) and drags the result toward zero.
+    ls2 = _t.full((bs, heads, ms + 1), -1.0e30, dtype=_t.float32, device=q.device)
     o_new = _t.zeros_like(o_ref)
     packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
                                 skip_hp=True)
@@ -626,6 +640,7 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     ops_zero = (ops[0], ops[1], ops[2], _t.zeros_like(ops[3]), ops[4], ops[5],
                 ops[6], ops[7])
     o_zero = _t.zeros_like(o_ref)
+    lg.zero_(); ls.fill_(-1.0e30)
     packed_mla_decode_stage1(q, ops_zero, lg, ls, indptr, idx, ns, ms, sm, 0.0)
     _decode_softmax_reducev_fwd(lg, ls, q, o_zero, 1.0,
                                 _v_shape_proxy(o_zero, R), indptr, ns, ms)
