@@ -92,6 +92,47 @@ def stage_sweep(bs, heads, seq, splits):
     return best
 
 
+def triton_resources(tag: str, jit_fn):
+    """Registers / spills / shared memory straight off the compiled kernel.
+
+    ncu needs GPU performance-counter permission (ERR_NVGPUCTRPERM in an
+    unprivileged pod), but the two numbers that explain the BLOCK_N ceiling do
+    not need counters at all -- Triton records them on the compiled kernel.
+    Shared memory per block against the SM's budget says whether smem is the
+    occupancy limiter; a non-zero spill count says the register allocator gave
+    up, which is invisible in wall-clock until it is the whole problem.
+    """
+    try:
+        cache = getattr(jit_fn, "cache", None)
+        if not cache:
+            print(f"  [{tag}] no compiled-kernel cache to read")
+            return
+        rows = []
+        for dev, entries in cache.items():
+            for key, k in entries.items():
+                shared = getattr(getattr(k, "metadata", None), "shared", None)
+                rows.append((
+                    getattr(k, "n_regs", None),
+                    getattr(k, "n_spills", None),
+                    shared,
+                ))
+        seen = set()
+        for regs, spills, shared in rows:
+            sig = (regs, spills, shared)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            note = ""
+            if spills:
+                note += "  <-- REGISTER SPILLS"
+            if shared and shared > 100_000:
+                note += "  <-- smem is the occupancy limiter"
+            print(f"  [{tag}] regs/thread={regs} spills={spills} "
+                  f"shared/block={shared}{note}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [{tag}] resource read failed: {type(e).__name__}: {e}")
+
+
 def ncu_profile(bs, heads, seq, splits, block_n, warps, stages):
     """Re-exec one kernel launch under ncu and print the counters."""
     ncu = None
@@ -142,6 +183,12 @@ def main():
     print(f"shape bs={bs} heads={heads} seq={seq} splits={splits}")
     best = stage_sweep(bs, heads, seq, splits)
     bn, w, st = (best[1], best[2], best[3]) if best else (64, 8, 1)
+    print("\n=== compiled-kernel resources (no counters needed) ===")
+    from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+        _fwd_packed_mla_stage1, _fwd_packed_mla_stage1_gf,
+    )
+    triton_resources("factored", _fwd_packed_mla_stage1_gf)
+    triton_resources("computed-tile", _fwd_packed_mla_stage1)
     ncu_profile(bs, heads, seq, splits, bn, w, st)
 
 
