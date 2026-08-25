@@ -1093,12 +1093,28 @@ def packed_mla_decode_gf_fwd(
         # the difference and measure it where it actually happens.
         import logging as _lg
 
+        # The reference must be given buffers it can trust and the split count
+        # it was designed for.
+        #
+        # The first version handed it torch.empty and num_kv_splits = ns_quant,
+        # the BORROWED count. Stage 1 only stores into splits that hold tokens,
+        # so on a short sequence most slots stayed uninitialised and the
+        # reference merged them -- meaning rel=1.0 could just as easily have
+        # meant "the reference is garbage" as "the group-factored path is
+        # wrong", and those are not the same finding.
+        #
+        # The per-split lse dump is what exposed this: all seven packed splits
+        # read SENT and the window slot carried a real 4.09, so the two-pass
+        # split was doing exactly what it should, which left the comparison
+        # itself as the thing that had not been checked.
         _o_ref = torch.empty_like(o)
-        _lg_buf = torch.empty_like(attn_logits[:, :, : max_kv_splits + 1])
-        _ls_buf = torch.empty_like(attn_lse[:, :, : max_kv_splits + 1])
+        _lg_buf = torch.zeros_like(attn_logits[:, :, : max_kv_splits + 1])
+        _ls_buf = torch.full_like(attn_lse[:, :, : max_kv_splits + 1], -1.0e30)
         packed_mla_decode_fwd(
             q, pool, layer_id, _o_ref, _lg_buf, _ls_buf, kv_indptr, kv_indices,
-            num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=logit_cap,
+            num_kv_splits_plus1 if has_hp else num_kv_splits,
+            max_kv_splits + 1 if has_hp else max_kv_splits,
+            sm_scale_withk, logit_cap=logit_cap,
         )
         d = (o.float() - _o_ref.float()).abs()
         rel = (d.max() / _o_ref.float().abs().max().clamp(min=1e-6)).item()
