@@ -1028,3 +1028,34 @@ def packed_mla_decode_gf_fwd(
         num_kv_splits_plus1 if has_hp else num_kv_splits,
         max_kv_splits + 1 if has_hp else max_kv_splits,
     )
+
+    if envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get():
+        # Run the production kernel on the SAME call and compare.
+        #
+        # Four hypotheses for this path's garbling have now been wrong -- empty
+        # splits, ns == 1, the -inf sentinel, CUDA-graph capture -- and every
+        # one was reasoned from a microbenchmark that passes its equivalence
+        # gate at three shapes while the server garbles. The one thing the
+        # bench cannot reproduce is the REAL pool's operands on REAL decode
+        # state: its arena is a synthetic fixture, its kv_indices are a dense
+        # arange, and its sequence lengths are uniform. So stop reasoning about
+        # the difference and measure it where it actually happens.
+        import logging as _lg
+
+        _o_ref = torch.empty_like(o)
+        _lg_buf = torch.empty_like(attn_logits[:, :, : max_kv_splits + 1])
+        _ls_buf = torch.empty_like(attn_lse[:, :, : max_kv_splits + 1])
+        packed_mla_decode_fwd(
+            q, pool, layer_id, _o_ref, _lg_buf, _ls_buf, kv_indptr, kv_indices,
+            num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=logit_cap,
+        )
+        d = (o.float() - _o_ref.float()).abs()
+        rel = (d.max() / _o_ref.float().abs().max().clamp(min=1e-6)).item()
+        _lg.getLogger(__name__).info(
+            "[GF-CHECK] layer=%s bs=%d maxdev=%.3e rel=%.3e "
+            "gf_nonfinite=%d ref_nonfinite=%d splits=%s",
+            layer_id, q.shape[0], d.max().item(), rel,
+            int((~torch.isfinite(o)).sum()),
+            int((~torch.isfinite(_o_ref)).sum()),
+            num_kv_splits[: min(4, num_kv_splits.numel())].tolist(),
+        )

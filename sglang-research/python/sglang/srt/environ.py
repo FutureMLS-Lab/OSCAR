@@ -242,6 +242,10 @@ class Envs:
     # changes the serving read path for every packed MLA model, and the accuracy
     # runs it would perturb are the deliverable it is meant to accelerate.
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
+    # Runs the production kernel alongside the group-factored one on the same
+    # call and logs the deviation. Expensive; a debugging instrument, not a
+    # serving option.
+    SGLANG_OSCAR_MLA_PACKED_GF_CHECK = EnvBool(False)
     # Shadow the packed latent with the BF16 fake-quant result and assert every
     # materialized read matches it. Doubles latent memory; for smoke runs only.
     SGLANG_OSCAR_MLA_PACKED_SELFCHECK = EnvBool(False)
