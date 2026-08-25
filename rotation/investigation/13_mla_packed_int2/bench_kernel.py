@@ -408,6 +408,39 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001
                 print(f"  {bn:>3}/{w} wide - {type(e).__name__}: "
                       f"{str(e).splitlines()[0][:90]}")
+
+        # SKIP_HP: what arena-awareness costs the fast kernel.
+        #
+        # The group-factored kernel is currently benchmark-only because it has
+        # no window arena, so its speed does not ship. The computed-tile kernel
+        # OVERRIDES arena rows via a full-width [BLOCK_N, D] select, and that
+        # branch costs 1.54x across the whole kernel even though ~2% of blocks
+        # take it -- the compiler reserves its registers everywhere. Folding
+        # that same shape in here would hand back most of the factoring win,
+        # because an arena value is arbitrary bf16 and cannot be written as a
+        # code plus a per-group scale.
+        #
+        # Excluding instead of overriding costs two int lookups and a mask, and
+        # lets a separate dense BF16 pass own those tokens as an extra split
+        # that stage 2 already merges. This arm prices the exclusion. If it is
+        # cheap the design is viable; if it is not, the arena has to be handled
+        # somewhere other than inside this loop.
+        print("\nSKIP_HP (exclude arena tokens; cost of arena-awareness):")
+        for bn, w in ((32, 4), (64, 8)):
+            try:
+                t_plain = timeit(lambda: packed_mla_decode_stage1_gf(
+                    q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3))
+                t_skip = timeit(lambda: packed_mla_decode_stage1_gf(
+                    q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    skip_hp=True))
+                print(f"  {bn:>3}/{w} no-arena {t_plain:.3f} ms  "
+                      f"arena-aware {t_skip:.3f} ms  "
+                      f"cost {t_skip/t_plain:.2f}x  (override path was 1.54x)")
+            except Exception as e:  # noqa: BLE001
+                print(f"  {bn:>3}/{w} skip_hp - {type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:90]}")
     except Exception as e:  # noqa: BLE001
         print(f"\ngroup-factored failed: {type(e).__name__}: "
               f"{str(e).splitlines()[0][:200]}")

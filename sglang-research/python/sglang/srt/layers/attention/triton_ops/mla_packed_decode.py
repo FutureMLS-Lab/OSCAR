@@ -479,7 +479,7 @@ def _v_shape_proxy(ref: torch.Tensor, lv: int) -> torch.Tensor:
 
 @triton.jit
 def _fwd_packed_mla_stage1_gf(
-    Q, Codes, Params, Rope,
+    Q, Codes, Params, Rope, HpRowOfSlot, HpOwnerOfRow,
     sm_scale_withk, kv_indptr, kv_indices, Att_Out, Att_Lse, num_kv_splits,
     stride_qbs, stride_qh, stride_mid_ob, stride_mid_oh, stride_mid_os,
     kv_group_num: tl.constexpr,
@@ -492,6 +492,7 @@ def _fwd_packed_mla_stage1_gf(
     MIN_BLOCK_KV: tl.constexpr,
     LLOYD: tl.constexpr,
     WIDE_LOAD: tl.constexpr,
+    SKIP_HP: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
     """Group-factored packed MLA stage-1, specialised to NG == 4.
@@ -574,6 +575,30 @@ def _fwd_packed_mla_stage1_gf(
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_ok, other=0
             ).to(tl.int64)
+
+            if SKIP_HP:
+                # EXCLUDE the window-arena tokens rather than override them.
+                #
+                # The computed-tile kernel overrides: it selects the arena's
+                # bf16 value into a full-width [BLOCK_N, D] tile. That branch is
+                # taken by ~2% of blocks but the compiler must reserve its
+                # registers in ALL of them, which measured 1.54x on the whole
+                # kernel. Folding that shape into the group-factored kernel
+                # would hand back most of what the factoring won, because the
+                # arena value is arbitrary bf16 -- it cannot be expressed as a
+                # code plus a per-group scale, so it forces the full-width tile
+                # this kernel exists to avoid.
+                #
+                # Excluding costs two int lookups and a mask, and no full-width
+                # tile ever enters the fast path. The excluded tokens are then
+                # computed by a small dense BF16 pass written into a separate
+                # split slot, and stage 2's LSE merge combines them -- it
+                # already merges partial (acc, lse) across splits, so an extra
+                # split is not a new mechanism.
+                r = tl.load(HpRowOfSlot + kv_loc, mask=n_ok, other=-1).to(tl.int32)
+                rr = tl.where(r >= 0, r, 0).to(tl.int64)
+                owner = tl.load(HpOwnerOfRow + rr, mask=n_ok, other=-1).to(tl.int32)
+                n_ok = n_ok & ~((r >= 0) & (owner == kv_loc.to(tl.int32)))
 
             # scale/zero: [BLOCK_N] per group, 8 loads per token, not 8192.
             s0 = tl.load(Params + kv_loc * 8 + 0, mask=n_ok, other=0.0)
@@ -687,7 +712,7 @@ def packed_mla_decode_stage1_gf(
     q, operands, att_out, att_lse, kv_indptr, kv_indices, num_kv_splits,
     max_kv_splits, sm_scale_withk, logit_cap,
     block_n: int = 0, num_warps: int = 0, num_stages: int = 0,
-    block_h: int = 0, wide_load: bool = True,
+    block_h: int = 0, wide_load: bool = True, skip_hp: bool = False,
 ):
     """Launch the group-factored stage-1. Benchmark-only: no window arena.
 
@@ -696,8 +721,8 @@ def packed_mla_decode_stage1_gf(
     launcher actually picks. It is 0.95x at 32/warps=8 only, which is not a
     configuration anything selects.
     """
-    codes, params, rope, hp, _hp_row, _hp_owner, group_size, lloyd = operands
-    if hp is not None:
+    codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
+    if hp is not None and not skip_hp:
         raise NotImplementedError(
             "the group-factored kernel has no window-arena path; folding one in "
             "reintroduces the full-width tile it exists to avoid, in a branch "
@@ -725,6 +750,8 @@ def packed_mla_decode_stage1_gf(
 
     return _fwd_packed_mla_stage1_gf[grid](
         q, codes, params, rope,
+        hp_row if skip_hp else kv_indices,
+        hp_owner if skip_hp else kv_indices,
         sm_scale_withk, kv_indptr, kv_indices, att_out, att_lse, num_kv_splits,
         q.stride(0), q.stride(1),
         att_out.stride(0), att_out.stride(1), att_out.stride(2),
@@ -732,6 +759,7 @@ def packed_mla_decode_stage1_gf(
         q_head_num=head_num,
         D=d, DPE=d_pe, GS=group_size,
         BLOCK_N=block_n, BLOCK_H=block_h, MIN_BLOCK_KV=_MIN_BLOCK_KV,
-        LLOYD=bool(lloyd), WIDE_LOAD=bool(wide_load), logit_cap=logit_cap,
+        LLOYD=bool(lloyd), WIDE_LOAD=bool(wide_load), SKIP_HP=bool(skip_hp),
+        logit_cap=logit_cap,
         num_warps=num_warps, num_stages=num_stages,
     )
