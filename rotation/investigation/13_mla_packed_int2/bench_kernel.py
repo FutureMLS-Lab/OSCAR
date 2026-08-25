@@ -700,6 +700,14 @@ def _run_equivalence():
         # the code of it.
         dict(bs=1, heads=16, seq=100, windows=576, splits=8),
         dict(bs=2, heads=16, seq=140, windows=576, splits=8),
+        # Same sequence, fewer splits. seq=256/splits=1 matches and
+        # seq=100/splits=8 does not, and both are window-only, so length and
+        # split count are still confounded. Holding seq at 100 and dropping to
+        # 1 split separates them: a MATCH here means the fault tracks the
+        # number of empty sentinel splits stage 2 has to merge, a MISMATCH
+        # means it tracks the sequence length itself.
+        dict(bs=1, heads=16, seq=100, windows=576, splits=1),
+        dict(bs=1, heads=16, seq=100, windows=576, splits=2),
     ):
         try:
             two_pass_equivalence(**kw)
