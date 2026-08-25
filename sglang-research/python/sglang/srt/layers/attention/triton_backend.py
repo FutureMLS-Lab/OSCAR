@@ -2457,6 +2457,43 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             pool = forward_batch.token_to_kv_pool
+            if envs.SGLANG_OSCAR_MLA_PACKED_GF.get():
+                # Group-factored two-pass path. Validated against the override
+                # kernel after stage 2 (rel 3.65e-03, inside bf16 rounding,
+                # with the arena confirmed load-bearing at 1.77e-01) and 4.75x
+                # faster in the microbenchmark.
+                #
+                # It needs one split slot for the BF16 window partial, and it
+                # BORROWS rather than allocates: the packed pass runs on
+                # num_kv_splits - 1 and the window writes the freed last slot,
+                # so stage 2 still reads num_kv_splits and no buffer, and in
+                # particular no CUDA-graph capture buffer, changes shape.
+                # Enlarging the split axis would have touched every model on
+                # this backend to speed up one pool.
+                from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+                    packed_mla_decode_gf_fwd,
+                )
+
+                ns = self.forward_metadata.num_kv_splits
+                ns_quant = getattr(self.forward_metadata, "num_kv_splits_gf", None)
+                if ns_quant is None:
+                    ns_quant = torch.clamp(ns - 1, min=1)
+                packed_mla_decode_gf_fwd(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    pool,
+                    layer.layer_id,
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    attn_logits,
+                    self.forward_metadata.attn_lse,
+                    kv_indptr,
+                    kv_indices,
+                    ns_quant,
+                    self.max_kv_splits - 1,
+                    layer.scaling * k_descale,
+                    logit_cap=logits_soft_cap,
+                    num_kv_splits_plus1=ns,
+                )
+                return o
             packed_mla_decode_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 pool,

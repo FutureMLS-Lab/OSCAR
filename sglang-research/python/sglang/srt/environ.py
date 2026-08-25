@@ -237,6 +237,11 @@ class Envs:
     # being unquantized. Requires a rotation path (there is nothing to pack
     # without one).
     SGLANG_OSCAR_MLA_KV_PACKED = EnvBool(False)
+    # Group-factored packed MLA decode: 4.75x on the microbenchmark, validated
+    # equal to the override kernel after stage 2. Default OFF because it
+    # changes the serving read path for every packed MLA model, and the accuracy
+    # runs it would perturb are the deliverable it is meant to accelerate.
+    SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
     # Shadow the packed latent with the BF16 fake-quant result and assert every
     # materialized read matches it. Doubles latent memory; for smoke runs only.
     SGLANG_OSCAR_MLA_PACKED_SELFCHECK = EnvBool(False)
