@@ -329,7 +329,7 @@ def _fwd_packed_mla_stage1(
         offs_mid_o_1 = (
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
-            + (split_kv_id + SLOT_OFF) * stride_mid_os
+            + split_kv_id * stride_mid_os
         ) // D
         tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
 
