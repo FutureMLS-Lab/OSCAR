@@ -70,6 +70,24 @@ DEFAULT_LATENT_RECENT_TOKENS = 256
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _dump_is_capturing() -> bool:
+    """True while sglang is capturing a CUDA graph."""
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        return bool(get_is_capture_mode())
+    except Exception:
+        return False
+
+
+def _dump_is_tracing() -> bool:
+    """True while dynamo is tracing; a sync here is a hard graph break."""
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
+
+
 def _load_or_make_rotations(
     rotation_path: str,
     layer_num: int,
@@ -766,6 +784,15 @@ class _Int2HPMixin:
     def _maybe_dump_c_kv(self, layer_id: int, c_kv: torch.Tensor) -> None:
         if not self.dump_c_kv_dir:
             return
+        # A dump inside CUDA-graph capture is illegal AND worthless. Illegal
+        # because .cpu() is a host sync and capture aborts with
+        # cudaErrorStreamCaptureInvalidated; worthless because the tensors
+        # flowing through capture are dummy warmup values, so anything saved
+        # there is noise that a rotation would then be fitted to. The write-side
+        # self-check has carried this guard from the start; the dump path never
+        # did, and it took down a 35-minute weight load to find out.
+        if _dump_is_capturing() or _dump_is_tracing():
+            return
         count = self._dump_counts.get(layer_id, 0)
         if count >= self.dump_max_tokens_per_layer:
             return
@@ -795,7 +822,13 @@ class _Int2HPMixin:
         if not getattr(self, "dump_c_kv_dir", ""):
             return
         for layer_id, buf in list(self._dump_buffers.items()):
-            path = os.path.join(self.dump_c_kv_dir, f"layer_{layer_id}.pt")
+            # Same global-id mapping as the full-flush path. Fixing only one of
+            # the two save sites left partial flushes writing local names, which
+            # is how layer_0.pt appeared for a model whose full-attention layers
+            # start at 3.
+            path = os.path.join(
+                self.dump_c_kv_dir, f"layer_{self._dump_file_id(layer_id)}.pt"
+            )
             torch.save(torch.cat(buf, dim=0), path)
             logger.info(
                 "[Int2HPKVPool] flushed partial layer %d (%d tokens) -> %s",
