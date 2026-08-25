@@ -362,6 +362,46 @@ def main() -> None:
                 print(f"  !! BLOCK_H DID NOT REACH THE KERNEL at {bn}/{w}: "
                       f"every BLOCK_H compiled to {next(iter(byh.values()))} "
                       f"-- the sweep measured one config twice, ignore its times")
+
+        # WIDE_LOAD: load each code byte once instead of once per 2-bit field.
+        # The BLOCK_H sweep priced the code path at ~80% of this kernel (halving
+        # BLOCK_H doubles code load+unpack, holds dot work fixed, and cost
+        # 1.82x), and the narrow form issues four loads per byte. Correctness is
+        # checked BEFORE the timing: a variant that unpacks to a different index
+        # order would be quietly wrong and still fast.
+        print("\nWIDE_LOAD (one load per code byte, not one per 2-bit field):")
+        for bn, w in itertools.product((32, 64), (4, 8)):
+            try:
+                on = torch.zeros_like(logits)
+                ln = torch.zeros_like(lse)
+                packed_mla_decode_stage1_gf(
+                    q, ops_nohp, on, ln, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3)
+                ow = torch.zeros_like(logits)
+                lw = torch.zeros_like(lse)
+                kw = packed_mla_decode_stage1_gf(
+                    q, ops_nohp, ow, lw, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    wide_load=True)
+                fin = torch.isfinite(on) & torch.isfinite(ow)
+                dev = (on[fin] - ow[fin]).abs().max().item() if fin.any() else float("nan")
+                ok = dev < 1e-3
+                t_n = timeit(lambda: packed_mla_decode_stage1_gf(
+                    q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3))
+                t_w = timeit(lambda: packed_mla_decode_stage1_gf(
+                    q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    wide_load=True))
+                regs = getattr(kw, "n_regs", None)
+                shared = getattr(getattr(kw, "metadata", None), "shared", None)
+                print(f"  {bn:>3}/{w} narrow {t_n:.3f} ms  wide {t_w:.3f} ms  "
+                      f"{t_n/t_w:.2f}x  maxdev={dev:.2e} "
+                      f"{'OK' if ok else '<-- WRONG, ignore the speed'}"
+                      f"  [regs={regs} smem={shared}]")
+            except Exception as e:  # noqa: BLE001
+                print(f"  {bn:>3}/{w} wide - {type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:90]}")
     except Exception as e:  # noqa: BLE001
         print(f"\ngroup-factored failed: {type(e).__name__}: "
               f"{str(e).splitlines()[0][:200]}")

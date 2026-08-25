@@ -491,6 +491,7 @@ def _fwd_packed_mla_stage1_gf(
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     LLOYD: tl.constexpr,
+    WIDE_LOAD: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
     """Group-factored packed MLA stage-1, specialised to NG == 4.
@@ -531,6 +532,8 @@ def _fwd_packed_mla_stage1_gf(
     mask_h = mask_h & (cur_head < q_head_num)
 
     offs_g = tl.arange(0, GS)
+    offs_b = tl.arange(0, GS // 4)
+    shf = 2 * tl.arange(0, 4)
     offs_dpe = D + tl.arange(0, DPE)
     offs_pe = tl.arange(0, DPE)
 
@@ -594,14 +597,41 @@ def _fwd_packed_mla_stage1_gf(
 
             # Code tiles in [GS, BLOCK_N] -- the layout tl.dot(q_g, .) wants, so
             # there is no transpose and nothing full-width is ever computed.
-            by0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((0 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-            c0 = ((by0 >> (2 * ((0 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
-            by1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((1 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-            c1 = ((by1 >> (2 * ((1 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
-            by2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((2 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-            c2 = ((by2 >> (2 * ((2 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
-            by3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((3 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-            c3 = ((by3 >> (2 * ((3 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+            if WIDE_LOAD:
+                # Four consecutive dims share one byte, so the narrow form below
+                # issues four loads per byte: (g*GS + offs_g)//4 maps GS=128 rows
+                # onto only 32 distinct addresses. Load those 32 rows once and
+                # unpack the four 2-bit fields into the [GS, BLOCK_N] tile.
+                #
+                # Worth trying specifically because the BLOCK_H sweep measured
+                # what this costs: halving BLOCK_H doubles the code load+unpack
+                # while leaving the dot work unchanged, and it cost 1.82x
+                # (0.341 -> 0.622 ms), which puts the code path at roughly 80%
+                # of the kernel. Address arithmetic alone was refuted before
+                # (0.78x), but that experiment broadcast the *parameters* and
+                # left this fourfold code redundancy untouched.
+                #
+                # g*GS is a multiple of 4 for GS=128, so the byte row is
+                # g*(GS//4) + d//4 and the shift is 2*(d%4) with no dependence
+                # on g. reshape maps (i, j) -> row 4i+j, which is exactly dim
+                # 4i+j, so the unpacked tile is index-identical to the narrow one.
+                w0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (0 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c0 = tl.reshape((w0[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                w1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (1 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c1 = tl.reshape((w1[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                w2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (2 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c2 = tl.reshape((w2[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                w3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (3 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c3 = tl.reshape((w3[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+            else:
+                by0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((0 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c0 = ((by0 >> (2 * ((0 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                by1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((1 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c1 = ((by1 >> (2 * ((1 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                by2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((2 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c2 = ((by2 >> (2 * ((2 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                by3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((3 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                c3 = ((by3 >> (2 * ((3 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
 
             qk = tl.dot(q0, c0) * s0[None, :] + qs0[:, None] * b0[None, :]
             qk += tl.dot(q1, c1) * s1[None, :] + qs1[:, None] * b1[None, :]
@@ -657,7 +687,7 @@ def packed_mla_decode_stage1_gf(
     q, operands, att_out, att_lse, kv_indptr, kv_indices, num_kv_splits,
     max_kv_splits, sm_scale_withk, logit_cap,
     block_n: int = 0, num_warps: int = 0, num_stages: int = 0,
-    block_h: int = 0,
+    block_h: int = 0, wide_load: bool = False,
 ):
     """Launch the group-factored stage-1. Benchmark-only: no window arena."""
     codes, params, rope, hp, _hp_row, _hp_owner, group_size, lloyd = operands
@@ -696,6 +726,6 @@ def packed_mla_decode_stage1_gf(
         q_head_num=head_num,
         D=d, DPE=d_pe, GS=group_size,
         BLOCK_N=block_n, BLOCK_H=block_h, MIN_BLOCK_KV=_MIN_BLOCK_KV,
-        LLOYD=bool(lloyd), logit_cap=logit_cap,
+        LLOYD=bool(lloyd), WIDE_LOAD=bool(wide_load), logit_cap=logit_cap,
         num_warps=num_warps, num_stages=num_stages,
     )
