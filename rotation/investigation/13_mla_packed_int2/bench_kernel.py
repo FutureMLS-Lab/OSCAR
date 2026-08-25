@@ -628,6 +628,35 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
         print(f"\ntwo-pass equivalence: NON-FINITE outputs "
               f"(ref {n_ref}, new {n_new} of {o_ref.numel()}) -- "
               f"this is an empty-split or masking fault, not a value mismatch")
+    # Bisect inside the harness now that it reproduces the failure: run the
+    # group-factored kernel with NO arena at all (ops_nohp -> nothing excluded,
+    # no window pass) against a reference on the same operands. That separates
+    # the two halves cleanly:
+    #   nohp MATCHes  -> the base kernel is fine; exclusion or the window pass
+    #                    is at fault
+    #   nohp MISMATCHes -> the base group-factored kernel is wrong at short
+    #                    sequences with empty splits, and the window is a red
+    #                    herring
+    try:
+        ops_nohp = ops[:3] + (None, None, None) + ops[6:]
+        lg3 = _t.zeros_like(lg); ls3 = _t.full_like(ls, -1.0e30)
+        o_a = _t.zeros_like(o_ref)
+        packed_mla_decode_stage1(q, ops_nohp, lg3, ls3, indptr, idx, ns, ms, sm, 0.0)
+        _decode_softmax_reducev_fwd(lg3, ls3, q, o_a, 1.0,
+                                    _v_shape_proxy(o_a, R), indptr, ns, ms)
+        lg4 = _t.zeros_like(lg); ls4 = _t.full_like(ls, -1.0e30)
+        o_b = _t.zeros_like(o_ref)
+        packed_mla_decode_stage1_gf(q, ops_nohp, lg4, ls4, indptr, idx, ns, ms,
+                                    sm, 0.0)
+        _decode_softmax_reducev_fwd(lg4, ls4, q, o_b, 1.0,
+                                    _v_shape_proxy(o_b, R), indptr, ns, ms)
+        dn = (o_a.float() - o_b.float()).abs()
+        rn = (dn.max() / o_a.float().abs().max().clamp(min=1e-6)).item()
+        print(f"  [bisect] NO-ARENA gf vs production: rel={rn:.3e} "
+              f"{'MATCH -> fault is exclusion/window' if rn < 2e-2 else 'MISMATCH -> base kernel is wrong here'}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [bisect] failed: {type(e).__name__}: {_err(e)}")
+
     d = (o_ref.float() - o_new.float()).abs()
     rel = (d.max() / o_ref.float().abs().max().clamp(min=1e-6)).item()
     print(f"\ntwo-pass equivalence vs the production override kernel "
