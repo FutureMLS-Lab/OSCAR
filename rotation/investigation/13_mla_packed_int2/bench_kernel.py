@@ -60,9 +60,17 @@ def build(bs: int, heads: int, seq: int, windows: int = 576,
     hp_owner = torch.full((n_hp,), -1, dtype=torch.int32, device=dev)
     for b in range(bs):
         base = b * seq
+        # Clamp both ranges into THIS request. Unclamped, seq < windows - 64
+        # makes the tail start negative, and torch wraps negative indices, so
+        # the arena for a short sequence was built out of other requests' slots
+        # -- a malformed fixture that would be read as a kernel failure. The
+        # prefix and tail are also clipped against each other so they cannot
+        # overlap and assign one slot two ring rows.
+        n_pre = min(64, seq)
+        tail_lo = max(seq - (windows - 64), n_pre)
         idx = torch.cat([
-            torch.arange(base, base + 64, device=dev),
-            torch.arange(base + seq - (windows - 64), base + seq, device=dev),
+            torch.arange(base, base + n_pre, device=dev),
+            torch.arange(base + tail_lo, base + seq, device=dev),
         ])
         ring = 1 + b * windows + torch.arange(idx.numel(), device=dev)
         hp[ring] = x[idx].to(torch.bfloat16)
