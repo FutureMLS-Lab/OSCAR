@@ -572,7 +572,7 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # This is the same fault already fixed in the in-server A/B and left
     # standing here, which is why the short-sequence shapes only started
     # failing once they were added: more empty splits, more contamination.
-    lg.zero_(); ls.fill_(-1.0e30)
+    lg.zero_(); ls.fill_(-1.0e4)
     o_ref = _t.zeros((bs, heads, R), dtype=q.dtype, device=q.device)
     packed_mla_decode_stage1(q, ops, lg, ls, indptr, idx, ns, ms, sm, 0.0)
     _decode_softmax_reducev_fwd(lg, ls, q, o_ref, 1.0,
@@ -582,7 +582,7 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     lg2 = _t.zeros((bs, heads, ms + 1, R), dtype=_t.float32, device=q.device)
     # -1e30, not 0: an unwritten split with lse=0 is not ignored by stage 2's
     # merge, it is weighted exp(0 - max) and drags the result toward zero.
-    ls2 = _t.full((bs, heads, ms + 1), -1.0e30, dtype=_t.float32, device=q.device)
+    ls2 = _t.full((bs, heads, ms + 1), -1.0e4, dtype=_t.float32, device=q.device)
     o_new = _t.zeros_like(o_ref)
     packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
                                 skip_hp=True)
@@ -609,7 +609,7 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # would mean the merge itself is at fault.
     _l0 = ls2[0, 0].tolist()
     print(f"  [diag] lse[0,0,:] = "
-          f"{['SENT' if v <= -1e29 else round(v, 3) for v in _l0]}  "
+          f"{['SENT' if v <= -9e3 else round(v, 3) for v in _l0]}  "
           f"(splits 0..{ms-1} packed, {ms} window)")
     _o0 = [round(float(lg2[0, 0, k].abs().max()), 4) for k in range(ms + 1)]
     print(f"  [diag] |att_out|max per split = {_o0}")
@@ -651,12 +651,12 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     #                    herring
     try:
         ops_nohp = ops[:3] + (None, None, None) + ops[6:]
-        lg3 = _t.zeros_like(lg); ls3 = _t.full_like(ls, -1.0e30)
+        lg3 = _t.zeros_like(lg); ls3 = _t.full_like(ls, -1.0e4)
         o_a = _t.zeros_like(o_ref)
         packed_mla_decode_stage1(q, ops_nohp, lg3, ls3, indptr, idx, ns, ms, sm, 0.0)
         _decode_softmax_reducev_fwd(lg3, ls3, q, o_a, 1.0,
                                     _v_shape_proxy(o_a, R), indptr, ns, ms)
-        lg4 = _t.zeros_like(lg); ls4 = _t.full_like(ls, -1.0e30)
+        lg4 = _t.zeros_like(lg); ls4 = _t.full_like(ls, -1.0e4)
         o_b = _t.zeros_like(o_ref)
         packed_mla_decode_stage1_gf(q, ops_nohp, lg4, ls4, indptr, idx, ns, ms,
                                     sm, 0.0)
@@ -681,7 +681,7 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     ops_zero = (ops[0], ops[1], ops[2], _t.zeros_like(ops[3]), ops[4], ops[5],
                 ops[6], ops[7])
     o_zero = _t.zeros_like(o_ref)
-    lg.zero_(); ls.fill_(-1.0e30)
+    lg.zero_(); ls.fill_(-1.0e4)
     packed_mla_decode_stage1(q, ops_zero, lg, ls, indptr, idx, ns, ms, sm, 0.0)
     _decode_softmax_reducev_fwd(lg, ls, q, o_zero, 1.0,
                                 _v_shape_proxy(o_zero, R), indptr, ns, ms)

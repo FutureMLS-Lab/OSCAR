@@ -40,7 +40,7 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 
-# lse written for a split with no live tokens is -1.0e30: large enough that
+# lse written for a split with no live tokens is -1.0e4: large enough that
 # exp(sentinel - anything_real) underflows to 0, finite so that subtracting it
 # from itself is 0 rather than NaN. Inlined at both store sites rather than
 # named here -- this Triton will not resolve a module-level Python float used
@@ -748,7 +748,7 @@ def _fwd_packed_mla_stage1_gf(
         # shares, to accommodate one pool.
         tl.store(
             Att_Lse + offs_mid_o_1,
-            tl.where(e_sum > 0, e_max + tl.log(safe), -1.0e30),
+            tl.where(e_sum > 0, e_max + tl.log(safe), -1.0e4),
             mask=mask_h,
         )
 
@@ -957,7 +957,7 @@ def _fwd_hp_window_stage1(
     tl.store(
         Att_Lse + offs_mid_o_1,
         tl.where(e_sum > 0, e_max + tl.log(tl.where(e_sum > 0, e_sum, 1.0)),
-                 -1.0e30),
+                 -1.0e4),
         mask=mask_h,
     )
 
@@ -1007,7 +1007,7 @@ def packed_mla_decode_gf_fwd(
     # -1e30 is the same inert sentinel the kernels write for an empty split:
     # stage 2's max ignores it and exp() underflows it to zero.
     _ns = max_kv_splits + 1 if has_hp else max_kv_splits
-    attn_lse[:, :, :_ns].fill_(-1.0e30)
+    attn_lse[:, :, :_ns].fill_(-1.0e4)
     attn_logits[:, :, :_ns].zero_()
 
     if not getattr(pool, "_gf_entry_logged", False):
@@ -1109,7 +1109,7 @@ def packed_mla_decode_gf_fwd(
         # itself as the thing that had not been checked.
         _o_ref = torch.empty_like(o)
         _lg_buf = torch.zeros_like(attn_logits[:, :, : max_kv_splits + 1])
-        _ls_buf = torch.full_like(attn_lse[:, :, : max_kv_splits + 1], -1.0e30)
+        _ls_buf = torch.full_like(attn_lse[:, :, : max_kv_splits + 1], -1.0e4)
         packed_mla_decode_fwd(
             q, pool, layer_id, _o_ref, _lg_buf, _ls_buf, kv_indptr, kv_indices,
             num_kv_splits_plus1 if has_hp else num_kv_splits,
