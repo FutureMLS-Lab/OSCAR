@@ -37,7 +37,8 @@ R, ROPE, GS = 512, 64, 128
 NG = R // GS
 
 
-def build(bs: int, heads: int, seq: int, windows: int = 576):
+def build(bs: int, heads: int, seq: int, windows: int = 576,
+          max_splits: int = 8):
     dev = "cuda"
     n_slots = bs * seq + 64
     x = torch.randn(n_slots, R, device=dev)
@@ -77,7 +78,6 @@ def build(bs: int, heads: int, seq: int, windows: int = 576):
     q = torch.randn(bs, heads, R + ROPE, device=dev, dtype=torch.bfloat16)
     kv_indptr = torch.arange(0, (bs + 1) * seq, seq, device=dev, dtype=torch.int32)
     kv_indices = torch.arange(bs * seq, device=dev, dtype=torch.int32)
-    max_splits = 8
     num_splits = torch.full((bs,), max_splits, device=dev, dtype=torch.int32)
     logits = torch.empty(bs, heads, max_splits, R, device=dev, dtype=torch.float32)
     lse = torch.empty(bs, heads, max_splits, device=dev, dtype=torch.float32)
@@ -254,6 +254,27 @@ def main() -> None:
                       f"{str(e).splitlines()[0][:60]}")
     except Exception as e:  # noqa: BLE001
         print(f"  dual load failed: {type(e).__name__}: {e}")
+
+    # SPLIT SWEEP. grid = (bs, head_blocks, splits); at bs=16 with one head
+    # block and 8 splits that is 128 programs on ~148 SMs. Occupancy was never
+    # a tested lever here, and it is the one knob that changes how many programs
+    # exist rather than what each one does. Both arms take the same split count.
+    print("\n=== kv-split sweep (grid occupancy) ===")
+    print(f"{'splits':>7} {'programs':>9} {'BF16 ms':>9} {'packed ms':>10} {'ratio':>7}")
+    for sp in (8, 16, 32, 64):
+        try:
+            o2, kv2, q2, ind2, idx2, ns2, ms2, lg2, ls2 = build(
+                bs, heads, seq, max_splits=sp)
+            tb = timeit(lambda: _decode_grouped_att_m_fwd(
+                q2, kv2, kv2[..., :R], lg2, ls2, ind2, idx2, ns2, ms2, sm, 0.0))
+            tp = timeit(lambda: packed_mla_decode_stage1(
+                q2, o2, lg2, ls2, ind2, idx2, ns2, ms2, sm, 0.0,
+                block_n=16, num_warps=8, num_stages=1))
+            print(f"{sp:>7} {bs*sp:>9} {tb:>9.3f} {tp:>10.3f} {tb/tp:>6.2f}x")
+            del o2, kv2, q2, lg2, ls2
+            torch.cuda.empty_cache()
+        except Exception as e:  # noqa: BLE001
+            print(f"{sp:>7} {'-':>9}  {type(e).__name__}: {str(e).splitlines()[0][:60]}")
 
     # The group-factored kernel: the only variant that changes WHAT reaches
     # tl.dot (a directly-loaded code tile) rather than how a computed tile is
