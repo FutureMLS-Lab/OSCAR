@@ -110,6 +110,23 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
+        # Kimi-K3 gates the attention output per head (g_proj, sigmoid). The
+        # expanded-MHA path applies it (forward_mha: attn_output * output_gate
+        # before o_proj); this path never did, so serving K3 as a real MLA
+        # latent produced fluent-shaped garbage -- an ungated output, not a
+        # quantization artefact. It reproduced with kv_cache_dtype=bfloat16 and
+        # no packed pool at all, which is what isolated it to the forward path.
+        #
+        # That is why use_expanded_mha_cache was pinned True: not caution, a
+        # missing gate. Computed here because only prepare has hidden_states,
+        # and always assigned -- including None -- so a stale gate from an
+        # earlier layer can never be applied to this one.
+        self._mla_output_gate = (
+            self.g_proj(hidden_states)[0].sigmoid()
+            if getattr(self, "g_proj", None) is not None
+            else None
+        )
+
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -610,6 +627,11 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+        # Same gate, same place as the expanded-MHA path: on the
+        # [tokens, num_local_heads * v_head_dim] tensor, before o_proj.
+        _gate = getattr(self, "_mla_output_gate", None)
+        if _gate is not None:
+            attn_bmm_output = attn_bmm_output * _gate
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
