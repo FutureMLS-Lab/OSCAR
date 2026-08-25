@@ -246,10 +246,21 @@ def scrape(log_path: str) -> dict:
 
 def main() -> None:
     results = []
-    for tag, packed, extra in (
+    # The gf arm differs from `packed` in exactly one variable, so any
+    # difference between them is the group-factored two-pass read path and
+    # nothing else. It is here because that path is validated only as a KERNEL:
+    # the equivalence gate compares stage-1+stage-2 in isolation, and says
+    # nothing about whether the backend wiring -- the borrowed split slot, the
+    # num_kv_splits-1 bookkeeping, CUDA-graph capture over a second kernel --
+    # is right in a live server. A microbenchmark cannot fail that way, so a
+    # server has to.
+    arms = [
         ("fake", False, {}),
         ("packed", True, {"SGLANG_OSCAR_MLA_PACKED_SELFCHECK": "1"}),
-    ):
+    ]
+    if os.environ.get("PROBE_GF", "1") == "1":
+        arms.append(("gf", True, {"SGLANG_OSCAR_MLA_PACKED_GF": "1"}))
+    for tag, packed, extra in arms:
         results.append(launch(tag, packed, extra))
 
     print("\n================ RESULT ================")
@@ -270,6 +281,52 @@ def main() -> None:
         print(f"\nPOOL: fake-quant {ka:,} -> packed {kb:,}  = {ratio:.2f}x")
         print("VERDICT:", "storage landed" if ratio > 1.5 else
               "STORAGE DID NOT CHANGE -- the pool is still BF16-sized")
+    # gf must match packed on POOL SIZE (it changes only the read path) and
+    # should beat it on decode throughput. Text is compared too: the failure
+    # this arm exists to catch is a wiring bug that still produces numbers.
+    g = next((r for r in results if r["tag"] == "gf"), None)
+    if g and b:
+        pg = g.get("pool_tokens") or g.get("max_total_num_tokens")
+        print(f"\nGF: pool {pg:,}" if pg else "\nGF: pool unknown", end="")
+        print(f" (packed {kb:,})" if kb else "")
+        if pg and kb and pg != kb:
+            print("  !! gf changed the POOL SIZE; it must only change the read "
+                  "path, so something other than the kernel moved")
+        tb, tg = b.get("decode_tok_s_median"), g.get("decode_tok_s_median")
+        if tb and tg:
+            print(f"  decode tok/s: packed {tb} -> gf {tg} = {tg / tb:.2f}x")
+        if g.get("error_lines"):
+            print(f"  !! gf errors: {g['error_lines']}")
+        # The field is `samples`, and sampling is temperature 0.7, so equality
+        # across arms was never the right test -- these will differ even when
+        # both are perfect. What matters is whether gf's text is STRUCTURALLY
+        # like the packed arm's, because the wiring failure to fear is one that
+        # still returns fluent-shaped noise, which is exactly how the K3 latent
+        # path failed. Report the shape statistics rather than a verdict, and
+        # flag only on a clear break.
+        def shape(samples):
+            ss = [x for x in (samples or []) if isinstance(x, str)]
+            if not ss:
+                return None
+            n = len(ss)
+            L = sum(len(x) for x in ss) / n
+            asc = sum(sum(c.isascii() for c in x) for x in ss)
+            tot = max(1, sum(len(x) for x in ss))
+            words = [w for x in ss for w in x.split()]
+            wl = sum(len(w) for w in words) / max(1, len(words))
+            empty = sum(1 for x in ss if not x.strip())
+            return {"n": n, "mean_chars": round(L), "ascii": round(asc / tot, 3),
+                    "mean_word": round(wl, 2), "empty": empty}
+        sb, sg = shape(b.get("samples")), shape(g.get("samples"))
+        print(f"  text shape  packed {sb}")
+        print(f"  text shape  gf     {sg}")
+        if sg and sg["empty"] == sg["n"]:
+            print("  !! gf produced EMPTY completions -- wiring is broken "
+                  "regardless of throughput")
+        elif sb and sg and abs(sb["ascii"] - sg["ascii"]) > 0.25:
+            print("  !! gf text is structurally unlike the packed arm's "
+                  "(ascii ratio moved a lot) -- suspect garbling, not sampling")
+
     with open(os.path.join(OUT, "probe.json"), "w") as f:
         json.dump(results, f, indent=2)
 
