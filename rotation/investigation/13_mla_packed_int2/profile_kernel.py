@@ -184,11 +184,29 @@ def main():
     best = stage_sweep(bs, heads, seq, splits)
     bn, w, st = (best[1], best[2], best[3]) if best else (64, 8, 1)
     print("\n=== compiled-kernel resources (no counters needed) ===")
-    from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
-        _fwd_packed_mla_stage1, _fwd_packed_mla_stage1_gf,
-    )
-    triton_resources("factored", _fwd_packed_mla_stage1_gf)
-    triton_resources("computed-tile", _fwd_packed_mla_stage1)
+    ops, kv, q, indptr, idx, ns, ms, lg, ls = build(bs, heads, seq,
+                                                    max_splits=splits)
+    ops_nohp = ops[:3] + (None, None, None) + ops[6:]
+    sm = 1.0 / (R + 64) ** 0.5
+    for tag, tbn, tw, tst in (("best", bn, w, st), ("BLOCK_N=64", 64, 8, 1)):
+        try:
+            k = packed_mla_decode_stage1_gf(
+                q, ops_nohp, lg, ls, indptr, idx, ns, ms, sm, 0.0,
+                block_n=tbn, num_warps=tw, num_stages=tst)
+            shared = getattr(getattr(k, "metadata", None), "shared", None)
+            regs = getattr(k, "n_regs", None)
+            spills = getattr(k, "n_spills", None)
+            note = ""
+            if spills:
+                note += "  <-- REGISTER SPILLS"
+            # B200 has 228 KB of shared memory per SM; anything close to that
+            # means one block per SM, i.e. smem is the occupancy limiter.
+            if shared and shared > 114_000:
+                note += "  <-- >half the SM's smem: 1 block/SM"
+            print(f"  [{tag} {tbn}/{tw}/st{tst}] regs/thread={regs} "
+                  f"spills={spills} shared/block={shared}{note}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{tag}] {type(e).__name__}: {str(e).splitlines()[0][:70]}")
     ncu_profile(bs, heads, seq, splits, bn, w, st)
 
 

@@ -686,7 +686,7 @@ def packed_mla_decode_stage1_gf(
     block_h = _safe_block_h(16, kv_group_num)
     grid = (batch, triton.cdiv(head_num, min(block_h, kv_group_num)), max_kv_splits)
 
-    _fwd_packed_mla_stage1_gf[grid](
+    return _fwd_packed_mla_stage1_gf[grid](
         q, codes, params, rope,
         sm_scale_withk, kv_indptr, kv_indices, att_out, att_lse, num_kv_splits,
         q.stride(0), q.stride(1),
