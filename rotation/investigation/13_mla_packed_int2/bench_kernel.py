@@ -642,6 +642,37 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
         print(f"  [diag] {int((~finite_lse).sum())} (batch, head) rows have "
               f"NO finite split at all -- stage 2 will compute -inf minus -inf")
 
+    # Merge the SAME buffers in torch, and check every (batch, head), not just
+    # row 0.
+    #
+    # Nine explanations for this failure have been wrong, and every one assumed
+    # something about a component instead of measuring it. Two possibilities
+    # remain and this separates them without a tenth guess:
+    #   torch merge CORRECT -> the stage-2 kernel is the bug
+    #   torch merge WRONG   -> the buffers do not contain what the row-0
+    #                          diagnostic showed, and the fault is upstream
+    # The row-0 diagnostic is itself a blind spot: it prints ls2[0, 0] and
+    # nothing has ever looked at the other heads or batch entries.
+    try:
+        S = ms + 1
+        _ls = ls2[:, :, :S].float()
+        _lg = lg2[:, :, :S, :].float()
+        _m = _ls.max(dim=2, keepdim=True).values
+        _w = (_ls - _m).exp()
+        _o = (_lg * _w.unsqueeze(-1)).sum(2) / _w.sum(2, keepdim=True).clamp(min=1e-30)
+        _d = (_o - o_ref.float()).abs().max().item()
+        _r = _d / o_ref.float().abs().max().clamp(min=1e-6).item()
+        print(f"  [merge] torch merge of the same buffers vs reference: rel={_r:.3e} "
+              f"{'CORRECT -> stage-2 kernel is the bug' if _r < 2e-2 else 'ALSO WRONG -> buffers are not what row 0 showed'}")
+        # Which (batch, head) rows have no real split at all, across the whole
+        # tensor rather than row 0 alone.
+        _real = (_ls > -9e3).sum(dim=2)
+        print(f"  [merge] real (non-sentinel) splits per (b,h): "
+              f"min={int(_real.min())} max={int(_real.max())} "
+              f"rows_with_zero={int((_real == 0).sum())}/{_real.numel()}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [merge] failed: {type(e).__name__}: {_err(e)}")
+
     _decode_softmax_reducev_fwd(lg2, ls2, q, o_new, 1.0,
                                 _v_shape_proxy(o_new, R), indptr, ns + 1, ms + 1)
 
