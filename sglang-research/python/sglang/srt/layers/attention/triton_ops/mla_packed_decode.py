@@ -487,51 +487,36 @@ def _fwd_packed_mla_stage1_gf(
     D: tl.constexpr,
     DPE: tl.constexpr,
     GS: tl.constexpr,
-    NG: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     LLOYD: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
-    """Group-factored packed MLA stage-1: no full-width dequantized tile.
+    """Group-factored packed MLA stage-1, specialised to NG == 4.
 
-    Five hypotheses about this kernel have been measured and all five refuted --
-    tiling, traffic, addressing, the dequant arithmetic (free: removing it
-    measures 1.00x) and the transpose. Two of them got *slower*, by 1.3x, in the
-    same way: replacing a direct wide ``tl.load`` with a constructed tile. That
-    is the pattern this kernel is built around.
+    Six hypotheses have been measured on the tiled kernel and all six refuted:
+    tiling, traffic (0.77x), addressing (0.78x, bit-identical), the dequant
+    arithmetic itself (ABLATE=2 removes it and measures **1.00x** -- it is free),
+    the transpose (0.86x), and head amortization (no room at 16 q heads/rank).
+    Every one of those still ended at a **computed** ``[BLOCK_N, D]`` tile fed to
+    ``tl.dot``, and a computed tile must be materialised through shared memory
+    where a loaded one can stream -- which is why BLOCK_N is pinned at 16 (32 is
+    slower, 64 exhausts smem) against the BF16 kernel's 32-64.
 
-    Every refuted variant still ended at a **computed** ``[BLOCK_N, D]`` tile fed
-    to ``tl.dot``, and a computed tile has to be materialized through shared
-    memory where a loaded one can stream. That is also why BLOCK_N is stuck at
-    16 (32 is slower, 64 exhausts shared memory) while the BF16 kernel it must
-    beat runs 32-64 -- i.e. 2-4x fewer loop iterations for the same work.
+    So factor the dequant out of the dot instead of computing it first:
 
-    So factor the dequant out of the dot instead of computing it before the dot.
-    With ``cv = code * s + z`` per group ``g``:
+        q . cv = sum_g [ s_g * sum_{d in g} q_d code_d + z_g * sum_{d in g} q_d ]
 
-        q . cv = sum_g [ s_g * sum_{d in g} q_d code_d  +  z_g * sum_{d in g} q_d ]
+    ``sum_{d in g} q_d`` is loop-invariant. ``tl.dot`` then sees the raw code
+    tile converted to bf16 -- INT2 values 0..3 are exact there -- and scale/zero
+    apply in the ``[BLOCK_H, BLOCK_N]`` domain, 256 elements instead of 8192.
+    Lloyd-Max is the same shape: ``(code - z) s = code s - z s``.
 
-    ``sum_{d in g} q_d`` is loop-invariant. What reaches ``tl.dot`` is the raw
-    code tile, converted to bf16 -- INT2 values 0..3 are exact in bf16 -- and the
-    scale/zero apply in the ``[BLOCK_H, BLOCK_N]`` domain, 256 elements instead
-    of 8192. Lloyd-Max is the same form: ``(code - z) * s = code*s - z*s``, so
-    ``A = s`` and ``B = -z*s``.
-
-    The value half factors the same way, per group:
-
-        acc[h, d in g] += sum_n (p_hn A_ng) code_nd  +  sum_n p_hn B_ng
-
-    which needs ``NG`` accumulators of ``[BLOCK_H, GS]`` -- the same registers as
-    one ``[BLOCK_H, D]``, since Triton cannot slice-assign a tile -- each stored
-    to its own slice of ``Att_Out``.
-
-    **No window arena.** Folding it in means reintroducing the full-width tile in
-    a branch the compiler must reserve registers for in every block, which is the
-    cost the arena-probe fix already had to remove once (1.54x). This entry point
-    exists to test whether the factoring is worth that work at all, so it is
-    reachable only from the benchmark with the arena off.
+    Unrolled by hand for NG == 4 because Triton cannot build a Python list of
+    tensors inside a jit function -- ``[tl.zeros(...) for _ in range(NG)]`` is a
+    compile error, which is what killed the first attempt. NG=4 is every shipped
+    config (kv_lora_rank 512 / group 128); the launcher refuses anything else.
     """
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -545,6 +530,7 @@ def _fwd_packed_mla_stage1_gf(
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)
 
+    offs_g = tl.arange(0, GS)
     offs_dpe = D + tl.arange(0, DPE)
     offs_pe = tl.arange(0, DPE)
 
@@ -552,9 +538,8 @@ def _fwd_packed_mla_stage1_gf(
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
-    off_qpe = (
-        cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
-    )
+    qbase = cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+    off_qpe = qbase + offs_dpe[None, :]
 
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
@@ -564,25 +549,21 @@ def _fwd_packed_mla_stage1_gf(
 
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
-    # NG accumulators rather than one [BLOCK_H, D]: same registers, but each is
-    # storable to its own D-slice, which a slice of a single tile is not.
-    accs = [tl.zeros([BLOCK_H, GS], dtype=tl.float32) for _ in range(NG)]
+    acc0 = tl.zeros([BLOCK_H, GS], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_H, GS], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_H, GS], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_H, GS], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
         qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
-        # Per-group query tiles and their sums, both loop-invariant.
-        qgs = []
-        qsums = []
-        for g in range(NG):
-            offs_dg = g * GS + tl.arange(0, GS)
-            qg = tl.load(
-                Q + cur_batch * stride_qbs + cur_head[:, None] * stride_qh
-                + offs_dg[None, :],
-                mask=mask_h[:, None],
-                other=0.0,
-            )
-            qgs.append(qg)
-            qsums.append(tl.sum(qg.to(tl.float32), 1))
+        q0 = tl.load(Q + qbase + (0 * GS + offs_g)[None, :], mask=mask_h[:, None], other=0.0)
+        q1 = tl.load(Q + qbase + (1 * GS + offs_g)[None, :], mask=mask_h[:, None], other=0.0)
+        q2 = tl.load(Q + qbase + (2 * GS + offs_g)[None, :], mask=mask_h[:, None], other=0.0)
+        q3 = tl.load(Q + qbase + (3 * GS + offs_g)[None, :], mask=mask_h[:, None], other=0.0)
+        qs0 = tl.sum(q0.to(tl.float32), 1)
+        qs1 = tl.sum(q1.to(tl.float32), 1)
+        qs2 = tl.sum(q2.to(tl.float32), 1)
+        qs3 = tl.sum(q3.to(tl.float32), 1)
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -591,37 +572,41 @@ def _fwd_packed_mla_stage1_gf(
                 kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_ok, other=0
             ).to(tl.int64)
 
-            # Scale/zero: [BLOCK_N] per group, not [BLOCK_N, D].
-            As = []
-            Bs = []
-            for g in range(NG):
-                s_g = tl.load(Params + kv_loc * (2 * NG) + (2 * g),
-                              mask=n_ok, other=0.0)
-                z_g = tl.load(Params + kv_loc * (2 * NG) + (2 * g + 1),
-                              mask=n_ok, other=0.0)
-                if LLOYD:
-                    As.append(s_g)
-                    Bs.append(-z_g * s_g)
-                else:
-                    As.append(s_g)
-                    Bs.append(z_g)
+            # scale/zero: [BLOCK_N] per group, 8 loads per token, not 8192.
+            s0 = tl.load(Params + kv_loc * 8 + 0, mask=n_ok, other=0.0)
+            z0 = tl.load(Params + kv_loc * 8 + 1, mask=n_ok, other=0.0)
+            s1 = tl.load(Params + kv_loc * 8 + 2, mask=n_ok, other=0.0)
+            z1 = tl.load(Params + kv_loc * 8 + 3, mask=n_ok, other=0.0)
+            s2 = tl.load(Params + kv_loc * 8 + 4, mask=n_ok, other=0.0)
+            z2 = tl.load(Params + kv_loc * 8 + 5, mask=n_ok, other=0.0)
+            s3 = tl.load(Params + kv_loc * 8 + 6, mask=n_ok, other=0.0)
+            z3 = tl.load(Params + kv_loc * 8 + 7, mask=n_ok, other=0.0)
+            if LLOYD:
+                b0 = -z0 * s0
+                b1 = -z1 * s1
+                b2 = -z2 * s2
+                b3 = -z3 * s3
+            else:
+                b0 = z0
+                b1 = z1
+                b2 = z2
+                b3 = z3
 
-            # QK: dot against the RAW codes, one group at a time. The code tile
-            # comes straight from tl.load; nothing full-width is computed.
-            qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-            codes_g = []
-            for g in range(NG):
-                offs_dg = g * GS + tl.arange(0, GS)
-                byte_g = tl.load(
-                    Codes + kv_loc[None, :] * (D // 4) + (offs_dg // 4)[:, None],
-                    mask=n_ok[None, :],
-                    other=0,
-                ).to(tl.int32)
-                # [GS, BLOCK_N], the layout tl.dot(q_g, .) wants -- no transpose.
-                c_t = ((byte_g >> (2 * (offs_dg % 4))[:, None]) & 0x3).to(qpe.dtype)
-                codes_g.append(c_t)
-                qk += As[g][None, :] * tl.dot(qgs[g], c_t)
-                qk += Bs[g][None, :] * qsums[g][:, None]
+            # Code tiles in [GS, BLOCK_N] -- the layout tl.dot(q_g, .) wants, so
+            # there is no transpose and nothing full-width is ever computed.
+            by0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((0 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+            c0 = ((by0 >> (2 * ((0 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+            by1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((1 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+            c1 = ((by1 >> (2 * ((1 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+            by2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((2 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+            c2 = ((by2 >> (2 * ((2 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+            by3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((3 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+            c3 = ((by3 >> (2 * ((3 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+
+            qk = tl.dot(q0, c0) * s0[None, :] + qs0[:, None] * b0[None, :]
+            qk += tl.dot(q1, c1) * s1[None, :] + qs1[:, None] * b1[None, :]
+            qk += tl.dot(q2, c2) * s2[None, :] + qs2[:, None] * b2[None, :]
+            qk += tl.dot(q3, c3) * s3[None, :] + qs3[:, None] * b3[None, :]
 
             kpe = tl.load(
                 Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
@@ -640,31 +625,25 @@ def _fwd_packed_mla_stage1_gf(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
 
-            # AV, per group: fold the scale into p, dot against the raw codes,
-            # and add the zero term as a per-(head, group) scalar.
-            for g in range(NG):
-                pa = (p * As[g][None, :]).to(qpe.dtype)
-                bterm = tl.sum(p * Bs[g][None, :], 1)
-                accs[g] = (
-                    accs[g] * re_scale[:, None]
-                    + tl.dot(pa, tl.trans(codes_g[g]))
-                    + bterm[:, None]
-                )
+            # AV: fold the group scale into p, dot against the raw codes, and add
+            # the zero term as a per-(head, group) scalar.
+            acc0 = acc0 * re_scale[:, None] + tl.dot((p * s0[None, :]).to(qpe.dtype), tl.trans(c0)) + tl.sum(p * b0[None, :], 1)[:, None]
+            acc1 = acc1 * re_scale[:, None] + tl.dot((p * s1[None, :]).to(qpe.dtype), tl.trans(c1)) + tl.sum(p * b1[None, :], 1)[:, None]
+            acc2 = acc2 * re_scale[:, None] + tl.dot((p * s2[None, :]).to(qpe.dtype), tl.trans(c2)) + tl.sum(p * b2[None, :], 1)[:, None]
+            acc3 = acc3 * re_scale[:, None] + tl.dot((p * s3[None, :]).to(qpe.dtype), tl.trans(c3)) + tl.sum(p * b3[None, :], 1)[:, None]
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
-        for g in range(NG):
-            offs_dg = g * GS + tl.arange(0, GS)
-            tl.store(
-                Att_Out
-                + cur_batch * stride_mid_ob
-                + cur_head[:, None] * stride_mid_oh
-                + split_kv_id * stride_mid_os
-                + offs_dg[None, :],
-                accs[g] / e_sum[:, None],
-                mask=mask_h[:, None],
-            )
+        obase = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        )
+        tl.store(Att_Out + obase + (0 * GS + offs_g)[None, :], acc0 / e_sum[:, None], mask=mask_h[:, None])
+        tl.store(Att_Out + obase + (1 * GS + offs_g)[None, :], acc1 / e_sum[:, None], mask=mask_h[:, None])
+        tl.store(Att_Out + obase + (2 * GS + offs_g)[None, :], acc2 / e_sum[:, None], mask=mask_h[:, None])
+        tl.store(Att_Out + obase + (3 * GS + offs_g)[None, :], acc3 / e_sum[:, None], mask=mask_h[:, None])
 
         offs_mid_o_1 = (
             cur_batch * stride_mid_ob
@@ -690,6 +669,12 @@ def packed_mla_decode_stage1_gf(
     d_pe = rope.shape[-1]
     d = codes.shape[-1] * 4
     n_groups = d // group_size
+    if n_groups != 4:
+        raise NotImplementedError(
+            f"group-factored kernel is unrolled for NG==4, got {n_groups} "
+            "(Triton rejects a Python list of tensors inside a jit function, "
+            "so the group loop cannot be written generically)"
+        )
     assert q.shape[-1] == d + d_pe, (q.shape, d, d_pe)
 
     block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
@@ -708,7 +693,7 @@ def packed_mla_decode_stage1_gf(
         att_out.stride(0), att_out.stride(1), att_out.stride(2),
         kv_group_num=kv_group_num,
         q_head_num=head_num,
-        D=d, DPE=d_pe, GS=group_size, NG=n_groups,
+        D=d, DPE=d_pe, GS=group_size,
         BLOCK_N=block_n, BLOCK_H=block_h, MIN_BLOCK_KV=_MIN_BLOCK_KV,
         LLOYD=bool(lloyd), logit_cap=logit_cap,
         num_warps=num_warps, num_stages=num_stages,
