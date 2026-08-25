@@ -962,6 +962,12 @@ def _fwd_hp_window_stage1(
     )
 
 
+def _check_is_capturing() -> bool:
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    return bool(get_is_capture_mode())
+
+
 def packed_mla_decode_gf_fwd(
     q, pool, layer_id, o, attn_logits, attn_lse, kv_indptr, kv_indices,
     num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=0.0,
@@ -1029,7 +1035,16 @@ def packed_mla_decode_gf_fwd(
         max_kv_splits + 1 if has_hp else max_kv_splits,
     )
 
-    if envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get():
+    if envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get() and not _check_is_capturing():
+        # Skipped during CUDA-graph capture: .item() and logging are host syncs
+        # and capture aborts with "operation not permitted when stream is
+        # capturing". The first version did not guard, so the instrument killed
+        # the very arm it was measuring and returned no text at all -- the same
+        # mistake the c_kv dump made earlier today, in a different file.
+        #
+        # Skipping capture is not a loss here. Replay executes no Python, so a
+        # host-side comparison could never observe it anyway; what this sees is
+        # the eager forwards, which is where a wrong kernel would already show.
         # Run the production kernel on the SAME call and compare.
         #
         # Four hypotheses for this path's garbling have now been wrong -- empty
