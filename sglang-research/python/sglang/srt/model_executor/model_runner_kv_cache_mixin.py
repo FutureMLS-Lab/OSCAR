@@ -723,15 +723,47 @@ class ModelRunnerKVCacheMixin:
                         # does not raise -- it quantizes in the wrong frame.
                         rotation_layer_ids=full_attention_layer_ids,
                     )
+                    # start/end_layer are reported because both PP ranks were
+                    # observed claiming all 24 of K3's full-attention layers.
+                    # The list is filtered by start_layer <= i < end_layer, and
+                    # those come from getattr(self.model, ..., <default>) -- so
+                    # a model that does not expose them silently gets the whole
+                    # range on every rank and every rank allocates the whole
+                    # pool. That is not a correctness bug, it is a capacity one:
+                    # this pool exists to hold more tokens, and allocating each
+                    # rank's unused half halves what it can hold. Whether the
+                    # split is real here is unresolved -- K3 does set both via
+                    # make_layers -- so log the inputs rather than guess, and
+                    # let the next run answer it at no extra cost.
                     logger.info(
                         "Enable hybrid mixed KV (packed INT2 MLA latent) for "
-                        "mambaish MLA model: full_attn_layers=%d kv_lora_rank=%d "
+                        "mambaish MLA model: full_attn_layers=%d of %d global "
+                        "(rank layer range [%d, %d)) kv_lora_rank=%d "
                         "qk_rope_head_dim=%d group=%s",
                         len(full_attention_layer_ids),
+                        len(getattr(config, "full_attention_layer_ids", []) or []),
+                        self.start_layer,
+                        self.end_layer,
                         self.model_config.kv_lora_rank,
                         self.model_config.qk_rope_head_dim,
                         envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
                     )
+                    if (
+                        self.end_layer - self.start_layer
+                        >= self.model_config.num_hidden_layers
+                        and self.server_args.pp_size > 1
+                    ):
+                        logger.warning(
+                            "Packed MLA pool: pp_size=%d but this rank's layer "
+                            "range [%d, %d) spans the whole model, so the "
+                            "full-attention filter kept all %d layers and this "
+                            "rank is allocating the other rank's half too. KV "
+                            "capacity is roughly halved.",
+                            self.server_args.pp_size,
+                            self.start_layer,
+                            self.end_layer,
+                            len(full_attention_layer_ids),
+                        )
                     if is_nsa_model:
                         hybrid_full_kv_pool = NSAPackedInt2KVPool(
                             kv_cache_dim=self.calculate_mla_kv_cache_dim(),
