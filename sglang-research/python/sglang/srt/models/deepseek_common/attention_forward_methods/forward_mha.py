@@ -292,6 +292,13 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if output_gate is not None:
             attn_output = attn_output * output_gate
+        # Same point, same shape, same tag scheme as the absorbed path, so the
+        # two arms can be diffed layer by layer.
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            _trace_attn_out,
+        )
+
+        _trace_attn_out(self, "mha", attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

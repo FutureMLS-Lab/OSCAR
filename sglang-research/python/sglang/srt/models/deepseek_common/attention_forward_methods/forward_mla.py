@@ -649,6 +649,7 @@ class DeepseekMLAForwardMixin:
         _gate = getattr(self, "_mla_output_gate", None)
         if _gate is not None:
             attn_bmm_output = attn_bmm_output * _gate
+        _trace_attn_out(self, "absorb", attn_bmm_output)
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
@@ -694,3 +695,40 @@ class DeepseekMLAForwardMixin:
                 or server_args.nsa_prefill_backend == "tilelang"
             )
         )
+
+
+def _trace_attn_out(mod, tag: str, t) -> None:
+    """Log the pre-o_proj tensor's norm once per layer, in BOTH MLA paths.
+
+    K3's absorbed path yields fluent but off-task text while the expanded-MHA
+    path scores 61.7, and the BF16 control proves the fault is in the forward
+    rather than in quantization. Adding g_proj fixed the loudest symptom and not
+    the defect, and scaling was measured correct, so what is left is unknown.
+
+    Both paths reduce to the same [tokens, num_local_heads * v_head_dim] tensor
+    immediately before o_proj, which makes them directly comparable. Running the
+    two arms on the same prompt and diffing this per layer says whether they
+    diverge at the FIRST full-attention layer -- a math difference -- or drift
+    apart later, which would be accumulation. Those have different causes, and
+    seven rounds of reasoning without this measurement produced six wrong
+    answers.
+    """
+    import os
+
+    if os.environ.get("SGLANG_OSCAR_TRACE_ATTN_OUT", "0") in ("0", "", "false"):
+        return
+    if getattr(mod, "_attn_out_traced", False):
+        return
+    mod._attn_out_traced = True
+    import logging as _lg
+
+    try:
+        f = t.float()
+        _lg.getLogger(__name__).info(
+            "[ATTN-OUT] path=%s layer=%s shape=%s norm=%.6e absmax=%.6e mean=%.6e",
+            tag, getattr(mod, "layer_id", "?"), tuple(t.shape),
+            f.norm().item(), f.abs().max().item(), f.mean().item(),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
