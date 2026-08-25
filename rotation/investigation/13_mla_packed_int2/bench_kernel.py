@@ -307,20 +307,27 @@ def main() -> None:
             q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
             max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1))
         print(f"  computed-tile  {t_base2:.3f} ms ({base/t_base2:.2f}x BF16)")
-        for bn in (16, 32, 64):
+        # BLOCK_N was still improving monotonically at 64 (1.34x/1.86x/2.49x over
+        # the computed tile), which is the prediction that separates this variant
+        # from the six refuted ones: a loaded tile streams, so the shared-memory
+        # ceiling that pinned the old kernel at 16 does not apply. Push until it
+        # stops paying, and sweep warps at each tile -- the optimum moved with
+        # batch on the old kernel (warps=4 was 1.27x at bs=32) and was never
+        # re-checked at a larger tile.
+        for bn, w in itertools.product((32, 64, 128, 256), (4, 8, 16)):
             try:
                 t_gf = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops_nohp, logits, lse, kv_indptr, kv_indices,
                     num_splits, max_splits, sm, 0.0, block_n=bn,
-                    num_warps=8, num_stages=1))
+                    num_warps=w, num_stages=1))
                 # BLOCK_N is the whole point: if the computed tile was what
                 # capped it at 16, removing the tile should let it rise.
-                print(f"  factored BLOCK_N={bn:>2} {t_gf:.3f} ms "
+                print(f"  factored BLOCK_N={bn:>3} warps={w:>2} {t_gf:.3f} ms "
                       f"({base/t_gf:.2f}x BF16) -> {t_base2/t_gf:.2f}x over "
                       f"the computed tile")
             except Exception as e:  # noqa: BLE001
-                print(f"  factored BLOCK_N={bn:>2} - {type(e).__name__}: "
-                      f"{str(e).splitlines()[0][:70]}")
+                print(f"  factored BLOCK_N={bn:>3} warps={w:>2} - "
+                      f"{type(e).__name__}: {str(e).splitlines()[0][:60]}")
     except Exception as e:  # noqa: BLE001
         print(f"\ngroup-factored failed: {type(e).__name__}: "
               f"{str(e).splitlines()[0][:200]}")
