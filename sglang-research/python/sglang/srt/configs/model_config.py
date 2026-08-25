@@ -544,16 +544,25 @@ class ModelConfig:
             # 288 B latent shared across heads, which is why K3's pool measured
             # 264,168 tokens where GLM-5.2's measured 1,882,304.
             #
-            # ``SGLANG_OSCAR_K3_EXPANDED_MHA=1`` restores the old declaration,
-            # because the two differ in far more than the cache: head_dim moves
-            # 192 -> kv_lora_rank + qk_rope_head_dim, the attention takes the
-            # absorbed path, and the workarounds written for a non-power-of-two
-            # 192 (the unfused flush path, the 3-group quantization limit) stop
-            # applying. Keep the escape hatch until the MLA declaration has a
-            # scored K3 run behind it.
+            # DEFAULT IS THE SCORED PATH. Expanded-MHA is what K3's published
+            # number was measured on (GPQA 61.7 vs BF16 64.1, n=167, cache and
+            # CUDA graph both on). The MLA declaration is better -- it is honest
+            # and it recovers the latent compression -- but it has no K3 score
+            # behind it yet, and it needs per-layer 512x512 latent rotations that
+            # do not exist for this model (/shared/kimi-k3-rotations holds
+            # per-head k/v matrices for the expanded storage). Defaulting to an
+            # unvalidated path would put a working, measured configuration at
+            # risk to make a point.
+            #
+            # ``SGLANG_OSCAR_K3_MLA_LATENT=1`` opts into it. Flip the default
+            # once that path has its own scored run. The two differ in far more
+            # than the cache: head_dim moves 192 -> kv_lora_rank + rope, the
+            # attention takes the absorbed path, and the workarounds written for
+            # a non-power-of-two 192 (the unfused flush path, the 3-group
+            # quantization limit) stop applying.
             from sglang.srt.environ import envs as _envs
 
-            if _envs.SGLANG_OSCAR_K3_EXPANDED_MHA.get():
+            if not _envs.SGLANG_OSCAR_K3_MLA_LATENT.get():
                 self.head_dim = (
                     self.hf_text_config.qk_nope_head_dim
                     + self.hf_text_config.qk_rope_head_dim
