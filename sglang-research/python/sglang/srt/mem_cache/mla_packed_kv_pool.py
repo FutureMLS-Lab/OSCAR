@@ -634,11 +634,6 @@ class _PackedLatentMixin(_Int2HPMixin):
         the row set is small (the reused prefix) and a dense staging buffer is
         cheaper than a second specialised kernel.
         """
-        from sglang.QuantKernel.mla_latent_int2 import (
-            assemble_rows,
-            gather_dequant_rows,
-        )
-
         return self._materialize_rows_li(
             self._local_layer_index(layer_id), slots, out
         )
@@ -654,6 +649,11 @@ class _PackedLatentMixin(_Int2HPMixin):
         that inferred which one it was given would silently read the wrong
         layer for exactly those. Splitting the entry points removes the guess.
         """
+        from sglang.QuantKernel.mla_latent_int2 import (
+            assemble_rows,
+            gather_dequant_rows,
+        )
+
         R = self.kv_lora_rank
         D = self.latent_row_dim()
         slots = slots.reshape(-1)

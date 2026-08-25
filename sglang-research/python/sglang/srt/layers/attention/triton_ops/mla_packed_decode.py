@@ -677,8 +677,17 @@ def _fwd_packed_mla_stage1_gf(
             qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            # An all-masked block makes every qk -inf, so n_e_max is -inf and
+            # qk - n_e_max is (-inf) - (-inf) = NaN -- acc is poisoned before e_sum
+            # is ever looked at, which is why guarding only the final divide did
+            # nothing. Exclusion creates exactly this: the sink-prefix block is
+            # entirely window tokens and it is the FIRST block of every request, so
+            # one NaN reaches every output. Subtracting 0 instead leaves exp(-inf)=0,
+            # so p and e_sum stay 0 and the block contributes nothing.
+            # e_max keeps the true -inf so a later non-empty block still rescales.
+            n_e_max_s = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+            re_scale = tl.exp(e_max - n_e_max_s)
+            p = tl.exp(qk - n_e_max_s[:, None])
 
             # AV: fold the group scale into p, dot against the raw codes, and add
             # the zero term as a per-(head, group) scalar.
@@ -885,8 +894,17 @@ def _fwd_hp_window_stage1(
         qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
+        # An all-masked block makes every qk -inf, so n_e_max is -inf and
+        # qk - n_e_max is (-inf) - (-inf) = NaN -- acc is poisoned before e_sum
+        # is ever looked at, which is why guarding only the final divide did
+        # nothing. Exclusion creates exactly this: the sink-prefix block is
+        # entirely window tokens and it is the FIRST block of every request, so
+        # one NaN reaches every output. Subtracting 0 instead leaves exp(-inf)=0,
+        # so p and e_sum stay 0 and the block contributes nothing.
+        # e_max keeps the true -inf so a later non-empty block still rescales.
+        n_e_max_s = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+        re_scale = tl.exp(e_max - n_e_max_s)
+        p = tl.exp(qk - n_e_max_s[:, None])
         acc = acc * re_scale[:, None] + tl.dot(p.to(cv.dtype), cv)
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
