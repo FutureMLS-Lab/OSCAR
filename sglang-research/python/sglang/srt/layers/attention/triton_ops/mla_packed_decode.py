@@ -1102,11 +1102,20 @@ def packed_mla_decode_gf_fwd(
         )
         d = (o.float() - _o_ref.float()).abs()
         rel = (d.max() / _o_ref.float().abs().max().clamp(min=1e-6)).item()
+        # Per-split lse for row 0. The window partial is written to slot
+        # num_kv_splits[b]; if that slot still carries the empty sentinel then
+        # the dense pass contributed NOTHING, and since the packed pass already
+        # excluded those tokens they are simply missing -- which at a short
+        # sequence, where the window is most of the sequence, is the whole
+        # answer. A slot holding a real lse says the opposite: the window ran
+        # and the fault is in how the two are combined.
+        _lse0 = attn_lse[0, 0, : max_kv_splits + 1].tolist()
         _lg.getLogger(__name__).info(
             "[GF-CHECK] layer=%s bs=%d maxdev=%.3e rel=%.3e "
-            "gf_nonfinite=%d ref_nonfinite=%d splits=%s",
+            "gf_nonfinite=%d ref_nonfinite=%d splits=%s lse[0,0,:]=%s",
             layer_id, q.shape[0], d.max().item(), rel,
             int((~torch.isfinite(o)).sum()),
             int((~torch.isfinite(_o_ref)).sum()),
             num_kv_splits[: min(4, num_kv_splits.numel())].tolist(),
+            [round(v, 2) if v > -1e29 else "SENT" for v in _lse0],
         )
