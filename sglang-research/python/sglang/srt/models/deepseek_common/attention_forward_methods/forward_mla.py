@@ -121,10 +121,27 @@ class DeepseekMLAForwardMixin:
         # missing gate. Computed here because only prepare has hidden_states,
         # and always assigned -- including None -- so a stale gate from an
         # earlier layer can never be applied to this one.
+        _has_gate = getattr(self, "g_proj", None) is not None
+        if not getattr(self, "_mla_gate_logged", False):
+            # Log once per layer that the gate is present and being applied.
+            # The gate fix was asserted to be live on the strength of the code
+            # reading correctly; nothing ever confirmed it from a running
+            # server. Five hypotheses about this path have now been wrong, and
+            # the two that were RIGHT -- the missing gate, and the kernel being
+            # innocent -- were both settled by an instrument rather than an
+            # argument.
+            import logging as _lg
+
+            self._mla_gate_logged = True
+            _lg.getLogger(__name__).info(
+                "[MLA-GATE] layer=%s g_proj=%s qk_head_dim=%s scaling=%.6f "
+                "kv_lora_rank=%s v_head_dim=%s",
+                getattr(self, "layer_id", "?"), _has_gate,
+                getattr(self, "qk_head_dim", None), getattr(self, "scaling", float("nan")),
+                getattr(self, "kv_lora_rank", None), getattr(self, "v_head_dim", None),
+            )
         self._mla_output_gate = (
-            self.g_proj(hidden_states)[0].sigmoid()
-            if getattr(self, "g_proj", None) is not None
-            else None
+            self.g_proj(hidden_states)[0].sigmoid() if _has_gate else None
         )
 
         q_lora = None
