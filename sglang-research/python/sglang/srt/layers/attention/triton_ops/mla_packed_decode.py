@@ -1037,10 +1037,15 @@ def packed_mla_decode_gf_fwd(
             envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get(),
             _check_is_capturing(), q.shape[0], max_kv_splits,
         )
+    # slot_off=1 whenever the window pass will write slot 0. The stock stage-2
+    # merge is wrong when two or more empty splits precede the first real one,
+    # and exclusion makes that the ordinary case at short sequences, so the
+    # window partial -- the one guaranteed real while the arena has content --
+    # takes slot 0 and these shift up.
     packed_mla_decode_stage1_gf(
         q, operands, attn_logits, attn_lse, kv_indptr, kv_indices,
         num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap,
-        skip_hp=has_hp,
+        skip_hp=has_hp, slot_off=1 if has_hp else 0,
     )
     if has_hp:
         if num_kv_splits_plus1 is None:
