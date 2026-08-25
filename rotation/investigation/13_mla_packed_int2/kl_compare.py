@@ -142,6 +142,11 @@ def cmp(a_path: str, b_path: str, label_a: str, label_b: str) -> int:
             d = abs(pa - pb)
             deltas.append(d)
             total += 1
+            # NOT a model-agreement signal: both arms score the SAME text, so
+            # these ids match by construction and the rate is always 100%. Kept
+            # only as an alignment assertion -- a mismatch would mean the two
+            # dumps are not scoring the same tokens and nothing below is
+            # comparable.
             if ta == tb:
                 agree += 1
             if len(worst) < 8 or d > worst[-1][0]:
@@ -183,7 +188,11 @@ def cmp(a_path: str, b_path: str, label_a: str, label_b: str) -> int:
         kls.sort()
         print(f"  mean symmetric KL    {sum(kls)/len(kls):.4e}")
         print(f"  p99  symmetric KL    {kls[min(len(kls)-1, int(0.99*len(kls)))]:.4e}")
-    print(f"  top-1 token agreement {100.0*agree/total:.2f}%  ({agree}/{total})")
+    if agree != total:
+        print(f"  !! token alignment {agree}/{total} -- the dumps are NOT scoring "
+              f"the same tokens; the numbers above are meaningless")
+    else:
+        print(f"  token alignment       {agree}/{total} (same text, as required)")
     # Calibration: bf16 nondeterminism alone lands well under 0.01 nats, and a
     # 2-bit KV cache against bf16 typically sits in the 0.02-0.2 range. A path
     # that is functionally different sits orders of magnitude above that.

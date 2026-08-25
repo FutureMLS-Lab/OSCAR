@@ -717,6 +717,18 @@ def _trace_attn_out(mod, tag: str, t) -> None:
 
     if os.environ.get("SGLANG_OSCAR_TRACE_ATTN_OUT", "0") in ("0", "", "false"):
         return
+    # Skip CUDA-graph capture. The tensors flowing through capture are dummy
+    # warmup values, so the first call -- which is what a once-per-layer trace
+    # records -- captured all zeros for the MHA arm and meaningless values for
+    # the absorbed one. Same mistake the c_kv dump made: a "first call" trace
+    # lands in capture, not in real decode.
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return
+    except Exception:  # noqa: BLE001
+        pass
     if getattr(mod, "_attn_out_traced", False):
         return
     mod._attn_out_traced = True
