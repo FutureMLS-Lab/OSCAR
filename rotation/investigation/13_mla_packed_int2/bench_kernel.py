@@ -489,22 +489,6 @@ def main() -> None:
             print(f"speedup over the current default: {cur[0][0]/ms:.2f}x")
 
 
-def _run_equivalence():
-    try:
-        two_pass_equivalence()
-    except Exception as e:  # noqa: BLE001
-        print(f"\ntwo-pass equivalence FAILED to run: {type(e).__name__}: "
-              f"{str(e).splitlines()[0][:160]}")
-
-
-if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("needs a GPU")
-        sys.exit(1)
-    main()
-    _run_equivalence()
-
-
 def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     """Does exclude-plus-dense-window equal the production override kernel?
 
@@ -576,3 +560,19 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
             / o_ref.float().abs().max().clamp(min=1e-6)).item()
     print(f"  arena sensitivity (zeroing it moves the reference) = {sens:.3e} "
           f"{'ok, the window is load-bearing' if sens > 1e-3 else 'WARNING: the window barely matters here, so MATCH proves little'}")
+
+
+def _run_equivalence():
+    try:
+        two_pass_equivalence()
+    except Exception as e:  # noqa: BLE001
+        print(f"\ntwo-pass equivalence FAILED to run: {type(e).__name__}: "
+              f"{str(e).splitlines()[0][:160]}")
+
+
+if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        print("needs a GPU")
+        sys.exit(1)
+    main()
+    _run_equivalence()
