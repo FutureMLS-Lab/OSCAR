@@ -999,6 +999,18 @@ def packed_mla_decode_gf_fwd(
     caller supplies the bumped tensor explicitly instead of this function
     allocating one per step.
     """
+    # NSA pools reach this function too. NSAPackedInt2KVPool shares the packed
+    # mixin, so it exposes packed_read_operands and the backend's duck-typed
+    # _is_packed_mla_pool accepts it -- but the group-factored path has never
+    # been run against an NSA cache, whose rows also carry an index head. It is
+    # better to refuse than to serve an untested layout: this path is opt-in, so
+    # anyone who reaches this error asked for it explicitly and gets told why.
+    if getattr(pool, "index_head_dim", None):
+        raise NotImplementedError(
+            "group-factored packed MLA decode has not been validated against an "
+            f"NSA cache (index_head_dim={pool.index_head_dim}). Leave "
+            "SGLANG_OSCAR_MLA_PACKED_GF off for NSA models."
+        )
     operands = pool.packed_read_operands(layer_id)
     has_hp = operands[3] is not None
 
