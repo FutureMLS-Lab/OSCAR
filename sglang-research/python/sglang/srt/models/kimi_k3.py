@@ -1037,6 +1037,26 @@ class KimiLinearModel(nn.Module):
 
 
 class KimiLinearForCausalLM(nn.Module):
+
+    # model_runner does getattr(self.model, "start_layer", 0) on the TOP-LEVEL
+    # module, but make_layers assigns start_layer/end_layer on the inner
+    # KimiLinearModel. Without these the getattr silently returns its defaults,
+    # 0 and num_hidden_layers, on EVERY pipeline rank -- so any code filtering
+    # by "does this rank own this layer" keeps everything.
+    #
+    # The packed MLA pool filters its full-attention layer list exactly that
+    # way, which is why both PP ranks reported all 24 of K3's full-attention
+    # layers and each allocated the half belonging to the other. It is silent:
+    # not a wrong answer, just half the KV capacity on a pool whose entire
+    # purpose is capacity.
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
     def __init__(
         self,
         config: KimiLinearConfig,
