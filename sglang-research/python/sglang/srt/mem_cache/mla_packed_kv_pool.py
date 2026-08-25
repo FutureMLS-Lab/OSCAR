@@ -194,6 +194,29 @@ class _PackedLatentMixin(_Int2HPMixin):
             hp_subspace_path="",
             rotation_layer_ids=rotation_layer_ids,
         )
+        # Global -> local layer index.
+        #
+        # On the hybrid path this pool holds ONLY the full-attention layers and
+        # is built with start_layer=0, so its arrays run 0..N-1. But the
+        # attention backend reaches it through
+        # ``forward_batch.token_to_kv_pool.packed_read_operands(layer.layer_id)``
+        # and ``layer.layer_id`` is global -- HybridLinearKVPool's
+        # _transfer_full_attention_id remap sits on get_key_buffer and friends,
+        # not on this entry point. ``layer_id - start_layer`` then indexes with
+        # a global id into a local array: for K3, full-attn layers 3,7,...,92
+        # against 24 entries, which is the IndexError.
+        #
+        # Keyed on rotation_layer_ids because that is exactly the signal that
+        # this pool was built local-indexed. A global id can collide with a
+        # valid local index (3, 7, 11 are all < 24 here), so guessing per-call
+        # would silently read the WRONG LAYER rather than raise -- the same
+        # failure class as loading a wrong-but-valid rotation. Membership is
+        # therefore required, not merely preferred.
+        self._global_to_local = (
+            {g: i for i, g in enumerate(rotation_layer_ids)}
+            if rotation_layer_ids
+            else None
+        )
         if not self.rotations:
             raise ValueError(
                 "Packed MLA latent storage needs a rotation path: without one "
@@ -471,6 +494,9 @@ class _PackedLatentMixin(_Int2HPMixin):
         """
         from sglang.QuantKernel.mla_latent_int2 import scatter_pack_rows
 
+        # LOCAL already: HybridLinearKVPool.set_kv_buffer remaps through
+        # _transfer_full_attention_id before delegating here, so this must NOT
+        # be mapped a second time.
         li = layer_id - self.start_layer
         R = self.kv_lora_rank
         c = self.rotate_latent(layer_id, c_kv.reshape(-1, R).to(torch.float32))
@@ -568,9 +594,26 @@ class _PackedLatentMixin(_Int2HPMixin):
         """
         return self.kv_lora_rank
 
+    def _local_layer_index(self, layer_id: int) -> int:
+        """Map an incoming layer id to this pool's own array index.
+
+        See the _global_to_local construction in __init__ for why membership is
+        required rather than best-effort.
+        """
+        g2l = getattr(self, "_global_to_local", None)
+        if g2l is None:
+            return layer_id - self.start_layer
+        if layer_id not in g2l:
+            raise ValueError(
+                f"layer_id={layer_id} is not one of this pool's full-attention "
+                f"layers {sorted(g2l)}. This pool is local-indexed; passing an "
+                f"id it does not own would read another layer's codes."
+            )
+        return g2l[layer_id]
+
     def packed_read_operands(self, layer_id: int):
         """Everything a packed attention kernel needs for one layer."""
-        li = layer_id - self.start_layer
+        li = self._local_layer_index(layer_id)
         return (
             self.c_codes[li],
             self.c_params[li],
@@ -596,7 +639,21 @@ class _PackedLatentMixin(_Int2HPMixin):
             gather_dequant_rows,
         )
 
-        li = layer_id - self.start_layer
+        return self._materialize_rows_li(
+            self._local_layer_index(layer_id), slots, out
+        )
+
+    def _materialize_rows_li(self, li: int, slots: torch.Tensor,
+                             out: Optional[torch.Tensor] = None):
+        """materialize_rows by LOCAL index.
+
+        The public entry point is reached from the attention backend with a
+        global ``layer.layer_id``, but the write-path self-check calls it from
+        inside a function that already holds a remapped local index. Ids 3, 7,
+        11, 15, 19 and 23 are valid under BOTH conventions here, so a helper
+        that inferred which one it was given would silently read the wrong
+        layer for exactly those. Splitting the entry points removes the guess.
+        """
         R = self.kv_lora_rank
         D = self.latent_row_dim()
         slots = slots.reshape(-1)
@@ -653,7 +710,9 @@ class _PackedLatentMixin(_Int2HPMixin):
         want = deq.to(self.dtype)
         if keep is not None:
             want = torch.where(keep.unsqueeze(-1), c_rot.to(self.dtype), want)
-        got = self.materialize_rows(layer_id, loc)[:, 0, : self.kv_lora_rank]
+        got = self._materialize_rows_li(
+            layer_id - self.start_layer, loc
+        )[:, 0, : self.kv_lora_rank]
         diff = (got.float() - want.float()).abs()
         rel = float(
             diff.max() / want.float().abs().max().clamp(min=1e-6)
