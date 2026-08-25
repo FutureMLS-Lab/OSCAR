@@ -541,6 +541,15 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     _decode_softmax_reducev_fwd(lg2, ls2, q, o_new, 1.0,
                                 _v_shape_proxy(o_new, R), indptr, ns + 1, ms + 1)
 
+    # Report NaN as its own verdict. A NaN makes max() NaN and every comparison
+    # False, so a bare threshold test silently reads as MISMATCH and hides
+    # which of the two failure modes happened -- wrong values, or no values.
+    n_ref = int((~_t.isfinite(o_ref)).sum())
+    n_new = int((~_t.isfinite(o_new)).sum())
+    if n_ref or n_new:
+        print(f"\ntwo-pass equivalence: NON-FINITE outputs "
+              f"(ref {n_ref}, new {n_new} of {o_ref.numel()}) -- "
+              f"this is an empty-split or masking fault, not a value mismatch")
     d = (o_ref.float() - o_new.float()).abs()
     rel = (d.max() / o_ref.float().abs().max().clamp(min=1e-6)).item()
     print(f"\ntwo-pass equivalence vs the production override kernel "

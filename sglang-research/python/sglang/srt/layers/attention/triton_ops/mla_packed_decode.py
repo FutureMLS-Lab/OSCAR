@@ -695,17 +695,32 @@ def _fwd_packed_mla_stage1_gf(
             + cur_head[:, None] * stride_mid_oh
             + split_kv_id * stride_mid_os
         )
-        tl.store(Att_Out + obase + (0 * GS + offs_g)[None, :], acc0 / e_sum[:, None], mask=mask_h[:, None])
-        tl.store(Att_Out + obase + (1 * GS + offs_g)[None, :], acc1 / e_sum[:, None], mask=mask_h[:, None])
-        tl.store(Att_Out + obase + (2 * GS + offs_g)[None, :], acc2 / e_sum[:, None], mask=mask_h[:, None])
-        tl.store(Att_Out + obase + (3 * GS + offs_g)[None, :], acc3 / e_sum[:, None], mask=mask_h[:, None])
+        # A split can now be non-empty in RANGE but empty in CONTENT: with
+        # SKIP_HP every token in it may belong to the window arena, which is
+        # normal for the split covering the sink prefix. e_sum is then 0 and
+        # acc / e_sum is 0/0 = NaN, and stage 2 propagates it -- the NaN is
+        # multiplied by exp(lse - max_lse) = exp(-inf) = 0, which is still NaN.
+        # Before exclusion this could not arise, because every in-range split
+        # had at least one live token, which is why the store was unguarded.
+        safe = tl.where(e_sum > 0, e_sum, 1.0)
+        tl.store(Att_Out + obase + (0 * GS + offs_g)[None, :], acc0 / safe[:, None], mask=mask_h[:, None])
+        tl.store(Att_Out + obase + (1 * GS + offs_g)[None, :], acc1 / safe[:, None], mask=mask_h[:, None])
+        tl.store(Att_Out + obase + (2 * GS + offs_g)[None, :], acc2 / safe[:, None], mask=mask_h[:, None])
+        tl.store(Att_Out + obase + (3 * GS + offs_g)[None, :], acc3 / safe[:, None], mask=mask_h[:, None])
 
         offs_mid_o_1 = (
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
         ) // D
-        tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
+        # -inf lse makes stage 2 ignore an empty split instead of poisoning the
+        # merge; storing e_max + log(0) would be -inf too, but only because
+        # e_max happens to be -inf as well, which is not a property to rely on.
+        tl.store(
+            Att_Lse + offs_mid_o_1,
+            tl.where(e_sum > 0, e_max + tl.log(safe), float("-inf")),
+            mask=mask_h,
+        )
 
 
 def packed_mla_decode_stage1_gf(
