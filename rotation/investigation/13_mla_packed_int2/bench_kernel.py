@@ -326,20 +326,42 @@ def main() -> None:
         # at BLOCK_H=16 that is 16*128*4 floats = 64 registers per thread of
         # accumulator alone. Halving BLOCK_H halves that AND doubles the grid,
         # which is the other thing that is short (128 programs on ~148 SMs).
+        # Every arm reports the resources of the kernel it ACTUALLY compiled.
+        # The first BLOCK_H sweep returned byte-identical times for 8 and 16
+        # because the launcher overwrote the argument with a hardcoded 16 on the
+        # first line of its body -- a knob that silently does not move produces a
+        # clean-looking table of a single configuration measured twice. regs and
+        # smem must differ when BLOCK_H differs, so printing them makes that
+        # failure loud instead of invisible.
+        seen_res = {}
         for bn, w, bh in itertools.product((32, 64), (4, 8), (8, 16)):
             try:
-                t_gf = timeit(lambda: packed_mla_decode_stage1_gf(
-                    q, ops_nohp, logits, lse, kv_indptr, kv_indices,
-                    num_splits, max_splits, sm, 0.0, block_n=bn,
-                    num_warps=w, num_stages=3, block_h=bh))
+                k_gf = [None]
+
+                def _run():
+                    k_gf[0] = packed_mla_decode_stage1_gf(
+                        q, ops_nohp, logits, lse, kv_indptr, kv_indices,
+                        num_splits, max_splits, sm, 0.0, block_n=bn,
+                        num_warps=w, num_stages=3, block_h=bh)
+
+                t_gf = timeit(_run)
+                kk = k_gf[0]
+                regs = getattr(kk, "n_regs", None)
+                shared = getattr(getattr(kk, "metadata", None), "shared", None)
+                seen_res.setdefault((bn, w), {})[bh] = (regs, shared)
                 # BLOCK_N is the whole point: if the computed tile was what
                 # capped it at 16, removing the tile should let it rise.
                 print(f"  factored BLOCK_N={bn:>3} warps={w:>2} BLOCK_H={bh:>2} {t_gf:.3f} ms "
                       f"({base/t_gf:.2f}x BF16) -> {t_base2/t_gf:.2f}x over "
-                      f"the computed tile")
+                      f"the computed tile  [regs={regs} smem={shared}]")
             except Exception as e:  # noqa: BLE001
                 print(f"  factored BLOCK_N={bn:>3} warps={w:>2} BLOCK_H={bh:>2} - "
                       f"{type(e).__name__}: {str(e).splitlines()[0][:60]}")
+        for (bn, w), byh in seen_res.items():
+            if len(byh) > 1 and len(set(byh.values())) == 1:
+                print(f"  !! BLOCK_H DID NOT REACH THE KERNEL at {bn}/{w}: "
+                      f"every BLOCK_H compiled to {next(iter(byh.values()))} "
+                      f"-- the sweep measured one config twice, ignore its times")
     except Exception as e:  # noqa: BLE001
         print(f"\ngroup-factored failed: {type(e).__name__}: "
               f"{str(e).splitlines()[0][:200]}")
