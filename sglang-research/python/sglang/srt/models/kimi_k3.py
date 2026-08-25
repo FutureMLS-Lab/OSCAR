@@ -166,12 +166,25 @@ class OscarQKVCapture:
 
 
 class KimiMLAAttention(DeepseekV2AttentionMLA):
-    """Kimi MLA weights executed through expanded MHA cache storage."""
+    """Kimi MLA weights, cached as expanded MHA or as the shared latent.
+
+    Which one is chosen by ``SGLANG_OSCAR_K3_MLA_LATENT``, the same flag that
+    sets ``attention_arch`` in model_config: the cache layout and the forward
+    path have to move together.
+    """
 
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", "")
         super().__init__(*args, **kwargs)
-        self.use_expanded_mha_cache = True
+        # Must agree with the ``attention_arch`` this model was configured with.
+        # dispatch_attn_forward_method short-circuits to AttnForwardMethod.MHA
+        # whenever this is set, so hardcoding it pinned K3 to the expanded path
+        # even when the config declared MLA and the pool was latent-shaped -- the
+        # forward then wrote per-head [8, 12, 192] into a [8, 1, 576] latent pool
+        # and CUDA-graph capture died on the broadcast. One flag drives both.
+        from sglang.srt.environ import envs as _envs
+
+        self.use_expanded_mha_cache = not _envs.SGLANG_OSCAR_K3_MLA_LATENT.get()
         self.g_proj = ColumnParallelLinear(
             self.hidden_size,
             self.num_heads * self.v_head_dim,
