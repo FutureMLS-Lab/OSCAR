@@ -579,10 +579,24 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
                                 _v_shape_proxy(o_ref, R), indptr, ns, ms)
 
     # One spare split for the window partial.
-    lg2 = _t.zeros((bs, heads, ms + 1, R), dtype=_t.float32, device=q.device)
+    # Pad the split axis well past what is used, all sentinel.
+    #
+    # The failure needs TWO conditions together: at least two sentinel splits
+    # AND no packed split with real content. seq=256 has a real split 0 and
+    # matches with two packed splits; seq=100 with one sentinel matches; seq=100
+    # with two or eight sentinels fails. And the wrong answer is numerically
+    # what you get if the window slot were never read at all.
+    #
+    # ms+1 is 2 for splits=1 and 3 for splits=2 -- and 3 is not a power of two.
+    # If stage 2 tiles the split axis, a padded tile could read past the
+    # allocation. Padding to ms+8 costs nothing and distinguishes "out of
+    # bounds on the split axis" from "the merge arithmetic is wrong": if
+    # splits=2 starts matching, the slot count was the problem.
+    _pad = 8
+    lg2 = _t.zeros((bs, heads, ms + _pad, R), dtype=_t.float32, device=q.device)
     # -1e30, not 0: an unwritten split with lse=0 is not ignored by stage 2's
     # merge, it is weighted exp(0 - max) and drags the result toward zero.
-    ls2 = _t.full((bs, heads, ms + 1), -1.0e4, dtype=_t.float32, device=q.device)
+    ls2 = _t.full((bs, heads, ms + _pad), -1.0e4, dtype=_t.float32, device=q.device)
     o_new = _t.zeros_like(o_ref)
     packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
                                 skip_hp=True)
