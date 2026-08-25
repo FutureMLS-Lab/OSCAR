@@ -572,11 +572,23 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
 
 
 def _run_equivalence():
-    try:
-        two_pass_equivalence()
-    except Exception as e:  # noqa: BLE001
-        print(f"\ntwo-pass equivalence FAILED to run: {type(e).__name__}: "
-              f"{str(e).splitlines()[0][:160]}")
+    # Several regimes, because one regime is how the split-borrowing bug got
+    # through. The gate ran at seq=4096 with 8 splits, where num_kv_splits is
+    # never 1, so it never exercised the case where the window slot collides
+    # with the last packed slot -- and a live server on 55-token prompts hit it
+    # immediately. Short sequences are also where the window covers MOST of the
+    # KV, so a dropped window is maximally visible there and nearly invisible
+    # at 20000 tokens.
+    for kw in (
+        dict(bs=8, heads=16, seq=4096, windows=576, splits=8),
+        dict(bs=8, heads=16, seq=256, windows=576, splits=1),
+        dict(bs=4, heads=16, seq=600, windows=576, splits=2),
+    ):
+        try:
+            two_pass_equivalence(**kw)
+        except Exception as e:  # noqa: BLE001
+            print(f"\ntwo-pass equivalence {kw} FAILED to run: "
+                  f"{type(e).__name__}: {str(e).splitlines()[0][:160]}")
 
 
 if __name__ == "__main__":

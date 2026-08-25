@@ -2478,6 +2478,18 @@ class TritonAttnBackend(AttentionBackend):
                 ns_quant = getattr(self.forward_metadata, "num_kv_splits_gf", None)
                 if ns_quant is None:
                     ns_quant = torch.clamp(ns - 1, min=1)
+                # Stage 2 must read ns_quant + 1, NOT the original ns.
+                #
+                # They agree whenever ns >= 2, but at ns == 1 the clamp keeps
+                # ns_quant at 1, so the packed pass writes split 0 and the
+                # window writes slot 1 -- while ns says to read one split. The
+                # window partial is then dropped, and the packed pass has
+                # already excluded those tokens, so they are lost outright. On a
+                # short sequence the window IS most of the sequence, which is
+                # why the live probe returned '!!!!!!' on 55-token prompts while
+                # the microbenchmark, run at 20000 tokens where ns is never 1,
+                # passed its equivalence gate.
+                ns_merge = ns_quant + 1
                 packed_mla_decode_gf_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     pool,
@@ -2491,7 +2503,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.max_kv_splits - 1,
                     layer.scaling * k_descale,
                     logit_cap=logits_soft_cap,
-                    num_kv_splits_plus1=ns,
+                    num_kv_splits_plus1=ns_merge,
                 )
                 return o
             packed_mla_decode_fwd(
