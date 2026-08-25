@@ -598,8 +598,9 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # merge, it is weighted exp(0 - max) and drags the result toward zero.
     ls2 = _t.full((bs, heads, ms + _pad), -1.0e4, dtype=_t.float32, device=q.device)
     o_new = _t.zeros_like(o_ref)
+    # slot_off=1: the window pass owns slot 0, the packed splits follow.
     packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
-                                skip_hp=True)
+                                skip_hp=True, slot_off=1)
     bh = _safe_block_h(16, heads)
     _fwd_hp_window_stage1[(bs, _tr.cdiv(heads, min(bh, heads)))](
         q, ops[2], ops[3], ops[4], ops[5],

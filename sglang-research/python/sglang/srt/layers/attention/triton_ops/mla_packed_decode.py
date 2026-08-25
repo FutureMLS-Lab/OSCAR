@@ -329,7 +329,7 @@ def _fwd_packed_mla_stage1(
         offs_mid_o_1 = (
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            + (split_kv_id + SLOT_OFF) * stride_mid_os
         ) // D
         tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
 
@@ -500,6 +500,7 @@ def _fwd_packed_mla_stage1_gf(
     LLOYD: tl.constexpr,
     WIDE_LOAD: tl.constexpr,
     SKIP_HP: tl.constexpr,
+    SLOT_OFF: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
     """Group-factored packed MLA stage-1, specialised to NG == 4.
@@ -706,10 +707,17 @@ def _fwd_packed_mla_stage1_gf(
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
+        # SLOT_OFF shifts these partials up by one so the dense window pass can
+        # own slot 0. The stock stage-2 merge is measurably wrong when two or
+        # more empty splits precede the first real one -- torch merging the
+        # identical buffers returns rel 3.7e-03 where the kernel returns 1.0 --
+        # and exclusion makes that pattern the normal case at short sequences.
+        # Keeping a real partial in slot 0 avoids generating it at all, which is
+        # preferable to editing a kernel every model on this backend shares.
         obase = (
             cur_batch * stride_mid_ob
             + cur_head[:, None] * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            + (split_kv_id + SLOT_OFF) * stride_mid_os
         )
         # A split can now be non-empty in RANGE but empty in CONTENT: with
         # SKIP_HP every token in it may belong to the window arena, which is
@@ -758,6 +766,7 @@ def packed_mla_decode_stage1_gf(
     max_kv_splits, sm_scale_withk, logit_cap,
     block_n: int = 0, num_warps: int = 0, num_stages: int = 0,
     block_h: int = 0, wide_load: bool = True, skip_hp: bool = False,
+    slot_off: int = 0,
 ):
     """Launch the group-factored stage-1. Benchmark-only: no window arena.
 
@@ -805,6 +814,7 @@ def packed_mla_decode_stage1_gf(
         D=d, DPE=d_pe, GS=group_size,
         BLOCK_N=block_n, BLOCK_H=block_h, MIN_BLOCK_KV=_MIN_BLOCK_KV,
         LLOYD=bool(lloyd), WIDE_LOAD=bool(wide_load), SKIP_HP=bool(skip_hp),
+        SLOT_OFF=int(slot_off),
         logit_cap=logit_cap,
         num_warps=num_warps, num_stages=num_stages,
     )
@@ -933,10 +943,12 @@ def _fwd_hp_window_stage1(
     # Slot kv_splits, one past the packed kernel's last. An all-masked window
     # leaves e_sum at 0 and e_max at -inf; storing lse = -inf makes stage 2's
     # merge ignore this split rather than poison it with a NaN.
+    # Slot 0, not kv_splits: see SLOT_OFF above. The window partial is the one
+    # partial guaranteed to hold real values whenever the arena has content, so
+    # it goes first and the packed splits follow.
     obase = (
         cur_batch * stride_mid_ob
         + cur_head[:, None] * stride_mid_oh
-        + kv_splits * stride_mid_os
     )
     tl.store(
         Att_Out + obase + offs_d[None, :],
@@ -949,7 +961,6 @@ def _fwd_hp_window_stage1(
     offs_mid_o_1 = (
         cur_batch * stride_mid_ob
         + cur_head * stride_mid_oh
-        + kv_splits * stride_mid_os
     ) // D
     # Finite sentinel, same reason as the packed kernel: -inf in the first
     # split stage 2 examines makes its seed max -inf too, and exp(-inf - -inf)
