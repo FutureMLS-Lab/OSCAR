@@ -282,6 +282,16 @@ class Envs:
     # decision: turn it on for long-context serving. Moving the crossover left
     # means fusing the window pass into the packed pass to remove the launch,
     # not adding a length threshold here.
+    # Launch configuration for the group-factored path's BF16 window pass.
+    # It was hardcoded at BLOCK_H=16 / BLOCK_N=32 / 4 warps / 2 stages, and at
+    # head_num=16 with batch=1 that BLOCK_H makes the grid (1, 1): a single CTA
+    # walking all 576 window tokens on a 148-SM part. The window is a FIXED
+    # cost per decode step, so it is most of why the path loses at short context
+    # and wins at long -- the packed body shrinks, this does not.
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(16)
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
+    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(4)
+    SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
     # Runs the production kernel alongside the group-factored one on the same
     # call and logs the deviation. Expensive; a debugging instrument, not a

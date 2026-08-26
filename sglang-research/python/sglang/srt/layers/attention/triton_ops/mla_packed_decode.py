@@ -1090,7 +1090,16 @@ def packed_mla_decode_gf_fwd(
         from sglang.srt.environ import envs as _envs
 
         batch, head_num = q.shape[0], q.shape[1]
-        block_h = _safe_block_h(16, head_num)
+        # The window pass was launched with a fixed BLOCK_H of 16, which at
+        # head_num=16 and batch=1 is a grid of (1, 1): ONE CTA walking all 576
+        # window tokens serially on a 148-SM part. That fixed cost is most of
+        # why the group-factored path loses 13% at ctx=1000 and wins 36% at
+        # 32000 -- the packed body shrinks but this does not. Splitting the
+        # head axis finer costs nothing at large batch (the grid is already
+        # wide) and buys parallelism exactly where the path is weak.
+        block_h = _safe_block_h(
+            _envs.SGLANG_OSCAR_MLA_WINDOW_BLOCK_H.get(), head_num
+        )
         _fwd_hp_window_stage1[
             (batch, triton.cdiv(head_num, min(block_h, head_num)))
         ](
@@ -1105,11 +1114,11 @@ def packed_mla_decode_gf_fwd(
             DPE=pool.qk_rope_head_dim,
             P_TOK=_envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get(),
             R_TOK=_envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
-            BLOCK_N=32,
+            BLOCK_N=_envs.SGLANG_OSCAR_MLA_WINDOW_BLOCK_N.get(),
             BLOCK_H=block_h,
             logit_cap=logit_cap,
-            num_warps=4,
-            num_stages=2,
+            num_warps=_envs.SGLANG_OSCAR_MLA_WINDOW_WARPS.get(),
+            num_stages=_envs.SGLANG_OSCAR_MLA_WINDOW_STAGES.get(),
         )
     _decode_softmax_reducev_fwd(
         attn_logits, attn_lse, q, o, 1.0,
