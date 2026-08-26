@@ -289,7 +289,11 @@ class Envs:
     # cost per decode step, so it is most of why the path loses at short context
     # and wins at long -- the packed body shrinks, this does not.
     #
-    # Swept at ctx 1000 and 4000, reporting group-factored / production decode:
+    # Tuned against production decode throughput at ctx 1000 / 4000, group-
+    # factored over production. Original constants were BLOCK_H 16, BLOCK_N 32,
+    # 4 warps, 2 stages = 0.846 / 1.052.
+    #
+    # Stage 1, BLOCK_H x warps (BLOCK_N 32, stages 2):
     #
     #     BLOCK_H   warps=4        warps=8
     #        16     0.846 / 1.052  0.859 / 1.078
@@ -297,21 +301,36 @@ class Envs:
     #         4     0.864 / 1.087  0.889 / 1.102
     #         2     0.872 / 1.093  0.893 / 1.110
     #
-    # WARPS is the lever, not BLOCK_H: every warps=8 row beats its warps=4
-    # counterpart by about 0.02, while BLOCK_H 16 -> 2 is worth about 0.03. The
-    # "one CTA at batch 1" reading was only part of it.
+    # Stage 2, BLOCK_N x stages (BLOCK_H 8, 8 warps) -- the bigger lever, and
+    # the one the first sweep missed by only varying BLOCK_H and warps:
     #
-    # BLOCK_H=8 rather than the measured-best 2: the sweep runs one request at a
-    # time, and a smaller BLOCK_H means more CTAs each re-loading the same window
-    # rows. At batch 1 that redundancy is free because the grid is otherwise
-    # empty; at batch 32 the grid is already wide and it is pure duplicate
-    # traffic. 8 is within noise of 2 here and far less extreme there.
+    #     BLOCK_N   stages=1  stages=2  stages=3  stages=4
+    #        16      0.759     0.825     0.860      --
+    #        32      0.794     0.890     0.916      --
+    #        64      0.841     0.934     0.935     0.918
+    #       128       --       0.909     0.777     0.782
+    #       256      out of shared memory: needs 898048 B, limit 232448
     #
-    # Net: 0.846 -> 0.891 at ctx 1000 and 1.052 -> 1.104 at 4000. Real, but it
-    # does NOT flip the short-context verdict -- the path is still 11% behind at
-    # 1000, so it remains a knob rather than a default.
+    # BLOCK_N 64 is a genuine peak: 128 regresses (0.934 -> 0.909, and 0.777 at
+    # stages 3, consistent with spilling) and 256 will not compile. Stages peak
+    # at 2-3; 4 is worse.
+    #
+    # Net 0.846 -> 0.934 at ctx 1000 and 1.052 -> 1.150 at 4000, about +10%.
+    # Run-to-run variation on this bench is ~1.7% (the 64/3 cell measured 0.952
+    # once and 0.935 on repeat), so treat single-cell differences under 2% as
+    # noise; the monotone trends across a row or column are the signal.
+    #
+    # BLOCK_H 8 rather than the marginally better 2: the bench sends ONE request
+    # at a time, and a smaller BLOCK_H means more CTAs each re-loading the same
+    # window rows. At batch 1 that redundancy is free because the grid is
+    # otherwise empty; at batch 32 the grid is already wide and it is duplicate
+    # traffic. Everything here is a batch-1 measurement.
+    #
+    # This does NOT make the path a default. It is still 6.6% behind production
+    # at ctx 1000. Closing that needs the window pass folded into the packed
+    # pass so its fixed cost disappears, which is a kernel rewrite, not a knob.
     SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(8)
-    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(64)
     SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(8)
     SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
