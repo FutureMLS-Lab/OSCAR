@@ -331,8 +331,13 @@ class _PackedLatentMixin(_Int2HPMixin):
         self._audit_every_n = 0
         self._audit_worst = 1.0
 
+        # bits, or this reports the 2-bit row for every width: at four bits it
+        # printed "288 B/token/layer ... 4.00x" while the pool had actually
+        # allocated 416 B and held 367568 tokens instead of 530936. The
+        # allocation was right and only the log lied, which is the more
+        # dangerous direction -- it reads as "the knob did nothing".
         bytes_tok = packed_latent_bytes_per_token(
-            R, self.qk_rope_head_dim, group_size
+            R, self.qk_rope_head_dim, group_size, bits=self._bits
         )
         logger.info(
             "[MLAPacked] packed latent storage: %d B/token/layer (BF16 would be "
