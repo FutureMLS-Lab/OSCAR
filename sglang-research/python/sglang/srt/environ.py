@@ -288,9 +288,31 @@ class Envs:
     # walking all 576 window tokens on a 148-SM part. The window is a FIXED
     # cost per decode step, so it is most of why the path loses at short context
     # and wins at long -- the packed body shrinks, this does not.
-    SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(16)
+    #
+    # Swept at ctx 1000 and 4000, reporting group-factored / production decode:
+    #
+    #     BLOCK_H   warps=4        warps=8
+    #        16     0.846 / 1.052  0.859 / 1.078
+    #         8     0.874 / 1.084  0.891 / 1.104
+    #         4     0.864 / 1.087  0.889 / 1.102
+    #         2     0.872 / 1.093  0.893 / 1.110
+    #
+    # WARPS is the lever, not BLOCK_H: every warps=8 row beats its warps=4
+    # counterpart by about 0.02, while BLOCK_H 16 -> 2 is worth about 0.03. The
+    # "one CTA at batch 1" reading was only part of it.
+    #
+    # BLOCK_H=8 rather than the measured-best 2: the sweep runs one request at a
+    # time, and a smaller BLOCK_H means more CTAs each re-loading the same window
+    # rows. At batch 1 that redundancy is free because the grid is otherwise
+    # empty; at batch 32 the grid is already wide and it is pure duplicate
+    # traffic. 8 is within noise of 2 here and far less extreme there.
+    #
+    # Net: 0.846 -> 0.891 at ctx 1000 and 1.052 -> 1.104 at 4000. Real, but it
+    # does NOT flip the short-context verdict -- the path is still 11% behind at
+    # 1000, so it remains a knob rather than a default.
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(8)
     SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
-    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(4)
+    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(8)
     SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
     # Runs the production kernel alongside the group-factored one on the same
