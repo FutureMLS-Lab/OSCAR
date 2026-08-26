@@ -1120,13 +1120,22 @@ def packed_mla_decode_gf_fwd(
             num_warps=_envs.SGLANG_OSCAR_MLA_WINDOW_WARPS.get(),
             num_stages=_envs.SGLANG_OSCAR_MLA_WINDOW_STAGES.get(),
         )
-    _decode_softmax_reducev_fwd(
-        attn_logits, attn_lse, q, o, 1.0,
-        _v_shape_proxy(o, pool.kv_lora_rank),
-        kv_indptr,
-        num_kv_splits_plus1 if has_hp else num_kv_splits,
-        max_kv_splits + 1 if has_hp else max_kv_splits,
-    )
+    if has_hp:
+        # Merge by the sentinel, not by sequence arithmetic. The shared stage 2
+        # derives which slot to read from kv_len_per_split, which assumes slot i
+        # holds split i of one uniform division -- an assumption slot_off=1
+        # breaks, and which handing it a different split count breaks again.
+        # That is the whole of the seq > window mismatch.
+        gf_softmax_reducev_fwd(attn_logits, attn_lse, q, o,
+                               num_slots=max_kv_splits + 1)
+    else:
+        _decode_softmax_reducev_fwd(
+            attn_logits, attn_lse, q, o, 1.0,
+            _v_shape_proxy(o, pool.kv_lora_rank),
+            kv_indptr,
+            num_kv_splits,
+            max_kv_splits,
+        )
 
     if envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get() and not _check_is_capturing():
         # Skipped during CUDA-graph capture: .item() and logging are host syncs
@@ -1192,3 +1201,96 @@ def packed_mla_decode_gf_fwd(
             num_kv_splits[: min(4, num_kv_splits.numel())].tolist(),
             [round(v, 2) if v > -1e29 else "SENT" for v in _lse0],
         )
+
+
+# ── stage 2 for the group-factored layout ────────────────────────────────────
+# The shared ``_fwd_kernel_stage2`` decides which slots to read from SEQUENCE
+# ARITHMETIC, not from the data:
+#
+#     kv_len_per_split = cdiv(cdiv(seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+#     for split_kv_id in range(0, MAX_KV_SPLITS):
+#         if split_kv_start < split_kv_end:      # range test, not a data test
+#             ... read slot split_kv_id ...
+#
+# That is correct only when slot i holds split i of a single uniform division of
+# the sequence. The group-factored path breaks both halves of that assumption:
+# ``slot_off=1`` puts the window partial in slot 0 and shifts the packed splits
+# up, and the merge is handed a different split COUNT than the packed pass used,
+# so ``kv_len_per_split`` differs and the range test lands on the wrong slots.
+#
+# It happened to work whenever the window covered the whole sequence: every
+# packed split came back empty, the only real data was in slot 0, and slot 0 is
+# what the range test reads first. That is why seq=100, 140 and 256 passed --
+# including at bs=8, which is why "bs >= 4" looked like the variable -- while
+# seq=600 and seq=4096 failed. Sequences longer than the window are the ONLY
+# case that mixes real and sentinel splits, and that is the normal serving case.
+#
+# This variant merges by the SENTINEL instead: a slot contributes when its lse
+# is above the sentinel floor, whatever its index means. Layout-independent, so
+# slot_off needs no cooperation from the merge.
+@triton.jit
+def _fwd_kernel_stage2_gf(
+    Mid_O, Mid_O_1, O,
+    stride_mid_ob, stride_mid_oh, stride_mid_os,
+    stride_obs, stride_oh,
+    NUM_SLOTS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+    SENTINEL: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
+
+    for slot in range(0, NUM_SLOTS):
+        tlogic = tl.load(Mid_O_1 + offs_logic + slot * stride_mid_os // Lv)
+        # The data decides, not the index. An untouched or empty slot carries
+        # the sentinel and is skipped no matter where it sits.
+        if tlogic > SENTINEL:
+            tv = tl.load(Mid_O + offs_v + slot * stride_mid_os, mask=mask_d,
+                         other=0.0)
+            n_e_max = tl.maximum(tlogic, e_max)
+            old_scale = tl.exp(e_max - n_e_max)
+            acc *= old_scale
+            exp_logic = tl.exp(tlogic - n_e_max)
+            acc += exp_logic * tv
+            e_sum = e_sum * old_scale + exp_logic
+            e_max = n_e_max
+
+    # A request with no contributing slot at all would divide by zero; emit
+    # zeros rather than NaN, which propagates and hides which request failed.
+    safe = tl.where(e_sum > 0, e_sum, 1.0)
+    tl.store(
+        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        tl.where(e_sum > 0, acc / safe, 0.0),
+        mask=mask_d,
+    )
+
+
+def gf_softmax_reducev_fwd(logits, lse, q, o, num_slots, sentinel=-1.0e30):
+    """Merge every slot that carries real data, regardless of what index it is.
+
+    ``sentinel`` is the floor written by an empty split. Stage 1 stores -1.0e4
+    for an empty split, so anything below the floor here is treated as absent;
+    a real lse never approaches it.
+    """
+    batch, head_num = q.shape[0], q.shape[1]
+    Lv = logits.shape[-1]
+    _fwd_kernel_stage2_gf[(batch, head_num)](
+        logits, lse, o,
+        logits.stride(0), logits.stride(1), logits.stride(2),
+        o.stride(0), o.stride(1),
+        NUM_SLOTS=num_slots,
+        BLOCK_DV=triton.next_power_of_2(Lv),
+        Lv=Lv,
+        SENTINEL=sentinel,
+    )

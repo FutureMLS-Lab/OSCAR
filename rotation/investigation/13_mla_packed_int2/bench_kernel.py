@@ -705,8 +705,14 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     except Exception as e:  # noqa: BLE001
         print(f"  [merge] failed: {type(e).__name__}: {_err(e)}")
 
-    _decode_softmax_reducev_fwd(lg2, ls2, q, o_new, 1.0,
-                                _v_shape_proxy(o_new, R), indptr, ns + 1, ms + 1)
+    # The same merge the GF launcher uses. Merging these buffers with the shared
+    # stage 2 was the bug the gate was reporting: it picks slots by sequence
+    # arithmetic, and slot_off=1 means slot i is not split i.
+    from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+        gf_softmax_reducev_fwd,
+    )
+
+    gf_softmax_reducev_fwd(lg2, ls2, q, o_new, num_slots=ms + 1)
 
     # Report NaN as its own verdict. A NaN makes max() NaN and every comparison
     # False, so a bare threshold test silently reads as MISMATCH and hides
@@ -800,6 +806,18 @@ def _run_equivalence():
         # means it tracks the sequence length itself.
         dict(bs=1, heads=16, seq=100, windows=576, splits=1),
         dict(bs=1, heads=16, seq=100, windows=576, splits=2),
+        # The failing shapes are seq=600 and seq=4096, both LONGER than the
+        # 576-token window; every passing shape is shorter. I read that as
+        # "bs >= 4" because the two failures happened to have bs 4 and 8 -- but
+        # bs=8 seq=256 passes, so batch is not the variable.
+        #
+        # seq <= windows means the window covers the whole sequence and EVERY
+        # packed split comes back empty. seq > windows is the only case that
+        # mixes real splits with sentinel ones, which is exactly what stage 2
+        # has to merge. These two isolate it: small batch past the window, and
+        # large batch exactly at it.
+        dict(bs=1, heads=16, seq=600, windows=576, splits=8),
+        dict(bs=8, heads=16, seq=576, windows=576, splits=8),
     ):
         try:
             two_pass_equivalence(**kw)
