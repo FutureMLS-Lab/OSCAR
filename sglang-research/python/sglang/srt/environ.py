@@ -237,10 +237,32 @@ class Envs:
     # being unquantized. Requires a rotation path (there is nothing to pack
     # without one).
     SGLANG_OSCAR_MLA_KV_PACKED = EnvBool(False)
-    # Group-factored packed MLA decode: 4.75x on the microbenchmark, validated
-    # equal to the override kernel after stage 2. Default OFF because it
-    # changes the serving read path for every packed MLA model, and the accuracy
-    # runs it would perturb are the deliverable it is meant to accelerate.
+    # Group-factored packed MLA decode. Correctness is settled: exact on all
+    # seven shapes of the kernel gate, and on a live DeepSeek-V2-Lite server it
+    # agrees with the production kernel to reduction-order noise -- 25 of 30
+    # greedy generations byte-identical over 128 tokens, mean |dlogprob| 0.0040
+    # across 3325 common-prefix positions.
+    #
+    # Default OFF because it is a WIN ONLY AT LONG CONTEXT. Measured decode
+    # throughput, group-factored / production:
+    #
+    #     ctx   1000   0.869x   <- 13% SLOWER
+    #     ctx   4000   1.068x
+    #     ctx  16000   1.249x
+    #     ctx  32000   1.357x
+    #
+    # The crossover sits between 1k and 4k, and the reason is structural rather
+    # than tunable: the path runs a second pass over the BF16 window arena, and
+    # that arena is a fixed 576 tokens (prefix 64 + recent 512). At ctx=1000 the
+    # packed body is ~424 tokens -- smaller than the window it pays an extra
+    # kernel launch to cover.
+    #
+    # This cannot be made adaptive per request. Under CUDA graphs the kernel
+    # choice is fixed at capture time, replay executes no Python, and sequence
+    # length only arrives at replay through metadata. So it is a deployment
+    # decision: turn it on for long-context serving. Moving the crossover left
+    # means fusing the window pass into the packed pass to remove the launch,
+    # not adding a length threshold here.
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
     # Runs the production kernel alongside the group-factored one on the same
     # call and logs the deviation. Expensive; a debugging instrument, not a
