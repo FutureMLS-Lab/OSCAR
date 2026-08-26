@@ -454,6 +454,33 @@ class _PackedLatentMixin(_Int2HPMixin):
         shp = x.shape
         return torch.matmul(x.reshape(-1, shp[-1]), R.to(x.dtype)).view(shp)
 
+    def _assert_same_frame(self, R, layer_id: int) -> None:
+        """The read frame must be the matrix the write actually used.
+
+        This bug class is SILENT: a mismatched frame raises nothing, it just
+        returns wrong numbers that look like a quantizer set too coarse. It cost
+        two full debugging cycles down the bit-width path before the tell showed
+        up -- extra bits did not help at all.
+
+        Identity comparison on the tensor object, once per layer, so it costs
+        nothing after the first forward and cannot itself desync. Under CUDA
+        graph replay no Python runs, but capture and the first eager forward
+        both execute this, which is enough to catch a wiring error.
+        """
+        seen = getattr(self, "_rot_write_frame", None)
+        if seen is None:
+            return
+        want = seen.get(self._local_layer_index(layer_id)
+                        if getattr(self, "_global_to_local", None) else layer_id)
+        if want is not None and R is not None and id(R) != want:
+            raise RuntimeError(
+                f"packed MLA latent read frame != write frame for layer "
+                f"{layer_id}. The cache was written under one rotation and is "
+                f"being read under another, which produces wrong output "
+                f"silently. Check which id space the caller holds: "
+                f"rotations is keyed by start_layer + position."
+            )
+
     def unrotate_output(self, layer_id: int, x: torch.Tensor,
                         local: bool = False) -> torch.Tensor:
         """``x @ R^T`` -- the attention output, before ``w_vc``.
@@ -462,6 +489,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         GLOBAL, so the default maps.
         """
         R = self.latent_rotation(layer_id, local=local)
+        self._assert_same_frame(R, layer_id)
         if R is None:
             return x
         shp = x.shape
@@ -559,6 +587,16 @@ class _PackedLatentMixin(_Int2HPMixin):
         # layer_id here is this pool's own index, the space rotations is keyed in.
         c = self.rotate_latent(layer_id, c_kv.reshape(-1, R).to(torch.float32),
                                local=True)
+        # Record which matrix this layer was WRITTEN with, so the read side can
+        # assert it is using the same one. Keyed by the pool index, which is the
+        # space rotations itself is keyed in.
+        _wf = getattr(self, "_rot_write_frame", None)
+        if _wf is None:
+            _wf = self._rot_write_frame = {}
+        if layer_id not in _wf:
+            _R = self.latent_rotation(layer_id, local=True)
+            if _R is not None:
+                _wf[layer_id] = id(_R)
         pe = k_pe.reshape(-1, self.qk_rope_head_dim)
         loc64 = loc.reshape(-1).to(torch.int64)
 
