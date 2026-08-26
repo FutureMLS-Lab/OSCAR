@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-spd
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - gpu-dp-qcqgp-5wsdx
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2Nhci1tbGFoeWI7IFc9L3dvcmsvb3NjYXI7IFBJTj1lNGFjNzRkN2QKbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9Ci4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIEhGX0hVQl9PRkZMSU5FPTEgUFlUSE9OUEFUSD0kVy9zZ2xhbmctcmVzZWFyY2gvcHl0aG9uCmVjaG8gIltqb2JdIEhFQUQ9JChnaXQgLUMgJFcgbG9nIC0tb25lbGluZSAtMSkiCkQ9JFcvcm90YXRpb24vaW52ZXN0aWdhdGlvbi8xM19tbGFfcGFja2VkX2ludDIKZ3JlcCAtcSAiTUVSR0UgaW50byB0aGUgc2xvdCBpbnN0ZWFkIG9mIG92ZXJ3cml0aW5nIiAkVy9zZ2xhbmctcmVzZWFyY2gvcHl0aG9uL3NnbGFuZy9zcnQvbGF5ZXJzL2F0dGVudGlvbi90cml0b25fb3BzL21sYV9wYWNrZWRfZGVjb2RlLnB5ICAgfHwgeyBlY2hvICJGQVRBTDogcGlubmVkIHRyZWUgcHJlZGF0ZXMgdGhlIGZvbGQgZml4OyB0aGUgc3BlZWQgbnVtYmVycyB3b3VsZCBkZXNjcmliZSBhIHdyb25nIGtlcm5lbCI7IGV4aXQgMTsgfQpleHBvcnQgT1VUX0RJUj0kUi9tbGFwYWNrZWRfc3BkOyBta2RpciAtcCAkT1VUX0RJUgp7CiAgZWNobyAiIyMjIHNoaXBwZWQgd2luZG93IGNvbmZpZyIKICBDVFhfTEVOPTQwMDAwIE1FTV9GUkFDPTAuODAgR0VOX1RPS0VOUz0xMjggQ1RYUz0xMDAwLDQwMDAsMTYwMDAsMzIwMDAgUkVQUz0zICAgICBweXRob24zIC11ICREL2dmX3NwZWVkLnB5IDI+JjEKICBlY2hvICIjIyMgdHVuZWQgd2luZG93IGNvbmZpZyBCTE9DS19IPTggQkxPQ0tfTj02NCB3YXJwcz04IgogIENUWF9MRU49NDAwMDAgTUVNX0ZSQUM9MC44MCBHRU5fVE9LRU5TPTEyOCBDVFhTPTEwMDAsNDAwMCwxNjAwMCwzMjAwMCBSRVBTPTMgICAgIFNHTEFOR19PU0NBUl9NTEFfV0lORE9XX0JMT0NLX0g9OCBTR0xBTkdfT1NDQVJfTUxBX1dJTkRPV19CTE9DS19OPTY0ICAgICBTR0xBTkdfT1NDQVJfTUxBX1dJTkRPV19XQVJQUz04IHB5dGhvbjMgLXUgJEQvZ2Zfc3BlZWQucHkgMj4mMQp9IHwgZ3JlcCAtYUUgIl4jIyN8XiAqWzAtOV0rICtbMC05XXxyYXRpb3x3b3JzdCBjb250ZXh0fEdGLUVOVFJZfFNLSVBQRUQiIHwgdGVlICRPVVRfRElSL3NwZC5sb2cKZWNobyAiW2pvYl0gZXhpdD0kPyIK
+          | base64 -d > /tmp/j.sh && bash -n /tmp/j.sh && bash /tmp/j.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            cpu: '16'
+            memory: 200Gi
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800
