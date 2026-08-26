@@ -52,6 +52,12 @@ def _err(e) -> str:
 def build(bs: int, heads: int, seq: int, windows: int = 576,
           max_splits: int = 8, bits: int = 2):
     dev = "cuda"
+    # Seeded: the fixture drew fresh random data every run, so the same real
+    # failure reported a different magnitude each time (0.32/0.64 one run,
+    # 0.25/0.33 the next) and looked like flakiness on top of the flakiness the
+    # uninitialized buffers were already causing. The failing SHAPES were stable
+    # throughout; only the numbers moved.
+    torch.manual_seed(int(os.environ.get("BENCH_SEED", "0")))
     n_slots = bs * seq + 64
     x = torch.randn(n_slots, R, device=dev)
     pe = torch.randn(n_slots, ROPE, device=dev, dtype=torch.bfloat16)
