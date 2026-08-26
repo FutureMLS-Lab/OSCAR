@@ -136,6 +136,66 @@ def _kl_drive(p, log_path: str) -> dict:
             "dump": pre_path, "gen_dump": gen_path}
 
 
+def _cmp_decode(a_path: str, b_path: str) -> int:
+    """Compare two free-running greedy generations on their COMMON PREFIX only.
+
+    Greedy decoding is chaotically sensitive: a 1e-6 difference flips one
+    near-tied token and every position after it is a different continuation, so
+    a plain position-by-position diff of two greedy runs measures the cascade,
+    not the kernel. Restricting to the prefix where both arms emitted the same
+    tokens is the part where the comparison is actually paired.
+
+    The divergence point is itself the headline number. Two kernels that agree
+    to reduction noise still eventually flip a near-tie, so "diverges at some
+    point" is expected; diverging at position 0 or 1 on most prompts is not.
+    """
+    A = json.load(open(a_path))
+    B = json.load(open(b_path))
+    deltas, first_div, n_ident, npr = [], [], 0, 0
+    for ra, rb in zip(A, B):
+        if ra.get("error") or rb.get("error"):
+            continue
+        la = [(e[0], e[1]) for e in (ra.get("input_token_logprobs") or [])
+              if e and e[0] is not None]
+        lb = [(e[0], e[1]) for e in (rb.get("input_token_logprobs") or [])
+              if e and e[0] is not None]
+        npr += 1
+        k = 0
+        while k < min(len(la), len(lb)) and la[k][1] == lb[k][1]:
+            deltas.append(abs(la[k][0] - lb[k][0]))
+            k += 1
+        if k == min(len(la), len(lb)):
+            n_ident += 1
+        else:
+            first_div.append(k)
+    print(f"  prompts compared      {npr}")
+    print(f"  identical generations {n_ident}/{npr}")
+    if first_div:
+        first_div.sort()
+        print(f"  first divergence      median={first_div[len(first_div)//2]} "
+              f"min={first_div[0]} max={first_div[-1]}")
+    if not deltas:
+        print("  no common-prefix positions -- the arms diverged immediately, "
+              "which is a kernel difference, not a cascade")
+        return 2
+    deltas.sort()
+    n = len(deltas)
+    mean = sum(deltas) / n
+    print(f"  common-prefix positions {n}")
+    print(f"  mean |dlogprob|         {mean:.6f}")
+    print(f"  p99  |dlogprob|         {deltas[min(n-1, int(0.99*n))]:.6f}")
+    print(f"  max  |dlogprob|         {deltas[-1]:.6f}")
+    # bf16 reduction-order noise between two orderings of the same sum sits
+    # around 1e-3; a functional difference sits orders of magnitude above.
+    verdict = ("reduction-order noise -- the kernels compute the same function"
+               if mean < 5e-3 else
+               "small but above reduction noise -- worth explaining"
+               if mean < 5e-2 else
+               "LARGE -- the kernels do not compute the same function")
+    print(f"  VERDICT: {verdict}")
+    return 0
+
+
 def main() -> int:
     os.makedirs(OUT, exist_ok=True)
     sp.OUT = OUT
@@ -169,7 +229,7 @@ def main() -> int:
     print("\n[gf_kl] ===== DECODE path: production kernel vs group-factored ====="
           "\n[gf_kl] this is the comparison that exercises the kernel under test",
           flush=True)
-    rc = klc.cmp(ga, gb, "prod-decode", "gf-decode")
+    rc = _cmp_decode(ga, gb)
 
     a, b = infos["prod"].get("dump"), infos["gf"].get("dump")
     if a and b:
@@ -182,11 +242,17 @@ def main() -> int:
         log = infos[tag].get("log")
         if log and os.path.exists(log):
             n = sum(1 for ln in open(log, errors="ignore") if "GF-ENTRY" in ln)
-            print(f"[gf_kl] {tag}: GF-ENTRY lines = {n}")
-            if tag == "gf" and n <= 1:
-                print("[gf_kl] !! the group-factored launcher was entered at "
-                      "most once, which is the health-check warmup -- the "
-                      "comparison above did NOT run the kernel under test")
+            # One line means LIVE, not "ran once": the launcher sets
+            # pool._gf_entry_logged and logs a single time per pool. An earlier
+            # version of this check warned on n <= 1 and would have cried wolf
+            # on every correct run. What actually distinguishes a vacuous run is
+            # ZERO lines in the gf arm.
+            state = ("live" if n >= 1 else "NEVER ENTERED")
+            print(f"[gf_kl] {tag}: GF-ENTRY lines = {n} ({state})")
+            if tag == "gf" and n == 0:
+                print("[gf_kl] !! the group-factored launcher was never "
+                      "entered -- the comparison above did NOT run the kernel "
+                      "under test")
     with open(os.path.join(OUT, "summary.json"), "w") as f:
         json.dump({k: {kk: vv for kk, vv in v.items() if kk != "samples"}
                    for k, v in infos.items()}, f, indent=2)
