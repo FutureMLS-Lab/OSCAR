@@ -1,0 +1,274 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-k3-g1h
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata: {}
+    spec:
+      containers:
+      - args:
+        - mkdir -p /shared/k3logs; exec > >(tee -a /shared/k3logs/head.tr3.log) 2>&1;
+          bash /scripts/head4.sh
+        command:
+        - bash
+        - -lc
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: OSCAR_ROOT
+          value: /shared/oscar-mlahyb
+        - name: SGLANG_OSCAR_K3_MLA_LATENT
+          value: '0'
+        - name: SGLANG_OSCAR_MLA_KV_GROUP_SIZE
+          value: '128'
+        - name: SGLANG_ENABLE_MIXED_KV_WINDOWS
+          value: '1'
+        - name: SGLANG_MIXED_KV_PREFIX_TOKENS
+          value: '64'
+        - name: SGLANG_MIXED_KV_RECENT_TOKENS
+          value: '256'
+        - name: HF_HOME
+          value: /hf
+        - name: HF_HUB_OFFLINE
+          value: '1'
+        - name: RUN
+          value: g1
+        - name: ARMS
+          value: lat2
+        - name: MAXREQ
+          value: '8'
+        - name: THREADS
+          value: '6'
+        - name: MEMFRAC
+          value: '0.62'
+        - name: MEMFRAC_RETRY
+          value: '0.66'
+        - name: MEMFRAC_MAX
+          value: '0.66'
+        - name: GEN_CAP
+          value: '30720'
+        - name: ARM_DEADLINE
+          value: '9000'
+        - name: START
+          value: '0'
+        - name: END
+          value: '30'
+        - name: KEEP
+          value: '1800'
+        - name: NCCL_DEBUG
+          value: WARN
+        - name: NCCL_IB_HCA
+          value: mlx5
+        - name: NCCL_TIMEOUT
+          value: '3600'
+        - name: TORCH_NCCL_BLOCKING_WAIT
+          value: '0'
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: '3600'
+        - name: GLOO_SOCKET_IFNAME
+          value: eth0
+        - name: TRITON_CACHE_DIR
+          value: /work/triton-cache
+        - name: MLA_ROT
+          value: /shared/k3_latent_rot
+        - name: KL_DUMP
+          value: '0'
+        - name: SGLANG_OSCAR_TRACE_ATTN_OUT
+          value: '0'
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: head
+        resources:
+          limits:
+            cpu: '80'
+            ephemeral-storage: 64Gi
+            memory: 1750Gi
+            nvidia.com/gpu: '8'
+            nvidia.com/rdma_ib: '4'
+          requests:
+            cpu: '40'
+            ephemeral-storage: 32Gi
+            memory: 1100Gi
+            nvidia.com/gpu: '8'
+            nvidia.com/rdma_ib: '4'
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /scripts
+          name: scripts
+        - mountPath: /work
+          name: work
+      dnsPolicy: ClusterFirst
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      schedulingGates:
+      - name: gpu-queue.xp/admit
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+        name: shm
+      - configMap:
+          defaultMode: 493
+          name: kimi3-scripts-lat
+        name: scripts
+      - emptyDir:
+          sizeLimit: 40Gi
+        name: work
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-k3-g1w
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata: {}
+    spec:
+      containers:
+      - args:
+        - mkdir -p /shared/k3logs; exec > >(tee -a /shared/k3logs/worker.tr3.log)
+          2>&1; bash /scripts/worker4.sh
+        command:
+        - bash
+        - -lc
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: OSCAR_ROOT
+          value: /shared/oscar-mlahyb
+        - name: SGLANG_OSCAR_K3_MLA_LATENT
+          value: '0'
+        - name: SGLANG_OSCAR_MLA_KV_GROUP_SIZE
+          value: '128'
+        - name: SGLANG_ENABLE_MIXED_KV_WINDOWS
+          value: '1'
+        - name: SGLANG_MIXED_KV_PREFIX_TOKENS
+          value: '64'
+        - name: SGLANG_MIXED_KV_RECENT_TOKENS
+          value: '256'
+        - name: HF_HOME
+          value: /hf
+        - name: HF_HUB_OFFLINE
+          value: '1'
+        - name: RUN
+          value: g1
+        - name: MAXREQ
+          value: '8'
+        - name: MEMFRAC
+          value: '0.62'
+        - name: NCCL_DEBUG
+          value: WARN
+        - name: NCCL_IB_HCA
+          value: mlx5
+        - name: NCCL_TIMEOUT
+          value: '3600'
+        - name: TORCH_NCCL_BLOCKING_WAIT
+          value: '0'
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: '3600'
+        - name: GLOO_SOCKET_IFNAME
+          value: eth0
+        - name: TRITON_CACHE_DIR
+          value: /work/triton-cache
+        - name: ARMS
+          value: lat2
+        - name: END
+          value: '30'
+        - name: START
+          value: '0'
+        - name: MLA_ROT
+          value: /shared/k3_latent_rot
+        - name: ARM_DEADLINE
+          value: '9000'
+        - name: MEMFRAC_RETRY
+          value: '0.66'
+        - name: MEMFRAC_MAX
+          value: '0.66'
+        - name: KL_DUMP
+          value: '0'
+        - name: SGLANG_OSCAR_TRACE_ATTN_OUT
+          value: '0'
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: worker
+        resources:
+          limits:
+            cpu: '80'
+            ephemeral-storage: 64Gi
+            memory: 1750Gi
+            nvidia.com/gpu: '8'
+            nvidia.com/rdma_ib: '4'
+          requests:
+            cpu: '40'
+            ephemeral-storage: 32Gi
+            memory: 1100Gi
+            nvidia.com/gpu: '8'
+            nvidia.com/rdma_ib: '4'
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /scripts
+          name: scripts
+        - mountPath: /work
+          name: work
+      dnsPolicy: ClusterFirst
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      schedulingGates:
+      - name: gpu-queue.xp/admit
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+        name: shm
+      - configMap:
+          defaultMode: 493
+          name: kimi3-scripts-lat
+        name: scripts
+      - emptyDir:
+          sizeLimit: 40Gi
+        name: work
