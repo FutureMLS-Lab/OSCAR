@@ -619,9 +619,10 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # merge, it is weighted exp(0 - max) and drags the result toward zero.
     ls2 = _t.full((bs, heads, ms + _pad), -1.0e4, dtype=_t.float32, device=q.device)
     o_new = _t.zeros_like(o_ref)
-    # slot_off=1: the window pass owns slot 0, the packed splits follow.
+    # slot_off is gone: the window pass merges into split 0's slot itself, so
+    # the packed splits keep their natural slot/range correspondence.
     packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
-                                skip_hp=True, slot_off=1)
+                                skip_hp=True, slot_off=0)
     from sglang.srt.environ import envs as _envs
 
     bh = _safe_block_h(16, heads)
@@ -705,14 +706,10 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     except Exception as e:  # noqa: BLE001
         print(f"  [merge] failed: {type(e).__name__}: {_err(e)}")
 
-    # The same merge the GF launcher uses. Merging these buffers with the shared
-    # stage 2 was the bug the gate was reporting: it picks slots by sequence
-    # arithmetic, and slot_off=1 means slot i is not split i.
-    from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
-        gf_softmax_reducev_fwd,
-    )
-
-    gf_softmax_reducev_fwd(lg2, ls2, q, o_new, num_slots=ms + 1)
+    # The ordinary stage 2, same as the reference path and same as the GF
+    # launcher now uses. Nothing about the slot layout is special any more.
+    _decode_softmax_reducev_fwd(lg2, ls2, q, o_new, 1.0,
+                                _v_shape_proxy(o_new, R), indptr, ns, ms)
 
     # Report NaN as its own verdict. A NaN makes max() NaN and every comparison
     # False, so a bare threshold test silently reads as MISMATCH and hides

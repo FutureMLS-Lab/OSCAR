@@ -962,11 +962,19 @@ def _fwd_hp_window_stage1(
         cur_batch * stride_mid_ob
         + cur_head[:, None] * stride_mid_oh
     )
-    tl.store(
-        Att_Out + obase + offs_d[None, :],
-        acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None],
-        mask=mask_h[:, None],
-    )
+    # MERGE into the slot instead of overwriting it.
+    #
+    # The window used to own a slot of its own, which forced slot_off=1 and
+    # shifted the packed splits up. The shared stage 2 picks slots by SEQUENCE
+    # ARITHMETIC -- it assumes slot i is split i of one uniform division -- so
+    # that shift silently addressed the wrong partials whenever the sequence was
+    # longer than the window (the only case that mixes real and empty splits;
+    # seq <= window has every packed split empty and happened to work).
+    #
+    # Folding the window partial into split 0's slot with the same LSE
+    # combination stage 2 itself uses keeps the slot/range correspondence
+    # intact, so no slot_off and no special merge are needed. Split 0's slot is
+    # always read: its range is non-empty for any non-empty sequence.
     # The whole offset is divided by D, exactly as the packed kernel does it.
     # Dividing each term separately is not the same expression -- integer
     # division does not distribute -- and would silently address the wrong lse.
@@ -974,13 +982,29 @@ def _fwd_hp_window_stage1(
         cur_batch * stride_mid_ob
         + cur_head * stride_mid_oh
     ) // D
-    # Finite sentinel, same reason as the packed kernel: -inf in the first
-    # split stage 2 examines makes its seed max -inf too, and exp(-inf - -inf)
-    # is NaN.
+    prev_lse = tl.load(Att_Lse + offs_mid_o_1, mask=mask_h, other=-1.0e4)
+    prev_out = tl.load(Att_Out + obase + offs_d[None, :], mask=mask_h[:, None],
+                       other=0.0)
+    win_lse = tl.where(e_sum > 0, e_max + tl.log(tl.where(e_sum > 0, e_sum, 1.0)),
+                       -1.0e4)
+    win_out = acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None]
+    m = tl.maximum(prev_lse, win_lse)
+    wp = tl.exp(prev_lse - m)
+    ww = tl.exp(win_lse - m)
+    den = wp + ww
+    tl.store(
+        Att_Out + obase + offs_d[None, :],
+        (prev_out * wp[:, None] + win_out * ww[:, None]) / den[:, None],
+        mask=mask_h[:, None],
+    )
+    # The MERGED lse, not the window's own: stage 2 reweights this slot by it,
+    # so it has to describe both contributions. Finite sentinel when neither
+    # side has anything -- -inf in the first split stage 2 examines makes its
+    # seed max -inf too, and exp(-inf - -inf) is NaN.
+    both_empty = (prev_lse <= -1.0e4) & (win_lse <= -1.0e4)
     tl.store(
         Att_Lse + offs_mid_o_1,
-        tl.where(e_sum > 0, e_max + tl.log(tl.where(e_sum > 0, e_sum, 1.0)),
-                 -1.0e4),
+        tl.where(both_empty, -1.0e4, m + tl.log(den)),
         mask=mask_h,
     )
 
@@ -1077,7 +1101,10 @@ def packed_mla_decode_gf_fwd(
     packed_mla_decode_stage1_gf(
         q, operands, attn_logits, attn_lse, kv_indptr, kv_indices,
         num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap,
-        skip_hp=has_hp, slot_off=1 if has_hp else 0,
+        # slot_off is gone: the window pass merges into split 0's slot, so the
+        # packed splits keep their natural slot/range correspondence and the
+        # stock stage 2 addresses them correctly.
+        skip_hp=has_hp, slot_off=0,
     )
     if has_hp:
         if num_kv_splits_plus1 is None:
@@ -1120,22 +1147,16 @@ def packed_mla_decode_gf_fwd(
             num_warps=_envs.SGLANG_OSCAR_MLA_WINDOW_WARPS.get(),
             num_stages=_envs.SGLANG_OSCAR_MLA_WINDOW_STAGES.get(),
         )
-    if has_hp:
-        # Merge by the sentinel, not by sequence arithmetic. The shared stage 2
-        # derives which slot to read from kv_len_per_split, which assumes slot i
-        # holds split i of one uniform division -- an assumption slot_off=1
-        # breaks, and which handing it a different split count breaks again.
-        # That is the whole of the seq > window mismatch.
-        gf_softmax_reducev_fwd(attn_logits, attn_lse, q, o,
-                               num_slots=max_kv_splits + 1)
-    else:
-        _decode_softmax_reducev_fwd(
-            attn_logits, attn_lse, q, o, 1.0,
-            _v_shape_proxy(o, pool.kv_lora_rank),
-            kv_indptr,
-            num_kv_splits,
-            max_kv_splits,
-        )
+    # One merge for both cases now. The window partial was folded into split 0
+    # by the window pass itself, so there is no extra slot and no shifted
+    # layout for stage 2 to know about.
+    _decode_softmax_reducev_fwd(
+        attn_logits, attn_lse, q, o, 1.0,
+        _v_shape_proxy(o, pool.kv_lora_rank),
+        kv_indptr,
+        num_kv_splits,
+        max_kv_splits,
+    )
 
     if envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get() and not _check_is_capturing():
         # Skipped during CUDA-graph capture: .item() and logging are host syncs
