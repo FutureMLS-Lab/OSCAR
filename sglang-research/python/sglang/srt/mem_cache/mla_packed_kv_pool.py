@@ -428,8 +428,21 @@ class _PackedLatentMixin(_Int2HPMixin):
         """
         if not self.rotations:
             return None
+        if local:
+            return self.rotations.get(layer_id)
+        # The key space is the POOL INDEX, ``start_layer + position``, because
+        # the loader writes ``rotations[start_layer + j]``. _local_layer_index
+        # returns the position alone, so the offset has to be added back.
+        #
+        # The two cases collapse differently and both must hold:
+        #   hybrid      start_layer 0, so key = position          (K3: 3 -> 0)
+        #   non-hybrid  key = start_layer + (g - start_layer) = g (unchanged)
+        # Dropping the offset happens to be right for K3, whose inner pool is
+        # built with start_layer=0, and silently wrong for every non-hybrid
+        # model under pipeline parallelism -- i.e. it would have traded this bug
+        # for the same bug on GLM-5.2.
         return self.rotations.get(
-            layer_id if local else self._local_layer_index(layer_id)
+            self.start_layer + self._local_layer_index(layer_id)
         )
 
     def rotate_latent(self, layer_id: int, x: torch.Tensor,
