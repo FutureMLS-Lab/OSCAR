@@ -50,17 +50,19 @@ def _err(e) -> str:
     return str(e)[:600].replace("\n", " | ")
 
 def build(bs: int, heads: int, seq: int, windows: int = 576,
-          max_splits: int = 8):
+          max_splits: int = 8, bits: int = 2):
     dev = "cuda"
     n_slots = bs * seq + 64
     x = torch.randn(n_slots, R, device=dev)
     pe = torch.randn(n_slots, ROPE, device=dev, dtype=torch.bfloat16)
     slots = torch.arange(n_slots, device=dev, dtype=torch.int32)
 
-    codes = torch.zeros((n_slots, R // 4), dtype=torch.uint8, device=dev)
+    # R // (8 // bits), not R // 4: the launcher derives the latent dimension
+    # back out of this width, so a fixed packing factor recovers half of it.
+    codes = torch.zeros((n_slots, R // (8 // bits)), dtype=torch.uint8, device=dev)
     params = torch.zeros((n_slots, NG * 2), dtype=torch.float32, device=dev)
     rope = pe.clone()
-    scatter_pack_rows(x, slots, codes, params, GS, False)
+    scatter_pack_rows(x, slots, codes, params, GS, False, bits)
 
     # A realistic window arena: sink + recent per request, i.e. the fraction of
     # blocks that must pay the arena probe. Benchmarking with an empty arena
@@ -88,7 +90,13 @@ def build(bs: int, heads: int, seq: int, windows: int = 576,
         hp_row[idx] = ring.to(torch.int32)
         hp_owner[ring] = idx.to(torch.int32)
 
-    ops = (codes, params, rope, hp, hp_row, hp_owner, GS, False)
+    # Must match packed_read_operands element for element. It gained ``bits``
+    # when the pool learned to store four-bit latents, and this hand-built tuple
+    # did not -- so every gate shape died with "expected 9, got 8" and the
+    # correctness gate silently stopped protecting anything. Positional tuples
+    # shared between a producer and a hand-written consumer fail exactly this
+    # way, and only running the gate finds it.
+    ops = (codes, params, rope, hp, hp_row, hp_owner, GS, False, bits)
 
     # BF16 baseline cache in the layout the stock kernel expects.
     kv = torch.empty((n_slots, 1, R + ROPE), dtype=torch.bfloat16, device=dev)
