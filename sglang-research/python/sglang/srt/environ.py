@@ -329,9 +329,22 @@ class Envs:
     # This does NOT make the path a default. It is still 6.6% behind production
     # at ctx 1000. Closing that needs the window pass folded into the packed
     # pass so its fixed cost disappears, which is a kernel rewrite, not a knob.
-    SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(8)
-    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(64)
-    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(8)
+    #
+    # REVERTED to the original constants 2026-08-26. The +10% is real as a
+    # measurement, but it is UNVERIFIED for correctness and cannot be verified
+    # with the gate as it stands: bench_kernel's build() hands the reference
+    # path torch.empty logits/lse, so the reference can read uninitialized
+    # slots. That shows up as nondeterministic catastrophic mismatches --
+    # bs=1 seq=100 MATCHed at 6.5e-03 in one run and MISMATCHed at 9.3e-01 in
+    # the next, on identical code, with several rel = 1.000e+00.
+    #
+    # So the honest state is: the gate's verdicts are not trustworthy right now,
+    # which means neither "the tuning is safe" nor "the tuning breaks it" is
+    # established. Ship the constants that have been in production, keep the
+    # knobs for measurement, and fix the fixture before touching the defaults.
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(16)
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
+    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(4)
     SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
     # Runs the production kernel alongside the group-factored one on the same
