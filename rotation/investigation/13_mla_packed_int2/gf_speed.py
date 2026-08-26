@@ -81,11 +81,20 @@ def _speed_drive(p, log_path: str) -> dict:
         # ~4 chars/token is close enough; the exact prompt length is identical
         # across arms, which is what the comparison needs.
         prompt = (filler * (ctx // 400 + 1))[: ctx * 4] + "\nSummarize:"
-        _one(prompt)  # warmup, discarded
-        ts = []
-        for _ in range(REPS):
-            dt, n = _one(prompt)
-            ts.append(n / dt if dt > 0 else 0.0)
+        # One context that the server refuses -- a prompt longer than
+        # --context-length returns HTTP 400 -- must not discard the contexts
+        # that already measured cleanly. The first version let the exception
+        # propagate and threw away three good points to report nothing.
+        try:
+            _one(prompt)  # warmup, discarded: it pays for autotuning and JIT
+            ts = []
+            for _ in range(REPS):
+                dt, n = _one(prompt)
+                ts.append(n / dt if dt > 0 else 0.0)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ctx={ctx:>6} SKIPPED: {type(e).__name__}: {str(e)[:80]}",
+                  flush=True)
+            continue
         res[ctx] = round(statistics.median(ts), 2)
         print(f"  ctx={ctx:>6} decode {res[ctx]:>8.2f} tok/s "
               f"(median of {REPS})", flush=True)
@@ -96,6 +105,17 @@ def main() -> int:
     os.makedirs(OUT, exist_ok=True)
     sp.OUT = OUT
     sp.drive = _speed_drive
+    # The server must be able to hold the longest context swept, plus the
+    # generation. Leaving this to serve_probe's default silently capped the
+    # sweep: a 32000-token prompt against --context-length 16384 comes back as
+    # HTTP 400, which reads like a driver bug rather than a configuration one.
+    need = max(CTXS) + GEN + 512
+    have = int(os.environ.get("CTX_LEN", sp.CTX))
+    if have < need:
+        print(f"[gf_speed] raising context length {have} -> {need} to cover "
+              f"the longest context in the sweep")
+        os.environ["CTX_LEN"] = str(need)
+        sp.CTX = str(need)
 
     infos = {}
     for tag, gf in (("prod", "0"), ("gf", "1")):
