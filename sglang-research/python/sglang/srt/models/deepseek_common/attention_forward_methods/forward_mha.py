@@ -353,6 +353,13 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        # The chunked variant needs the same trace as forward_normal_core.
+        # Instrumenting only one of them produced zero output: K3's prefill
+        # takes the chunked path, and its decode is CUDA-graph captured where
+        # the guard correctly skips. Both routes were dark at once, which reads
+        # as "the trace does not work" rather than "the trace is in the wrong
+        # function".
+        _trace_attn_out(self, "mha-chunked", attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
