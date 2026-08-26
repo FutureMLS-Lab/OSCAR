@@ -107,8 +107,15 @@ def build(bs: int, heads: int, seq: int, windows: int = 576,
     kv_indptr = torch.arange(0, (bs + 1) * seq, seq, device=dev, dtype=torch.int32)
     kv_indices = torch.arange(bs * seq, device=dev, dtype=torch.int32)
     num_splits = torch.full((bs,), max_splits, device=dev, dtype=torch.int32)
-    logits = torch.empty(bs, heads, max_splits, R, device=dev, dtype=torch.float32)
-    lse = torch.empty(bs, heads, max_splits, device=dev, dtype=torch.float32)
+    # zeros/-1e4, NOT torch.empty. Stage 1 writes only the splits it owns, so an
+    # uninitialized buffer lets the REFERENCE path read slots nobody wrote --
+    # and stage 2's LSE merge happily folds that garbage in. The symptom is a
+    # gate whose verdicts move between runs on identical code: bs=1 seq=100
+    # MATCHed at 6.5e-03 once and MISMATCHed at 9.3e-01 the next time, with
+    # several rel = 1.000e+00. An unsound gate is worse than no gate, because
+    # its failures get attributed to whatever changed most recently.
+    logits = torch.zeros(bs, heads, max_splits, R, device=dev, dtype=torch.float32)
+    lse = torch.full((bs, heads, max_splits), -1.0e4, device=dev, dtype=torch.float32)
     return ops, kv, q, kv_indptr, kv_indices, num_splits, max_splits, logits, lse
 
 
