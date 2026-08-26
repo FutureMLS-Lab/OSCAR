@@ -119,6 +119,11 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
     # captured kernels do -- so any host-side audit or self-check inside the
     # write path can only ever see eager forwards. The ring is still maintained
     # (it is all captured torch ops), but auditing it requires eager decode.
+    # Teacher-forced scoring needs this: input logprobs from position 0 force a
+    # full recompute, and a cached prefix silently returns fewer positions, so
+    # two arms come back with different position counts and are not comparable.
+    if os.environ.get("DISABLE_RADIX", "0") == "1":
+        args += ["--disable-radix-cache"]
     if os.environ.get("DISABLE_CG", "0") == "1":
         args += ["--disable-cuda-graph"]
     else:
