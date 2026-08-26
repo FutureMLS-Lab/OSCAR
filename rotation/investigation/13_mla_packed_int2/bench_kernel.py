@@ -732,8 +732,11 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # A split that silently dropped the window would still look close, because
     # the packed tier holds the same tokens at 2 bits. So check that the window
     # actually contributed: zeroing the arena must CHANGE the answer.
-    ops_zero = (ops[0], ops[1], ops[2], _t.zeros_like(ops[3]), ops[4], ops[5],
-                ops[6], ops[7])
+    # Sliced, not index-listed: the explicit (ops[0], ..., ops[7]) form silently
+    # dropped the 9th element when the pool gained a bit width, and this branch
+    # then died with "expected 9, got 8" AFTER the MATCH lines had already
+    # printed -- so the gate looked like it passed.
+    ops_zero = ops[:3] + (_t.zeros_like(ops[3]),) + ops[4:]
     o_zero = _t.zeros_like(o_ref)
     lg.zero_(); ls.fill_(-1.0e4)
     packed_mla_decode_stage1(q, ops_zero, lg, ls, indptr, idx, ns, ms, sm, 0.0)
