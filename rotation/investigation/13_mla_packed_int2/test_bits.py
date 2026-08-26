@@ -80,7 +80,6 @@ def main() -> int:
         d_ok = d_recovered == R
 
         diff = (deq.reshape(N, R) - ref).abs()
-        exact = int((diff == 0).sum())
         total = diff.numel()
         rel = (deq.reshape(N, R) - x).norm() / x.norm()
 
@@ -88,20 +87,47 @@ def main() -> int:
         qmax, qmin = int(q.max()), int(q.min())
         uses_width = qmax == (1 << bits) - 1
 
+        # Compare CODES, not dequantized floats. The two implementations divide
+        # and round in different orders, so the reconstructed values differ in
+        # the last fp32 ULP on a few percent of elements -- which an exact-float
+        # comparison reports as a 2.5% failure while max |diff| stays at 4.8e-07,
+        # seven orders below a quantization step. The invariant that matters is
+        # that the same code was chosen; a real drift moves a code by a full
+        # step, which is O(scale), not O(eps).
+        g = x.reshape(-1, R // GS, GS).float()
+        lo = g.amin(-1, keepdim=True)
+        rng = g.amax(-1, keepdim=True) - lo
+        maxq_t = float((1 << bits) - 1)
+        sc = torch.where(rng.abs() > 1e-8, rng / maxq_t, torch.ones_like(rng))
+        q_ref = torch.round((g - lo) / sc).clamp_(0, maxq_t).to(torch.int32)
+        q_ref = q_ref.reshape(-1, GS)
+        code_mismatch = int((q.reshape(-1, GS) != q_ref).sum())
+        step = sc.mean().item()
+
         print(f"\n=== bits={bits} ===")
         print(f"  codes width      {got_w} (want {want_w})  {'ok' if width_ok else 'WRONG'}")
         print(f"  D recovered      {d_recovered} (want {R})  {'ok' if d_ok else 'WRONG'}")
-        print(f"  exact vs torch   {exact}/{total} = {100.0*exact/total:.4f}%")
-        print(f"  max |diff|       {diff.max().item():.3e}")
+        print(f"  code mismatches  {code_mismatch}/{total} = "
+              f"{100.0*code_mismatch/total:.4f}%")
+        print(f"  max |diff|       {diff.max().item():.3e}  "
+              f"(one quantization step is ~{step:.3f})")
         print(f"  code range       [{qmin}, {qmax}]  "
               f"{'ok' if uses_width else 'DOES NOT USE THE FULL WIDTH'}")
         print(f"  round-trip rel   {rel.item():.4f}")
 
         if not (width_ok and d_ok and uses_width):
             rc = 1
-        # A handful of ties can round the other way; a real drift is not a handful.
-        if exact < total * 0.999:
-            print("  !! more than 0.1% of elements differ from the reference")
+        # The documented limit is ~0.010% of codes differing by one step on raw
+        # c_kv, from quotients that land within half a ULP of a .5 boundary.
+        if code_mismatch > total * 0.001:
+            print(f"  !! {100.0*code_mismatch/total:.3f}% of CODES differ from the "
+                  f"reference -- that is drift, not rounding")
+            rc = 1
+        # Independently: no reconstructed value may be off by anything
+        # approaching a quantization step.
+        if diff.max().item() > 0.01 * step:
+            print("  !! a reconstructed value is off by an appreciable fraction "
+                  "of a quantization step")
             rc = 1
 
     # One extra bit halves the step, so two extra bits should cut the error by
