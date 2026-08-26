@@ -609,6 +609,8 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
     # slot_off=1: the window pass owns slot 0, the packed splits follow.
     packed_mla_decode_stage1_gf(q, ops, lg2, ls2, indptr, idx, ns, ms, sm, 0.0,
                                 skip_hp=True, slot_off=1)
+    from sglang.srt.environ import envs as _envs
+
     bh = _safe_block_h(16, heads)
     _fwd_hp_window_stage1[(bs, _tr.cdiv(heads, min(bh, heads)))](
         q, ops[2], ops[3], ops[4], ops[5],
@@ -616,8 +618,16 @@ def two_pass_equivalence(bs=8, heads=16, seq=4096, windows=576, splits=8):
         q.stride(0), q.stride(1),
         lg2.stride(0), lg2.stride(1), lg2.stride(2),
         kv_group_num=heads, q_head_num=heads, D=R, DPE=64,
-        P_TOK=P_TOK, R_TOK=R_TOK, BLOCK_N=32, BLOCK_H=bh, logit_cap=0.0,
-        num_warps=4, num_stages=2,
+        P_TOK=P_TOK, R_TOK=R_TOK,
+        # Read the same env the serving launcher reads. Hardcoding these meant
+        # the gate always ran the ORIGINAL launch config no matter what was
+        # tuned, so an attribution run comparing "tuned" against "original"
+        # compared the original against itself and proved nothing.
+        BLOCK_N=_envs.SGLANG_OSCAR_MLA_WINDOW_BLOCK_N.get(),
+        BLOCK_H=_safe_block_h(_envs.SGLANG_OSCAR_MLA_WINDOW_BLOCK_H.get(), heads),
+        logit_cap=0.0,
+        num_warps=_envs.SGLANG_OSCAR_MLA_WINDOW_WARPS.get(),
+        num_stages=_envs.SGLANG_OSCAR_MLA_WINDOW_STAGES.get(),
     )
     # Localise the fault before stage 2 can smear it. Two guesses have already
     # been wrong here, so report WHICH tensor and WHICH split goes non-finite
