@@ -326,6 +326,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         model_config.kv_lora_rank,
                         model_config.qk_rope_head_dim,
                         envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        # Must match what _init_packed allocates. A cell_size
+                        # computed at a different width either wastes the
+                        # difference or runs the pool off its end.
+                        bits=envs.SGLANG_OSCAR_MLA_KV_BITS.get(),
                     )
                     * num_layers
                 )

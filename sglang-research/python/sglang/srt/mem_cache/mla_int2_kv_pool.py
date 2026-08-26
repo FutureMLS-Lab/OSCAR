@@ -308,6 +308,24 @@ class _Int2HPMixin:
             )
         self._group_size = group_size
         self._lloyd_max = lloyd_max
+        # Read here rather than passed in, so every pool that mixes this in gets
+        # the same width the sizing arithmetic in pool_configurator used. Two
+        # readers of one env var cannot disagree; a constructor argument
+        # threaded through two call paths can, and the failure mode is a pool
+        # allocated at one width and indexed at another.
+        from sglang.srt.environ import envs as _envs
+
+        self._bits = _envs.SGLANG_OSCAR_MLA_KV_BITS.get()
+        if self._bits not in (2, 4):
+            raise ValueError(
+                f"SGLANG_OSCAR_MLA_KV_BITS={self._bits} is not supported; "
+                f"the pack/unpack kernels implement 2 and 4"
+            )
+        if self._lloyd_max and self._bits != 2:
+            raise ValueError(
+                "SGLANG_LLOYD_MAX is a 2-bit codebook and cannot be combined "
+                f"with SGLANG_OSCAR_MLA_KV_BITS={self._bits}"
+            )
         # Rotations and latents must live in a dtype that can actually hold them,
         # which is not always the pool's store dtype. sglang defaults a
         # DeepSeek-DSA model's KV cache to fp8_e4m3 on SM100+ (bfloat16 only on

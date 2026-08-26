@@ -149,7 +149,8 @@ def envs_selfcheck_budget() -> int:
 
 
 def packed_latent_bytes_per_token(kv_lora_rank: int, qk_rope_head_dim: int,
-                                  group_size: int, param_dtype_bytes: int = 4) -> int:
+                                  group_size: int, param_dtype_bytes: int = 4,
+                                  bits: int = 2) -> int:
     """Bytes one token of latent occupies per layer under packed storage.
 
     Kept next to the buffers it describes so the pool-size arithmetic in
@@ -159,7 +160,7 @@ def packed_latent_bytes_per_token(kv_lora_rank: int, qk_rope_head_dim: int,
     """
     n_groups = kv_lora_rank // group_size
     return (
-        kv_lora_rank // 4                       # codes
+        kv_lora_rank // (8 // bits)             # codes
         + n_groups * 2 * param_dtype_bytes      # (scale, zero) per group
         + qk_rope_head_dim * 2                  # k_pe, bf16
     )
@@ -254,7 +255,7 @@ class _PackedLatentMixin(_Int2HPMixin):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.c_codes = [
-                torch.zeros((n_rows, R // 4), dtype=torch.uint8, device=self.device)
+                torch.zeros((n_rows, R // (8 // self._bits)), dtype=torch.uint8, device=self.device)
                 for _ in range(self.layer_num)
             ]
             self.c_params = [
@@ -505,7 +506,7 @@ class _PackedLatentMixin(_Int2HPMixin):
 
         scatter_pack_rows(
             c, loc64.to(torch.int32), self.c_codes[li], self.c_params[li],
-            self._group_size, self._lloyd_max,
+            self._group_size, self._lloyd_max, self._bits,
         )
         self.rope_buf[li][loc64] = pe.to(self.dtype)
 
@@ -623,6 +624,7 @@ class _PackedLatentMixin(_Int2HPMixin):
             self.hp_owner_of_row if self._latent_windows else None,
             self._group_size,
             self._lloyd_max,
+            self._bits,
         )
 
     def materialize_rows(self, layer_id: int, slots: torch.Tensor,
@@ -667,7 +669,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         c_rot = self._deq_scratch[:n]
         gather_dequant_rows(
             slots32, self.c_codes[li], self.c_params[li], c_rot,
-            self._group_size, self._lloyd_max,
+            self._group_size, self._lloyd_max, self._bits,
         )
         if out is None:
             if self._read_scratch is None or self._read_scratch.shape[0] < n:
@@ -705,7 +707,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         self._selfcheck_budget -= 1
         self._selfcheck_n += 1
         _c, _p, deq = quantize_dequantize_reuse(
-            c_rot, self._group_size, self._lloyd_max
+            c_rot, self._group_size, self._lloyd_max, self._bits
         )
         want = deq.to(self.dtype)
         if keep is not None:

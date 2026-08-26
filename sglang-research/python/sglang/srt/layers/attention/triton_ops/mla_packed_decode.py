@@ -80,6 +80,9 @@ def _fwd_packed_mla_stage1(
     DPE: tl.constexpr,        # qk_rope_head_dim (64)
     GS: tl.constexpr,         # quant group size
     NG: tl.constexpr,         # groups per row = D // GS
+    BITS: tl.constexpr,       # bits per latent value (2 or 4)
+    PF: tl.constexpr,         # latent values packed per byte = 8 // BITS
+    MASK: tl.constexpr,       # (1 << BITS) - 1
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
@@ -144,11 +147,11 @@ def _fwd_packed_mla_stage1(
 
             # ---- dequantize the latent for this block: [BLOCK_N, D] --------
             byte = tl.load(
-                Codes + kv_loc[:, None] * (D // 4) + (offs_d // 4)[None, :],
+                Codes + kv_loc[:, None] * (D // PF) + (offs_d // PF)[None, :],
                 mask=n_ok[:, None],
                 other=0,
             ).to(tl.int32)
-            code = (byte >> (2 * (offs_d % 4))[None, :]) & 0x3
+            code = (byte >> (BITS * (offs_d % PF))[None, :]) & MASK
             if ABLATE == 1:
                 scale = 0.0
                 zero = 0.0
@@ -264,11 +267,11 @@ def _fwd_packed_mla_stage1(
                 # layout the first dot wants, and delete the transpose. The rope
                 # load below has always done exactly this.
                 byte_t = tl.load(
-                    Codes + kv_loc[None, :] * (D // 4) + (offs_d // 4)[:, None],
+                    Codes + kv_loc[None, :] * (D // PF) + (offs_d // PF)[:, None],
                     mask=n_ok[None, :],
                     other=0,
                 ).to(tl.int32)
-                code_t = (byte_t >> (2 * (offs_d % 4))[:, None]) & 0x3
+                code_t = (byte_t >> (BITS * (offs_d % PF))[:, None]) & MASK
                 scale_t = tl.load(
                     Params + kv_loc[None, :] * (2 * NG) + (2 * gid)[:, None],
                     mask=n_ok[None, :],
@@ -354,7 +357,7 @@ def packed_mla_decode_stage1(
     dual_load: bool | None = None,
 ):
     """``q`` is ``[batch, head, D+DPE]``; ``operands`` from ``packed_read_operands``."""
-    codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
+    codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd, bits = operands
     # BLOCK_N 16 / 8 warps rather than the BF16 kernel's 32 / 4. The dequant
     # keeps three extra values live per element (the code byte and the group's
     # scale and zero) on top of the output tile, and at 32x512 that is past the
@@ -364,7 +367,10 @@ def packed_mla_decode_stage1(
     num_warps = num_warps or envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
     num_stages = num_stages or envs.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
     d_pe = rope.shape[-1]
-    d = codes.shape[-1] * 4
+    # Derived from the stored byte width, so it MUST use the same packing
+    # factor the pool allocated with -- at four bits this expression yields
+    # half the latent dimension and every index downstream is wrong.
+    d = codes.shape[-1] * (8 // bits)
     assert q.shape[-1] == d + d_pe, (q.shape, d, d_pe)
 
     batch, head_num = q.shape[0], q.shape[1]
@@ -411,6 +417,9 @@ def packed_mla_decode_stage1(
         DPE=d_pe,
         GS=group_size,
         NG=n_groups,
+        BITS=bits,
+        PF=8 // bits,
+        MASK=(1 << bits) - 1,
         BLOCK_N=block_n,
         BLOCK_H=block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
@@ -775,7 +784,7 @@ def packed_mla_decode_stage1_gf(
     launcher actually picks. It is 0.95x at 32/warps=8 only, which is not a
     configuration anything selects.
     """
-    codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd = operands
+    codes, params, rope, hp, hp_row, hp_owner, group_size, lloyd, bits = operands
     if hp is not None and not skip_hp:
         raise NotImplementedError(
             "the group-factored kernel has no window-arena path; folding one in "
@@ -783,7 +792,10 @@ def packed_mla_decode_stage1_gf(
             "the compiler must reserve for in every block"
         )
     d_pe = rope.shape[-1]
-    d = codes.shape[-1] * 4
+    # Derived from the stored byte width, so it MUST use the same packing
+    # factor the pool allocated with -- at four bits this expression yields
+    # half the latent dimension and every index downstream is wrong.
+    d = codes.shape[-1] * (8 // bits)
     n_groups = d // group_size
     if n_groups != 4:
         raise NotImplementedError(
@@ -1005,6 +1017,14 @@ def packed_mla_decode_gf_fwd(
     # been run against an NSA cache, whose rows also carry an index head. It is
     # better to refuse than to serve an untested layout: this path is opt-in, so
     # anyone who reaches this error asked for it explicitly and gets told why.
+    _bits = getattr(pool, "_bits", 2)
+    if _bits != 2:
+        raise NotImplementedError(
+            "the group-factored packed MLA decode unpacks four 2-bit fields per "
+            "byte, hand-unrolled; it has not been ported to "
+            f"SGLANG_OSCAR_MLA_KV_BITS={_bits}. Use the production kernel "
+            "(SGLANG_OSCAR_MLA_PACKED_GF=0) at this width."
+        )
     if getattr(pool, "index_head_dim", None):
         raise NotImplementedError(
             "group-factored packed MLA decode has not been validated against an "
@@ -1066,7 +1086,7 @@ def packed_mla_decode_gf_fwd(
                 "pool has a window arena: stage 2 must read one split past the "
                 "packed kernel's last, or the BF16 window is silently dropped."
             )
-        _, _, rope, hp, hp_row, hp_owner, _, _ = operands
+        _, _, rope, hp, hp_row, hp_owner, _, _, _ = operands
         from sglang.srt.environ import envs as _envs
 
         batch, head_num = q.shape[0], q.shape[1]

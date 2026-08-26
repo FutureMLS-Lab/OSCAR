@@ -228,6 +228,25 @@ class Envs:
     SGLANG_OSCAR_MLA_KV_DUMP_DIR = EnvStr("")
     SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
     SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
+    # Bits per latent value in the packed MLA pool. 2 is the validated default.
+    #
+    # 4 exists because a model's latent may simply not be INT2-representable.
+    # Measured on Kimi-K3's c_kv dump, out-of-sample relative error against the
+    # 0.10 a 2-bit KV cache needs, with the shipped rotation applied:
+    #
+    #     2 bits, group  32   0.2255   fail
+    #     2 bits, group 128   0.3491   fail
+    #     3 bits, group  32   0.0957   pass, 5.00 bits/elem
+    #     4 bits, group 128   0.0694   pass, 4.50 bits/elem   <- cheapest
+    #
+    # Four bits at group 128 beats three at group 32 because a group of 32
+    # spends 2 bits/elem on scales alone. So K3's latent is worth 3.56x over
+    # bf16, not the 4x that 2-bit packing would claim. GLM-5.2 is fine at 2 bits;
+    # this is a property of the tensor, so measure the dump before assuming.
+    #
+    # Lloyd-Max is a three-threshold codebook and therefore 2-bit only; the
+    # pack wrappers refuse to combine it with any other width.
+    SGLANG_OSCAR_MLA_KV_BITS = EnvInt(2)
     SGLANG_OSCAR_MLA_KV_REAL_KERNEL = EnvBool(False)
     # Store the MLA/NSA latent as *packed* INT2 codes instead of fake-quantizing
     # into a BF16 cache. This is the difference between a quality measurement
