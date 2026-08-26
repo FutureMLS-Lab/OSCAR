@@ -157,6 +157,17 @@ def packed_latent_bytes_per_token(kv_lora_rank: int, qk_rope_head_dim: int,
     ``pool_configurator`` and the allocation here cannot drift apart -- a
     ``cell_size`` that disagrees with what the pool actually allocates either
     wastes the difference or OOMs at the end of the pool.
+
+    At kv_lora_rank 512, rope 64, group 128, against BF16's 1152 B:
+
+        bits=2   288 B = codes 128 + params 32 + k_pe 128   POOL 4.00x
+        bits=4   416 B = codes 256 + params 32 + k_pe 128   POOL 2.77x
+
+    Do not quote the latent-only ratio (6.40x and 3.56x) as the pool ratio.
+    ``k_pe`` is NOT quantized, so it is a fixed 128 B floor: 44% of a 2-bit row
+    and 31% of a 4-bit one. At four bits it is the second-largest term after the
+    codes themselves, which is where the next real capacity win is -- not in the
+    codes.
     """
     n_groups = kv_lora_rank // group_size
     return (
