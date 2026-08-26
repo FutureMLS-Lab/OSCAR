@@ -407,22 +407,48 @@ class _PackedLatentMixin(_Int2HPMixin):
 
     # ── rotation hooks used by the model's MLA forward ──────────────────────
 
-    def latent_rotation(self, layer_id: int) -> Optional[torch.Tensor]:
+    def latent_rotation(self, layer_id: int, local: bool = False
+                        ) -> Optional[torch.Tensor]:
+        """The rotation for a layer. ``local`` says which id space you hold.
+
+        ``self.rotations`` is keyed by this pool's LOCAL index -- the loader
+        writes ``rotations[start_layer + j]`` while reading the file
+        ``layer_<rotation_layer_ids[j]>.pt``. So a caller holding a global id
+        must be mapped, and a caller holding a local one must not be.
+
+        This cannot be inferred from the value. On a hybrid model the two spaces
+        OVERLAP: K3's locals run 0..23 and its globals are 3, 7, ..., 92, so
+        ``rotations.get(3)`` succeeds for a global id 3 and quietly returns
+        local 3's matrix -- which is layer 15's. That is the "valid-but-wrong
+        rotation" this file warns about elsewhere, and it does not raise: the
+        write rotates in one frame and the read unrotates in another, which
+        looks exactly like a quantizer that is too coarse. It is why K3 garbled
+        identically at 2 and 4 bits while the pack/unpack kernels reproduced the
+        offline quantizer to four decimals.
+        """
         if not self.rotations:
             return None
-        return self.rotations.get(layer_id)
+        return self.rotations.get(
+            layer_id if local else self._local_layer_index(layer_id)
+        )
 
-    def rotate_latent(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
+    def rotate_latent(self, layer_id: int, x: torch.Tensor,
+                      local: bool = False) -> torch.Tensor:
         """``x @ R`` -- the query side, and the fresh keys handed to a kernel."""
-        R = self.latent_rotation(layer_id)
+        R = self.latent_rotation(layer_id, local=local)
         if R is None:
             return x
         shp = x.shape
         return torch.matmul(x.reshape(-1, shp[-1]), R.to(x.dtype)).view(shp)
 
-    def unrotate_output(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
-        """``x @ R^T`` -- the attention output, before ``w_vc``."""
-        R = self.latent_rotation(layer_id)
+    def unrotate_output(self, layer_id: int, x: torch.Tensor,
+                        local: bool = False) -> torch.Tensor:
+        """``x @ R^T`` -- the attention output, before ``w_vc``.
+
+        Called from the attention layer with ``attn_mqa.layer_id``, which is
+        GLOBAL, so the default maps.
+        """
+        R = self.latent_rotation(layer_id, local=local)
         if R is None:
             return x
         shp = x.shape
@@ -516,7 +542,10 @@ class _PackedLatentMixin(_Int2HPMixin):
         # be mapped a second time.
         li = layer_id - self.start_layer
         R = self.kv_lora_rank
-        c = self.rotate_latent(layer_id, c_kv.reshape(-1, R).to(torch.float32))
+        # local=True: HybridLinearKVPool.set_kv_buffer already remapped, so
+        # layer_id here is this pool's own index, the space rotations is keyed in.
+        c = self.rotate_latent(layer_id, c_kv.reshape(-1, R).to(torch.float32),
+                               local=True)
         pe = k_pe.reshape(-1, self.qk_rope_head_dim)
         loc64 = loc.reshape(-1).to(torch.int64)
 
@@ -752,7 +781,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         # the arena in fp32 rather than bf16; if it is at bf16 epsilon, the
         # question is closed rather than assumed.
         if keep is not None and bool(keep.any()):
-            R = self.latent_rotation(layer_id)
+            R = self.latent_rotation(layer_id, local=True)
             if R is not None:
                 k = keep.reshape(-1)
                 got_w = got[k].float()
