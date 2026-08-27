@@ -334,7 +334,26 @@ class Envs:
     # (0.877-0.967 at ctx 1000 on GLM-5.2, against 0.862 on DeepSeek-V2-Lite),
     # so it is the kernel and not node noise. gf is now a default ABOVE a
     # context threshold rather than never -- see SGLANG_OSCAR_MLA_PACKED_GF.
-    # The fixed-cost window pass is still what bounds it at short context.
+    #
+    # And the window pass is now MEASURED as the cause, not assumed. Setting
+    # both window sizes to 0 removes the arena, so gf runs ONE kernel like
+    # production; gf/production at ctx 1000 then goes
+    #
+    #     conc 1   0.882 -> 0.984
+    #     conc 8   0.914 -> 1.018
+    #     conc 32  0.966 -> 0.976
+    #
+    # i.e. the deficit essentially vanishes at low concurrency. At conc 32 it
+    # barely moves, which is the same mechanism seen from the other side: a
+    # fixed per-STEP cost is already amortized by a wide batch. Two results
+    # agree -- skipping fully-excluded blocks INSIDE the packed pass did
+    # nothing (mean -0.011 over 9 points), because the cost was never in the
+    # packed pass.
+    #
+    # So making gf a universal default requires FOLDING the window pass into
+    # the packed pass -- one kernel, one grid -- and not tuning either of them.
+    # Removing the arena is not an option: it is what keeps the newest tokens
+    # in BF16.
     #
     # REVERTED to the original constants 2026-08-26. The +10% is real as a
     # measurement, but it is UNVERIFIED for correctness and cannot be verified
