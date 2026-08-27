@@ -39,8 +39,6 @@ spec:
           name: work
       priorityClassName: zz-k3-nopreempt
       restartPolicy: Never
-      tolerations:
-      - operator: Exists
       volumes:
       - name: sh
         persistentVolumeClaim:

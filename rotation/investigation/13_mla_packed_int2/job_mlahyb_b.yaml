@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-mlahyb-b
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFc9L3NoYXJlZC9vc2Nhci1tbGFoeWIKLiAkUi9vc2Nhci12ZW52L2Jpbi9hY3RpdmF0ZQpleHBvcnQgSEZfSE9NRT0vaGYgUFlUSE9OUEFUSD0kVy9zZ2xhbmctcmVzZWFyY2gvcHl0aG9uIEhGX0hVQl9PRkZMSU5FPTEKZWNobyAiW2pvYl0gSEVBRD0kKGdpdCAtQyAkVyBsb2cgLS1vbmVsaW5lIC0xKSIKClJVTl9ESVI9JFIvbWxhaHliX2I7IG1rZGlyIC1wICRSVU5fRElSCiMgQWJzb2x1dGUgc25hcHNob3QgcGF0aDogdGhlIGNhY2hlIGRpciBoYXMgbm8gcmVmcy8sIHNvIG9mZmxpbmUgcmVwby1pZAojIHJlc29sdXRpb24gcmFpc2VzICdjb3VsZG4ndCBjb25uZWN0IHRvIGh1Z2dpbmdmYWNlLmNvJyBldmVuIHRob3VnaCB0aGUKIyB3ZWlnaHRzIGFyZSByaWdodCB0aGVyZS4KTU9ERUw9L2hmL2h1Yi9tb2RlbHMtLXRvZ2V0aGVyY29tcHV0ZXItLUtpbWktSzMtTVRQLWxpdGUvc25hcHNob3RzLzlkZjcyZWUwYTIwMmVhMWI5NTg2NzA3ZmViMGU4NDM2YjQzOTA1ODkKCiMgS2ltaUxpbmVhckZvckNhdXNhbExNICsgbGluZWFyX2F0dG5fY29uZmlnID0gbWFtYmFpc2ggQU5EIE1MQSAtLSBleGFjdGx5IHRoZQojIGNvbWJpbmF0aW9uIHRoYXQgaGFkIG5vIElOVDIgcGF0aCBiZWZvcmUuIDggbGF5ZXJzIC8gMTE3IEdCIGZpdHMgb25lIEIyMDAsIHNvCiMgdGhpcyB2YWxpZGF0ZXMgdGhlIGNvZGUgcGF0aCBLMyBuZWVkcyB3aXRob3V0IGEgMTYtR1BVIHdlaWdodCBsb2FkLgojIFJvdGF0aW9uIGlzIHRoZSBoYWRhbWFyZCBmYWxsYmFjazogbm8gcGVyLWxheWVyIDUxMng1MTIgbGF0ZW50IG1hdHJpY2VzIGV4aXN0CiMgZm9yIHRoZSBLMyBmYW1pbHksIHNvIHRoaXMgdmFsaWRhdGVzIFBPT0wgU0VMRUNUSU9OICsgU0laRSArIGNvaGVyZW5jZSwgbm90IGFjY3VyYWN5LgpleHBvcnQgU0dMQU5HX0VOQUJMRV9NSVhFRF9LVl9XSU5ET1dTPTEKZXhwb3J0IFNHTEFOR19PU0NBUl9NTEFfS1ZfUEFDS0VEPTEKZXhwb3J0IFNHTEFOR19PU0NBUl9NTEFfS1ZfUk9UQVRJT05fUEFUSD1oYWRhbWFyZApleHBvcnQgU0dMQU5HX09TQ0FSX01MQV9LVl9HUk9VUF9TSVpFPTEyOApleHBvcnQgU0dMQU5HX0xMT1lEX01BWD0xCmV4cG9ydCBTR0xBTkdfTUlYRURfS1ZfUFJFRklYX1RPS0VOUz02NApleHBvcnQgU0dMQU5HX01JWEVEX0tWX1JFQ0VOVF9UT0tFTlM9NTEyCgpsYXVuY2ggKCkgewogIGxvY2FsIHRhZz0kMTsgbG9jYWwga3ZkPSQyCiAgZWNobyAiPT09PT0gYXJtICR0YWcgKGt2LWNhY2hlLWR0eXBlPSRrdmQpID09PT09IgogIHB5dGhvbjMgLW0gc2dsYW5nLmxhdW5jaF9zZXJ2ZXIgLS1tb2RlbC1wYXRoICRNT0RFTCAtLXRydXN0LXJlbW90ZS1jb2RlIFwKICAgIC0tdHAgMSAtLXBvcnQgMzE0MDEgLS1ob3N0IDEyNy4wLjAuMSBcCiAgICAtLWF0dGVudGlvbi1iYWNrZW5kIHRyaXRvbiAtLXByZWZpbGwtYXR0ZW50aW9uLWJhY2tlbmQgdHJpdG9uIFwKICAgIC0tZGVjb2RlLWF0dGVudGlvbi1iYWNrZW5kIHRyaXRvbiBcCiAgICAtLWt2LWNhY2hlLWR0eXBlICRrdmQgLS1wYWdlLXNpemUgOCBcCiAgICAtLW1lbS1mcmFjdGlvbi1zdGF0aWMgMC44NSAtLW1heC1ydW5uaW5nLXJlcXVlc3RzIDMyIFwKICAgIC0tY3VkYS1ncmFwaC1tYXgtYnMgOCAtLWNvbnRleHQtbGVuZ3RoIDgxOTIgXAogICAgLS1tYW1iYS1zY2hlZHVsZXItc3RyYXRlZ3kgZXh0cmFfYnVmZmVyIFwKICAgID4gJFJVTl9ESVIvc2VydmVyLiR0YWcubG9nIDI+JjEgJgogIGxvY2FsIHBpZD0kIQogIGZvciBpIGluICQoc2VxIDEgMjAwKTsgZG8KICAgIGN1cmwgLXNmIGh0dHA6Ly8xMjcuMC4wLjE6MzE0MDEvaGVhbHRoX2dlbmVyYXRlID4vZGV2L251bGwgMj4mMSAmJiBicmVhawogICAga2lsbCAtMCAkcGlkIDI+L2Rldi9udWxsIHx8IHsgZWNobyAiWyR0YWddIHNlcnZlciBESUVEIjsgdGFpbCAtMzAgJFJVTl9ESVIvc2VydmVyLiR0YWcubG9nOyByZXR1cm4gMTsgfQogICAgc2xlZXAgMTAKICBkb25lCiAgZWNobyAiWyR0YWddICQoZ3JlcCAtb0UgJ21heF90b3RhbF9udW1fdG9rZW5zPVswLTldKycgJFJVTl9ESVIvc2VydmVyLiR0YWcubG9nIHwgaGVhZCAtMSkiCiAgZWNobyAiWyR0YWddIHBvb2wtc2VsZWN0OiI7IGdyZXAgLUUgImh5YnJpZCBtaXhlZCBLVnxwYWNrZWQgbGF0ZW50IHN0b3JhZ2UiICRSVU5fRElSL3NlcnZlci4kdGFnLmxvZyB8IGhlYWQgLTMKICBjdXJsIC1zZiBodHRwOi8vMTI3LjAuMC4xOjMxNDAxL2dlbmVyYXRlIC1IICdDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL2pzb24nIFwKICAgIC1kICd7InRleHQiOiJMaXN0IHRoZSBmaXJzdCBmaXZlIHByaW1lIG51bWJlcnMgYW5kIGFkZCB0aGVtLiIsInNhbXBsaW5nX3BhcmFtcyI6eyJ0ZW1wZXJhdHVyZSI6MC4wLCJtYXhfbmV3X3Rva2VucyI6NDh9fScgfCBoZWFkIC1jIDQwMDsgZWNobwogIGtpbGwgJHBpZCAyPi9kZXYvbnVsbDsgd2FpdCAkcGlkIDI+L2Rldi9udWxsOyBzbGVlcCA1Cn0KCmxhdW5jaCBpbnQyIGludDIgfHwgdHJ1ZQpsYXVuY2ggYmYxNiBiZmxvYXQxNiB8fCB0cnVlCmVjaG8gIj09PSBTVU1NQVJZID09PSIKZm9yIHQgaW4gaW50MiBiZjE2OyBkbyBlY2hvICIkdDogJChncmVwIC1vRSAnbWF4X3RvdGFsX251bV90b2tlbnM9WzAtOV0rJyAkUlVOX0RJUi9zZXJ2ZXIuJHQubG9nIDI+L2Rldi9udWxsIHwgaGVhZCAtMSkiOyBkb25lCmVjaG8gIltqb2JdIGRvbmUiCg==
+          | base64 -d > /tmp/g.sh; bash /tmp/g.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            cpu: '16'
+            memory: 200Gi
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

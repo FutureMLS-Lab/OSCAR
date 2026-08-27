@@ -117,8 +117,6 @@ spec:
       - name: gpu-queue.xp/admit
       securityContext: {}
       terminationGracePeriodSeconds: 30
-      tolerations:
-      - operator: Exists
       volumes:
       - name: sh
         persistentVolumeClaim:
@@ -252,8 +250,6 @@ spec:
       - name: gpu-queue.xp/admit
       securityContext: {}
       terminationGracePeriodSeconds: 30
-      tolerations:
-      - operator: Exists
       volumes:
       - name: sh
         persistentVolumeClaim:
