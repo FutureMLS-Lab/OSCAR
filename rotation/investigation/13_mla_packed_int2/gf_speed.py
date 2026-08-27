@@ -38,7 +38,13 @@ GEN = int(os.environ.get("GEN_TOKENS", "128"))
 REPS = int(os.environ.get("REPS", "3"))
 
 
-def _wait_healthy(p, log_path: str, timeout: float = 1800.0) -> str | None:
+def _wait_healthy(p, log_path: str, timeout: float | None = None) -> str | None:
+    # 1800s was sized for a 16B model on one GPU. A 355B FP8 model loading
+    # eight shards off a PVC can spend most of that budget before it serves a
+    # token, and a timeout here throws away the whole arm -- so make it a knob
+    # rather than discovering the limit by losing a 25-minute load to it.
+    if timeout is None:
+        timeout = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
     deadline = time.time() + timeout
     while time.time() < deadline:
         if p.poll() is not None:
