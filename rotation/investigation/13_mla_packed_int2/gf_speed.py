@@ -54,7 +54,13 @@ def _wait_healthy(p, log_path: str, timeout: float = 1800.0) -> str | None:
     return "server never became healthy"
 
 
-CONC = int(os.environ.get("CONC", "1"))
+# A LIST, not a scalar. The point of measuring concurrency is that gf's window
+# pass is a fixed per-STEP cost while the packed body scales with the batch, so
+# the ratio should improve with concurrency -- and one number cannot show a
+# trend. Sweeping inside one server launch also matters practically: a 355B FP8
+# model takes ~20 minutes to come up, so a scalar CONC would mean relaunching
+# per point and turning a 2-hour job into a 6-hour one.
+CONCS = [int(x) for x in os.environ.get("CONCS", os.environ.get("CONC", "1")).split(",")]
 
 
 def _many(prompt: str, n: int) -> tuple[float, int]:
@@ -111,23 +117,28 @@ def _speed_drive(p, log_path: str) -> dict:
         # ~4 chars/token is close enough; the exact prompt length is identical
         # across arms, which is what the comparison needs.
         prompt = (filler * (ctx // 400 + 1))[: ctx * 4] + "\nSummarize:"
-        # One context that the server refuses -- a prompt longer than
-        # --context-length returns HTTP 400 -- must not discard the contexts
-        # that already measured cleanly. The first version let the exception
-        # propagate and threw away three good points to report nothing.
-        try:
-            _many(prompt, CONC)  # warmup, discarded: autotuning and JIT
-            ts = []
-            for _ in range(REPS):
-                dt, n = _many(prompt, CONC)
-                ts.append(n / dt if dt > 0 else 0.0)
-        except Exception as e:  # noqa: BLE001
-            print(f"  ctx={ctx:>6} SKIPPED: {type(e).__name__}: {str(e)[:80]}",
+        for conc in CONCS:
+            # One context that the server refuses -- a prompt longer than
+            # --context-length returns HTTP 400 -- must not discard the points
+            # that already measured cleanly. The first version let the exception
+            # propagate and threw away three good points to report nothing.
+            try:
+                _many(prompt, conc)  # warmup, discarded: autotuning and JIT
+                ts = []
+                for _ in range(REPS):
+                    dt, n = _many(prompt, conc)
+                    ts.append(n / dt if dt > 0 else 0.0)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ctx={ctx:>6} conc={conc:>3} SKIPPED: "
+                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+                continue
+            # String key: json.dump turns tuple keys into a TypeError and int
+            # keys into strings, so the summary would not survive the round
+            # trip through summary.json in a comparable form either way.
+            res[f"{ctx}:{conc}"] = round(statistics.median(ts), 2)
+            print(f"  ctx={ctx:>6} conc={conc:>3} decode "
+                  f"{res[f'{ctx}:{conc}']:>9.2f} tok/s (median of {REPS})",
                   flush=True)
-            continue
-        res[ctx] = round(statistics.median(ts), 2)
-        print(f"  ctx={ctx:>6} conc={CONC} decode {res[ctx]:>8.2f} tok/s "
-              f"(median of {REPS})", flush=True)
     return {"tps": res}
 
 
@@ -158,18 +169,34 @@ def main() -> int:
     if not (a and b):
         print("[gf_speed] an arm produced no timings")
         return 2
-    print(f"\n[gf_speed] decode tok/s at concurrency {CONC}, production vs group-factored")
-    print(f"{'ctx':>8} {'prod':>10} {'gf':>10} {'ratio':>8}  verdict")
+    print("\n[gf_speed] decode tok/s, production vs group-factored")
+    print(f"{'ctx':>8} {'conc':>5} {'prod':>10} {'gf':>10} {'ratio':>8}  verdict")
     worst = None
     for ctx in CTXS:
-        pa, pb = a.get(ctx), b.get(ctx)
-        if not (pa and pb):
-            continue
-        r = pb / pa
-        v = "gf faster" if r > 1.02 else ("gf SLOWER" if r < 0.98 else "tie")
-        if worst is None or r < worst[1]:
-            worst = (ctx, r)
-        print(f"{ctx:>8} {pa:>10.2f} {pb:>10.2f} {r:>8.3f}  {v}")
+        for conc in CONCS:
+            k = f"{ctx}:{conc}"
+            pa, pb = a.get(k), b.get(k)
+            if not (pa and pb):
+                continue
+            r = pb / pa
+            v = "gf faster" if r > 1.02 else ("gf SLOWER" if r < 0.98 else "tie")
+            if worst is None or r < worst[1]:
+                worst = (k, r)
+            print(f"{ctx:>8} {conc:>5} {pa:>10.2f} {pb:>10.2f} {r:>8.3f}  {v}")
+    # The trend across concurrency is the actual question, so state it rather
+    # than leaving it to be eyeballed out of the table: gf's window pass is a
+    # fixed per-step cost, so if the mechanism is what I think it is, the ratio
+    # rises with concurrency at fixed context.
+    if len(CONCS) > 1:
+        print(f"\n[gf_speed] ratio vs concurrency at fixed context")
+        for ctx in CTXS:
+            row = []
+            for conc in CONCS:
+                k = f"{ctx}:{conc}"
+                if a.get(k) and b.get(k):
+                    row.append(f"c{conc}={b[k] / a[k]:.3f}")
+            if row:
+                print(f"  ctx={ctx:>6}  " + "  ".join(row))
     for tag in ("prod", "gf"):
         log = infos[tag].get("log")
         n = (sum(1 for ln in open(log, errors="ignore") if "GF-ENTRY" in ln)

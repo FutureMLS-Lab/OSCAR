@@ -89,8 +89,14 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
             # and if it comes out clean the fault is the exclusion or the window
             # pass, which is where the bs=1 evidence already points.
             "SGLANG_ENABLE_MIXED_KV_WINDOWS": os.environ.get("WINDOWS", "1"),
-            "SGLANG_OSCAR_MLA_KV_ROTATION_PATH": "hadamard",
-            "SGLANG_OSCAR_MLA_KV_GROUP_SIZE": "128",
+            # `hadamard` is the uncalibrated fallback, which is right for a
+            # storage-size probe and wrong for anything on a real model: on K3
+            # a data-independent rotation is worth almost nothing (0.4854 vs
+            # 0.4876 identity) while the fitted OSCAR reaches 0.1999. Any arm
+            # that scores or that reads a REAL cache has to pass ROT_PATH.
+            "SGLANG_OSCAR_MLA_KV_ROTATION_PATH": os.environ.get(
+                "ROT_PATH", "hadamard"),
+            "SGLANG_OSCAR_MLA_KV_GROUP_SIZE": os.environ.get("GROUP_SIZE", "128"),
             "SGLANG_LLOYD_MAX": "1",
             # These are what actually gate the arena: the pool sets
             # _latent_windows from (prefix > 0 or recent > 0), NOT from
@@ -105,7 +111,12 @@ def launch(tag: str, packed: bool, extra_env: dict) -> dict:
     args = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", MODEL, "--trust-remote-code",
-        "--tp", "1", "--port", str(PORT), "--host", "127.0.0.1",
+        # TP was hardcoded to 1 because DeepSeek-V2-Lite fits on one GPU. That
+        # model is gone from the PVC, and every MLA model that still has
+        # weights is NSA and multi-GPU, so a hardcoded 1 means this probe can
+        # no longer run at all rather than merely running small.
+        "--tp", os.environ.get("TP_SIZE", "1"),
+        "--port", str(PORT), "--host", "127.0.0.1",
         "--attention-backend", "triton",
         "--prefill-attention-backend", "triton",
         "--decode-attention-backend", "triton",
