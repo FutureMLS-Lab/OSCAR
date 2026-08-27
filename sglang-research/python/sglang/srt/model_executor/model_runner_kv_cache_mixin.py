@@ -419,8 +419,16 @@ class ModelRunnerKVCacheMixin:
                 # Scoped here rather than flipping SGLANG_LLOYD_MAX, which the
                 # expanded-INT2 K/V path also reads -- a path this evidence says
                 # nothing about. An explicit env setting still wins.
-                lloyd_max=(envs.SGLANG_LLOYD_MAX.get()
-                           if envs.SGLANG_LLOYD_MAX.is_set() else True),
+                # Only at two bits. Lloyd-Max here is a THREE-THRESHOLD
+                # codebook, so the pool refuses to combine it with any other
+                # width -- and defaulting it ON without this check would make
+                # SGLANG_OSCAR_MLA_KV_BITS=4 fail to start a server at all,
+                # breaking the 4-bit path this same change set added.
+                lloyd_max=(
+                    envs.SGLANG_LLOYD_MAX.get()
+                    if envs.SGLANG_LLOYD_MAX.is_set()
+                    else envs.SGLANG_OSCAR_MLA_KV_BITS.get() == 2
+                ),
                 # The window arena is addressed by req_pool_index, so it has to
                 # cover every index the request pool can hand out -- sizing it
                 # from max_running_requests instead would silently drop the
