@@ -627,14 +627,37 @@ def _fwd_packed_mla_stage1_gf(
                 # is computed or skipped -- so the only thing the computation
                 # buys is its own cost.
                 #
-                # It is worth a per-block reduction because exclusion is not
-                # rare at short context: the arena is P_TOK + R_TOK = 576
-                # positions, which at seq 1000 is 58% of the sequence. Those
-                # tokens are then computed AGAIN, densely, by the window pass --
-                # which is why gf is 0.877x of production at ctx 1000 while
-                # being 1.72x at 32k. At long context almost no block is fully
-                # excluded, so the reduction is pure overhead there, but it is
-                # one BLOCK_N-wide integer reduction against four MMAs.
+                # MEASURED, AND IT DOES NOT HELP. Kept, not deleted, because
+                # it is correct (equivalence gate 162 MATCH / 0 MISMATCH) and
+                # because the shipped-defaults GPQA 86.67% was scored with it
+                # in the tree -- removing it would change a scored config to
+                # chase a number that is zero.
+                #
+                # The reasoning that motivated it was: the arena is
+                # P_TOK + R_TOK = 576 positions, 58% of the sequence at seq
+                # 1000, and those tokens get computed AGAIN by the window pass,
+                # so skipping their blocks should recover gf's short-context
+                # deficit. Same job, same node, ratio against the production
+                # kernel, block skip the only variable:
+                #
+                #     ctx   conc  without  with     delta
+                #     1000     1   0.877   0.882   +0.005
+                #     1000     8   0.967   0.914   -0.053
+                #     1000    32   0.922   0.966   +0.044
+                #     2000     1   0.985   0.967   -0.018
+                #     2000     8   1.011   0.950   -0.061
+                #     2000    32   1.044   1.060   +0.016
+                #     4000     1   1.068   1.034   -0.034
+                #     4000     8   1.037   1.040   +0.003
+                #     4000    32   1.092   1.090   -0.002
+                #
+                # 4 up, 5 down, mean -0.011. Noise, not a speedup. So the
+                # short-context deficit is NOT the fully-excluded blocks'
+                # arithmetic -- do not re-litigate this one. The remaining
+                # suspects are the window pass's own fixed cost (a second
+                # kernel launch and its own grid) and the loads that happen
+                # BEFORE this test (kv_indices, HpRowOfSlot, HpOwnerOfRow),
+                # which no amount of skipping downstream work can avoid.
                 live = tl.sum(n_ok.to(tl.int32)) > 0
             else:
                 live = True
