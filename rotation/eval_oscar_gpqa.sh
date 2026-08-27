@@ -188,10 +188,29 @@ if [[ -n "${EXTRA_SERVER_ARGS:-}" ]]; then
 fi
 
 echo "[eval-oscar] model=${MODEL} tp=${TP_SIZE} gpus=${GPUS} rot=${ROT_DIR} out=${RUN_DIR}"
+# SGLANG_LLOYD_MAX is PASSED ONLY IF THE CALLER SET IT.
+#
+# It used to be `SGLANG_LLOYD_MAX="${LLOYD_MAX:-0}"` in the prefix below, which
+# always put the variable in the environment -- so `is_set()` was always True
+# and the pool's own default never ran. That matters now that the packed MLA
+# pools default Lloyd-Max ON at 2 bits: forcing the variable silently pinned
+# every eval to the uniform codebook, which on GLM-5.2 is 76.67% against
+# 83.33%. A harness that hardcodes a default cannot test that default, and it
+# reports the shipped configuration's number for a configuration nobody ships.
+#
+# Same shape of bug as gf_speed setting SGLANG_OSCAR_MLA_PACKED_GF in both
+# arms: whenever a harness supplies a value "for reproducibility", the branch
+# that runs when nobody supplies one stops being exercised.
+OPT_ENV=()
+if [ -n "${LLOYD_MAX:-}" ]; then
+    OPT_ENV+=("SGLANG_LLOYD_MAX=${LLOYD_MAX}")
+    echo "[eval-oscar] SGLANG_LLOYD_MAX pinned to ${LLOYD_MAX} by the caller"
+else
+    echo "[eval-oscar] SGLANG_LLOYD_MAX left UNSET -- the pool's own default applies"
+fi
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
 SGLANG_COQUANT_ROTATION_MODE=coquant \
-SGLANG_LLOYD_MAX="${LLOYD_MAX:-0}" \
 SGLANG_OSCAR_ABSORB_V_ROTATION="${ABSORB_V:-0}" \
 SGLANG_MIXED_KV_HP_MAX_SPLITS=8 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
@@ -210,6 +229,7 @@ SGLANG_OSCAR_V_ROTATION_PATH="${ROT_DIR}/${V_ROT_FILENAME:-v_rotation_sst_r_h_pb
 SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP:-0.96}" \
 SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP:-0.92}" \
 CUDA_VISIBLE_DEVICES="${GPUS}" \
+env "${OPT_ENV[@]}" \
 python -m sglang.launch_server "${SERVER_ARGS[@]}" >> "${LOG_SERVER}" 2>&1 &
 SERVER_PID=$!
 
