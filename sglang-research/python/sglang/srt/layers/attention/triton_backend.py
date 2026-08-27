@@ -2493,8 +2493,15 @@ class TritonAttnBackend(AttentionBackend):
                     )
                     self._gf_split_bufs = buf
                 ns_quant, ns_merge = buf[0][: ns.shape[0]], buf[1][: ns.shape[0]]
-                torch.clamp(ns - 1, min=1, out=ns_quant)
-                torch.add(ns_quant, 1, out=ns_merge)
+                # inference_mode for the same reason the launcher needs it:
+                # these buffers derive from `ns`, which under CUDA-graph capture
+                # is an INFERENCE TENSOR, and `out=` is an in-place write just
+                # like fill_(). I fixed only the explicit fill_/zero_ first and
+                # this one killed the very next capture -- `out=` does not look
+                # like mutation at a glance, which is exactly why it was missed.
+                with torch.inference_mode():
+                    torch.clamp(ns - 1, min=1, out=ns_quant)
+                    torch.add(ns_quant, 1, out=ns_merge)
                 # ns_merge is ns_quant + 1, NOT the original ns.
                 #
                 # They agree whenever ns >= 2, but at ns == 1 the clamp keeps
