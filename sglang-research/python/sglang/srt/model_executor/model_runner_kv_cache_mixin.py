@@ -403,7 +403,24 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
                 group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
-                lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                # Default ON for the PACKED pools only, unlike the shared
+                # SGLANG_LLOYD_MAX default. Measured paired on GLM-5.2, packed 2-bit
+                # + OSCAR rotation, 30 GPQA questions, the codebook the ONLY variable
+                # and storage byte-identical:
+                #
+                #     uniform grid   76.67%
+                #     Lloyd-Max      83.33%    +6.67 pp at zero cost
+                #
+                # The rotation is what earns it: Rcov P H drives the latent toward
+                # Gaussian and Lloyd-Max puts its four levels at the conditional means
+                # of a normal, so the two compose. Offline on K3's dump the same
+                # pairing is 0.3491 -> 0.2604 at group 128.
+                #
+                # Scoped here rather than flipping SGLANG_LLOYD_MAX, which the
+                # expanded-INT2 K/V path also reads -- a path this evidence says
+                # nothing about. An explicit env setting still wins.
+                lloyd_max=(envs.SGLANG_LLOYD_MAX.get()
+                           if envs.SGLANG_LLOYD_MAX.is_set() else True),
                 # The window arena is addressed by req_pool_index, so it has to
                 # cover every index the request pool can hand out -- sizing it
                 # from max_running_requests instead would silently drop the
