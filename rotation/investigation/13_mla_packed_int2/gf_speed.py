@@ -54,6 +54,36 @@ def _wait_healthy(p, log_path: str, timeout: float = 1800.0) -> str | None:
     return "server never became healthy"
 
 
+CONC = int(os.environ.get("CONC", "1"))
+
+
+def _many(prompt: str, n: int) -> tuple[float, int]:
+    """Fire n identical requests together and return wall time and total tokens.
+
+    Every speed number for this path so far is batch-1, which measures the
+    kernel and nothing else. The packed pool's reason to exist is CAPACITY --
+    288 B/token/layer against BF16's 1152 -- and capacity only shows up when
+    enough requests are in flight to feel the KV limit. A kernel that loses at
+    batch 1 can still win the deployment.
+    """
+    import threading
+    res = [None] * n
+    def one(i):
+        try:
+            res[i] = _one(prompt)
+        except Exception:  # noqa: BLE001
+            res[i] = None
+    t0 = time.time()
+    ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    dt = time.time() - t0
+    got = [r for r in res if r]
+    return dt, sum(r[1] for r in got)
+
+
 def _one(prompt: str) -> tuple[float, int]:
     body = json.dumps({
         "text": prompt,
@@ -86,17 +116,17 @@ def _speed_drive(p, log_path: str) -> dict:
         # that already measured cleanly. The first version let the exception
         # propagate and threw away three good points to report nothing.
         try:
-            _one(prompt)  # warmup, discarded: it pays for autotuning and JIT
+            _many(prompt, CONC)  # warmup, discarded: autotuning and JIT
             ts = []
             for _ in range(REPS):
-                dt, n = _one(prompt)
+                dt, n = _many(prompt, CONC)
                 ts.append(n / dt if dt > 0 else 0.0)
         except Exception as e:  # noqa: BLE001
             print(f"  ctx={ctx:>6} SKIPPED: {type(e).__name__}: {str(e)[:80]}",
                   flush=True)
             continue
         res[ctx] = round(statistics.median(ts), 2)
-        print(f"  ctx={ctx:>6} decode {res[ctx]:>8.2f} tok/s "
+        print(f"  ctx={ctx:>6} conc={CONC} decode {res[ctx]:>8.2f} tok/s "
               f"(median of {REPS})", flush=True)
     return {"tps": res}
 
@@ -128,7 +158,7 @@ def main() -> int:
     if not (a and b):
         print("[gf_speed] an arm produced no timings")
         return 2
-    print("\n[gf_speed] decode tok/s, production vs group-factored")
+    print(f"\n[gf_speed] decode tok/s at concurrency {CONC}, production vs group-factored")
     print(f"{'ctx':>8} {'prod':>10} {'gf':>10} {'ratio':>8}  verdict")
     worst = None
     for ctx in CTXS:

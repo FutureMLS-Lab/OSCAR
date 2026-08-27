@@ -127,6 +127,13 @@ def main() -> int:
         infos[tag] = sp.launch(tag, packed=packed, extra_env={
             "SGLANG_OSCAR_MLA_PACKED_GF": "0",
             "SGLANG_OSCAR_MLA_KV_BITS": "2",
+            # Lloyd-Max places its four levels at the conditional means of a
+            # normal instead of on a uniform grid, and the OSCAR rotation is
+            # what makes the coordinates normal -- the two compose. Offline on
+            # K3's dump the codebook is worth 0.3491 -> 0.2604 at group 128,
+            # for identical bits/elem. LLOYD is read from the env so this arm
+            # can be flipped without another driver.
+            "SGLANG_LLOYD_MAX": os.environ.get("LLOYD", "0"),
         })
         print(f"[pvb] {tag}: {json.dumps({k: v for k, v in infos[tag].items() if k != 'samples'})[:220]}",
               flush=True)
