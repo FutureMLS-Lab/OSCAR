@@ -330,6 +330,12 @@ class Envs:
     # at ctx 1000. Closing that needs the window pass folded into the packed
     # pass so its fixed cost disappears, which is a kernel rewrite, not a knob.
     #
+    # 2026-08-27: the short-context deficit is confirmed on a second model
+    # (0.877-0.967 at ctx 1000 on GLM-5.2, against 0.862 on DeepSeek-V2-Lite),
+    # so it is the kernel and not node noise. gf is now a default ABOVE a
+    # context threshold rather than never -- see SGLANG_OSCAR_MLA_PACKED_GF.
+    # The fixed-cost window pass is still what bounds it at short context.
+    #
     # REVERTED to the original constants 2026-08-26. The +10% is real as a
     # measurement, but it is UNVERIFIED for correctness and cannot be verified
     # with the gate as it stands: bench_kernel's build() hands the reference
@@ -346,6 +352,23 @@ class Envs:
     SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
     SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(4)
     SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
+    # TRI-STATE, and the default value below is NOT the effective default.
+    # Unset means AUTO: the backend turns gf on when the server's context length
+    # is >= 8192, decided once at init. Setting it to 0 or 1 pins it.
+    #
+    # `EnvBool(False)` is the value `.get()` returns when nothing is set; the
+    # backend asks `.is_set()` first, so the False here is only the fallback for
+    # any caller that does not. Do not "simplify" this to a plain default --
+    # that silently removes the auto rule.
+    #
+    # Why auto, and why on the context length rather than the batch's actual
+    # sequence lengths: measured end to end on GLM-5.2-FP8, gf/production decode
+    # tok/s is 0.877-0.967 at ctx 1000, ~1.0 at 2000, and 1.29-1.72 from 16k up,
+    # rising with concurrency. So gf is a clear win at long context and a real
+    # loss at short, and a CUDA graph's capture key is the batch size, not the
+    # sequence length -- one graph serves seq=100 and seq=32000 alike, so a
+    # per-batch branch cannot execute at replay. Per-server is the only
+    # adaptivity that survives capture. Full table in triton_backend.py.
     SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
     # Runs the production kernel alongside the group-factored one on the same
     # call and logs the deviation. Expensive; a debugging instrument, not a

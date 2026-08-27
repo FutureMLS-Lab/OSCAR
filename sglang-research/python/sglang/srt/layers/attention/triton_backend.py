@@ -340,6 +340,42 @@ class TritonAttnBackend(AttentionBackend):
             _is_packed_mla_pool(model_runner.token_to_kv_pool) and self.use_mla
         )
         self.max_context_len = model_runner.model_config.context_len
+        # Group-factored decode: ON by default above a context threshold.
+        #
+        # Measured end to end on GLM-5.2-FP8 (tp8, B200, packed 2-bit + OSCAR),
+        # gf / production decode tok/s, two back-to-back server launches with
+        # this as the only variable:
+        #
+        #     ctx      conc=1   conc=8   conc=32
+        #     1000      0.877    0.967     0.922     <-- gf LOSES
+        #     2000      0.985    1.011     1.044
+        #     4000      1.068    1.037     1.092
+        #     16000     1.295    1.285     1.660
+        #     32000     1.369    1.353     1.720
+        #
+        # The crossover sits between 2k and 4k, and the loss at 1k reproduces on
+        # a different model (0.862x on DeepSeek-V2-Lite), so it is the kernel,
+        # not node noise. gf's window pass is a fixed per-STEP cost: at 1k it is
+        # most of the work, at 32k it is a rounding error, which is also why the
+        # ratio IMPROVES with concurrency once the context is long.
+        #
+        # Why this is decided ONCE, from the server's context length, and not
+        # per batch from the actual sequence lengths: a CUDA graph's capture key
+        # is the batch size, NOT the sequence length, so one graph serves
+        # seq=100 and seq=32000 alike. A per-batch branch would simply bake in
+        # whichever side ran at capture time and never execute again at replay.
+        # Per-server is the only adaptivity that survives graph capture.
+        #
+        # The threshold is 8192 rather than the 3000-ish crossover because the
+        # errors are asymmetric: guessing wrong costs at most ~12% when prompts
+        # turn out short, and costs a 1.3-1.7x speedup when they turn out long.
+        # A server configured for long context is one where long decodes are
+        # worth optimizing for.
+        self._gf_enabled = (
+            envs.SGLANG_OSCAR_MLA_PACKED_GF.get()
+            if envs.SGLANG_OSCAR_MLA_PACKED_GF.is_set()
+            else self.max_context_len >= 8192
+        )
         # ``mixed_kv_enabled()`` is True only for ``UnifiedInt2HPKVPool``
         # (SWAKVPool / MHA pools lack the method), so this gate already
         # excludes the plain hybrid-SWA path. The unified pool can now span
@@ -2457,7 +2493,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             pool = forward_batch.token_to_kv_pool
-            if envs.SGLANG_OSCAR_MLA_PACKED_GF.get():
+            if self._gf_enabled:
                 # Group-factored two-pass path. Validated against the override
                 # kernel after stage 2 (rel 3.65e-03, inside bf16 rounding,
                 # with the arena confirmed load-bearing at 1.77e-01) and 4.75x

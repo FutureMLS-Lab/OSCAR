@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-gfshort
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - gpu-dp-qcqgp-5wsdx
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2Nhci1tbGFoeWI7IFc9L3dvcmsvb3NjYXI7IFBJTj00YjY4NWQ1YWQKIyBBbiBlbXB0eSBQSU4gY2hlY2tzIG91dCB3aXRoIGEgQkxBTksgZXJyb3IgbWVzc2FnZSBhbmQgdGhlIGpvYiBkaWVzIGxvb2tpbmcKIyBsaWtlIGEgY2xvbmUgZmFpbHVyZS4gQXNzZXJ0IGl0IGJlZm9yZSB0b3VjaGluZyBnaXQuClsgLW4gIiRQSU4iIF0gfHwgeyBlY2hvICJGQVRBTDogZW1wdHkgUElOIjsgZXhpdCAxOyB9Cm1rZGlyIC1wIC93b3JrCmdpdCBjbG9uZSAtcSAtLWxvY2FsIC0tbm8taGFyZGxpbmtzICIkU1JDIiAiJFciIHx8IHsgZWNobyAiRkFUQUwgY2xvbmUgZmFpbGVkIjsgZXhpdCAxOyB9CmdpdCAtQyAiJFciIGNoZWNrb3V0IC1xIC1mIC0tZGV0YWNoICIkUElOIiB8fCB7IGVjaG8gIkZBVEFMIHBpbiAkUElOIGZhaWxlZCI7IGV4aXQgMTsgfQouICRSL29zY2FyLXZlbnYvYmluL2FjdGl2YXRlCmV4cG9ydCBIRl9IT01FPS9oZiBQWVRIT05QQVRIPSRXL3NnbGFuZy1yZXNlYXJjaC9weXRob24KZWNobyAiW2pvYl0gSEVBRD0kKGdpdCAtQyAkVyBsb2cgLS1vbmVsaW5lIC0xKSIKCkk9JFcvcm90YXRpb24vaW52ZXN0aWdhdGlvbi8xM19tbGFfcGFja2VkX2ludDIKSz0kVy9zZ2xhbmctcmVzZWFyY2gvcHl0aG9uL3NnbGFuZy9zcnQvbGF5ZXJzL2F0dGVudGlvbgojIEV2ZXJ5IGd1YXJkIGJlbG93IGFzc2VydHMgdGhlIHByZXNlbmNlIG9mIGEgdGhpbmcgdGhpcyBydW4gREVQRU5EUyBvbi4gQQojIHN0YWxlIHBpbiB0aGF0IGxhY2tzIGFueSBvZiB0aGVtIGRvZXMgbm90IGZhaWwgbG91ZGx5LCBpdCBwcm9kdWNlcyBhIHBsYXVzaWJsZQojIHRhYmxlIC0tIHdoaWNoIGlzIHRoZSBleHBlbnNpdmUgZmFpbHVyZSwgbm90IHRoZSBjcmFzaC4KZ3JlcCAtcSAiQ09OQ1MiICRJL2dmX3NwZWVkLnB5ICAgICAgICAgICB8fCB7IGVjaG8gIkZBVEFMOiBwaW5uZWQgdHJlZSBoYXMgbm8gY29uY3VycmVuY3kgc3dlZXAiOyBleGl0IDE7IH0KZ3JlcCAtcSAiVFBfU0laRSIgJEkvc2VydmVfcHJvYmUucHkgICAgICB8fCB7IGVjaG8gIkZBVEFMOiBwaW5uZWQgdHJlZSBzdGlsbCBoYXJkY29kZXMgdHA9MSI7IGV4aXQgMTsgfQpncmVwIC1xICJIRUFMVEhfVElNRU9VVCIgJEkvZ2Zfc3BlZWQucHkgIHx8IHsgZWNobyAiRkFUQUw6IHBpbm5lZCB0cmVlIGxhY2tzIHRoZSBoZWFsdGgtdGltZW91dCBrbm9iIjsgZXhpdCAxOyB9CmdyZXAgLXEgIndpdGggdG9yY2guaW5mZXJlbmNlX21vZGUoKToiICRLL3RyaXRvbl9iYWNrZW5kLnB5IFwKICB8fCB7IGVjaG8gIkZBVEFMOiBzdGFsZSBwaW4sIHRoZSBiYWNrZW5kIG91dD0gd3JpdGVzIHdvdWxkIGtpbGwgY2FwdHVyZSI7IGV4aXQgMTsgfQpncmVwIC1xICJ3aXRoIHRvcmNoLmluZmVyZW5jZV9tb2RlKCk6IiAkSy90cml0b25fb3BzL21sYV9wYWNrZWRfZGVjb2RlLnB5IFwKICB8fCB7IGVjaG8gIkZBVEFMOiBzdGFsZSBwaW4sIHRoZSBpbi1wbGFjZSB3cml0ZSB3b3VsZCBraWxsIGNhcHR1cmUiOyBleGl0IDE7IH0KZ3JlcCAtcSAiTUVBU1VSRUQsIG5vdCBhcmd1ZWQiICRLL3RyaXRvbl9vcHMvbWxhX3BhY2tlZF9kZWNvZGUucHkgXAogIHx8IHsgZWNobyAiRkFUQUw6IHN0YWxlIHBpbiwgTlNBIHdvdWxkIHN0aWxsIGJlIHJlZnVzZWQgb3V0cmlnaHQiOyBleGl0IDE7IH0KZ3JlcCAtcSAiTUVSR0UgaW50byB0aGUgc2xvdCBpbnN0ZWFkIG9mIG92ZXJ3cml0aW5nIiAkSy90cml0b25fb3BzL21sYV9wYWNrZWRfZGVjb2RlLnB5IFwKICB8fCB7IGVjaG8gIkZBVEFMOiBwaW5uZWQgdHJlZSBsYWNrcyB0aGUgZm9sZCBmaXgiOyBleGl0IDE7IH0KCmV4cG9ydCBST1RfUEFUSD0kUi9nbG01Mi1yb3RhdGlvbnMKZWNobyAiW2pvYl0gcm90YXRpb24gbGF5ZXJzOiAkKGxzICRST1RfUEFUSC9sYXllcl8qLnB0IDI+L2Rldi9udWxsIHwgd2MgLWwpIgojIExpc3Qgd2hhdCBJUyB0aGVyZSByYXRoZXIgdGhhbiBhc3NlcnRpbmcgYSBndWVzc2VkIHNuYXBzaG90IHBhdGggLS0gdGhlIGxhc3QKIyB0aW1lIEkgYXNzZXJ0ZWQgb25lLCB0aGUgYXNzZXJ0IHdhcyB3cm9uZyBhbmQgaGlkIHRoZSByZWFsIHN0YXRlLgplY2hvICJbam9iXSBHTE0gc25hcHNob3QgZGlycyB1bmRlciAvaGY6IgpscyAtZCAvaGYvaHViL21vZGVscy0temFpLW9yZy0tR0xNLTUuMi1GUDgvc25hcHNob3RzLyovIDI+L2Rldi9udWxsIHwgaGVhZCAtMwpscyAvaGYvaHViL21vZGVscy0temFpLW9yZy0tR0xNLTUuMi1GUDgvc25hcHNob3RzLyovIDI+L2Rldi9udWxsIHwgaGVhZCAtNQoKZXhwb3J0IE1PREVMPXphaS1vcmcvR0xNLTUuMi1GUDggVFBfU0laRT04CmV4cG9ydCBPVVRfRElSPSRSL21sYXBhY2tlZF9nZnNwZWVkX3Nob3J0OyBta2RpciAtcCAkT1VUX0RJUgpleHBvcnQgQ1RYUz0xMDAwLDIwMDAsNDAwMApleHBvcnQgQ09OQ1M9MSw4LDMyCmV4cG9ydCBSRVBTPTIgR0VOX1RPS0VOUz0xMjgKZXhwb3J0IE1FTV9GUkFDPTAuNzggQ0dfTUFYX0JTPTMyCiMgMzU1QiBGUDggYWNyb3NzIGVpZ2h0IHNoYXJkcyBvZmYgYSBQVkM7IDE4MDBzIGlzIGEgMTZCIG1vZGVsJ3MgYnVkZ2V0LgpleHBvcnQgSEVBTFRIX1RJTUVPVVQ9MzAwMApleHBvcnQgUE9SVD0zMTMzMQoKewogIGVjaG8gIkhFQUQ9JChnaXQgLUMgJFcgbG9nIC0tb25lbGluZSAtMSkiCiAgZW52IHwgZ3JlcCAtRSAnXihNT0RFTHxUUF9TSVpFfFJPVF9QQVRIfENUWFN8Q09OQ1N8UkVQU3xHRU5fVE9LRU5TfE1FTV9GUkFDfENHX01BWF9CU3xIRUFMVEhfVElNRU9VVHxPVVRfRElSKT0nIHwgc29ydAp9ID4gJE9VVF9ESVIvY29uZmlnLmVudgpjYXQgJE9VVF9ESVIvY29uZmlnLmVudgoKIyBGaWx0ZXIgb24gUkVBRCwgbmV2ZXIgb24gd3JpdGU6IHRoZSBmdWxsIHN0cmVhbSBsYW5kcyBpbiB0aGUgbG9nIGFuZCBvbmx5IHRoZQojIGNvbnNvbGUgdmlldyBpcyB0cmltbWVkLiBGaWx0ZXJpbmcgdGhlIHdyaXR0ZW4gc3RyZWFtIGlzIGhvdyB0d28gZWFybGllcgojIHJvdW5kcyBwcm9kdWNlZCBoZWFkZXJzIGFuZCBzd2FsbG93ZWQgdGhlaXIgb3duIHRyYWNlYmFja3MuCnB5dGhvbjMgJEkvZ2Zfc3BlZWQucHkgMj4mMSB8IHRlZSAtYSAkT1VUX0RJUi9wb2QubG9nIHwgdGFpbCAtNjAKZWNobyAiW2pvYl0gPT09PSBnZl9zcGVlZCBleGl0PSQ/ID09PT0iCgplY2hvICJbam9iXSA9PT09IHRhYmxlID09PT0iCmdyZXAgLWFFICJjdHg9fHJhdGlvfGdmIGZhc3RlcnxnZiBTTE9XRVJ8dGllfHdvcnN0IGNvbnRleHR8R0YtRU5UUll8cmF0aW8gdnMgY29uY3VycmVuY3l8YzE9fGFuIGFybSBwcm9kdWNlZCIgJE9VVF9ESVIvcG9kLmxvZyB8IHRhaWwgLTQwCmVjaG8gIltqb2JdID09PT0gcGVyLWFybSBzZXJ2ZXIgZmFjdHMgPT09PSIKZm9yIHQgaW4gcHJvZCBnZjsgZG8KICBMPSRPVVRfRElSL3NlcnZlci4kdC5sb2cKICBbIC1mICIkTCIgXSB8fCB7IGVjaG8gIiAgJHQ6IG5vIHNlcnZlciBsb2ciOyBjb250aW51ZTsgfQogIGVjaG8gIiAgLS0tICR0IC0tLSIKICBncmVwIC1hb0UgIm1heF90b3RhbF9udW1fdG9rZW5zPVswLTldK3xrdl9jYWNoZV9kdHlwZT0nW2EtejAtOV9dKid8Q2FwdHVyZSBjdWRhIGdyYXBoIGJzIFxbW15dXSpcXSIgJEwgfCBzb3J0IC11IHwgaGVhZCAtNAogIGVjaG8gIiAgR0YtRU5UUlkgbGluZXM6ICQoZ3JlcCAtYWMgJ0dGLUVOVFJZJyAkTCkiCiAgZWNobyAiICBwYWNrZWQ6ICQoZ3JlcCAtYW9FICdcW01MQVBhY2tlZFxdIHBhY2tlZCBsYXRlbnQgc3RvcmFnZTogW15cIl17MCw4MH0nICRMIHwgaGVhZCAtMSkiCiAgZ3JlcCAtYSAiVHJhY2ViYWNrIiAkTCB8IGhlYWQgLTIKZG9uZQoKIyBUaGUgcnVuIGFib3ZlIHJlcG9ydGVkIEpvYiBGYWlsZWQgb24gYSBmdWxseSBzdWNjZXNzZnVsIHN3ZWVwOiB0aGUgbGFzdAojIGNvbW1hbmQgd2FzIGBncmVwIFRyYWNlYmFja2AsIHdoaWNoIHJldHVybnMgMSB3aGVuIGl0IGZpbmRzIG5vdGhpbmcsIGFuZAojIHVuZGVyIGBzZXQgLXVvIHBpcGVmYWlsYCB0aGF0IGJlY29tZXMgdGhlIHNjcmlwdCdzIGV4aXQgY29kZS4gQSBoYXJuZXNzIHdob3NlCiMgc3VjY2VzcyBwYXRoIGV4aXRzIG5vbi16ZXJvIHRyYWlucyB5b3UgdG8gaWdub3JlIHRoZSBzdGF0dXMgZmllbGQuCmVjaG8gIltqb2JdIGRvbmUiCg==
+          | base64 -d > /tmp/j.sh && bash -n /tmp/j.sh && bash /tmp/j.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+          requests:
+            cpu: '48'
+            memory: 800Gi
+            nvidia.com/gpu: '8'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800
