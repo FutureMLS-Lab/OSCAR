@@ -54,13 +54,62 @@ def _wait_healthy(p, log_path: str, timeout: float = 1800.0) -> str | None:
     return "server never became healthy"
 
 
+GEN_TOKENS = int(os.environ.get("GEN_TOKENS", "128"))
+PAD_TOKENS = int(os.environ.get("PAD_TOKENS", "3000"))
+
+
+def _gen_dump(url: str, out_path: str) -> None:
+    """Score GENERATED tokens. Prefill does not read the packed pool at all.
+
+    klc.dump uses max_new_tokens=0, which scores the INPUT -- and prefill
+    computes k/v straight from latent_cache rather than reading back what the
+    pool stored, so a packed arm and a BF16 arm agree to the last bit and the
+    comparison says 0.0000 while testing nothing. That is exactly the trap
+    gf_kl.py already hit and had fixed; reusing klc.dump here walked into it a
+    second time.
+
+    Only decode reads quantized latents back. temperature=0 removes sampling
+    noise so a divergence is attributable to the storage, and the prompt is
+    padded so decode reads a real cache rather than a handful of keys.
+    """
+    pad = "The following is background material that should be ignored. " * 60
+    rows = []
+    for i, text in enumerate(klc.TEXTS):
+        prompt = (pad * max(1, PAD_TOKENS // 600))[: PAD_TOKENS * 4] + "\n\n" + text
+        body = json.dumps({
+            "text": prompt,
+            "sampling_params": {"max_new_tokens": GEN_TOKENS, "temperature": 0.0},
+            "return_logprob": True,
+        }).encode()
+        try:
+            r = json.loads(urllib.request.urlopen(urllib.request.Request(
+                f"{url}/generate", data=body,
+                headers={"Content-Type": "application/json"}), timeout=900).read())
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{i}] request failed: {type(e).__name__}: {e}", flush=True)
+            rows.append({"i": i, "error": str(e)[:200]})
+            continue
+        one = r[0] if isinstance(r, list) else r
+        meta = one.get("meta_info", {})
+        rows.append({
+            "i": i,
+            "text": text,
+            "input_token_logprobs": meta.get("output_token_logprobs"),
+            "input_top_logprobs": meta.get("output_top_logprobs"),
+        })
+        print(f"  [{i}] {len(meta.get('output_token_logprobs') or [])} generated",
+              flush=True)
+    with open(out_path, "w") as f:
+        json.dump(rows, f)
+
+
 def _drive(p, log_path: str) -> dict:
     err = _wait_healthy(p, log_path)
     if err:
         return {"error": err}
     out = os.path.join(OUT, f"lp.{_drive.tag}.json")
     t0 = time.time()
-    klc.dump(f"http://127.0.0.1:{sp.PORT}", out, TOP_K)
+    _gen_dump(f"http://127.0.0.1:{sp.PORT}", out)
     return {"wall_s": round(time.time() - t0, 1), "dump": out}
 
 
