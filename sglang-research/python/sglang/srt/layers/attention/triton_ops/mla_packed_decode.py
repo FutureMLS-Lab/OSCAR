@@ -1089,9 +1089,27 @@ def packed_mla_decode_gf_fwd(
     #
     # -1e30 is the same inert sentinel the kernels write for an empty split:
     # stage 2's max ignores it and exp() underflows it to zero.
+    #
+    # Under CUDA-graph capture these two buffers arrive as INFERENCE TENSORS,
+    # and torch refuses an in-place write to one outside InferenceMode:
+    #
+    #   RuntimeError: Inplace update to inference tensor outside InferenceMode
+    #
+    # It killed the scheduler at startup, in init_device_graphs, not in serving.
+    # It never showed earlier because every prior group-factored run was either
+    # the kernel gate (no graphs at all) or serve_probe (small batch / graphs
+    # off); GLM-5.2 is the first model to reach this path WITH capture on.
+    #
+    # Writing inside torch.inference_mode() is what actually works. `.data` does
+    # NOT -- it looks like the obvious escape hatch and still raises, verified
+    # directly rather than assumed:
+    #
+    #   t.data[:, :, :2].fill_(-1.0)  ->  same RuntimeError
+    #   with torch.inference_mode(): t[...].fill_(-1.0)  ->  OK
     _ns = max_kv_splits + 1 if has_hp else max_kv_splits
-    attn_lse[:, :, :_ns].fill_(-1.0e4)
-    attn_logits[:, :, :_ns].zero_()
+    with torch.inference_mode():
+        attn_lse[:, :, :_ns].fill_(-1.0e4)
+        attn_logits[:, :, :_ns].zero_()
 
     if not getattr(pool, "_gf_entry_logged", False):
         # One line, unconditionally, the first time this path runs. The A/B
