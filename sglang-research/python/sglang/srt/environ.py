@@ -350,10 +350,33 @@ class Envs:
     # nothing (mean -0.011 over 9 points), because the cost was never in the
     # packed pass.
     #
-    # So making gf a universal default requires FOLDING the window pass into
-    # the packed pass -- one kernel, one grid -- and not tuning either of them.
-    # Removing the arena is not an option: it is what keeps the newest tokens
-    # in BF16.
+    # I first wrote that the fix was to FOLD the window pass into the packed
+    # pass -- one kernel, one grid. That was wrong, and it is worth recording
+    # why: the production kernel ALREADY does exactly that. It is a single
+    # kernel that overrides arena tokens with a computed tile
+    # (`if tl.max(use_hp) > 0: hpv = tl.load(HP ...)`). So "fold it" is not an
+    # unexplored direction, it is the very arm gf is measured against.
+    #
+    # The two are the two ends of one trade-off:
+    #   production  folded, 1 kernel  -- ~2% of blocks take the arena branch,
+    #                                    but registers are reserved in ALL of
+    #                                    them
+    #   gf          split, 2 kernels  -- no full-width tile in the fast path,
+    #                                    but a fixed second-pass cost per step
+    # Their crossovers are opposite, which is precisely why a context-gated
+    # default is the right answer given these two implementations, and why
+    # neither can be tuned into dominating the other.
+    #
+    # Range-splitting the loop (main body over [P, tail_start) with no HP code
+    # at all) is NOT a safe third option: a token that has fallen out of the
+    # recent window can still legitimately own its ring row when the ring has
+    # not yet wrapped past it -- seq 700, P 64, tail 188, a token at 150 written
+    # when seq was 600. Only 100 tokens have passed, the 512-row ring has not
+    # wrapped, so the owner check still matches and a range-based skip would
+    # drop a live token. That is why the tag check exists in every block.
+    #
+    # Removing the arena is not an option either: it is what keeps the newest
+    # tokens in BF16. The zero-window run above is a diagnostic, not a config.
     #
     # REVERTED to the original constants 2026-08-26. The +10% is real as a
     # measurement, but it is UNVERIFIED for correctness and cannot be verified
