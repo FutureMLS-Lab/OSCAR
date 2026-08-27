@@ -617,7 +617,21 @@ class _PackedLatentMixin(_Int2HPMixin):
                 keep, ring.to(torch.int32), torch.full_like(ring, -1, dtype=torch.int32)
             )
         else:
-            self.hp_row_of_slot[loc64] = -1
+            # A DEVICE tensor, not the Python scalar `-1`.
+            #
+            # Assigning a Python scalar into a tensor slice does a pageable H2D
+            # copy, which CUDA graph capture refuses outright:
+            # "operation not permitted when stream is capturing"
+            # (cudaErrorStreamCaptureUnsupported). The arena branch above has
+            # always used torch.where over device tensors and captures fine,
+            # which is why only this branch was broken -- and it was broken
+            # invisibly, because every shipped configuration has an arena
+            # (prefix 64 / recent 512), so this line only runs when someone
+            # sets both window sizes to 0. Found by doing exactly that in a
+            # localization experiment, not by a user hitting it.
+            self.hp_row_of_slot[loc64] = torch.full_like(
+                loc64, -1, dtype=torch.int32
+            )
 
         # The self-check reads a max back to the host, which is illegal inside a
         # graph capture ("operation not permitted when stream is capturing") and
