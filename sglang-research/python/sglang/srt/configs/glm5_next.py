@@ -73,6 +73,22 @@ class Glm5NextTextConfig(PretrainedConfig):
         num_nextn_predict_layers: int = 1,
         mhc: bool = True,
         swiglu_limit: float = 10.0,
+        # Manifold-Constrained Hyper-Connections (mHC, Xie et al. 2026).
+        # Names match transformers 5.16.1's Glm5NextTextConfig so the model port
+        # can follow the reference implementation field for field.
+        hc_mult: int = 4,
+        hc_eps: float = 1e-6,
+        hc_sinkhorn_iters: int = 20,
+        indexer_types: Optional[List[str]] = None,
+        # Flat mirrors of linear_attn_config's nested keys. The reference
+        # config converts the dict into these; this checkpoint still ships the
+        # dict (its transformers_version says 5.16.0, but glm5_next only exists
+        # in 5.16.1), so the conversion has to happen HERE or every KDA layer
+        # would silently take the default geometry.
+        linear_head_dim: int = 128,
+        linear_num_heads: int = 64,
+        linear_conv_kernel_dim: int = 4,
+        linear_lower_bound: Optional[float] = -5.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -115,6 +131,53 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mhc = mhc
         self.swiglu_limit = swiglu_limit
+        self.hc_mult = hc_mult
+        self.hc_eps = hc_eps
+        self.hc_sinkhorn_iters = hc_sinkhorn_iters
+
+        self.linear_head_dim = linear_head_dim
+        self.linear_num_heads = linear_num_heads
+        self.linear_conv_kernel_dim = linear_conv_kernel_dim
+        self.linear_lower_bound = linear_lower_bound
+        if isinstance(linear_attn_config, dict):
+            self.linear_head_dim = linear_attn_config.get("head_dim", linear_head_dim)
+            self.linear_num_heads = linear_attn_config.get("num_heads", linear_num_heads)
+            self.linear_conv_kernel_dim = linear_attn_config.get(
+                "short_conv_kernel_size", linear_conv_kernel_dim
+            )
+            self.linear_lower_bound = linear_attn_config.get(
+                "gate_lower_bound", linear_lower_bound
+            )
+            if linear_attn_config.get("safe_gate", True) and self.linear_lower_bound is None:
+                self.linear_lower_bound = -5.0
+
+        # Per-layer indexer mode. The reference derives it from
+        # index_topk_pattern, or from index_topk_freq / index_skip_topk_offset.
+        self.indexer_types = indexer_types
+        if self.indexer_types is None:
+            pattern = kwargs.get("index_topk_pattern")
+            if pattern is not None:
+                self.indexer_types = (
+                    [{"F": "full", "S": "shared"}[ch] for ch in pattern]
+                    if isinstance(pattern, str)
+                    else list(pattern)
+                )
+            else:
+                freq = max(kwargs.get("index_topk_freq", 1), 1)
+                offset = kwargs.get("index_skip_topk_offset", 2)
+                self.indexer_types = [
+                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
+                    for i in range(num_hidden_layers)
+                ]
+
+        # The reference normalises "full_attention" to "deepseek_sparse_attention"
+        # so downstream code has one spelling to test. Mirror it, or a checkpoint
+        # written with the other spelling would take the linear-attention branch.
+        if self.layer_types:
+            self.layer_types = [
+                "deepseek_sparse_attention" if t == "full_attention" else t
+                for t in self.layer_types
+            ]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
