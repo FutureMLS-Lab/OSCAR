@@ -616,105 +616,128 @@ def _fwd_packed_mla_stage1_gf(
                 rr = tl.where(r >= 0, r, 0).to(tl.int64)
                 owner = tl.load(HpOwnerOfRow + rr, mask=n_ok, other=-1).to(tl.int32)
                 n_ok = n_ok & ~((r >= 0) & (owner == kv_loc.to(tl.int32)))
-
-            # scale/zero: [BLOCK_N] per group, 8 loads per token, not 8192.
-            s0 = tl.load(Params + kv_loc * 8 + 0, mask=n_ok, other=0.0)
-            z0 = tl.load(Params + kv_loc * 8 + 1, mask=n_ok, other=0.0)
-            s1 = tl.load(Params + kv_loc * 8 + 2, mask=n_ok, other=0.0)
-            z1 = tl.load(Params + kv_loc * 8 + 3, mask=n_ok, other=0.0)
-            s2 = tl.load(Params + kv_loc * 8 + 4, mask=n_ok, other=0.0)
-            z2 = tl.load(Params + kv_loc * 8 + 5, mask=n_ok, other=0.0)
-            s3 = tl.load(Params + kv_loc * 8 + 6, mask=n_ok, other=0.0)
-            z3 = tl.load(Params + kv_loc * 8 + 7, mask=n_ok, other=0.0)
-            if LLOYD:
-                b0 = -z0 * s0
-                b1 = -z1 * s1
-                b2 = -z2 * s2
-                b3 = -z3 * s3
-            else:
-                b0 = z0
-                b1 = z1
-                b2 = z2
-                b3 = z3
-
-            # Code tiles in [GS, BLOCK_N] -- the layout tl.dot(q_g, .) wants, so
-            # there is no transpose and nothing full-width is ever computed.
-            if WIDE_LOAD:
-                # Four consecutive dims share one byte, so the narrow form below
-                # issues four loads per byte: (g*GS + offs_g)//4 maps GS=128 rows
-                # onto only 32 distinct addresses. Load those 32 rows once and
-                # unpack the four 2-bit fields into the [GS, BLOCK_N] tile.
+                # Skip a block whose tokens are ALL window-arena tokens, instead
+                # of computing four MMAs and masking the result away.
                 #
-                # Worth trying specifically because the BLOCK_H sweep measured
-                # what this costs: halving BLOCK_H doubles the code load+unpack
-                # while leaving the dot work unchanged, and it cost 1.82x
-                # (0.341 -> 0.622 ms), which puts the code path at roughly 80%
-                # of the kernel. Address arithmetic alone was refuted before
-                # (0.78x), but that experiment broadcast the *parameters* and
-                # left this fourfold code redundancy untouched.
+                # This is bit-identical, not an approximation, and the kernel
+                # already proves it a few lines down: for an all-masked block
+                # every qk is -inf, so p = exp(-inf) = 0, e_sum and acc are
+                # multiplied by re_scale and have zero added, and e_max keeps
+                # its previous value. The block contributes nothing whether it
+                # is computed or skipped -- so the only thing the computation
+                # buys is its own cost.
                 #
-                # g*GS is a multiple of 4 for GS=128, so the byte row is
-                # g*(GS//4) + d//4 and the shift is 2*(d%4) with no dependence
-                # on g. reshape maps (i, j) -> row 4i+j, which is exactly dim
-                # 4i+j, so the unpacked tile is index-identical to the narrow one.
-                w0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (0 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c0 = tl.reshape((w0[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
-                w1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (1 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c1 = tl.reshape((w1[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
-                w2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (2 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c2 = tl.reshape((w2[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
-                w3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (3 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c3 = tl.reshape((w3[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                # It is worth a per-block reduction because exclusion is not
+                # rare at short context: the arena is P_TOK + R_TOK = 576
+                # positions, which at seq 1000 is 58% of the sequence. Those
+                # tokens are then computed AGAIN, densely, by the window pass --
+                # which is why gf is 0.877x of production at ctx 1000 while
+                # being 1.72x at 32k. At long context almost no block is fully
+                # excluded, so the reduction is pure overhead there, but it is
+                # one BLOCK_N-wide integer reduction against four MMAs.
+                live = tl.sum(n_ok.to(tl.int32)) > 0
             else:
-                by0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((0 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c0 = ((by0 >> (2 * ((0 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
-                by1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((1 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c1 = ((by1 >> (2 * ((1 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
-                by2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((2 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c2 = ((by2 >> (2 * ((2 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
-                by3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((3 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
-                c3 = ((by3 >> (2 * ((3 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                live = True
 
-            qk = tl.dot(q0, c0) * s0[None, :] + qs0[:, None] * b0[None, :]
-            qk += tl.dot(q1, c1) * s1[None, :] + qs1[:, None] * b1[None, :]
-            qk += tl.dot(q2, c2) * s2[None, :] + qs2[:, None] * b2[None, :]
-            qk += tl.dot(q3, c3) * s3[None, :] + qs3[:, None] * b3[None, :]
+            if live:
+                # scale/zero: [BLOCK_N] per group, 8 loads per token, not 8192.
+                s0 = tl.load(Params + kv_loc * 8 + 0, mask=n_ok, other=0.0)
+                z0 = tl.load(Params + kv_loc * 8 + 1, mask=n_ok, other=0.0)
+                s1 = tl.load(Params + kv_loc * 8 + 2, mask=n_ok, other=0.0)
+                z1 = tl.load(Params + kv_loc * 8 + 3, mask=n_ok, other=0.0)
+                s2 = tl.load(Params + kv_loc * 8 + 4, mask=n_ok, other=0.0)
+                z2 = tl.load(Params + kv_loc * 8 + 5, mask=n_ok, other=0.0)
+                s3 = tl.load(Params + kv_loc * 8 + 6, mask=n_ok, other=0.0)
+                z3 = tl.load(Params + kv_loc * 8 + 7, mask=n_ok, other=0.0)
+                if LLOYD:
+                    b0 = -z0 * s0
+                    b1 = -z1 * s1
+                    b2 = -z2 * s2
+                    b3 = -z3 * s3
+                else:
+                    b0 = z0
+                    b1 = z1
+                    b2 = z2
+                    b3 = z3
 
-            kpe = tl.load(
-                Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
-                mask=n_ok[None, :],
-                other=0.0,
-            )
-            qk += tl.dot(qpe, kpe.to(qpe.dtype))
-            qk *= sm_scale_withk
+                # Code tiles in [GS, BLOCK_N] -- the layout tl.dot(q_g, .) wants, so
+                # there is no transpose and nothing full-width is ever computed.
+                if WIDE_LOAD:
+                    # Four consecutive dims share one byte, so the narrow form below
+                    # issues four loads per byte: (g*GS + offs_g)//4 maps GS=128 rows
+                    # onto only 32 distinct addresses. Load those 32 rows once and
+                    # unpack the four 2-bit fields into the [GS, BLOCK_N] tile.
+                    #
+                    # Worth trying specifically because the BLOCK_H sweep measured
+                    # what this costs: halving BLOCK_H doubles the code load+unpack
+                    # while leaving the dot work unchanged, and it cost 1.82x
+                    # (0.341 -> 0.622 ms), which puts the code path at roughly 80%
+                    # of the kernel. Address arithmetic alone was refuted before
+                    # (0.78x), but that experiment broadcast the *parameters* and
+                    # left this fourfold code redundancy untouched.
+                    #
+                    # g*GS is a multiple of 4 for GS=128, so the byte row is
+                    # g*(GS//4) + d//4 and the shift is 2*(d%4) with no dependence
+                    # on g. reshape maps (i, j) -> row 4i+j, which is exactly dim
+                    # 4i+j, so the unpacked tile is index-identical to the narrow one.
+                    w0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (0 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c0 = tl.reshape((w0[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                    w1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (1 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c1 = tl.reshape((w1[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                    w2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (2 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c2 = tl.reshape((w2[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                    w3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + (3 * (GS // 4) + offs_b)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c3 = tl.reshape((w3[:, None, :] >> shf[None, :, None]) & 0x3, (GS, BLOCK_N)).to(qpe.dtype)
+                else:
+                    by0 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((0 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c0 = ((by0 >> (2 * ((0 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                    by1 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((1 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c1 = ((by1 >> (2 * ((1 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                    by2 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((2 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c2 = ((by2 >> (2 * ((2 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
+                    by3 = tl.load(Codes + kv_loc[None, :] * (D // 4) + ((3 * GS + offs_g) // 4)[:, None], mask=n_ok[None, :], other=0).to(tl.int32)
+                    c3 = ((by3 >> (2 * ((3 * GS + offs_g) % 4))[:, None]) & 0x3).to(qpe.dtype)
 
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+                qk = tl.dot(q0, c0) * s0[None, :] + qs0[:, None] * b0[None, :]
+                qk += tl.dot(q1, c1) * s1[None, :] + qs1[:, None] * b1[None, :]
+                qk += tl.dot(q2, c2) * s2[None, :] + qs2[:, None] * b2[None, :]
+                qk += tl.dot(q3, c3) * s3[None, :] + qs3[:, None] * b3[None, :]
 
-            qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
+                kpe = tl.load(
+                    Rope + kv_loc[None, :] * DPE + offs_pe[:, None],
+                    mask=n_ok[None, :],
+                    other=0.0,
+                )
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                qk *= sm_scale_withk
 
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            # An all-masked block makes every qk -inf, so n_e_max is -inf and
-            # qk - n_e_max is (-inf) - (-inf) = NaN -- acc is poisoned before e_sum
-            # is ever looked at, which is why guarding only the final divide did
-            # nothing. Exclusion creates exactly this: the sink-prefix block is
-            # entirely window tokens and it is the FIRST block of every request, so
-            # one NaN reaches every output. Subtracting 0 instead leaves exp(-inf)=0,
-            # so p and e_sum stay 0 and the block contributes nothing.
-            # e_max keeps the true -inf so a later non-empty block still rescales.
-            n_e_max_s = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
-            re_scale = tl.exp(e_max - n_e_max_s)
-            p = tl.exp(qk - n_e_max_s[:, None])
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
 
-            # AV: fold the group scale into p, dot against the raw codes, and add
-            # the zero term as a per-(head, group) scalar.
-            acc0 = acc0 * re_scale[:, None] + tl.dot((p * s0[None, :]).to(qpe.dtype), tl.trans(c0)) + tl.sum(p * b0[None, :], 1)[:, None]
-            acc1 = acc1 * re_scale[:, None] + tl.dot((p * s1[None, :]).to(qpe.dtype), tl.trans(c1)) + tl.sum(p * b1[None, :], 1)[:, None]
-            acc2 = acc2 * re_scale[:, None] + tl.dot((p * s2[None, :]).to(qpe.dtype), tl.trans(c2)) + tl.sum(p * b2[None, :], 1)[:, None]
-            acc3 = acc3 * re_scale[:, None] + tl.dot((p * s3[None, :]).to(qpe.dtype), tl.trans(c3)) + tl.sum(p * b3[None, :], 1)[:, None]
+                qk = tl.where(mask_h[:, None] & n_ok[None, :], qk, float("-inf"))
 
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                # An all-masked block makes every qk -inf, so n_e_max is -inf and
+                # qk - n_e_max is (-inf) - (-inf) = NaN -- acc is poisoned before e_sum
+                # is ever looked at, which is why guarding only the final divide did
+                # nothing. Exclusion creates exactly this: the sink-prefix block is
+                # entirely window tokens and it is the FIRST block of every request, so
+                # one NaN reaches every output. Subtracting 0 instead leaves exp(-inf)=0,
+                # so p and e_sum stay 0 and the block contributes nothing.
+                # e_max keeps the true -inf so a later non-empty block still rescales.
+                n_e_max_s = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+                re_scale = tl.exp(e_max - n_e_max_s)
+                p = tl.exp(qk - n_e_max_s[:, None])
+
+                # AV: fold the group scale into p, dot against the raw codes, and add
+                # the zero term as a per-(head, group) scalar.
+                acc0 = acc0 * re_scale[:, None] + tl.dot((p * s0[None, :]).to(qpe.dtype), tl.trans(c0)) + tl.sum(p * b0[None, :], 1)[:, None]
+                acc1 = acc1 * re_scale[:, None] + tl.dot((p * s1[None, :]).to(qpe.dtype), tl.trans(c1)) + tl.sum(p * b1[None, :], 1)[:, None]
+                acc2 = acc2 * re_scale[:, None] + tl.dot((p * s2[None, :]).to(qpe.dtype), tl.trans(c2)) + tl.sum(p * b2[None, :], 1)[:, None]
+                acc3 = acc3 * re_scale[:, None] + tl.dot((p * s3[None, :]).to(qpe.dtype), tl.trans(c3)) + tl.sum(p * b3[None, :], 1)[:, None]
+
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
 
         # SLOT_OFF shifts these partials up by one so the dense window pass can
         # own slot 0. The stock stage-2 merge is measurably wrong when two or
