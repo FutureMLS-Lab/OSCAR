@@ -1049,9 +1049,24 @@ def packed_mla_decode_gf_fwd(
             f"SGLANG_OSCAR_MLA_KV_BITS={_bits}. Use the production kernel "
             "(SGLANG_OSCAR_MLA_PACKED_GF=0) at this width."
         )
-    if getattr(pool, "index_head_dim", None):
+    # NSA is allowed through when the in-call A/B check is armed.
+    #
+    # The original refusal assumed an NSA row carries an extra index head the
+    # kernel does not know about. That is wrong: the indexer's
+    # index_k_with_scale_buffer is a SEPARATE fp8 buffer that selects which
+    # tokens to read, not part of what attention reads. Both pools get
+    # packed_read_operands from the same _PackedLatentMixin -- the subclasses
+    # override only __init__ -- so the operand tuple is field-for-field
+    # identical.
+    #
+    # That reasoning is not enough to ship on; it is the same kind of
+    # read-the-code argument that was wrong repeatedly here. So NSA stays
+    # refused UNLESS GF_CHECK is on, which runs the production kernel alongside
+    # and reports the deviation. Measure first, then relax for real.
+    if getattr(pool, "index_head_dim", None) and not envs.SGLANG_OSCAR_MLA_PACKED_GF_CHECK.get():
         raise NotImplementedError(
             "group-factored packed MLA decode has not been validated against an "
+            
             f"NSA cache (index_head_dim={pool.index_head_dim}). Leave "
             "SGLANG_OSCAR_MLA_PACKED_GF off for NSA models."
         )
