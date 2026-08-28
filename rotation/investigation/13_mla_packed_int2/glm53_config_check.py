@@ -107,6 +107,46 @@ def main() -> int:
           f"{truth.count('linear_attention')} are KDA linear attention with no "
           f"KV to compress. Do not quote the cell ratio as a model-level saving.")
 
+    # 5. Indexer geometry must agree with the STORED tensor shapes, not just be
+    #    present. index_kpool defaults to 16 in the reference and is 4 here, so
+    #    a config that merely parses can still size index_kpool_compress_ape
+    #    wrong; checking the field against itself would not catch that.
+    import struct, collections
+    wm = json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"]
+    want = {}
+    for k in wm:
+        for t in ("index_kpool_compress_ape", "index_kpool_compress_gate",
+                  "indexer.wq_b.weight", "indexer.wk.weight",
+                  "indexer.weights_proj.weight"):
+            if k.endswith(t) and t not in want:
+                want[t] = k
+    by = collections.defaultdict(list)
+    for t, k in want.items():
+        by[wm[k]].append((t, k))
+    shapes = {}
+    for shard, items in by.items():
+        with open(os.path.join(d, shard), "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            meta = json.loads(f.read(n))
+        for t, k in items:
+            shapes[t] = meta[k]["shape"]
+    exp = {
+        "index_kpool_compress_ape": [tc.index_kpool, tc.index_head_dim],
+        "index_kpool_compress_gate": [tc.index_head_dim, tc.hidden_size],
+        "indexer.wq_b.weight": [tc.index_n_heads * tc.index_head_dim, tc.q_lora_rank],
+        "indexer.wk.weight": [tc.index_head_dim, tc.hidden_size],
+        "indexer.weights_proj.weight": [tc.index_n_heads, tc.hidden_size],
+    }
+    print(f"\nindexer: kpool={tc.index_kpool} n_heads={tc.index_n_heads} "
+          f"tail={tc.index_kpool_always_select_tail} "
+          f"types={collections.Counter(tc.indexer_types or [])}")
+    for t, e in exp.items():
+        got = shapes.get(t)
+        good = got == e
+        ok &= good
+        print(f"  {t:<28} stored {got}  from config {e}  "
+              f"{'ok' if good else 'MISMATCH'}")
+
     print(f"\nVERDICT: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 2
 

@@ -51,9 +51,19 @@ class Glm5NextTextConfig(PretrainedConfig):
         qk_head_dim: Optional[int] = 256,
         v_head_dim: Optional[int] = 256,
         mla_use_nope: bool = True,
-        # DeepSeek sparse attention (NSA/DSA) selector.
+        # DeepSeek sparse attention (DSA) selector. GLM-5.3-Flash's indexer is
+        # NOT GLM-5.2's: it adds K-POOLING, so `index_kpool` and
+        # `index_n_heads` are load-bearing rather than cosmetic.
+        #
+        # index_kpool defaults to 16 in the reference config and is 4 in this
+        # checkpoint. Taking the default would size
+        # index_kpool_compress_ape as [16, 128] against a stored [4, 128] --
+        # that one at least fails loudly, unlike most of the traps here.
         index_head_dim: Optional[int] = 128,
         index_topk: Optional[int] = 2048,
+        index_n_heads: int = 32,
+        index_kpool: int = 16,
+        index_kpool_always_select_tail: bool = True,
         # Layer mix. ``layer_types`` is authoritative -- see is_kda_layer.
         layer_types: Optional[List[str]] = None,
         linear_attn_config: Optional[dict] = None,
@@ -112,6 +122,9 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.mla_use_nope = mla_use_nope
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        self.index_n_heads = index_n_heads
+        self.index_kpool = index_kpool
+        self.index_kpool_always_select_tail = index_kpool_always_select_tail
 
         self.layer_types = layer_types
         self.linear_attn_config = linear_attn_config
@@ -339,7 +352,11 @@ class Glm5NextConfig(PretrainedConfig):
             "num_attention_heads", "num_key_value_heads", "rms_norm_eps",
             "q_lora_rank", "kv_lora_rank", "qk_nope_head_dim",
             "qk_rope_head_dim", "qk_head_dim", "v_head_dim", "mla_use_nope",
-            "index_head_dim", "index_topk", "layer_types",
+            "index_head_dim", "index_topk", "index_n_heads", "index_kpool",
+            "index_kpool_always_select_tail", "indexer_types", "layer_types",
+            "hc_mult", "hc_eps", "hc_sinkhorn_iters",
+            "linear_head_dim", "linear_num_heads", "linear_conv_kernel_dim",
+            "linear_lower_bound",
             "linear_attn_config", "num_nextn_predict_layers",
             "first_k_dense_replace", "n_routed_experts", "rope_theta",
             "rope_scaling", "moe_intermediate_size", "num_experts_per_tok",
