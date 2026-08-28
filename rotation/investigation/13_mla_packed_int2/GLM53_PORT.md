@@ -106,3 +106,48 @@ nothing to compress. Never quote the cell ratio as a model-level saving.
 Config → KDA → DSA → assembly → **BF16 control first** → packed pool. The
 BF16-first rule is the Kimi-K3 lesson: `use_expanded_mha_cache=True` was hiding
 a broken forward path while I spent two cycles tuning the quantizer.
+
+## Why not just take upstream sglang? (checked, 2026-08-28)
+
+Fair question, and it should have been checked before writing anything. The
+answer is "half yes", and the half that is yes was a real miss.
+
+**sglang 0.5.18 does NOT support this model.** `glm5_next` / `Glm5Next` is zero
+hits across the wheel; its glm models stop at glm4_moe / glm_ocr / glm_image_vl.
+So rebasing would not produce a running GLM-5.3-Flash: the config, the KDA
+wiring, the k-pool selector and the assembly all still have to be written.
+
+**But upstream HAS an mHC kernel that I hand-wrote in pure torch.**
+`sglang/kernels/ops/layernorm/mhc.py` (1618 lines, TileLang-jitted
+`hc_split_sinkhorn_kernel`) computes exactly the same thing -- `pre =
+sigmoid(mixes*scale[0] + base) + eps`, `post = 2*sigmoid(...)`, Sinkhorn. It is
+there for **DeepSeek-V4**, which also uses mHC (`sglang/srt/configs/deepseek_v4.py`
+carries `hc_mult` and `hc_sinkhorn_iters`).
+
+**It is not a cherry-pick.** It imports `sglang.kernels.jit.utils`,
+`sglang.srt.layers.attention.dsa.utils` and `sglang.srt.layers.utils.common`;
+this fork has no `sglang/kernels/` tree at all and has `nsa/` where upstream has
+`dsa/`. `tilelang` is not installed either. Taking it means grafting a chunk of
+upstream's structure, not copying a file.
+
+**Also corrects an earlier claim of mine:** I said `deepseek_v4` was "zero hits
+in the fork" and left the impression the model was unsupported everywhere.
+Upstream ships `deepseek_v4.py` and `deepseek_v4_dspark.py`. It is unsupported
+*here*, not unsupported.
+
+**Cost of switching base**: this fork carries the whole OSCAR / packed-INT2
+stack -- packed pool, GF kernel, rotations, the mixed-KV window arena -- i.e.
+everything behind 4.00x and the 86.67% score. Rebasing means porting all of it.
+
+**Decision**: keep this base; write the model here; keep the torch mHC for now.
+It is bit-exact against the HF reference, so it also serves as the oracle for
+whichever kernel replaces it.
+
+**But the torch mHC has to be profiled once the model runs.** Op count per
+decode step, 45 layers x 2 mHC sites: **16,650 small-tensor launches, 13,680 of
+them the Sinkhorn loop** (19 iterations x 8 ops). The tensors are
+`[tokens, 4, 4]` -- negligible FLOPs, essentially pure launch overhead.
+Mitigating: sglang captures decode into CUDA graphs, so launch cost is paid at
+capture rather than replay, which makes a naive per-launch extrapolation an
+overestimate. This is an op COUNT, not a timing. It says "profile mHC", not
+"the torch version is already too slow".
