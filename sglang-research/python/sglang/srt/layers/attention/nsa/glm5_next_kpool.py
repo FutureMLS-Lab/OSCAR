@@ -144,3 +144,57 @@ def select_pools(
         ~selected_valid[..., None].expand_as(selected_indices).flatten(-2), -1
     )
     return topk_indices, selected_valid
+
+
+def append_visible_tail(
+    topk_indices: torch.Tensor,
+    token_visible: torch.Tensor,
+    key_valid: torch.Tensor,
+    index_kpool: int,
+) -> torch.Tensor:
+    """Append the current INCOMPLETE pool as raw token indices.
+
+    Pools cover whole groups of ``index_kpool``; whatever is left over at the
+    end of the visible range belongs to no complete pool and would never be
+    selectable, so it is appended verbatim. With kpool 4 and visible
+    ``[A B C D E F]``, the pools give ``[A B C D]`` and the tail gives
+    ``[E F]``.
+
+    The width is ``index_kpool - 1``, not ``index_kpool``: a leftover of
+    exactly ``index_kpool`` tokens is a COMPLETE pool and is already
+    selectable, so the remainder is always in ``[0, index_kpool)``.
+
+    ``tail_start`` counts from ``first_key``, not from 0, for the same reason
+    pool boundaries do -- left padding must not shift it.
+    """
+    max_tail_width = index_kpool - 1
+    if max_tail_width == 0:
+        return topk_indices
+
+    batch_size, _, kv_length = token_visible.shape
+    device = token_visible.device
+
+    first_key = torch.where(
+        key_valid.any(-1),
+        key_valid.long().argmax(-1),
+        torch.full((batch_size,), kv_length, dtype=torch.long, device=device),
+    )
+    visible_count = token_visible.long().sum(-1)
+    tail_count = visible_count.remainder(index_kpool)
+    tail_offsets = torch.arange(max_tail_width, device=device)
+
+    tail_start = first_key[:, None] + visible_count - tail_count
+    tail_indices = tail_start[..., None] + tail_offsets
+
+    # Three independent reasons a tail slot is dead: it is past this row's
+    # remainder, it runs off the end of the cache, or it lands on a padded /
+    # not-yet-visible token. All three have to be masked -- dropping any one
+    # leaves a plausible index that silently points at the wrong token.
+    tail_valid = (tail_offsets[None, None, :] < tail_count[..., None]) & tail_indices.lt(
+        kv_length
+    )
+    kv_idx = tail_indices.clamp(0, kv_length - 1)
+    tail_visible = token_visible.gather(dim=-1, index=kv_idx)
+    tail_indices = tail_indices.masked_fill(~(tail_valid & tail_visible), -1)
+
+    return torch.cat([topk_indices, tail_indices], dim=-1)

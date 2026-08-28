@@ -37,6 +37,7 @@ def main() -> int:
     print(f"reference transformers {transformers.__version__}")
 
     from sglang.srt.layers.attention.nsa.glm5_next_kpool import (
+        append_visible_tail,
         build_pools,
         select_pools,
         visible_tokens,
@@ -97,6 +98,38 @@ def main() -> int:
     same = bool((r_vis == m_vis).all())
     ok &= same
     print(f"  visible       exact {'MATCH' if same else 'MISMATCH'}")
+
+    # End to end: the whole selection stage against the reference indexer's
+    # forward. This is the one that matters -- the pieces can each match and
+    # still be wired together wrongly.
+    with torch.no_grad():
+        hidden = torch.randn(B, S, HIDDEN)
+        q_resid = torch.randn(B, S, QLORA)
+        r_topk = ref(hidden_states=hidden, q_resid=q_resid,
+                     attention_mask=valid, past_key_values=None)
+
+        # Mine, following the reference's own order of operations.
+        q = ref.wq_b(q_resid).view(B, S, -1, D)
+        k = ref.k_norm(ref.wk(hidden)).view(B, S, -1, D).squeeze(2)
+        gate_scores = torch.nn.functional.linear(hidden, ref.index_kpool_compress_gate)
+        vis = visible_tokens(valid, S, S)
+        pk, pi, pv = build_pools(k, gate_scores, valid, ape, KP)
+        hw = ref.weights_proj(hidden).float() * (NH ** -0.5)
+        m_topk, _ = select_pools(q, pk, pi, pv, hw, vis,
+                                 ref.softmax_scale, TOPK, KP, S)
+        m_topk = append_visible_tail(m_topk, vis, valid, KP)
+        width = TOPK + (KP - 1 if Cfg.index_kpool_always_select_tail else 0)
+        m_topk = torch.nn.functional.pad(
+            m_topk, (0, max(0, width - m_topk.shape[-1])), value=-1)[..., :width]
+        m_topk = m_topk.masked_fill(~valid[..., None], -1).to(torch.int32)
+
+    same = r_topk.shape == m_topk.shape and bool((r_topk == m_topk).all())
+    ok &= same
+    print(f"  END-TO-END   {tuple(r_topk.shape)} vs {tuple(m_topk.shape)}  "
+          f"{'exact MATCH' if same else 'MISMATCH'}")
+    if not same and r_topk.shape == m_topk.shape:
+        diff = (r_topk != m_topk)
+        print(f"    differing entries: {int(diff.sum())}/{r_topk.numel()}")
 
     # Negative controls -- a test that also passes the obvious-but-wrong
     # implementations proves nothing about the port.
