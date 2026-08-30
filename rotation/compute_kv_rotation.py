@@ -21,19 +21,37 @@ import torch
 
 
 def build_hadamard(n: int) -> torch.Tensor:
-    if n < 1 or n & (n - 1):
-        raise ValueError(f"Hadamard size must be a power of two, got {n}")
+    """Build an orthogonal Walsh transform, block-diagonal for non-powers of two.
+
+    Kimi-K3 has a 192-dimensional K head. Decomposing 192 as 128 + 64
+    preserves orthogonality while retaining the standard normalized Sylvester
+    transform within each power-of-two block.
+    """
+    if n < 1:
+        raise ValueError(f"Hadamard size must be positive, got {n}")
     if n == 1:
         return torch.ones(1, 1, dtype=torch.float64)
+    if n & (n - 1):
+        largest_power = 1 << (n.bit_length() - 1)
+        return torch.block_diag(
+            build_hadamard(largest_power),
+            build_hadamard(n - largest_power),
+        )
     h = build_hadamard(n // 2)
     return torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0) / math.sqrt(2)
 
 
 def bit_reversal_perm(d: int) -> torch.Tensor:
-    if d < 1 or d & (d - 1):
-        raise ValueError(f"Bit-reversal size must be a power of two, got {d}")
-    bits = int(math.log2(d))
-    return torch.tensor([int(bin(i)[2:].zfill(bits)[::-1], 2) for i in range(d)])
+    """Return bit-reversal order, filtering a padded domain for arbitrary d."""
+    if d < 1:
+        raise ValueError(f"Bit-reversal size must be positive, got {d}")
+    bits = (d - 1).bit_length()
+    padded = 1 << bits
+    order = [
+        int(bin(i)[2:].zfill(bits)[::-1], 2)
+        for i in range(padded)
+    ]
+    return torch.tensor([index for index in order if index < d])
 
 
 def make_br_perm_matrix(eigenvalues: torch.Tensor) -> torch.Tensor:
@@ -47,18 +65,15 @@ def make_br_perm_matrix(eigenvalues: torch.Tensor) -> torch.Tensor:
 
 
 def load_tensor(layer_dir: Path, name: str, chunk_id) -> torch.Tensor:
-    """Load a single chunk (chunk_id is int) or concat all chunks (chunk_id == "all").
-
-    "all" mode skips chunk 0 (a 6-token warmup batch produced by the prefill
-    schedule that would dominate hessian estimation with degenerate samples).
-    """
+    """Load one chunk or concatenate all explicitly selected chunks."""
     sub_dir = layer_dir / name
-    if isinstance(chunk_id, str) and chunk_id == "all":
+    if isinstance(chunk_id, str) and chunk_id in {"all", "all-except-0"}:
         chunk_paths = sorted(
             sub_dir.glob("*.pt"),
             key=lambda p: int(p.stem),
         )
-        chunk_paths = [p for p in chunk_paths if int(p.stem) != 0]
+        if chunk_id == "all-except-0":
+            chunk_paths = [p for p in chunk_paths if int(p.stem) != 0]
         if not chunk_paths:
             raise FileNotFoundError(f"No chunk files in {sub_dir}")
         tensors = [
@@ -108,21 +123,29 @@ def compute_qqt(layer_dir: Path, chunk_id: int, head_dim: int):
     return eigvecs, eigvals
 
 
-def compute_sst(layer_dir: Path, chunk_id: int, head_dim: int):
+def compute_sst(
+    layer_dir: Path,
+    chunk_id: int,
+    qk_head_dim: int,
+    v_head_dim: int | None = None,
+):
+    v_head_dim = v_head_dim or qk_head_dim
     q = load_tensor(layer_dir, "q", chunk_id)
     k = load_tensor(layer_dir, "k", chunk_id)
     v = load_tensor(layer_dir, "v", chunk_id)
     n_heads = q.shape[1] if q.ndim >= 3 else q.shape[0]
     kv_heads = k.shape[1] if k.ndim >= 3 else k.shape[0]
     gqa_ratio = n_heads // kv_heads
-    q_flat = q.reshape(-1, n_heads, head_dim)
-    k_flat = k.reshape(-1, kv_heads, head_dim)
-    v_flat = v.reshape(-1, kv_heads, head_dim)
+    q_flat = q.reshape(-1, n_heads, qk_head_dim)
+    k_flat = k.reshape(-1, kv_heads, qk_head_dim)
+    v_flat = v.reshape(-1, kv_heads, v_head_dim)
     n_tokens = q_flat.shape[0]
 
-    cov = torch.zeros(head_dim, head_dim, dtype=torch.float64)
+    cov = torch.zeros(v_head_dim, v_head_dim, dtype=torch.float64)
     for h in range(kv_heads):
-        qg = q_flat[:, h * gqa_ratio : (h + 1) * gqa_ratio, :].reshape(-1, head_dim)
+        qg = q_flat[
+            :, h * gqa_ratio : (h + 1) * gqa_ratio, :
+        ].reshape(-1, qk_head_dim)
         kh = k_flat[:, h, :]
         vh = v_flat[:, h, :]
         qtq = qg.T @ qg / qg.shape[0]
@@ -297,16 +320,27 @@ def get_rotation_layer(state: dict, layer_id: int) -> torch.Tensor:
 
 
 def write_hadamard_rotation(
-    output_dir: Path, head_dim: int, num_layers: int
+    output_dir: Path,
+    k_head_dim: int,
+    v_head_dim: int,
+    layer_ids: list[int],
 ) -> None:
-    """Pure fixed Hadamard rotation (data-free; no dump required)."""
-    h = build_hadamard(head_dim).float()
-    err = (h @ h.T - torch.eye(head_dim)).abs().max().item()
-    print(f"Hadamard orthogonality error: {err:.2e}")
-    eigvals = torch.ones(head_dim, dtype=torch.float32)
-    for target in ("k", "v"):
+    """Pure fixed Hadamard rotation (data-free; no dump required).
+
+    ``layer_ids`` are the global ids to key the file by, which for hybrid models
+    are sparse (Qwen3.5: 3, 7, 11, ...). K and V may have different head dims
+    (Kimi-K3: K=192, V=128), so each target builds its own Hadamard.
+    """
+    for target, head_dim in (("k", k_head_dim), ("v", v_head_dim)):
+        h = build_hadamard(head_dim).float()
+        err = (h @ h.T - torch.eye(head_dim)).abs().max().item()
+        print(
+            f"{target.upper()} Hadamard head_dim={head_dim} "
+            f"orthogonality error: {err:.2e}"
+        )
+        eigvals = torch.ones(head_dim, dtype=torch.float32)
         result = empty_result("hadamard")
-        for layer_id in range(num_layers):
+        for layer_id in layer_ids:
             add_layer(result, layer_id, h, eigvals)
         path = output_dir / f"{target}_rotation_hadamard.pt"
         torch.save(result, str(path))
@@ -325,10 +359,24 @@ def main() -> None:
     parser.add_argument(
         "--chunk-id",
         default="all",
-        help='Dump chunk id to use, or "all" to concat every chunk (skipping the '
-        "6-token warmup chunk 0). Default: all.",
+        help='Dump chunk id, "all", or "all-except-0". Default: all.',
     )
-    parser.add_argument("--head-dim", type=int, default=128)
+    # default kept at 128 for the existing per-model scripts; `_head_dim_pinned`
+    # below distinguishes "user asked for 128" from "nobody said", which matters
+    # for heterogeneous-geometry models that carry the real dim in the dump.
+    parser.add_argument("--head-dim", type=int, default=None)
+    parser.add_argument(
+        "--k-head-dim",
+        type=int,
+        default=None,
+        help="K/Q head dimension; defaults to --head-dim.",
+    )
+    parser.add_argument(
+        "--v-head-dim",
+        type=int,
+        default=None,
+        help="V head dimension; defaults to --head-dim.",
+    )
     parser.add_argument(
         "--method",
         required=True,
@@ -361,33 +409,69 @@ def main() -> None:
         help="Number of layers to emit. Required when --method hadamard and no "
         "--dump-path is given; otherwise inferred from the dump.",
     )
+    parser.add_argument(
+        "--layer-ids",
+        type=str,
+        default=None,
+        help="Comma-separated list of global layer ids to use as keys in the "
+        "rotation file (e.g. '3,7,11,15,19,23,27,31' for Qwen3.5-4B). When "
+        "omitted, hadamard mode emits keys range(num_layers). Required for "
+        "hybrid models where full-attention layers are sparse so the in-server "
+        "OSCAR pool can look up rotations by global id.",
+    )
     parser.add_argument("--ref-k-rotation", type=Path, default=None)
     parser.add_argument("--ref-v-rotation", type=Path, default=None)
     args = parser.parse_args()
+    # None means "not pinned on the CLI": per-layer dims from the dump win.
+    k_head_dim = args.k_head_dim or args.head_dim
+    v_head_dim = args.v_head_dim or args.head_dim
+
+    layer_ids = None
+    if args.layer_ids is not None:
+        layer_ids = [int(x) for x in args.layer_ids.split(",") if x.strip()]
+        if not layer_ids:
+            raise ValueError("--layer-ids was provided but parsed to an empty list")
 
     if args.method == "hadamard":
         output_dir = args.output_dir or (args.dump_path if args.dump_path else None)
         if output_dir is None:
             raise ValueError("--output-dir is required when --method hadamard")
         output_dir.mkdir(parents=True, exist_ok=True)
-        if args.num_layers is not None:
-            num_layers = args.num_layers
+        if layer_ids is not None:
+            if args.num_layers is not None and args.num_layers != len(layer_ids):
+                raise ValueError(
+                    f"--num-layers={args.num_layers} disagrees with "
+                    f"--layer-ids (len={len(layer_ids)})"
+                )
         elif args.dump_path is not None:
-            num_layers = len(layer_dirs(args.dump_path))
+            layer_ids = [
+                int(layer_dir.name.split("_", 1)[1])
+                for layer_dir in layer_dirs(args.dump_path)
+            ]
+        elif args.num_layers is not None:
+            layer_ids = list(range(args.num_layers))
         else:
             raise ValueError(
-                "hadamard method needs either --num-layers or --dump-path to know "
-                "how many layers to emit"
+                "hadamard method needs --layer-ids, --num-layers, or --dump-path "
+                "to know how many layers to emit"
             )
-        print(f"Method=hadamard head_dim={args.head_dim} num_layers={num_layers}")
-        write_hadamard_rotation(output_dir, args.head_dim, num_layers)
+        print(
+            f"Method=hadamard k_head_dim={k_head_dim or 128} "
+            f"v_head_dim={v_head_dim or 128} layers={layer_ids}"
+        )
+        write_hadamard_rotation(
+            output_dir, k_head_dim or 128, v_head_dim or 128, layer_ids
+        )
         return
 
     if args.dump_path is None:
         raise ValueError(f"--dump-path is required for --method {args.method}")
     output_dir = args.output_dir or args.dump_path
     output_dir.mkdir(parents=True, exist_ok=True)
-    hadamard = build_hadamard(args.head_dim)
+    hadamards = {
+        "k": build_hadamard(k_head_dim) if k_head_dim else None,
+        "v": build_hadamard(v_head_dim) if v_head_dim else None,
+    }
     dirs = layer_dirs(args.dump_path)
     print(f"Found {len(dirs)} layers in {args.dump_path}")
     print(f"Method={args.method} composition={args.composition} chunk={args.chunk_id}")
@@ -423,19 +507,42 @@ def main() -> None:
     }
     for layer_dir in dirs:
         layer_id = int(layer_dir.name.split("_", 1)[1])
+        # Per-layer head_dim — heterogeneous for gemma4_unified (sliding=256,
+        # full=512). Infer cheaply from one dumped K chunk (head_dim is constant
+        # within a layer) and build a matching Hadamard so each layer gets a
+        # correctly-sized rotation.
+        _k_chunks = sorted((layer_dir / "k").glob("*.pt"), key=lambda p: int(p.stem))
+        layer_head_dim = torch.load(
+            str(_k_chunks[0]), map_location="cpu"
+        ).shape[-1]
+        layer_hadamard = build_hadamard(layer_head_dim)
         errors = []
         for target, hessian in METHOD_TARGETS[args.method]:
-            rotation, eigvals = HESSIAN_FNS[hessian](layer_dir, args.chunk_id, args.head_dim)
+            # K and V may differ (Kimi-K3: 192/128). When the CLI does not pin
+            # them, fall back to the per-layer dim read from the dump, which is
+            # what heterogeneous-geometry models (gemma4) need.
+            if hessian == "sst":
+                rotation, eigvals = compute_sst(
+                    layer_dir,
+                    args.chunk_id,
+                    k_head_dim or layer_head_dim,
+                    v_head_dim or layer_head_dim,
+                )
+            else:
+                target_dim = (k_head_dim if target == "k" else v_head_dim) or layer_head_dim
+                rotation, eigvals = HESSIAN_FNS[hessian](
+                    layer_dir, args.chunk_id, target_dim
+                )
             loaded_rotation = compose_rotation(
-                rotation, eigvals, hadamard, args.composition
+                rotation, eigvals, hadamards.get(target) or layer_hadamard, args.composition
             )
             err = (
                 loaded_rotation @ loaded_rotation.T
-                - torch.eye(args.head_dim, dtype=torch.float64)
+                - torch.eye(loaded_rotation.shape[0], dtype=torch.float64)
             ).abs().max().item()
             errors.append(f"{target.upper()}({hessian})={err:.1e}")
             add_layer(results[(target, hessian)], layer_id, loaded_rotation, eigvals)
-        print(f"  Layer {layer_id:>2}: {', '.join(errors)}")
+        print(f"  Layer {layer_id:>2} (hd={layer_head_dim}): {', '.join(errors)}")
 
     for (target, hessian), result in results.items():
         path = output_dir / f"{target}_rotation_{hessian}_{args.composition}.pt"

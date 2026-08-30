@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-probe-chk2
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2Nhci1tbGFoeWI7IFc9L3dvcmsvb3NjYXI7IFBJTj0yYzkyZDE5MTlmCm1rZGlyIC1wIC93b3JrCmdpdCBjbG9uZSAtcSAtLWxvY2FsIC0tbm8taGFyZGxpbmtzICIkU1JDIiAiJFciIHx8IHsgZWNobyAiRkFUQUwgY2xvbmUgZmFpbGVkIjsgZXhpdCAxOyB9CmdpdCAtQyAiJFciIGNoZWNrb3V0IC1xIC1mIC0tZGV0YWNoICIkUElOIiB8fCB7IGVjaG8gIkZBVEFMIHBpbiAkUElOIGZhaWxlZCI7IGV4aXQgMTsgfQpjcCAtYSAiJFNSQy90aGlyZF9wYXJ0eS9zaW1wbGVfZXZhbHMvLiIgIiRXL3RoaXJkX3BhcnR5L3NpbXBsZV9ldmFscy8iIDI+L2Rldi9udWxsIHx8IHRydWUKZmluZCAiJFcvdGhpcmRfcGFydHkvc2ltcGxlX2V2YWxzIiAtbmFtZSBfX3B5Y2FjaGVfXyAtdHlwZSBkIC1wcnVuZSAtZXhlYyBybSAtcmYge30gKyAyPi9kZXYvbnVsbAouICRSL29zY2FyLXZlbnYvYmluL2FjdGl2YXRlCmV4cG9ydCBIRl9IT01FPS9oZiBQWVRIT05QQVRIPSRXL3NnbGFuZy1yZXNlYXJjaC9weXRob24KZWNobyAiW2pvYl0gSEVBRD0kKGdpdCAtQyAkVyBsb2cgLS1vbmVsaW5lIC0xKSIKZ3JlcCAtcSAiU0dMQU5HX09TQ0FSX01MQV9QQUNLRURfR0YiICRXL3NnbGFuZy1yZXNlYXJjaC9weXRob24vc2dsYW5nL3NydC9sYXllcnMvYXR0ZW50aW9uL3RyaXRvbl9iYWNrZW5kLnB5IFwKICB8fCB7IGVjaG8gIkZBVEFMOiBwaW5uZWQgdHJlZSBsYWNrcyB0aGUgR0Ygd2lyaW5nIjsgZXhpdCAxOyB9CmdyZXAgLXEgIl9tbGFfb3V0cHV0X2dhdGUiICRXL3NnbGFuZy1yZXNlYXJjaC9weXRob24vc2dsYW5nL3NydC9tb2RlbHMvZGVlcHNlZWtfY29tbW9uL2F0dGVudGlvbl9mb3J3YXJkX21ldGhvZHMvZm9yd2FyZF9tbGEucHkgXAogIHx8IHsgZWNobyAiRkFUQUw6IHBpbm5lZCB0cmVlIGxhY2tzIHRoZSBLMyBvdXRwdXQtZ2F0ZSBmaXgiOyBleGl0IDE7IH0KZ3JlcCAtcSAtLSAiLTEuMGUzMCIgJFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbi9zZ2xhbmcvc3J0L2xheWVycy9hdHRlbnRpb24vdHJpdG9uX29wcy9tbGFfcGFja2VkX2RlY29kZS5weSBcCiAgfHwgeyBlY2hvICJGQVRBTDogcGlubmVkIHRyZWUgbGFja3MgdGhlIGZpbml0ZSBlbXB0eS1zcGxpdCBzZW50aW5lbCI7IGV4aXQgMTsgfQpncmVwIC1xICJfY2hlY2tfaXNfY2FwdHVyaW5nIiAgJFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbi9zZ2xhbmcvc3J0L2xheWVycy9hdHRlbnRpb24vdHJpdG9uX29wcy9tbGFfcGFja2VkX2RlY29kZS5weSBcCiAgfHwgeyBlY2hvICJGQVRBTDogcGlubmVkIHRyZWUgbGFja3MgdGhlIGluLXNlcnZlciBBL0IiOyBleGl0IDE7IH0KZ3JlcCAtcSAiX2dmX3NwbGl0X2J1ZnMiICRXL3NnbGFuZy1yZXNlYXJjaC9weXRob24vc2dsYW5nL3NydC9sYXllcnMvYXR0ZW50aW9uL3RyaXRvbl9iYWNrZW5kLnB5IFwKICB8fCB7IGVjaG8gIkZBVEFMOiBwaW5uZWQgdHJlZSBsYWNrcyB0aGUgcGVyc2lzdGVudCBzcGxpdCBidWZmZXJzIjsgZXhpdCAxOyB9CmdyZXAgLXEgIlBST0JFX0dGIiAkVy9yb3RhdGlvbi9pbnZlc3RpZ2F0aW9uLzEzX21sYV9wYWNrZWRfaW50Mi9zZXJ2ZV9wcm9iZS5weSBcCiAgfHwgeyBlY2hvICJGQVRBTDogcHJvYmUgbGFja3MgdGhlIGdmIGFybSI7IGV4aXQgMTsgfQoKZXhwb3J0IFJVTl9ESVI9JFIvbWxhcGFja2VkX3Byb2JlX2NoazI7IG1rZGlyIC1wICRSVU5fRElSCmV4cG9ydCBPVVRfRElSPSRSVU5fRElSCiMgSEZfSFVCX09GRkxJTkU6IHRoZSB3ZWlnaHRzIGFyZSBhbHJlYWR5IGluIHRoZSBQVkMgY2FjaGUgYW5kIGEgaHViIHJvdW5kIHRyaXAKIyBpcyB0aGUgZGlmZmVyZW5jZSBiZXR3ZWVuICJydW5zIiBhbmQgInJ1bnMgaWYgdGhlIG5ldHdvcmsgZmVlbHMgbGlrZSBpdCIuCmV4cG9ydCBIRl9IVUJfT0ZGTElORT0xClNHTEFOR19PU0NBUl9NTEFfUEFDS0VEX0dGX0NIRUNLPTEgTUFYX05FVz02NCBweXRob24zIC11ICRXL3JvdGF0aW9uL2ludmVzdGlnYXRpb24vMTNfbWxhX3BhY2tlZF9pbnQyL3NlcnZlX3Byb2JlLnB5IFwKICAyPiYxIHwgdGVlICRSVU5fRElSL3Byb2JlLmxvZwplY2hvICJbam9iXSBleGl0PSR7UElQRVNUQVRVU1swXX0iCg==
+          | base64 -d > /tmp/g.sh; bash /tmp/g.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            cpu: '16'
+            memory: 200Gi
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

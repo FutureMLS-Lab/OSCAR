@@ -31,11 +31,6 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
-except ImportError:
-    pass
-
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -49,6 +44,13 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+)
+from sglang.srt.layers.moe.triton_kernels_compat import (
+    GatherIndx,
+    RoutingData,
+    ScatterIndx,
+    build_routing_from_standard,
+    routing,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -327,12 +329,27 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # renormalize=True is equivalent to sm_first=False
-            routing_data, gather_idx, scatter_idx = routing(
-                router_logits,
-                self.topk_config.top_k,
-                sm_first=not self.topk_config.renormalize,
-            )
+            if routing is not None:
+                # renormalize=True is equivalent to sm_first=False
+                routing_data, gather_idx, scatter_idx = routing(
+                    router_logits,
+                    self.topk_config.top_k,
+                    sm_first=not self.topk_config.renormalize,
+                )
+            else:
+                standard_topk = select_experts(
+                    hidden_states=hidden_states,
+                    layer_id=self.layer_id,
+                    router_logits=router_logits,
+                    topk_config=self.topk_config,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                )
+                routing_data, gather_idx, scatter_idx = build_routing_from_standard(
+                    standard_topk,
+                    num_experts=router_logits.shape[-1],
+                    top_k=self.topk_config.top_k,
+                )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(

@@ -46,6 +46,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    SAFE_GATE: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
+    A_PER_DIM: tl.constexpr,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
@@ -79,7 +82,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
-    p_A_log = A_log + i_hv
+    if A_PER_DIM:
+        p_A_log = A_log + o_k
+    else:
+        p_A_log = A_log + i_hv
     if IS_KDA:
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
@@ -150,7 +156,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Compute sigmoid gating
         # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
+        if A_PER_DIM:
+            b_A_log = tl.load(p_A_log, mask=mask_k, other=0.0).to(tl.float32)
+        else:
+            b_A_log = tl.load(p_A_log).to(tl.float32)
         if IS_KDA:
             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
@@ -158,16 +167,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_a = tl.load(p_a).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
+        # Compute the standard or bounded KDA forget gate.
         x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        if SAFE_GATE:
+            b_g = LOWER_BOUND * tl.sigmoid(tl.exp(b_A_log) * x)
+        else:
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
@@ -262,6 +274,7 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -273,6 +286,11 @@ def fused_sigmoid_gating_delta_rule_update(
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
     """
+    if lower_bound is not None and not (-5.0 <= lower_bound < 0.0):
+        raise ValueError(
+            f"KDA lower_bound must be in [-5, 0), got {lower_bound}"
+        )
+
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
@@ -302,6 +320,12 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_retrieve_parent_token_token = 0
 
     NP2_T = triton.next_power_of_2(T)
+    if A_log.numel() not in (HV, K):
+        raise ValueError(
+            f"A_log must contain one value per value head ({HV}) or key "
+            f"channel ({K}), got {A_log.numel()}"
+        )
+    a_per_dim = A_log.numel() == K
 
     grid = (NK, NV, N * HV)
 
@@ -343,6 +367,9 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        SAFE_GATE=is_kda and lower_bound is not None,
+        LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
+        A_PER_DIM=a_per_dim,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,

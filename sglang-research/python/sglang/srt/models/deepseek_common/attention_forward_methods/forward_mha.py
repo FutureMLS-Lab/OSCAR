@@ -215,8 +215,12 @@ class DeepseekMHAForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        use_expanded_cache = getattr(self, "use_expanded_mha_cache", False)
+        if not use_expanded_cache:
+            self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
+            not use_expanded_cache
+            and
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
@@ -262,6 +266,28 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
 
             k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        # The output gate is a property of the MODEL -- K3 defines g_proj and
+        # gates its attention output per head -- not of the cache layout.
+        # Computing it inside the use_expanded_cache branch silently dropped it
+        # for the latent cache. That is a different function, not a precision
+        # effect: a sigmoid gate lies in (0, 1), so omitting it inflates every
+        # attention output. Traced layer by layer, the latent arm ran 1.9-3.7x
+        # hot from the FIRST full-attention layer, on the same code path as the
+        # expanded arm, which is what identified this.
+        #
+        # Stashed on self rather than returned in the tuple because there are
+        # three *_core variants and only forward_normal_core ever accepted the
+        # gate as an argument; the chunked and one-shot variants would have kept
+        # dropping it. Assigned unconditionally, including None, so a gate from
+        # an earlier layer cannot leak into a later one.
+        _g_proj = getattr(self, "g_proj", None)
+        self._mha_output_gate = (
+            _g_proj(hidden_states)[0].sigmoid() if _g_proj is not None else None
+        )
+        if use_expanded_cache:
+            qkv_capture = getattr(self, "expanded_qkv_capture", None)
+            if qkv_capture is not None:
+                qkv_capture(q, k, v, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(
@@ -270,9 +296,32 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_gate: torch.Tensor = None,
     ) -> torch.Tensor:
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=getattr(self, "use_expanded_mha_cache", False),
+        )
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        # The parameter is kept for callers that still pass the gate explicitly;
+        # prepare now always stashes it, which is what reaches the other cores.
+        gate = (
+            output_gate
+            if output_gate is not None
+            else getattr(self, "_mha_output_gate", None)
+        )
+        if gate is not None:
+            attn_output = attn_output * gate
+        # Same point, same shape, same tag scheme as the absorbed path, so the
+        # two arms can be diffed layer by layer.
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            _trace_attn_out,
+        )
+
+        _trace_attn_out(self, "mha", attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -327,6 +376,23 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        gate = getattr(self, "_mha_output_gate", None)
+        if gate is not None:
+            attn_output = attn_output * gate
+        # Function-scoped like the one in forward_normal_core: forward_mla
+        # imports from this module, so a module-level import would be circular.
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            _trace_attn_out,
+        )
+
+        # The chunked variant needs the same trace as forward_normal_core so
+        # that whichever one runs is visible. The earlier guess that K3 prefills
+        # through here was wrong -- once both were instrumented, every traced
+        # line came back tagged "mha", so K3 takes forward_normal_core and this
+        # path stayed dark. The real reason the first attempt logged nothing is
+        # that decode is CUDA-graph captured, where the trace guard correctly
+        # skips; only an uncaptured run shows anything at all.
+        _trace_attn_out(self, "mha-chunked", attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

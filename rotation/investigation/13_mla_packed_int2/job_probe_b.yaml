@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-probe-b
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2NhcjsgVz0vd29yay9vc2NhcjsgUElOPWZmN2Y1NTg2MzcKbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9CmNwIC1hICIkU1JDL3RoaXJkX3BhcnR5L3NpbXBsZV9ldmFscy8uIiAiJFcvdGhpcmRfcGFydHkvc2ltcGxlX2V2YWxzLyIgMj4vZGV2L251bGwgfHwgdHJ1ZQpmaW5kICIkVy90aGlyZF9wYXJ0eS9zaW1wbGVfZXZhbHMiIC1uYW1lIF9fcHljYWNoZV9fIC10eXBlIGQgLXBydW5lIC1leGVjIHJtIC1yZiB7fSArIDI+L2Rldi9udWxsCi4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIFBZVEhPTlBBVEg9JFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbgplY2hvICJbam9iXSBIRUFEPSQoZ2l0IC1DICRXIGxvZyAtLW9uZWxpbmUgLTEpIgoKZXhwb3J0IFJVTl9ESVI9JFIvbWxhcGFja2VkX3Byb2JlX2I7IG1rZGlyIC1wICRSVU5fRElSCmV4cG9ydCBPVVRfRElSPSRSVU5fRElSCiMgSEZfSFVCX09GRkxJTkU6IHRoZSB3ZWlnaHRzIGFyZSBhbHJlYWR5IGluIHRoZSBQVkMgY2FjaGUgYW5kIGEgaHViIHJvdW5kIHRyaXAKIyBpcyB0aGUgZGlmZmVyZW5jZSBiZXR3ZWVuICJydW5zIiBhbmQgInJ1bnMgaWYgdGhlIG5ldHdvcmsgZmVlbHMgbGlrZSBpdCIuCmV4cG9ydCBIRl9IVUJfT0ZGTElORT0xCnB5dGhvbjMgLXUgJFcvcm90YXRpb24vaW52ZXN0aWdhdGlvbi8xM19tbGFfcGFja2VkX2ludDIvc2VydmVfcHJvYmUucHkgXAogIDI+JjEgfCB0ZWUgJFJVTl9ESVIvcHJvYmUubG9nCmVjaG8gIltqb2JdIGV4aXQ9JHtQSVBFU1RBVFVTWzBdfSIK
+          | base64 -d > /tmp/g.sh; bash /tmp/g.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            cpu: '16'
+            memory: 200Gi
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

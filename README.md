@@ -61,13 +61,25 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 <details>
 <summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
 
-Qwen3.5
-| Model | Mode | GPQA (198) | Δ vs BF16 |
-|-------|------|------------|-----------|
-| Qwen3.5-4B | baseline | **75.25%** | — |
-| Qwen3.5-4B | OSCAR | **74.75%** | −0.50 pp |
-| Qwen3.5-35B-A3B | baseline | **80.30%** | — |
-| Qwen3.5-35B-A3B | OSCAR | **82.32%** | +2.02 pp |
+Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std over 3 seeds (35B-A3B AIME: 8 seeds, N=30 is high-variance). OSCAR quantizer per model best: 4B uniform, 35B-A3B Lloyd-Max.
+
+**Qwen3.5-4B**
+| Benchmark | BF16 | OSCAR | Δ vs BF16 |
+|---|:---:|:---:|:---:|
+| GPQA-Diamond | 76.9 ± 1.3 | **75.8 ± 1.6** | −1.2 |
+| HumanEval | 81.7 ± 1.8 | **83.9 ± 1.0** | +2.2 |
+| AIME 2025 | 47.8 ± 3.1 | **46.7 ± 0.0** | −1.1 |
+| MATH500 | 89.5 ± 0.6 | **88.0 ± 0.6** | −1.5 |
+
+**Qwen3.5-35B-A3B**
+| Benchmark | BF16 | OSCAR | Δ vs BF16 |
+|---|:---:|:---:|:---:|
+| GPQA-Diamond | 83.3 ± 1.8 | **84.0 ± 1.3** | +0.7 |
+| HumanEval | 83.9 ± 0.6 | **86.6 ± 1.8** | +2.6 |
+| AIME 2025 † | 66.7 ± 5.3 | **62.1 ± 4.7** | −4.6 |
+| MATH500 | 92.8 ± 0.2 | **91.7 ± 0.4** | −1.1 |
+
+<sub>† AIME N=30 is high-variance; measured over 8 seeds. The −4.6 gap is not statistically significant (Welch t=1.72). At 3 seeds it read −6.7, inflated by a favorable BF16 draw.</sub>
 
 MiniMax2.7
 | Benchmark | BF16 | OSCAR (LM_RATIO=1.16) | Δ |
@@ -76,6 +88,54 @@ MiniMax2.7
 | HumanEval | 0.8817 | **0.8854** | +0.4 pp |
 | AIME 2025 | 0.7667 | **0.7667** | 0.0 pp |
 | MATH500 | 0.9379 | **0.9279** | −1.0 pp |
+
+</details>
+
+<details>
+<summary><b>MLA models — packed 2-bit latent (GLM-5.2, GLM-5.3, Kimi-K3)</b> </summary>
+
+**What is quantized.** MLA stores one shared latent `c_kv` plus a positional
+`k_pe`. OSCAR quantizes **the latent** and leaves **`k_pe` in BF16** — the
+opposite way round from how it is easy to read. Per token per layer, at
+`kv_lora_rank=512`, `qk_rope_head_dim=64`, group 128:
+
+| buffer | bytes | contents |
+|---|---:|---|
+| `c_codes` | 128 | the 512-dim latent at **2 bits**, 4 per byte |
+| `c_params` | 32 | (scale, zero) fp32 per quantization group |
+| `rope_buf` | 128 | `k_pe`, **BF16, never quantized** |
+| **total** | **288** | vs BF16's `(512+64)·2 = 1152` → **4.00×** |
+
+`k_pe` staying BF16 is load-bearing: it is the positional half of the MLA key
+and 2-bit'ing it destroys the rope term. It is also **44% of the cell**, which
+caps this axis — a latent compressed to zero bits would still leave 256 B, i.e.
+**4.5× is the ceiling**, and the shipped 4.00× already sits just under it.
+
+**GPQA-Diamond, full 198 questions, `max_tokens=32768`, single seed.** Same
+question set and permutations across arms (`Random(0)`), so the rows are paired.
+
+| Model | BF16 | packed 2-bit (4.00×) | Δ |
+|---|---:|---:|---:|
+| GLM-5.2 | 82.32 | 74.75 | −7.57 pp |
+| GLM-5.3 | 82.83 | **77.78** | **−5.05 pp** |
+
+GLM-5.3 required **zero model-code changes** — `GlmMoeDsaForCausalLM` is
+identical to GLM-5.2's — but rotations do **not** transfer between models and
+must be refitted from each model's own `c_kv` dump.
+
+**Ratio / accuracy frontier (GLM-5.2, all end-to-end at n=198).** Every knob
+inside 2 bits has been measured; none closes the 4.00× gap, and bit width buys
+more accuracy per unit of ratio surrendered than group size does:
+
+| config | ratio | GPQA | vs BF16 |
+|---|---:|---:|---:|
+| 2-bit g128 (shipped) | 4.00× | 74.75 | −7.57 |
+| 2-bit g32 | 3.00× | 77.78 | −4.54 |
+| 4-bit g128 | 2.77× | 80.81 | −1.51 |
+| BF16 | — | 82.32 | — |
+
+Kimi-K3 runs the same packed path at 4.00× (TP 8 × PP 2); its GPQA arm is
+reported separately and is not in this table.
 
 </details>
 
@@ -286,6 +346,9 @@ Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int
 | MiniMax-M2.7 | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview |
 | Qwen3.5 (4B, 35B-A3B) | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview (hybrid linear-attn) |
 | GLM-5.1 | SGLang `zhongzhu/glm-mla` | 🧪 experimental (MLA latent) |
+| GLM-5.2 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×) |
+| GLM-5.3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; zero model-code change from GLM-5.2) |
+| Kimi-K3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; TP 8 × PP 2) |
 | Qwen3-VL (4B, 8B) | SGLang `zhongzhu/VL` | 🧪 preview |
 | Qwen3-32B, Qwen3-4B-Thinking, Gemma-4-12B | llama.cpp `zhongzhu/llamacpp` + [GGUF](https://huggingface.co/Zhongzhu) | ✅ supported (Mac / Metal) |
 
@@ -301,6 +364,16 @@ Calibration-pipeline folders included on this branch (`rotation/<model>/`):
 | `rotation/qwen3-8B/` | `Qwen/Qwen3-8B` | 1 | 1 | |
 | `rotation/qwen3-32B/` | `Qwen/Qwen3-32B` | 2-4 | 4 | |
 | `rotation/GLM-4.7/` | `zai-org/GLM-4.7-FP8` | 8 | 8 | FP8 weights, 92 layers |
+| `rotation/gemma-4-12B-it/` | `google/gemma-4-12B-it` | 1 | 1 | `gemma4_unified` hybrid-SWA, dual head_dim (sliding 8×256 / full 1×512), all INT2; needs transformers ≥5.5; INT2 ≈ BF16 on GPQA (62.63%); optional vision via `--enable-multimodal` |
+
+### Per-model GPQA: BF16 vs OSCAR INT2
+
+Single-seed GPQA-Diamond (198) — full-precision baseline vs OSCAR INT2 KV cache, with the calibration tag used.
+
+| Model | Calibration | GPQA (BF16) | GPQA (OSCAR INT2) |
+|---|---|---|---|
+| `Qwen/Qwen3-4B-Thinking-2507` | `seq20000_prompt83_group128` | 67.27 | 67.17 |
+| `google/gemma-4-12B-it` | `seq30000_prompt134_group128` | 62.63 | 62.63 |
 
 > MiniMax-M2.7 / Qwen3.5 calibration scripts live on `zhongzhu/hybrid-model`; pre-fit rotations for several models are available on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 

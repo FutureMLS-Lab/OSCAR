@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-gateskip
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - gpu-dp-qcqgp-5wsdx
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2Nhci1tbGFoeWI7IFc9L3dvcmsvb3NjYXI7IFBJTj1jMWYzYzM2ZjMKWyAtbiAiJFBJTiIgXSB8fCB7IGVjaG8gIkZBVEFMOiBlbXB0eSBQSU4iOyBleGl0IDE7IH0KbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9Ci4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIFBZVEhPTlBBVEg9JFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbgplY2hvICJbam9iXSBIRUFEPSQoZ2l0IC1DICRXIGxvZyAtLW9uZWxpbmUgLTEpIgoKSz0kVy9zZ2xhbmctcmVzZWFyY2gvcHl0aG9uL3NnbGFuZy9zcnQvbGF5ZXJzL2F0dGVudGlvbi90cml0b25fb3BzL21sYV9wYWNrZWRfZGVjb2RlLnB5CmdyZXAgLXEgImxpdmUgPSB0bC5zdW0iICRLIHx8IHsgZWNobyAiRkFUQUw6IHBpbm5lZCB0cmVlIGxhY2tzIHRoZSBibG9jayBza2lwIjsgZXhpdCAxOyB9CmdyZXAgLXEgIk1FUkdFIGludG8gdGhlIHNsb3QgaW5zdGVhZCBvZiBvdmVyd3JpdGluZyIgJEsgfHwgeyBlY2hvICJGQVRBTDogbGFja3MgdGhlIGZvbGQgZml4IjsgZXhpdCAxOyB9CgpleHBvcnQgUlVOX0RJUj0kUi9tbGFwYWNrZWRfZ2F0ZV9za2lwOyBta2RpciAtcCAkUlVOX0RJUgojIFNob3J0IHNlcXVlbmNlcyBGSVJTVCBhbmQgaW4gYnVsazogdGhvc2UgYXJlIHRoZSBzaGFwZXMgd2hlcmUgdGhlIG5ldyBza2lwCiMgYWN0dWFsbHkgZmlyZXMgKHRoZSA1NzYtdG9rZW4gYXJlbmEgaXMgbW9zdCBvZiB0aGUgc2VxdWVuY2UpLCBzbyBhIGdhdGUgdGhhdAojIG9ubHkgcmFuIDIwMDAwIHdvdWxkIGV4ZXJjaXNlIHRoZSBjaGFuZ2UgYWxtb3N0IG5vdCBhdCBhbGwuCmZvciBzaGFwZSBpbiAiMSAxNiAxMDAiICIyIDE2IDE0MCIgIjggMTYgMjU2IiAiNCAxNiA2MDAiICIxIDE2IDEwMDAiIFwKICAgICAgICAgICAgICI4IDE2IDEwMDAiICIzMiAxNiAxMDAwIiAiOCAxNiA0MDk2IiAiMTYgMTYgMjAwMDAiOyBkbwogIGVjaG8gIj09PT09IHNoYXBlICRzaGFwZSA9PT09PSIKICBweXRob24zIC11ICRXL3JvdGF0aW9uL2ludmVzdGlnYXRpb24vMTNfbWxhX3BhY2tlZF9pbnQyL2JlbmNoX2tlcm5lbC5weSAkc2hhcGUgMj4mMQpkb25lID4gJFJVTl9ESVIvZ2F0ZS5sb2cgMj4mMQoKZWNobyAiW2pvYl0gPT09PSBlcXVpdmFsZW5jZSB2ZXJkaWN0IHBlciBzaGFwZSA9PT09IgojIFJlYWQgdGhlIGZ1bGwgbG9nIGFuZCBmaWx0ZXIgaGVyZTsgbmV2ZXIgZmlsdGVyIHdoYXQgZ2V0cyB3cml0dGVuLgphd2sgJy9ePT09PT0gc2hhcGUve3M9JDB9IC9nZiB2cyBwcm9kdWN0aW9ufE1BVENIfE1JU01BVENIL3twcmludCBzIiB8ICIkMH0nICRSVU5fRElSL2dhdGUubG9nIFwKICB8IGdyZXAgLXZpRSAnZmF1bHQgaXMgZXhjbHVzaW9uJyB8IHRhaWwgLTMwCmVjaG8gIltqb2JdID09PT0gY291bnRzID09PT0iCmVjaG8gIiAgTUlTTUFUQ0ggbGluZXM6ICQoZ3JlcCAtYWMgJ01JU01BVENIJyAkUlVOX0RJUi9nYXRlLmxvZykiCmVjaG8gIiAgTUFUQ0ggbGluZXM6ICAgICQoZ3JlcCAtYWMgJ01BVENIJyAkUlVOX0RJUi9nYXRlLmxvZykiCmVjaG8gIiAgdHJhY2ViYWNrczogICAgICQoZ3JlcCAtYWMgJ1RyYWNlYmFjaycgJFJVTl9ESVIvZ2F0ZS5sb2cpIgpncmVwIC1hIC1BNiAnVHJhY2ViYWNrJyAkUlVOX0RJUi9nYXRlLmxvZyB8IGhlYWQgLTI0CiMgVGhlIHZlcmRpY3QgZ3JlcHMgZm9yIE1JU01BVENILCBub3Qgb25seSBmb3IgZXhjZXB0aW9ucyAtLSBhbiBlYXJsaWVyIHZlcnNpb24KIyBvZiB0aGlzIGxpbmUgcHJpbnRlZCBQQVNTIHdoaWxlIE1JU01BVENIIHdhcyBvbiBzY3JlZW4uCmlmIGdyZXAgLWFxICdNSVNNQVRDSCcgJFJVTl9ESVIvZ2F0ZS5sb2cgfHwgZ3JlcCAtYXEgJ1RyYWNlYmFjaycgJFJVTl9ESVIvZ2F0ZS5sb2c7IHRoZW4KICBlY2hvICJbam9iXSBHQVRFIFZFUkRJQ1Q6IEZBSUwiCmVsc2UKICBlY2hvICJbam9iXSBHQVRFIFZFUkRJQ1Q6IFBBU1MiCmZpCmVjaG8gIltqb2JdIGRvbmUiCg==
+          | base64 -d > /tmp/j.sh && bash -n /tmp/j.sh && bash /tmp/j.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            cpu: '8'
+            memory: 120Gi
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

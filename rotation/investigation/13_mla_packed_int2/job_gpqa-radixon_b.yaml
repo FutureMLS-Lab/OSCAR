@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-gpqa-radixon-b
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2NhcjsgVz0vd29yay9vc2NhcjsgUElOPTcyMDEzOGU2MjUKbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9CmNwIC1hICIkU1JDL3RoaXJkX3BhcnR5L3NpbXBsZV9ldmFscy8uIiAiJFcvdGhpcmRfcGFydHkvc2ltcGxlX2V2YWxzLyIgMj4vZGV2L251bGwgfHwgdHJ1ZQpmaW5kICIkVy90aGlyZF9wYXJ0eS9zaW1wbGVfZXZhbHMiIC1uYW1lIF9fcHljYWNoZV9fIC10eXBlIGQgLXBydW5lIC1leGVjIHJtIC1yZiB7fSArIDI+L2Rldi9udWxsCi4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIFBZVEhPTlBBVEg9JFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbgplY2hvICJbam9iXSBIRUFEPSQoZ2l0IC1DICRXIGxvZyAtLW9uZWxpbmUgLTEpIgoKZXhwb3J0IEdQVVM9JChzZXEgLXMsIDAgNykKIyBCMjAwIGlzIFNNMTAwOyB0aGUgTlNBIGF1dG8tYmFja2VuZHMgYXJlIGJ5cGFzc2VkIGJlY2F1c2UgdGhlIGhhcm5lc3MgbmFtZXMKIyB0cml0b24gZXhwbGljaXRseSwgd2hpY2ggaXMgYWxzbyB3aGF0IG1ha2VzIGEgUHl0aG9uLWxldmVsIGRlcXVhbnQgcmVhY2hhYmxlLgpleHBvcnQgQVRUTl9CQUNLRU5EPXRyaXRvbiBQUkVGSUxMX0JBQ0tFTkQ9dHJpdG9uCmV4cG9ydCBNTEFfUk9UX1BBVEg9JFIvZ2xtNTItcm90YXRpb25zIFJPVF9ESVI9JFIvZ2xtNTItcm90YXRpb25zCmVjaG8gIltnbG1dIHJvdGF0aW9uIGxheWVyczogJChscyAkUk9UX0RJUi9sYXllcl8qLnB0IHwgd2MgLWwpIgojIFBpbiB0aGUgS1YgZHR5cGUuIHNnbGFuZyBwaWNrcyBmcDhfZTRtMyBmb3IgYSBEU0EgbW9kZWwgb24gU00xMDArLCB3aGljaCBwdXRzCiMgfjI4JSBvZiBldmVyeSA1MTJ4NTEyIHJvdGF0aW9uIHN1Ym5vcm1hbDsgdGhhdCBhcm0gc2NvcmVkIDUuNTYuCmV4cG9ydCBNTEFfS1ZfQ0FDSEVfRFRZUEU9YmZsb2F0MTYKZXhwb3J0IExMT1lEX01BWD0xIE1MQV9HUk9VUF9TSVpFPTEyOApleHBvcnQgU0dMQU5HX01JWEVEX0tWX1BSRUZJWF9UT0tFTlM9NjQKZXhwb3J0IFNHTEFOR19NSVhFRF9LVl9SRUNFTlRfVE9LRU5TPTUxMgpleHBvcnQgTUxBX1BBQ0tFRD0xIE1MQV9QQUNLRURfU0VMRkNIRUNLPTAKZXhwb3J0IE1PREVMPXphaS1vcmcvR0xNLTUuMi1GUDggVFBfU0laRT04IE5BTUU9bWxhcGFja2VkX3JhZGl4b25fYgojIE1FTV9GUkFDLCBub3QgTUVNX0ZSQUNUSU9OX1NUQVRJQzogZXZhbF9vc2Nhcl9ncHFhLnNoIHJlYWRzIE1FTV9GUkFDIGZpcnN0LgpleHBvcnQgQ1VEQV9HUkFQSF9NQVhfQlM9MzIgTUVNX0ZSQUM9MC44NSBOVU1fV09SS0VSUz0xNgpleHBvcnQgUlVOX0RJUj0kUi9tbGFwYWNrZWRfcmFkaXhvbl9iOyBta2RpciAtcCAkUlVOX0RJUgojIFJhZGl4IGNhY2hlIE9OLiBTaW5nbGUgdmFyaWFibGUgYWdhaW5zdCBtbGFwYWNrZWRfbm9yYWRpeF9hLCB3aGljaCBpcwojIHRoZSBTQU1FIHBpbiAoNzIwMTM4ZTYyNSkuIFRoZSBwcmV2aW91cyByYWRpeC1vbiBhcm0gd2FzIHBpbiAwYWY4NGU4M2UsCiMgc28gaXRzICs5LjA5IHBwIGdhcCBjYXJyaWVkIGEgY29kZS1waW4gY29uZm91bmQgYW5kIGNhbm5vdCBiZSBhdHRyaWJ1dGVkLgpleHBvcnQgRElTQUJMRV9SQURJWD0wCnsKICBlY2hvICJIRUFEPSQoZ2l0IC1DICRXIGxvZyAtLW9uZWxpbmUgLTEpIgogIGVudiB8IGdyZXAgLUUgJ14oTUxBX3xST1RffExMT1lEX01BWHxTR0xBTkdffE1PREVMfFRQX1NJWkV8Q1VEQV9HUkFQSF9NQVhfQlN8TUVNX0ZSQUN8TlVNX1dPUktFUlN8QVRUTl9CQUNLRU5EfFBSRUZJTExfQkFDS0VORHxOVU1fRVhBTVBMRVN8TkFNRXxESVNBQkxFX1JBRElYKScgfCBzb3J0Cn0gPiAkUlVOX0RJUi9jb25maWcuZW52CmNhdCAkUlVOX0RJUi9jb25maWcuZW52CgpiYXNoICRXL3JvdGF0aW9uL2V2YWxfb3NjYXJfZ3BxYS5zaCAyPiYxIHwgdGVlIC1hICRSVU5fRElSL3BvZC5sb2cgfCB0YWlsIC0zMAoKZWNobyAiW2dsbV0gPT09PSBzY29yZSA9PT09IgpncmVwIC1pRSAiZ3BxYS9zY29yZSIgJFJVTl9ESVIvZXZhbC5sb2cgMj4vZGV2L251bGwgfCBoZWFkIC0yCmVjaG8gIltnbG1dID09PT0gcG9vbCAvIGR0eXBlIC8gY2FjaGUgKHJlYWQgYmFjayBmcm9tIHRoZSBTRVJWRVIsIG5vdCBpbnRlbnQpID09PT0iCmdyZXAgLW9FICJtYXhfdG90YWxfbnVtX3Rva2Vucz1bMC05XSt8a3ZfY2FjaGVfZHR5cGU9J1thLXowLTlfXSonfGRpc2FibGVfcmFkaXhfY2FjaGU9W0EtWmEtel0rfHBhZ2Vfc2l6ZT1bMC05XSt8bWF4X3J1bm5pbmdfcmVxdWVzdHM9WzAtOV0rIiBcCiAgJFJVTl9ESVIvc2VydmVyLmxvZyB8IHNvcnQgLXUKZ3JlcCAtb2hFICJcW01MQVBhY2tlZFxdLip8XFtJbnQySFBLVlBvb2xcXSB3cml0ZSBwYXRoPS4qfFxbTUxBSW50MlxdIGxvYWRlZC4qIiAkUlVOX0RJUi9zZXJ2ZXIubG9nIHwgc29ydCAtdSB8IGhlYWQgLTEyCmVjaG8gIltnbG1dID09PT0gY3VkYSBncmFwaCA9PT09IgpncmVwIC1vRSAiQ2FwdHVyZSBjdWRhIGdyYXBoIGJzIFxbW15dXSpcXSIgJFJVTl9ESVIvc2VydmVyLmxvZyB8IHNvcnQgLXUgfCBoZWFkIC0yCmVjaG8gImdyYXBoX3RydWU9JChncmVwIC1jICdjdWRhIGdyYXBoOiBUcnVlJyAkUlVOX0RJUi9zZXJ2ZXIubG9nKSBncmFwaF9mYWxzZT0kKGdyZXAgLWMgJ2N1ZGEgZ3JhcGg6IEZhbHNlJyAkUlVOX0RJUi9zZXJ2ZXIubG9nKSIKZ3JlcCAtb0UgIiNydW5uaW5nLXJlcTogWzAtOV0rIiAkUlVOX0RJUi9zZXJ2ZXIubG9nIHwgc29ydCB8IHVuaXEgLWMgfCBzb3J0IC1ybiB8IGhlYWQgLTgKZWNobyAiW2dsbV0gPT09PSBwcmVmaXggY2FjaGUgPT09PSIKZ3JlcCAtb0UgIiNjYWNoZWQtdG9rZW46IFswLTldK3xjYWNoZSBoaXQgcmF0ZTogWzAtOS5dKyUiICRSVU5fRElSL3NlcnZlci5sb2cgfCB0YWlsIC01CmVjaG8gIltnbG1dID09PT0gZGVjb2RlIHRocm91Z2hwdXQgPT09PSIKZ3JlcCAtb0UgImdlbiB0aHJvdWdocHV0IFwodG9rZW4vc1wpOiBbMC05Ll0rIiAkUlVOX0RJUi9zZXJ2ZXIubG9nIHwgdGFpbCAtNQo=
+          | base64 -d > /tmp/g.sh; bash /tmp/g.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '8'
+          requests:
+            cpu: '48'
+            memory: 800Gi
+            nvidia.com/gpu: '8'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

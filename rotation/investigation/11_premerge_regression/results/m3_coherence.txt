@@ -1,0 +1,17 @@
+n=24 pass=24 fail=0 pass_rate=1.0 overall=PASS
+
+--- PASS sample (3920 word tokens, digit_frac 0.07, no repeated block) ---
+<mm:think>Let me work through this problem step by step.
+
+First, let me identify the dicarboxylic acid. It contains a cis-alkene and when dehydrated forms an anhydride. The anhydride has:
+- 1H NMR: single peak at 7 ppm
+- 13C NMR: two peaks at 137 ppm and 165 ppm
+
+The single peak at 7 ppm in 1H NMR with 137 ppm in 13C suggests vinylic protons. The 165 ppm peak suggests carbonyl carbons (anhydride). Two peaks total means high symmetry.
+
+This is maleic anhydride! It has:
+- Two equivalent vinylic protons (singlet at ~7 ppm)
+- Two equivalent vinyl carbons (137 ppm)
+- Two equivalent carbonyl carbons (165 ppm)
+
+So the starting dicarboxylic acid is maleic acid (cis-butenedioic acid), and it dehydrat

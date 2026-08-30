@@ -223,6 +223,307 @@ class Envs:
     # orthogonal matrices loaded from K/V rotation checkpoints.
     SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")
     SGLANG_OSCAR_V_ROTATION_PATH = EnvStr("")
+    # MLA / NSA latent KV INT2 fake-quant (GLM-5.1-FP8, DeepSeek-V2 style).
+    SGLANG_OSCAR_MLA_KV_ROTATION_PATH = EnvStr("")
+    SGLANG_OSCAR_MLA_KV_DUMP_DIR = EnvStr("")
+    SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
+    SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
+    # Bits per latent value in the packed MLA pool. 2 is the validated default.
+    #
+    # 4 exists because a model's latent may simply not be INT2-representable.
+    # Measured on Kimi-K3's c_kv dump, out-of-sample relative error against the
+    # 0.10 a 2-bit KV cache needs, with the shipped rotation applied:
+    #
+    #     2 bits, group  32   0.2255   fail
+    #     2 bits, group 128   0.3491   fail
+    #     3 bits, group  32   0.0957   pass, 5.00 bits/elem
+    #     4 bits, group 128   0.0694   pass, 4.50 bits/elem   <- cheapest
+    #
+    # Four bits at group 128 beats three at group 32 because a group of 32
+    # spends 2 bits/elem on scales alone. So K3's latent is worth 3.56x over
+    # bf16, not the 4x that 2-bit packing would claim. GLM-5.2 is fine at 2 bits;
+    # this is a property of the tensor, so measure the dump before assuming.
+    #
+    # Lloyd-Max is a three-threshold codebook and therefore 2-bit only; the
+    # pack wrappers refuse to combine it with any other width.
+    SGLANG_OSCAR_MLA_KV_BITS = EnvInt(2)
+    SGLANG_OSCAR_MLA_KV_REAL_KERNEL = EnvBool(False)
+    # Store the MLA/NSA latent as *packed* INT2 codes instead of fake-quantizing
+    # into a BF16 cache. This is the difference between a quality measurement
+    # and a deployment: with it on, ``c_kv`` occupies 2 bits/value plus group
+    # params (160 B/token/layer instead of 1024 B) and ``max_total_num_tokens``
+    # actually moves. ``k_pe`` stays BF16 -- MLA depends on the positional half
+    # being unquantized. Requires a rotation path (there is nothing to pack
+    # without one).
+    SGLANG_OSCAR_MLA_KV_PACKED = EnvBool(False)
+    # Group-factored packed MLA decode. Correctness is settled: exact on all
+    # seven shapes of the kernel gate, and on a live DeepSeek-V2-Lite server it
+    # agrees with the production kernel to reduction-order noise -- 25 of 30
+    # greedy generations byte-identical over 128 tokens, mean |dlogprob| 0.0040
+    # across 3325 common-prefix positions.
+    #
+    # Default OFF because it is a WIN ONLY AT LONG CONTEXT. Measured decode
+    # throughput, group-factored / production:
+    #
+    #     ctx   1000   0.869x   <- 13% SLOWER
+    #     ctx   4000   1.068x
+    #     ctx  16000   1.249x
+    #     ctx  32000   1.357x
+    #
+    # The crossover sits between 1k and 4k, and the reason is structural rather
+    # than tunable: the path runs a second pass over the BF16 window arena, and
+    # that arena is a fixed 576 tokens (prefix 64 + recent 512). At ctx=1000 the
+    # packed body is ~424 tokens -- smaller than the window it pays an extra
+    # kernel launch to cover.
+    #
+    # This cannot be made adaptive per request. Under CUDA graphs the kernel
+    # choice is fixed at capture time, replay executes no Python, and sequence
+    # length only arrives at replay through metadata. So it is a deployment
+    # decision: turn it on for long-context serving. Moving the crossover left
+    # means fusing the window pass into the packed pass to remove the launch,
+    # not adding a length threshold here.
+    # Launch configuration for the group-factored path's BF16 window pass.
+    # It was hardcoded at BLOCK_H=16 / BLOCK_N=32 / 4 warps / 2 stages, and at
+    # head_num=16 with batch=1 that BLOCK_H makes the grid (1, 1): a single CTA
+    # walking all 576 window tokens on a 148-SM part. The window is a FIXED
+    # cost per decode step, so it is most of why the path loses at short context
+    # and wins at long -- the packed body shrinks, this does not.
+    #
+    # Tuned against production decode throughput at ctx 1000 / 4000, group-
+    # factored over production. Original constants were BLOCK_H 16, BLOCK_N 32,
+    # 4 warps, 2 stages = 0.846 / 1.052.
+    #
+    # Stage 1, BLOCK_H x warps (BLOCK_N 32, stages 2):
+    #
+    #     BLOCK_H   warps=4        warps=8
+    #        16     0.846 / 1.052  0.859 / 1.078
+    #         8     0.874 / 1.084  0.891 / 1.104
+    #         4     0.864 / 1.087  0.889 / 1.102
+    #         2     0.872 / 1.093  0.893 / 1.110
+    #
+    # Stage 2, BLOCK_N x stages (BLOCK_H 8, 8 warps) -- the bigger lever, and
+    # the one the first sweep missed by only varying BLOCK_H and warps:
+    #
+    #     BLOCK_N   stages=1  stages=2  stages=3  stages=4
+    #        16      0.759     0.825     0.860      --
+    #        32      0.794     0.890     0.916      --
+    #        64      0.841     0.934     0.935     0.918
+    #       128       --       0.909     0.777     0.782
+    #       256      out of shared memory: needs 898048 B, limit 232448
+    #
+    # BLOCK_N 64 is a genuine peak: 128 regresses (0.934 -> 0.909, and 0.777 at
+    # stages 3, consistent with spilling) and 256 will not compile. Stages peak
+    # at 2-3; 4 is worse.
+    #
+    # Net 0.846 -> 0.934 at ctx 1000 and 1.052 -> 1.150 at 4000, about +10%.
+    # Run-to-run variation on this bench is ~1.7% (the 64/3 cell measured 0.952
+    # once and 0.935 on repeat), so treat single-cell differences under 2% as
+    # noise; the monotone trends across a row or column are the signal.
+    #
+    # BLOCK_H 8 rather than the marginally better 2: the bench sends ONE request
+    # at a time, and a smaller BLOCK_H means more CTAs each re-loading the same
+    # window rows. At batch 1 that redundancy is free because the grid is
+    # otherwise empty; at batch 32 the grid is already wide and it is duplicate
+    # traffic. Everything here is a batch-1 measurement.
+    #
+    # This does NOT make the path a default. It is still 6.6% behind production
+    # at ctx 1000. Closing that needs the window pass folded into the packed
+    # pass so its fixed cost disappears, which is a kernel rewrite, not a knob.
+    #
+    # 2026-08-27: the short-context deficit is confirmed on a second model
+    # (0.877-0.967 at ctx 1000 on GLM-5.2, against 0.862 on DeepSeek-V2-Lite),
+    # so it is the kernel and not node noise. gf is now a default ABOVE a
+    # context threshold rather than never -- see SGLANG_OSCAR_MLA_PACKED_GF.
+    #
+    # And the window pass is now MEASURED as the cause, not assumed. Setting
+    # both window sizes to 0 removes the arena, so gf runs ONE kernel like
+    # production; gf/production at ctx 1000 then goes
+    #
+    #     conc 1   0.882 -> 0.984
+    #     conc 8   0.914 -> 1.018
+    #     conc 32  0.966 -> 0.976
+    #
+    # i.e. the deficit essentially vanishes at low concurrency. At conc 32 it
+    # barely moves, which is the same mechanism seen from the other side: a
+    # fixed per-STEP cost is already amortized by a wide batch. Two results
+    # agree -- skipping fully-excluded blocks INSIDE the packed pass did
+    # nothing (mean -0.011 over 9 points), because the cost was never in the
+    # packed pass.
+    #
+    # I first wrote that the fix was to FOLD the window pass into the packed
+    # pass -- one kernel, one grid. That was wrong, and it is worth recording
+    # why: the production kernel ALREADY does exactly that. It is a single
+    # kernel that overrides arena tokens with a computed tile
+    # (`if tl.max(use_hp) > 0: hpv = tl.load(HP ...)`). So "fold it" is not an
+    # unexplored direction, it is the very arm gf is measured against.
+    #
+    # The two are the two ends of one trade-off:
+    #   production  folded, 1 kernel  -- ~2% of blocks take the arena branch,
+    #                                    but registers are reserved in ALL of
+    #                                    them
+    #   gf          split, 2 kernels  -- no full-width tile in the fast path,
+    #                                    but a fixed second-pass cost per step
+    # Their crossovers are opposite, which is precisely why a context-gated
+    # default is the right answer given these two implementations, and why
+    # neither can be tuned into dominating the other.
+    #
+    # Range-splitting the loop (main body over [P, tail_start) with no HP code
+    # at all) is NOT a safe third option: a token that has fallen out of the
+    # recent window can still legitimately own its ring row when the ring has
+    # not yet wrapped past it -- seq 700, P 64, tail 188, a token at 150 written
+    # when seq was 600. Only 100 tokens have passed, the 512-row ring has not
+    # wrapped, so the owner check still matches and a range-based skip would
+    # drop a live token. That is why the tag check exists in every block.
+    #
+    # Removing the arena is not an option either: it is what keeps the newest
+    # tokens in BF16. The zero-window run above is a diagnostic, not a config.
+    #
+    # REVERTED to the original constants 2026-08-26. The +10% is real as a
+    # measurement, but it is UNVERIFIED for correctness and cannot be verified
+    # with the gate as it stands: bench_kernel's build() hands the reference
+    # path torch.empty logits/lse, so the reference can read uninitialized
+    # slots. That shows up as nondeterministic catastrophic mismatches --
+    # bs=1 seq=100 MATCHed at 6.5e-03 in one run and MISMATCHed at 9.3e-01 in
+    # the next, on identical code, with several rel = 1.000e+00.
+    #
+    # So the honest state is: the gate's verdicts are not trustworthy right now,
+    # which means neither "the tuning is safe" nor "the tuning breaks it" is
+    # established. Ship the constants that have been in production, keep the
+    # knobs for measurement, and fix the fixture before touching the defaults.
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(16)
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
+    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(4)
+    SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
+    # TRI-STATE, and the default value below is NOT the effective default.
+    # Unset means AUTO: the backend turns gf on when the server's context length
+    # is >= 8192, decided once at init. Setting it to 0 or 1 pins it.
+    #
+    # `EnvBool(False)` is the value `.get()` returns when nothing is set; the
+    # backend asks `.is_set()` first, so the False here is only the fallback for
+    # any caller that does not. Do not "simplify" this to a plain default --
+    # that silently removes the auto rule.
+    #
+    # Why auto, and why on the context length rather than the batch's actual
+    # sequence lengths: measured end to end on GLM-5.2-FP8, gf/production decode
+    # tok/s is 0.877-0.967 at ctx 1000, ~1.0 at 2000, and 1.29-1.72 from 16k up,
+    # rising with concurrency. So gf is a clear win at long context and a real
+    # loss at short, and a CUDA graph's capture key is the batch size, not the
+    # sequence length -- one graph serves seq=100 and seq=32000 alike, so a
+    # per-batch branch cannot execute at replay. Per-server is the only
+    # adaptivity that survives capture. Full table in triton_backend.py.
+    SGLANG_OSCAR_MLA_PACKED_GF = EnvBool(False)
+    # Runs the production kernel alongside the group-factored one on the same
+    # call and logs the deviation. Expensive; a debugging instrument, not a
+    # serving option.
+    SGLANG_OSCAR_MLA_PACKED_GF_CHECK = EnvBool(False)
+    # Shadow the packed latent with the BF16 fake-quant result and assert every
+    # materialized read matches it. Doubles latent memory; for smoke runs only.
+    SGLANG_OSCAR_MLA_PACKED_SELFCHECK = EnvBool(False)
+    # How many reads the self-check verifies before switching itself off. Each
+    # one re-materializes the row set and syncs the stream.
+    SGLANG_OSCAR_MLA_PACKED_SELFCHECK_BUDGET = EnvInt(600)
+    # Number of BF16 window rows per request in the packed pool's HP arena.
+    # 0 = sink + recent (the two windows), which is the only correct value;
+    # exposed so the arena can be sized down for probes.
+    SGLANG_OSCAR_MLA_PACKED_HP_REQS = EnvInt(0)
+    # Packed MLA decode kernel tiling. 16/8 rather than the BF16 kernel's 32/4
+    # because the dequant keeps the code byte and the group scale/zero live on
+    # top of the output tile.
+    SGLANG_OSCAR_MLA_PACKED_BLOCK_N = EnvInt(16)
+    # The group-factored kernel's own tile width. It used to read the knob
+    # above, which meant it shipped at 16 -- the computed tile's optimum and
+    # this kernel's PESSIMUM. Measured at warps=4 BLOCK_H=16, three shapes,
+    # BLOCK_N the only variable: 32 is 1.61-1.68x faster than 16 everywhere,
+    # with 64 in between, so the ordering is monotone rather than a single
+    # lucky point. Separate knob because one value cannot serve both kernels.
+    SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N = EnvInt(32)
+    # The group-factored kernel's own pipeline depth, for the same reason as
+    # the tile above: it read the computed tile's STAGES and shipped at 1,
+    # while every measurement of it in bench_kernel had been taken at 3 --
+    # eight hardcoded call sites that no env could move. Measured three times
+    # at the production shape (heads=8, i.e. 64 heads over TP=8), bn=32
+    # warps=4 BLOCK_H=8, stages the only variable:
+    #
+    #     shape              stages=1   stages=3
+    #     bs16 seq20000      0.230      0.208     1.11x
+    #     bs32 seq20000      0.458      0.407     1.13x
+    #
+    # Reproduced across three independent runs to within 0.001 ms.
+    #
+    # BUT END TO END IT IS A TIE, and that is the number to quote. Same
+    # harness as the tile A/B, both arms GF ON, stages the only variable:
+    #
+    #     ctx        c1      c8     c32
+    #     4000     1.017   1.011   1.003
+    #     16000    1.000   1.000   0.999
+    #     32000    1.000   1.001   1.000
+    #
+    # GF only auto-enables at ctx>=8192, so the 4000 row does not occur in
+    # production -- and the rows that do are exactly 1.000. Contrast the
+    # tile change, whose 1.6-1.8x in stage-1 DID survive as 1.03-1.33x
+    # end to end: attenuation is not proportional, so a stage-1 win is
+    # never evidence of a serving win on its own.
+    #
+    # Kept at 3 anyway: strictly faster in the kernel, equivalence-verified
+    # (18 MATCH / 0 MISMATCH against the stages=1 control), and nothing has
+    # been scored at either value. Do not cite 1.11x as a user-visible gain.
+    SGLANG_OSCAR_MLA_PACKED_GF_STAGES = EnvInt(3)
+    # 4, measured, not 8. Swept on the production computed-tile kernel at three
+    # batch sizes, seq 20000, BLOCK_N=16 stages=1:
+    #   bs=8   0.529 ms both        1.00x
+    #   bs=16  0.917 vs 1.161       1.27x
+    #   bs=32  1.811 vs 2.307       1.27x
+    # Never worse, 1.27x better wherever it differs. The 8 was chosen to avoid
+    # register spills and never benchmarked, so this is the first time the knob
+    # has had a measurement behind it -- and it applies to the kernel serving
+    # today, independent of the group-factored path.
+    SGLANG_OSCAR_MLA_PACKED_WARPS = EnvInt(4)
+    SGLANG_OSCAR_MLA_PACKED_STAGES = EnvInt(1)
+    # Expand the per-group scale/zero in registers instead of addressing them as
+    # a [BLOCK_N, D] tile through gid. Bit-identical -- the pack layout is
+    # d = g * GS + j, so the broadcast reproduces gid element for element -- and
+    # it removes 128x-redundant address computation, which is the cost that
+    # survived the bandwidth refutation.
+    #
+    # A/B'd on hardware now, and it is SLOWER, so it stays off:
+    #
+    #     shape              bcast=0   bcast=1
+    #     bs16 seq20000      0.916 ms  0.990 ms   -8%
+    #     bs32 seq20000      1.806 ms  1.936 ms   -7%
+    #
+    # Correctness was fine (0 mismatches), so this is a pure speed refutation:
+    # removing redundant address arithmetic does not pay when it costs the
+    # registers that held it. Do not re-enable without a new measurement.
+    SGLANG_OSCAR_MLA_PACKED_PARAM_BCAST = EnvBool(False)
+    # Read the packed codes twice, once per dot layout, instead of transposing
+    # one tile. The transpose is a shared-memory layout conversion; the second
+    # dequant is free (measured: removing the dequant entirely is 1.00x). Off by
+    # default until A/B'd on hardware.
+    SGLANG_OSCAR_MLA_PACKED_DUAL_LOAD = EnvBool(False)
+    # Audit the BF16 window arena during *decode*. The write-side self-check and
+    # the teacher-forced NLL run both clear the packed read path, but teacher
+    # forcing is a single prefill: the ring's owner tag, wrap and eviction are
+    # never exercised. This counts, from pool state alone, how many of the slots
+    # that should be BF16 a reader would actually accept.
+    SGLANG_OSCAR_MLA_PACKED_AUDIT = EnvBool(False)
+    SGLANG_OSCAR_MLA_PACKED_AUDIT_BUDGET = EnvInt(80)
+    # Sample every Nth decode step: the tag only gets interesting after the ring
+    # has wrapped, which takes thousands of steps.
+    SGLANG_OSCAR_MLA_PACKED_AUDIT_STRIDE = EnvInt(200)
+    # Audit every batch element, not just element 0. The failure being hunted is
+    # an arena row reclaimed by whichever request now holds the same req index,
+    # and that victim is not necessarily element 0.
+    SGLANG_OSCAR_MLA_PACKED_AUDIT_ALL = EnvBool(False)
+    # Opt Kimi-K3 into the honest MLA declaration (latent c_kv storage) instead
+    # of the expanded per-head K/V 192/128 its published score was measured on.
+    # Off by default until the latent path has its own scored K3 run: it also
+    # needs per-layer 512x512 latent rotations, which do not exist for K3 yet.
+    SGLANG_OSCAR_K3_MLA_LATENT = EnvBool(False)
+    # OSCAR-for-latent high-precision subspace: dir of layer_<i>.pt files, each
+    # [k, kv_lora_rank] orthonormal rows = the top-k most sensitivity-weighted
+    # latent directions (from the kv_b_proj Hessian). Their projection is kept in
+    # BF16; only the residual is rotated + INT2-quantized. Beats plain Hadamard.
+    SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH = EnvStr("")
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)

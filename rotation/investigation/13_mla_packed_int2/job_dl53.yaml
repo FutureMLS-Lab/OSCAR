@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-dl53
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - gpu-dp-qcqgp-5wsdx
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbAojIEdMTS01LjMgaXMgNzA0IEdpQiBhY3Jvc3MgMTQxIHNoYXJkcy4gSXQgTVVTVCBsYW5kIG9uIC9oZiAoNDBUIGZyZWUpLCBub3QKIyAvc2hhcmVkICgyODNHIGZyZWUpIC0tIC9zaGFyZWQgY2Fubm90IGhvbGQgaXQgYW5kIGEgaGFsZi13cml0dGVuIDcwMCBHQgojIGRvd25sb2FkIHdvdWxkIGFsc28gc3RyYW5kIHRoZSB0d28gNjRrIGV2YWwgYXJtcyB0aGF0IGFyZSB3cml0aW5nIHRoZXJlLgpkZiAtaCAvaGYgfCB0YWlsIC0xCi4gL3NoYXJlZC9vc2Nhci12ZW52L2Jpbi9hY3RpdmF0ZQpleHBvcnQgSEZfSE9NRT0vaGYgSEZfSFVCX0VOQUJMRV9IRl9UUkFOU0ZFUj0xCnB5dGhvbjMgLSA8PCdQWScKaW1wb3J0IG9zCmZyb20gaHVnZ2luZ2ZhY2VfaHViIGltcG9ydCBzbmFwc2hvdF9kb3dubG9hZApwID0gc25hcHNob3RfZG93bmxvYWQoCiAgICAiemFpLW9yZy9HTE0tNS4zIiwKICAgICMgTm8gYWxsb3dfcGF0dGVybnM6IHRoZSBwYWNrZWQgcG9vbCBuZWVkcyB0aGUgcmVhbCB3ZWlnaHRzLCBhbmQgYQogICAgIyBjb25maWctb25seSBkb3dubG9hZCB3b3VsZCBsb29rIGxpa2Ugc3VjY2VzcyBhbmQgZmFpbCBhdCBsb2FkIHRpbWUuCiAgICBtYXhfd29ya2Vycz0xNiwKICAgIHJlc3VtZV9kb3dubG9hZD1UcnVlLAopCnByaW50KCJbZGxdIHNuYXBzaG90IGF0IiwgcCkKaW1wb3J0IGdsb2IKbiA9IGxlbihnbG9iLmdsb2Iob3MucGF0aC5qb2luKHAsICIqLnNhZmV0ZW5zb3JzIikpKQpwcmludChmIltkbF0gc2FmZXRlbnNvcnMgc2hhcmRzIG9uIGRpc2s6IHtufSAoZXhwZWN0IDE0MSkiKQpQWQplY2hvICJbZGxdIGRvbmUiCg==
+          | base64 -d > /tmp/j.sh && bash -n /tmp/j.sh && bash /tmp/j.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '0'
+          requests:
+            cpu: '16'
+            memory: 120Gi
+            nvidia.com/gpu: '0'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

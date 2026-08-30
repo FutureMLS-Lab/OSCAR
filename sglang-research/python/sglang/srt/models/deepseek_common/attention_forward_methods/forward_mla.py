@@ -30,6 +30,21 @@ from sglang.srt.utils import BumpAllocator
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
+def _packed_latent_pool(forward_batch, layer_id):
+    """The packed-INT2 latent pool, or ``None`` for every other pool.
+
+    Duck-typed on the two methods that define the contract so this file keeps
+    no import dependency on the OSCAR pools, and so nothing that merely looks
+    like an MLA pool can accidentally qualify.
+    """
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None or not hasattr(pool, "packed_read_operands"):
+        return None
+    if not hasattr(pool, "rotate_latent"):
+        return None
+    return pool
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
@@ -94,6 +109,40 @@ class DeepseekMLAForwardMixin:
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        # Kimi-K3 gates the attention output per head (g_proj, sigmoid). The
+        # expanded-MHA path applies it (forward_mha: attn_output * output_gate
+        # before o_proj); this path never did, so serving K3 as a real MLA
+        # latent produced fluent-shaped garbage -- an ungated output, not a
+        # quantization artefact. It reproduced with kv_cache_dtype=bfloat16 and
+        # no packed pool at all, which is what isolated it to the forward path.
+        #
+        # That is why use_expanded_mha_cache was pinned True: not caution, a
+        # missing gate. Computed here because only prepare has hidden_states,
+        # and always assigned -- including None -- so a stale gate from an
+        # earlier layer can never be applied to this one.
+        _has_gate = getattr(self, "g_proj", None) is not None
+        if not getattr(self, "_mla_gate_logged", False):
+            # Log once per layer that the gate is present and being applied.
+            # The gate fix was asserted to be live on the strength of the code
+            # reading correctly; nothing ever confirmed it from a running
+            # server. Five hypotheses about this path have now been wrong, and
+            # the two that were RIGHT -- the missing gate, and the kernel being
+            # innocent -- were both settled by an instrument rather than an
+            # argument.
+            import logging as _lg
+
+            self._mla_gate_logged = True
+            _lg.getLogger(__name__).info(
+                "[MLA-GATE] layer=%s g_proj=%s qk_head_dim=%s scaling=%.6f "
+                "kv_lora_rank=%s v_head_dim=%s",
+                getattr(self, "layer_id", "?"), _has_gate,
+                getattr(self, "qk_head_dim", None), getattr(self, "scaling", float("nan")),
+                getattr(self, "kv_lora_rank", None), getattr(self, "v_head_dim", None),
+            )
+        self._mla_output_gate = (
+            self.g_proj(hidden_states)[0].sigmoid() if _has_gate else None
+        )
 
         q_lora = None
         topk_indices = None
@@ -405,6 +454,7 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
+            _packed = None
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
@@ -435,6 +485,33 @@ class DeepseekMLAForwardMixin:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 
+            # Packed-INT2 latent: the cache holds the *rotated* latent, because
+            # that is the frame the quantizer is calibrated in and un-rotating
+            # every row a kernel touches would cost more than the read. Cancel
+            # it at the two ends instead, where it is a 512x512 matmul on the
+            # query and on the attention output rather than on the cache:
+            #
+            #     q . c^T = (q R) . (c R)^T          out = (sum p (c R)) R^T
+            #
+            # The fresh keys of this forward go to the kernel rotated too, so
+            # they sit in the same frame as the cached rows they are
+            # concatenated with; the pool rotates its own copy on the write.
+            # Only the plain-concat branch above builds the q/k this needs; the
+            # aiter fused path writes the cache itself and has no `k` to rotate.
+            _packed = (
+                None if _use_aiter_gfx95
+                else _packed_latent_pool(forward_batch, self.attn_mqa.layer_id)
+            )
+            if _packed is not None:
+                _lid = self.attn_mqa.layer_id
+                _packed.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k, k_nope)
+                save_kv_cache = False
+                k_nope = _packed.rotate_latent(_lid, k_nope)
+                q = torch.cat(
+                    [_packed.rotate_latent(_lid, q_nope_out), q_pe], dim=-1
+                )
+                k = torch.cat([k_nope, k_pe], dim=-1)
+
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
@@ -447,6 +524,11 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+            if _packed is not None:
+                attn_output = _packed.unrotate_output(
+                    self.attn_mqa.layer_id,
+                    attn_output.view(-1, self.num_local_heads, self.kv_lora_rank),
+                )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -562,6 +644,12 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+        # Same gate, same place as the expanded-MHA path: on the
+        # [tokens, num_local_heads * v_head_dim] tensor, before o_proj.
+        _gate = getattr(self, "_mla_output_gate", None)
+        if _gate is not None:
+            attn_bmm_output = attn_bmm_output * _gate
+        _trace_attn_out(self, "absorb", attn_bmm_output)
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
@@ -607,3 +695,52 @@ class DeepseekMLAForwardMixin:
                 or server_args.nsa_prefill_backend == "tilelang"
             )
         )
+
+
+def _trace_attn_out(mod, tag: str, t) -> None:
+    """Log the pre-o_proj tensor's norm once per layer, in BOTH MLA paths.
+
+    K3's absorbed path yields fluent but off-task text while the expanded-MHA
+    path scores 61.7, and the BF16 control proves the fault is in the forward
+    rather than in quantization. Adding g_proj fixed the loudest symptom and not
+    the defect, and scaling was measured correct, so what is left is unknown.
+
+    Both paths reduce to the same [tokens, num_local_heads * v_head_dim] tensor
+    immediately before o_proj, which makes them directly comparable. Running the
+    two arms on the same prompt and diffing this per layer says whether they
+    diverge at the FIRST full-attention layer -- a math difference -- or drift
+    apart later, which would be accumulation. Those have different causes, and
+    seven rounds of reasoning without this measurement produced six wrong
+    answers.
+    """
+    import os
+
+    if os.environ.get("SGLANG_OSCAR_TRACE_ATTN_OUT", "0") in ("0", "", "false"):
+        return
+    # Skip CUDA-graph capture. The tensors flowing through capture are dummy
+    # warmup values, so the first call -- which is what a once-per-layer trace
+    # records -- captured all zeros for the MHA arm and meaningless values for
+    # the absorbed one. Same mistake the c_kv dump made: a "first call" trace
+    # lands in capture, not in real decode.
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    if getattr(mod, "_attn_out_traced", False):
+        return
+    mod._attn_out_traced = True
+    import logging as _lg
+
+    try:
+        f = t.float()
+        _lg.getLogger(__name__).info(
+            "[ATTN-OUT] path=%s layer=%s shape=%s norm=%.6e absmax=%.6e mean=%.6e",
+            tag, getattr(mod, "layer_id", "?"), tuple(t.shape),
+            f.norm().item(), f.abs().max().item(), f.mean().item(),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+

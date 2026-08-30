@@ -28,7 +28,7 @@ CHUNK_ID="${CHUNK_ID:-all}"
 # with DUMP_PATH or CALIB_DIR for a specific calibration.
 DATASET="${DATASET:-GPQA}"
 if [[ -z "${CALIB_DIR:-}" ]]; then
-    CALIB_DIR="$(ls -1dt "${SCRIPT_DIR}/${DATASET}"/seq*_prompt*_group*/ 2>/dev/null | head -1 | sed 's:/$::')"
+    CALIB_DIR="$(ls -1dt "${CALIB_ROOT:-${SCRIPT_DIR}}/${DATASET}"/seq*_prompt*_group*/ 2>/dev/null | head -1 | sed 's:/$::' || true)"
 fi
 DUMP_PATH="${DUMP_PATH:-${CALIB_DIR}/qkv_dumps/gpqa}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CALIB_DIR}/rotations}"
@@ -55,6 +55,14 @@ if [[ -z "${PY:-}" ]]; then
     exit 1
 fi
 
+# Hybrid models hold KV on sparse layers (Qwen3.5: 3, 7, 11, ...), so they select
+# by explicit id; dense models just say how many layers there are.
+if [[ -n "${LAYER_IDS:-}" ]]; then
+    LAYER_SELECTOR=(--layer-ids "${LAYER_IDS}")
+else
+    LAYER_SELECTOR=(--num-layers "${NUM_LAYERS}")
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 echo "[compute_rotation] method=${METHOD} head_dim=${HEAD_DIM} output_dir=${OUTPUT_DIR}"
@@ -64,7 +72,7 @@ case "${METHOD}" in
         "${PY}" "${COMPUTE_SCRIPT}" \
             --method hadamard \
             --head-dim "${HEAD_DIM}" \
-            --num-layers "${NUM_LAYERS}" \
+            "${LAYER_SELECTOR[@]}" \
             --output-dir "${OUTPUT_DIR}"
         ;;
     qqt_sst|ktk_vtv|qqt|sst|ktk|vtv|uresidual)

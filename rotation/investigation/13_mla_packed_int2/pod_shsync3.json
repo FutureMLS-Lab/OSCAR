@@ -1,0 +1,111 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "zz-shsync3",
+  "namespace": "charlie"
+ },
+ "spec": {
+  "affinity": {
+   "nodeAffinity": {
+    "requiredDuringSchedulingIgnoredDuringExecution": {
+     "nodeSelectorTerms": [
+      {
+       "matchExpressions": [
+        {
+         "key": "kubernetes.io/hostname",
+         "operator": "NotIn",
+         "values": [
+          "gpu-dp-qcqgp-5wsdx",
+          "gpu-dp-qcqgp-7822f"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  "containers": [
+   {
+    "command": [
+     "bash",
+     "-lc",
+     "sleep 21600"
+    ],
+    "image": "nvcr.io/nvidia/pytorch:25.01-py3",
+    "imagePullPolicy": "IfNotPresent",
+    "name": "c",
+    "resources": {
+     "requests": {
+      "cpu": "2",
+      "memory": "8Gi"
+     }
+    },
+    "volumeMounts": [
+     {
+      "mountPath": "/shared",
+      "name": "sh"
+     },
+     {
+      "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+      "name": "kube-api-access-t546r",
+      "readOnly": true
+     }
+    ]
+   }
+  ],
+  "restartPolicy": "Never",
+  "tolerations": [
+   {
+    "operator": "Exists"
+   }
+  ],
+  "volumes": [
+   {
+    "name": "sh",
+    "persistentVolumeClaim": {
+     "claimName": "shared-data"
+    }
+   },
+   {
+    "name": "kube-api-access-t546r",
+    "projected": {
+     "defaultMode": 420,
+     "sources": [
+      {
+       "serviceAccountToken": {
+        "expirationSeconds": 3607,
+        "path": "token"
+       }
+      },
+      {
+       "configMap": {
+        "items": [
+         {
+          "key": "ca.crt",
+          "path": "ca.crt"
+         }
+        ],
+        "name": "kube-root-ca.crt"
+       }
+      },
+      {
+       "downwardAPI": {
+        "items": [
+         {
+          "fieldRef": {
+           "apiVersion": "v1",
+           "fieldPath": "metadata.namespace"
+          },
+          "path": "namespace"
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  ]
+ }
+}

@@ -602,6 +602,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        notify_kv_pool_of_forward_batch(ret)
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
@@ -1196,6 +1197,27 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
+
+
+def notify_kv_pool_of_forward_batch(forward_batch: "ForwardBatch") -> None:
+    """Hand a finished ``ForwardBatch`` to a KV pool that needs per-forward state.
+
+    A KV pool whose tiering depends on a token's *position in its sequence*
+    cannot get that from ``set_kv_buffer(layer, loc, ...)``; only the batch
+    knows it. ``MLAInt2HPKVPool`` / ``NSAInt2HPKVPool`` use it to place their
+    BF16 sink and BF16 recent windows over the shared latent. Every other pool
+    has no ``note_forward_batch`` and is untouched.
+
+    Must be called after ``positions`` is filled in, and from every place a
+    ``ForwardBatch`` is built that will then run the model -- notably the CUDA
+    graph runner, which constructs one directly and captures the ops built on
+    it. A pool that is handed stale metadata detects the shape mismatch and
+    falls back to quantizing every token.
+    """
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    hook = getattr(pool, "note_forward_batch", None)
+    if hook is not None:
+        hook(forward_batch)
 
 
 def _clamp_position_native(seq_lens):

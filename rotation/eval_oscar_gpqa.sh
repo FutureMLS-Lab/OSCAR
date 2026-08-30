@@ -35,21 +35,102 @@ TP_SIZE="${TP_SIZE:-4}"
 GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
 PORT="${PORT:-31057}"
 DIST_PORT="${DIST_PORT:-41057}"
-MEM_FRAC="${MEM_FRAC:-0.8}"
+# Every other script in rotation/ spells this MEM_FRACTION_STATIC, so accept
+# that name too -- a caller that used it got the 0.8 default with no warning.
+MEM_FRAC="${MEM_FRAC:-${MEM_FRACTION_STATIC:-0.8}}"
 MAX_RUNNING="${MAX_RUNNING:-64}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
+# V-rotation absorption folds R_v into o_proj. It assumes one rotation per
+# layer, so it is invalid for per-head (format_version 2) checkpoints -- with
+# per-head rotations and absorption on, Qwen3-30B-A3B scores 34.3 on GPQA
+# against 58.6 with it off, i.e. worse than a shared rotation. Default off.
+ABSORB_V="${ABSORB_V:-0}"
+# MLA models (shared latent c_kv) rotate the latent, not per-head K/V, and read a
+# different variable. Set MLA_ROT_PATH to the directory of per-layer layer_*.pt;
+# the K/V paths above are then unused. Leaving it empty keeps the MHA path.
+MLA_ROT_PATH="${MLA_ROT_PATH:-}"
+# MLA models quantize the shared latent through the rotation path and keep the
+# KV cache itself in bf16; passing --kv-cache-dtype int2 makes sglang abort with
+# "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype".
 GROUP_SIZE="${GROUP_SIZE:-128}"
+
+if [[ -n "${MLA_ROT_PATH}" ]]; then
+    # Arrays, not strings: an empty string still expands to one empty argv
+    # entry, which sglang's argparse rejects as an unexpected positional.
+    #
+    # The MLA pool fake-quantizes into a normal float KV cache, so that cache's
+    # dtype is the dtype its rotations and dequantized latents live in -- and it
+    # otherwise follows the GPU generation, not the recipe: sglang gives a
+    # DeepSeek-DSA model fp8_e4m3 on SM100+ and bfloat16 on Hopper and below.
+    # The same eval then measures a different method per cluster (GLM-5.2-FP8
+    # scored 68.7 on H100 and 5.6 on B200). Pin it; set MLA_KV_CACHE_DTYPE to
+    # fp8_e4m3 deliberately if that is what you mean to measure.
+    KV_DTYPE_ARGS=(--kv-cache-dtype "${MLA_KV_CACHE_DTYPE:-bfloat16}")
+    # --kv-cache-quant-group-size is only accepted alongside int2, and the MLA
+    # pool takes its group size from SGLANG_OSCAR_MLA_KV_GROUP_SIZE instead.
+    GROUP_SIZE_ARGS=()
+else
+    KV_DTYPE_ARGS=(--kv-cache-dtype int2)
+    GROUP_SIZE_ARGS=(--kv-cache-quant-group-size "${GROUP_SIZE}")
+fi
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
+# Prefix caching. This eval used to pin --disable-radix-cache because mixed-KV
+# tiering and the radix cache corrupted each other. Two causes, both fixed:
+#   * CUDA-graph padded decode writes landed in HP-prefix slot 0, which was
+#     allocatable -- and with the cache on that page is normally part of the
+#     *shared* prefix node, so one padded replay corrupted the prefix every
+#     live request reads. HP-prefix page 0 is now a reserved padding sink.
+#     (This was the big one: 27.78 vs 57.07 on Qwen3-30B-A3B GPQA-198.)
+#   * A cached prefix could reach into the borrower's BF16 HP-recent window,
+#     serving it at 2 bits; RadixCache._mixed_kv_tier_cap now bounds every
+#     match, internal ones included.
+# Cache on by default: 60.61 with 198/198 answered and a 17.1% token hit rate.
+# Set DISABLE_RADIX=1 for the old behavior (and to A/B it).
+if [[ "${DISABLE_RADIX:-0}" == "1" ]]; then
+    RADIX_ARGS=(--disable-radix-cache)
+else
+    RADIX_ARGS=()
+fi
+# Attention backends. FA3's int2 prefill asserts on sliding-window layers, so a
+# model with local attention (Gemma-4 has 40 such layers) must set both of these
+# to triton -- the int2 prefill path reads the global one, so overriding only
+# PREFILL_BACKEND is not enough.
+ATTN_BACKEND="${ATTN_BACKEND:-fa3}"
+PREFILL_BACKEND="${PREFILL_BACKEND:-fa3}"
+# Multi-node. The 400B-class models (MiniMax-M3, GLM-5.2-FP8) do not fit on one
+# node, so without these the example cannot run them at all. Set NNODES>1 plus
+# NODE_RANK and DIST_ADDR on each node; only rank 0 drives the eval.
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+DIST_ADDR="${DIST_ADDR:-}"
+if [[ "${NNODES}" -gt 1 ]]; then
+    [[ -n "${DIST_ADDR}" ]] || { echo "[eval-oscar] NNODES>1 needs DIST_ADDR=<head-ip>:<port>" >&2; exit 1; }
+    MULTINODE_ARGS=(--nnodes "${NNODES}" --node-rank "${NODE_RANK}" --dist-init-addr "${DIST_ADDR}")
+else
+    # Only single-node gets the loopback rendezvous. argparse is last-wins,
+    # so emitting this after MULTINODE_ARGS made loopback beat the real head
+    # address and NNODES>1 could never rendezvous -- the documented
+    # multi-node support for MiniMax-M3 / GLM-5.2 could not work at all.
+    MULTINODE_ARGS=(--dist-init-addr "127.0.0.1:${DIST_PORT}")
+fi
 NUM_WORKERS="${NUM_WORKERS:-32}"
 N_REPEATS="${N_REPEATS:-1}"
 NAME="${NAME:-gpqa_oscar}"
 
-CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV_NAME}"
-
-export PATH="${CONDA_PREFIX}/bin:${PATH}"
+# Respect an environment the caller already activated. Gemma-4 needs
+# transformers >= 5.5 for Gemma4TextConfig and runs from its own venv; forcing
+# the default conda env here silently reverted it, and sglang then reported the
+# model as "not a registered model" because gemma4_unified failed to import.
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    echo "[eval-oscar] using pre-activated venv ${VIRTUAL_ENV}"
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+else
+    CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
+    CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_NAME}"
+    export PATH="${CONDA_PREFIX}/bin:${PATH}"
+fi
 # Prepend per-rank Triton cache redirector so TP workers don't race on shared
 # launcher .so / metadata files in TRITON_CACHE_DIR.
 export PYTHONPATH="${REPO_ROOT}/rotation/_triton_per_rank:${SGLANG_RESEARCH_DIR}/python:${PYTHONPATH:-}"
@@ -83,42 +164,89 @@ trap cleanup EXIT INT TERM
 SERVER_ARGS=(
     --model-path "${MODEL}"
     --tensor-parallel-size "${TP_SIZE}"
-    --prefill-attention-backend fa3
+    --attention-backend "${ATTN_BACKEND:-fa3}"
+    --prefill-attention-backend "${PREFILL_BACKEND:-fa3}"
     --decode-attention-backend triton
-    --kv-cache-dtype int2
-    --kv-cache-quant-group-size "${GROUP_SIZE}"
+    "${MULTINODE_ARGS[@]}"
+    "${KV_DTYPE_ARGS[@]}"
+    "${GROUP_SIZE_ARGS[@]}"
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
+    "${RADIX_ARGS[@]}"
     --enable-cache-report
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
     --host 127.0.0.1
     --port "${PORT}"
-    --dist-init-addr "127.0.0.1:${DIST_PORT}"
     --trust-remote-code
 )
 if [[ -n "${REASONING_PARSER:-}" ]]; then
     SERVER_ARGS+=(--reasoning-parser "${REASONING_PARSER}")
 fi
+if [[ -n "${EXTRA_SERVER_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    SERVER_ARGS+=(${EXTRA_SERVER_ARGS})
+fi
 
 echo "[eval-oscar] model=${MODEL} tp=${TP_SIZE} gpus=${GPUS} rot=${ROT_DIR} out=${RUN_DIR}"
+# SGLANG_LLOYD_MAX is PASSED ONLY IF THE CALLER SET IT.
+#
+# It used to be `SGLANG_LLOYD_MAX="${LLOYD_MAX:-0}"` in the prefix below, which
+# always put the variable in the environment -- so `is_set()` was always True
+# and the pool's own default never ran. That matters now that the packed MLA
+# pools default Lloyd-Max ON at 2 bits: forcing the variable silently pinned
+# every eval to the uniform codebook, which on GLM-5.2 is 76.67% against
+# 83.33%. A harness that hardcodes a default cannot test that default, and it
+# reports the shipped configuration's number for a configuration nobody ships.
+#
+# Same shape of bug as gf_speed setting SGLANG_OSCAR_MLA_PACKED_GF in both
+# arms: whenever a harness supplies a value "for reproducibility", the branch
+# that runs when nobody supplies one stops being exercised.
+OPT_ENV=()
+if [ -n "${LLOYD_MAX:-}" ]; then
+    OPT_ENV+=("SGLANG_LLOYD_MAX=${LLOYD_MAX}")
+    echo "[eval-oscar] SGLANG_LLOYD_MAX pinned to ${LLOYD_MAX} by the caller"
+else
+    echo "[eval-oscar] SGLANG_LLOYD_MAX left UNSET -- the pool's own default applies"
+fi
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
-SGLANG_OSCAR_ABSORB_V_ROTATION=1 \
+SGLANG_COQUANT_ROTATION_MODE=coquant \
+SGLANG_OSCAR_ABSORB_V_ROTATION="${ABSORB_V:-0}" \
 SGLANG_MIXED_KV_HP_MAX_SPLITS=8 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
 SGLANG_MIXED_KV_RECENT_TOKENS=${SGLANG_MIXED_KV_RECENT_TOKENS:-256} \
 SGLANG_MIXED_KV_HP_DTYPE=bfloat16 \
 SGLANG_MIXED_KV_SCALE_DTYPE=float32 \
+SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS="${HP_PREFIX_POOL_TOKENS:-0}" \
+SGLANG_MIXED_KV_AUDIT="${MIXED_KV_AUDIT:-0}" \
+SGLANG_MIXED_KV_AUDIT_EVERY="${MIXED_KV_AUDIT_EVERY:-25}" \
+SGLANG_OSCAR_MLA_KV_ROTATION_PATH="${MLA_ROT_PATH:-}" \
+SGLANG_OSCAR_MLA_KV_GROUP_SIZE="${MLA_GROUP_SIZE:-128}" \
+SGLANG_OSCAR_MLA_KV_PACKED="${MLA_PACKED:-0}" \
+SGLANG_OSCAR_MLA_PACKED_SELFCHECK="${MLA_PACKED_SELFCHECK:-0}" \
 SGLANG_OSCAR_K_ROTATION_PATH="${ROT_DIR}/${K_ROT_FILENAME:-k_rotation_qqt_r_h_pbr.pt}" \
 SGLANG_OSCAR_V_ROTATION_PATH="${ROT_DIR}/${V_ROT_FILENAME:-v_rotation_sst_r_h_pbr.pt}" \
 SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP:-0.96}" \
 SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP:-0.92}" \
-SGLANG_LLOYD_MAX="${SGLANG_LLOYD_MAX:-0}" \
 CUDA_VISIBLE_DEVICES="${GPUS}" \
+env "${OPT_ENV[@]}" \
 python -m sglang.launch_server "${SERVER_ARGS[@]}" >> "${LOG_SERVER}" 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 240); do
+
+# Only rank 0 has the HTTP server and drives the eval; the other ranks just serve
+# their shard. Without this they wait on a health endpoint that never comes up
+# and then tear the group down, which surfaces on rank 0 as
+# "DistNetworkError: Failed to recv, got 0 bytes".
+if [[ "${NODE_RANK}" != "0" ]]; then
+    echo "[eval-oscar] rank ${NODE_RANK}: serving only, waiting for the group"
+    wait "${SERVER_PID}"
+    exit 0
+fi
+# 400B-class models at TP=16 spend ~1220 s just loading weights, so the old
+# fixed 240x5s = 20 min ceiling killed them mid-load.
+HEALTH_WAIT_STEPS="${HEALTH_WAIT_STEPS:-240}"
+for _ in $(seq 1 "${HEALTH_WAIT_STEPS}"); do
     if curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
         echo "[eval-oscar] server ready"
         break
@@ -138,6 +266,21 @@ if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
 fi
 
 echo "[eval-oscar] launching eval via simple_evals (vendored at third_party/simple_evals)"
+# A fresh clone leaves third_party/simple_evals empty (it is a submodule) and
+# every grader imports it, so the eval dies with
+#   ImportError: cannot import name 'common' from 'simple_evals'
+# only after the model is loaded. Initialise it up front and fail loudly.
+SE="${REPO_ROOT}/third_party/simple_evals"
+if [[ ! -f "${SE}/common.py" ]]; then
+    echo "[eval-oscar] third_party/simple_evals is empty; initialising submodule"
+    git -C "${REPO_ROOT}" submodule update --init --recursive third_party/simple_evals || true
+    find "${SE}" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+fi
+if [[ ! -f "${SE}/common.py" ]]; then
+    echo "[eval-oscar] cannot find ${SE}/common.py -- run: git submodule update --init --recursive" >&2
+    exit 1
+fi
+
 RUNNER="${REPO_ROOT}/rotation/_eval_runner/run_simple_eval.py"
 python "${RUNNER}" \
     --task gpqa \

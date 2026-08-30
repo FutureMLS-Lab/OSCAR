@@ -17,6 +17,11 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
+if not is_cpu():
+    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
 if is_npu():
@@ -131,9 +136,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # KimiLinearStateShape stores conv as (conv_kernel-1, conv_dim/tp), i.e.
+        # TRANSPOSED relative to Mamba2StateShape's (conv_dim/tp, conv_kernel-1)
+        # -- which is why every conv use below transposes first.  Take the shape
+        # off the transposed view so conv_states_shape[-1] is the conv state
+        # length, matching what MambaAttnBackendBase._init_track_conv_indices
+        # expects.  Reading conv[0].shape[-1] directly here would silently yield
+        # conv_dim (thousands) instead of conv_kernel-1.
+        self.conv_states_shape = tuple(
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
+            .transpose(-1, -2)
+            .shape
+        )
+        if not is_cpu() and not is_npu():
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
 
     def forward_decode(
         self,
@@ -173,6 +207,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=getattr(layer, "gate_lower_bound", None),
         )
 
     def forward_extend(
@@ -195,7 +230,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+        mixed_qkv = mixed_qkv.transpose(0, 1)  # [conv_dim, seq], as GDN uses
+
+        # Prefix cache: stash the conv window at the last aligned chunk boundary
+        # before causal_conv1d_fn overwrites conv_states with the end-of-sequence
+        # window.  `conv_states` is already the transposed view, so this indexes
+        # exactly as the GDN path does.
+        forward_metadata = self.forward_metadata
+        if forward_metadata.has_mamba_track_mask:
+            mixed_qkv_to_track = mixed_qkv[
+                :, forward_metadata.track_conv_indices
+            ].transpose(0, 1)
+            conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
+
+        q, k, v = mixed_qkv.split(splits, dim=0)
         q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
             splits, dim=0
         )
@@ -243,6 +291,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
+        # Only ask the kernel for the per-chunk states when the prefix cache is
+        # going to store them; otherwise keep the cheaper single-tensor return.
+        track = forward_metadata.has_mamba_track_mask
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -252,6 +303,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            return_intermediate_states=track,
         )
+        if track:
+            core_attn_out, h = core_attn_out
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
 
         return core_attn_out

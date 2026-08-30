@@ -1,0 +1,167 @@
+# Pre-merge regression sweep, investigation/11 -- the two dense-MHA Qwen3 rows.
+#
+#   zz-pm-q38b   Qwen3-8B   TP=2  shared rotation (Zoo qqt_sst) + Lloyd-Max ON  + recent 512
+#   zz-pm-q332b  Qwen3-32B  TP=4  shared rotation V1 (qqt_sst)  + uniform (LM 0) + recent 256
+#
+# Fixed probe protocol from investigation/11/CONTRACT.md, identical in both:
+#   GPQA NUM_EXAMPLES=24, MAX_NEW_TOKENS=8192, MAX_RUNNING=32,
+#   client concurrency (NUM_WORKERS) 16, radix cache ON, CUDA_GRAPH_MAX_BS=32,
+#   temp 1.0 / top_p 0.95 / top_k 40 (eval_oscar_gpqa.sh defaults), ABSORB_V=0.
+#
+# MAX_RUNNING and client concurrency stay decoupled: get_batch_sizes_to_capture
+# truncates the captured set to max-running-requests *and appends it*, so
+# MAX_RUNNING=16 would make 16 a captured size and blind the probe.
+#
+# TREE is /shared/zz-premerge/tree (HEAD afdcad68), NOT zz-m27-recheck/tree_post
+# -- tree_post is at 4b06c059 with zero _safe_block_h, i.e. a PRE-fix tree.
+# run_model11.sh asserts both the pinned SHA and _safe_block_h from the
+# pod-local copy the server actually imports from, and hard-fails if the
+# rotation is Hadamard-like.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-q38b
+  namespace: charlie
+  labels: {app: zz-premerge, family: dense-mha}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: zz-premerge, family: dense-mha}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostIPC: true
+      priorityClassName: normal
+      schedulerName: volcano
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                # 117 corrupts INT2 output; 073 is driver-broken.
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+      containers:
+      - name: arm
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        command: ["/bin/bash","-lc"]
+        args:
+        - bash /shared/zz-premerge/tree/rotation/investigation/11_premerge_regression/run_model11.sh
+        env:
+        - {name: ARM,               value: zz-pm-q38b}
+        - {name: MODEL_REPO,        value: models--Qwen--Qwen3-8B}
+        - {name: MODEL_DIR,         value: qwen3-8B}
+        # qwen3-8B/ has no rotations/ dir; the recipe is the published Zoo one,
+        # byte-identical to rotation/qwen3-8B/GPQA/seq20000_prompt83_group128/.
+        - {name: ROT_SUBDIR,        value: OSCAR-RotationZoo/Qwen3-8B/seq20000_prompt83_group128}
+        - {name: TREE,              value: /shared/zz-premerge/tree}
+        - {name: TP_SIZE,           value: '2'}
+        - {name: LLOYD_MAX,         value: '1'}     # 8B recipe: Lloyd-Max ON
+        - {name: HP_PREFIX,         value: '64'}
+        - {name: HP_RECENT,         value: '512'}   # 8B recipe: recent 512
+        - {name: ABSORB_V,          value: '0'}
+        - {name: PORT,              value: '32200'}
+        - {name: NUM_EXAMPLES,      value: '24'}
+        - {name: MAX_NEW_TOKENS,    value: '8192'}
+        - {name: MAX_RUNNING,       value: '32'}
+        - {name: NUM_WORKERS,       value: '16'}    # client concurrency
+        - {name: CUDA_GRAPH_MAX_BS, value: '32'}
+        - {name: DISABLE_RADIX,     value: '0'}     # radix cache ON
+        - {name: MEM_FRAC,          value: '0.85'}
+        - {name: HOME,              value: /tmp/h}
+        - {name: HF_HOME,           value: /shared/huggingface}
+        - {name: PYTHONUNBUFFERED,  value: '1'}
+        resources:
+          limits: {nvidia.com/gpu: '2'}
+          requests: {cpu: '12', memory: 160Gi, nvidia.com/gpu: '2'}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home,   mountPath: /home/charlie}
+        - {name: scratch, mountPath: /tmp}
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home,   persistentVolumeClaim: {claimName: home-charlie-rwx}}
+      - {name: scratch, emptyDir: {}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-pm-q332b
+  namespace: charlie
+  labels: {app: zz-premerge, family: dense-mha}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: zz-premerge, family: dense-mha}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      hostIPC: true
+      priorityClassName: normal
+      schedulerName: volcano
+      tolerations:
+      - {key: node-group, operator: Equal, value: nccl, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - research-common-h100-117.cloud.together.ai
+                - research-common-h100-073.cloud.together.ai
+      containers:
+      - name: arm
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        command: ["/bin/bash","-lc"]
+        args:
+        - bash /shared/zz-premerge/tree/rotation/investigation/11_premerge_regression/run_model11.sh
+        env:
+        - {name: ARM,               value: zz-pm-q332b}
+        - {name: MODEL_REPO,        value: models--Qwen--Qwen3-32B}
+        - {name: MODEL_DIR,         value: qwen3-32B}
+        # V1 shared rotation, in-tree at rotation/qwen3-32B/rotations/ and
+        # byte-identical to Zoo Qwen3-32B/seq16000_prompt69_group128/.
+        # Empty ROT_SUBDIR -> the wrapper's own rotations/ dir.
+        - {name: TREE,              value: /shared/zz-premerge/tree}
+        - {name: TP_SIZE,           value: '4'}
+        - {name: LLOYD_MAX,         value: '0'}     # 32B recipe: uniform
+        - {name: HP_PREFIX,         value: '64'}
+        - {name: HP_RECENT,         value: '256'}   # 32B recipe: window 64/256
+        - {name: ABSORB_V,          value: '0'}
+        - {name: PORT,              value: '32300'}
+        - {name: NUM_EXAMPLES,      value: '24'}
+        - {name: MAX_NEW_TOKENS,    value: '8192'}
+        - {name: MAX_RUNNING,       value: '32'}
+        - {name: NUM_WORKERS,       value: '16'}    # client concurrency
+        - {name: CUDA_GRAPH_MAX_BS, value: '32'}
+        - {name: DISABLE_RADIX,     value: '0'}     # radix cache ON
+        - {name: MEM_FRAC,          value: '0.85'}
+        - {name: HOME,              value: /tmp/h}
+        - {name: HF_HOME,           value: /shared/huggingface}
+        - {name: PYTHONUNBUFFERED,  value: '1'}
+        resources:
+          limits: {nvidia.com/gpu: '4'}
+          requests: {cpu: '24', memory: 320Gi, nvidia.com/gpu: '4'}
+        volumeMounts:
+        - {name: shared, mountPath: /shared}
+        - {name: home,   mountPath: /home/charlie}
+        - {name: scratch, mountPath: /tmp}
+      volumes:
+      - {name: shared, persistentVolumeClaim: {claimName: shared-data}}
+      - {name: home,   persistentVolumeClaim: {claimName: home-charlie-rwx}}
+      - {name: scratch, emptyDir: {}}

@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-mlapk-gate5
+  namespace: charlie
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -lc
+        - echo c2V0IC11byBwaXBlZmFpbApSPS9zaGFyZWQ7IFNSQz0kUi9vc2Nhci1tbGFoeWI7IFc9L3dvcmsvb3NjYXI7IFBJTj1hNDhiNDkyZTEKbWtkaXIgLXAgL3dvcmsKZ2l0IGNsb25lIC1xIC0tbG9jYWwgLS1uby1oYXJkbGlua3MgIiRTUkMiICIkVyIgfHwgeyBlY2hvICJGQVRBTCBjbG9uZSBmYWlsZWQiOyBleGl0IDE7IH0KZ2l0IC1DICIkVyIgY2hlY2tvdXQgLXEgLWYgLS1kZXRhY2ggIiRQSU4iIHx8IHsgZWNobyAiRkFUQUwgcGluICRQSU4gZmFpbGVkIjsgZXhpdCAxOyB9Ci4gJFIvb3NjYXItdmVudi9iaW4vYWN0aXZhdGUKZXhwb3J0IEhGX0hPTUU9L2hmIEhGX0hVQl9PRkZMSU5FPTEgUFlUSE9OUEFUSD0kVy9zZ2xhbmctcmVzZWFyY2gvcHl0aG9uCmVjaG8gIltqb2JdIEhFQUQ9JChnaXQgLUMgJFcgbG9nIC0tb25lbGluZSAtMSkiCkQ9JFcvcm90YXRpb24vaW52ZXN0aWdhdGlvbi8xM19tbGFfcGFja2VkX2ludDIKIyBHdWFyZHMgb24gd2hhdCB0aGlzIHJ1biBhY3R1YWxseSBkZXBlbmRzIG9uLCBwaHJhc2VkIHNvIGEgc3RhbGUgcGluIGZhaWxzCiMgbG91ZGx5IGluc3RlYWQgb2YgcXVpZXRseSBtZWFzdXJpbmcgdGhlIHdyb25nIHRoaW5nLgpncmVwIC1xICJESVNBQkxFX1JBRElYIiAkRC9zZXJ2ZV9wcm9iZS5weSBcCiAgfHwgeyBlY2hvICJGQVRBTDogcHJvYmUgY2Fubm90IGRpc2FibGUgdGhlIHByZWZpeCBjYWNoZTsgdGVhY2hlciBmb3JjaW5nIHdvdWxkIGJlIGluY29tcGFyYWJsZSI7IGV4aXQgMTsgfQpncmVwIC1xICJTR0xBTkdfT1NDQVJfTUxBX1dJTkRPV19CTE9DS19OLmdldCgpIiAkRC9iZW5jaF9rZXJuZWwucHkgfHwgeyBlY2hvICJGQVRBTDogYmVuY2ggc3RpbGwgaGFyZGNvZGVzIHRoZSB3aW5kb3cgY29uZmlnOyB0aGUgY29tcGFyaXNvbiB3b3VsZCBiZSB2YWN1b3VzIjsgZXhpdCAxOyB9CmdyZXAgLXEgImhwX293bmVyLCBHUywgRmFsc2UsIGJpdHMiICREL2JlbmNoX2tlcm5lbC5weSB8fCB7IGVjaG8gIkZBVEFMOiBzdGFsZSBnYXRlLCBvcGVyYW5kcyB0dXBsZSBzdGlsbCA4LXdpZGUiOyBleGl0IDE7IH0KZ3JlcCAtcSAiU0dMQU5HX09TQ0FSX01MQV9XSU5ET1dfQkxPQ0tfSCIgJFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbi9zZ2xhbmcvc3J0L2xheWVycy9hdHRlbnRpb24vdHJpdG9uX29wcy9tbGFfcGFja2VkX2RlY29kZS5weSBcCiAgfHwgeyBlY2hvICJGQVRBTDogcGlubmVkIHRyZWUgbGFja3MgdGhlIGNvbnRleHQgc3dlZXAiOyBleGl0IDE7IH0KZ3JlcCAtcSAiZGVmIGNtcCIgJEQva2xfY29tcGFyZS5weSB8fCB7IGVjaG8gIkZBVEFMOiBrbF9jb21wYXJlIGxhY2tzIGNtcCI7IGV4aXQgMTsgfQpncmVwIC1xICJTR0xBTkdfT1NDQVJfTUxBX1BBQ0tFRF9HRiIgJFcvc2dsYW5nLXJlc2VhcmNoL3B5dGhvbi9zZ2xhbmcvc3J0L2xheWVycy9hdHRlbnRpb24vdHJpdG9uX2JhY2tlbmQucHkgXAogIHx8IHsgZWNobyAiRkFUQUw6IHBpbm5lZCB0cmVlIGxhY2tzIHRoZSBHRiB3aXJpbmciOyBleGl0IDE7IH0KZ3JlcCAtcSAic2xvdF9vZmY9MSBpZiBoYXNfaHAiICRXL3NnbGFuZy1yZXNlYXJjaC9weXRob24vc2dsYW5nL3NydC9sYXllcnMvYXR0ZW50aW9uL3RyaXRvbl9vcHMvbWxhX3BhY2tlZF9kZWNvZGUucHkgXAogIHx8IHsgZWNobyAiRkFUQUw6IHBpbm5lZCB0cmVlIGxhY2tzIHRoZSBzbG90LTAgd2lyaW5nIjsgZXhpdCAxOyB9CmV4cG9ydCBPVVRfRElSPSRSL21sYXBhY2tlZF9nYXRlNTsgbWtkaXIgLXAgJE9VVF9ESVIKIyBUaGUgd2luZG93IGxhdW5jaCBjb25maWcgY2hhbmdlZCAoQkxPQ0tfSCAxNi0+OCwgQkxPQ0tfTiAzMi0+NjQsIHdhcnBzIDQtPjgpLgojIFNwZWVkIHdhcyBtZWFzdXJlZDsgZXF1aXZhbGVuY2Ugd2FzIG5vdC4gVGlsaW5nIGFuZCB3YXJwIGNvdW50IGNoYW5nZSB0aGUKIyBvcmRlciBvZiB0aGUgc29mdG1heCBhY2N1bXVsYXRpb24sIHNvIHJlLXJ1biB0aGUgZ2F0ZSB0aGF0IGNvbXBhcmVzIHRoZQojIGdyb3VwLWZhY3RvcmVkIHBhdGggYWdhaW5zdCB0aGUgcHJvZHVjdGlvbiBrZXJuZWwgYXQgZXZlcnkgc2hhcGUuCmVjaG8gIj09PSBlcXVpdmFsZW5jZSBnYXRlIHVuZGVyIHRoZSB0dW5lZCB3aW5kb3cgY29uZmlnID09PSIKeyBlY2hvICIjIyMgdHVuZWQgd2luZG93IGNvbmZpZyAoQkxPQ0tfSD04IEJMT0NLX049NjQgd2FycHM9OCkiCiAgcHl0aG9uMyAtdSAkRC9iZW5jaF9rZXJuZWwucHkgMj4mMQogIGVjaG8gIiMjIyBPUklHSU5BTCB3aW5kb3cgY29uZmlnIChCTE9DS19IPTE2IEJMT0NLX049MzIgd2FycHM9NCkiCiAgU0dMQU5HX09TQ0FSX01MQV9XSU5ET1dfQkxPQ0tfSD0xNiBTR0xBTkdfT1NDQVJfTUxBX1dJTkRPV19CTE9DS19OPTMyIFwKICAgIFNHTEFOR19PU0NBUl9NTEFfV0lORE9XX1dBUlBTPTQgcHl0aG9uMyAtdSAkRC9iZW5jaF9rZXJuZWwucHkgMj4mMQp9IHwgXAogIHRlZSAvdG1wL2dhdGUub3V0IHwgZ3JlcCAtYUUgIk1BVENIfE1JU01BVENIfG1heGRldnxyZWx8c2hhcGV8YnM9fFZFUkRJQ1R8RXJyb3J8VHJhY2ViYWNrIiB8IHRhaWwgLTQwCmlmIGdyZXAgLXFhRSAiTUlTTUFUQ0h8RkFJTEVEIHRvIHJ1bnxub3QgZW5vdWdoIHZhbHVlc3xUcmFjZWJhY2siIC90bXAvZ2F0ZS5vdXQ7IHRoZW4KICBlY2hvICJHQVRFIFZFUkRJQ1Q6IEZBSUwiCiAgZ3JlcCAtYUUgIk1JU01BVENIfEZBSUxFRCB0byBydW58bm90IGVub3VnaCB2YWx1ZXMiIC90bXAvZ2F0ZS5vdXQgfCBoZWFkIC01CiAgZXhpdCAxCmZpCmVjaG8gIkdBVEUgVkVSRElDVDogUEFTUyAtLSBldmVyeSBzaGFwZSBtYXRjaGVkIGFuZCBubyBleGNlcHRpb24gYW55d2hlcmUiCmVjaG8gIltqb2JdIGV4aXQ9JD8iCg==
+          | base64 -d > /tmp/j.sh && bash -n /tmp/j.sh && bash /tmp/j.sh
+        env:
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: HOME
+          value: /tmp/h
+        image: nvcr.io/nvidia/pytorch:25.01-py3
+        imagePullPolicy: IfNotPresent
+        name: g
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            cpu: '16'
+            memory: 200Gi
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - mountPath: /shared
+          name: sh
+        - mountPath: /hf
+          name: hf
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /work
+          name: work
+      priorityClassName: zz-k3-nopreempt
+      restartPolicy: Never
+      volumes:
+      - name: sh
+        persistentVolumeClaim:
+          claimName: shared-data
+      - name: hf
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: shm
+      - emptyDir:
+          sizeLimit: 20Gi
+        name: work
+  ttlSecondsAfterFinished: 604800

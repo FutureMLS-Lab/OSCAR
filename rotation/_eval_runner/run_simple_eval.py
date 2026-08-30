@@ -30,12 +30,14 @@ assert SE_DIR.is_dir(), (
     "into third_party/ and rename the directory to simple_evals (underscore)"
 )
 sys.path.insert(0, str(SE_DIR.parent))
+sys.path.insert(0, str(HERE))  # for the local aime_eval module
 
 
 def _build_argparser():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", required=True, choices=["gpqa"],
-                   help="simple-evals task; only gpqa wired up for now")
+    p.add_argument("--task", required=True,
+                   choices=["gpqa", "humaneval", "aime25", "math500"],
+                   help="simple-evals task")
     p.add_argument("--model", required=True, help="HF model id served by sglang")
     p.add_argument("--base-url", required=True, help="OpenAI-compatible endpoint")
     p.add_argument("--api-key", default="EMPTY")
@@ -44,6 +46,8 @@ def _build_argparser():
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--n-repeats", type=int, default=1)
+    p.add_argument("--seed", type=int, default=None,
+                   help="sampling seed (run 3+ seeds for mean±variance)")
     p.add_argument("--num-examples", type=int, default=None,
                    help="Restrict to N examples (default: all)")
     p.add_argument("--variant", default="diamond", help="GPQA variant: diamond | main")
@@ -64,15 +68,22 @@ class SglangChatSampler:
     image_format = "url"
 
     def __init__(self, model, base_url, api_key, system_message,
-                 temperature, top_p, top_k, max_tokens):
+                 temperature, top_p, top_k, max_tokens, seed=None):
+        import httpx
         from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=httpx.Timeout(connect=30, read=28800, write=30, pool=30),
+            max_retries=0,
+        )
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
         self.max_tokens = max_tokens
+        self.seed = seed
 
     def _pack_message(self, role, content):
         return {"role": str(role), "content": content}
@@ -88,13 +99,16 @@ class SglangChatSampler:
         trial = 0
         while True:
             try:
+                _extra = {"top_k": self.top_k}
+                if self.seed is not None:
+                    _extra["seed"] = self.seed
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     top_p=self.top_p,
-                    extra_body={"top_k": self.top_k},
+                    extra_body=_extra,
                 )
                 content = resp.choices[0].message.content
                 if content is None:
@@ -129,6 +143,7 @@ def main():
         model=args.model, base_url=args.base_url, api_key=args.api_key,
         system_message=args.system_message, temperature=args.temperature,
         top_p=args.top_p, top_k=args.top_k, max_tokens=args.max_tokens,
+        seed=args.seed,
     )
 
     # Cap simple-evals' map_with_progress concurrency. GPQAEval.__call__
@@ -138,9 +153,9 @@ def main():
     from simple_evals import common as _se_common
     _orig_map = _se_common.map_with_progress
     def _patched_map(f, xs, num_threads=None, pbar=True):
-        if num_threads is None:
-            num_threads = args.num_threads
-        return _orig_map(f, xs, num_threads=num_threads, pbar=pbar)
+        # Force args.num_threads ALWAYS (HumanEval hardcodes num_threads=3).
+        # This INT2 server is fastest single-stream, so honor --num-threads 1.
+        return _orig_map(f, xs, num_threads=args.num_threads, pbar=pbar)
     _se_common.map_with_progress = _patched_map
 
     # Monkey-patch ANSWER_PATTERN_MULTICHOICE back to the permissive `\s*`
@@ -189,6 +204,29 @@ def main():
         evaluator = GPQAEval(
             n_repeats=args.n_repeats, variant=args.variant,
             num_examples=args.num_examples,
+        )
+    elif args.task == "humaneval":
+        # Local subclass: upstream's find_code falls back to the whole response
+        # when the model emits no ```python fence, which a thinking model does
+        # not, scoring ~0.15 regardless of the model. See humaneval_eval.py.
+        from humaneval_eval import HumanEval
+        # pass@1, single sample/task (this server is single-stream); base HumanEval (164)
+        evaluator = HumanEval(
+            num_examples=args.num_examples,
+            num_samples_per_task=1,
+            ks_passes=[1],
+        )
+    elif args.task == "aime25":
+        import aime_eval
+        evaluator = aime_eval.AIMEEval(
+            num_examples=args.num_examples, n_repeats=args.n_repeats,
+        )
+    elif args.task == "math500":
+        # Deterministic boxed-extraction + sympy grading (no LLM equality-checker,
+        # which fails with a verbose thinking model). See math500_eval.py.
+        import math500_eval
+        evaluator = math500_eval.MATH500Eval(
+            num_examples=args.num_examples, n_repeats=args.n_repeats,
         )
     else:
         raise ValueError(f"task {args.task} not wired up yet")

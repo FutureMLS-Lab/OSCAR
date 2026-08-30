@@ -8,7 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    CHUNK_SIZE,
+    chunk_gated_delta_rule_fwd_h,
+)
 from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.fused_norm_gate import layer_norm_gated_fwd
@@ -860,8 +863,13 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
+    return_intermediate_states: bool = False,
 ):
-    chunk_size = 64
+    # Must stay equal to fla.chunk_delta_h.CHUNK_SIZE: the prefix-cache index
+    # math in MambaAttnBackendBase._init_track_{conv,ssm}_indices assumes the
+    # kernel chunked on exactly that grid, so a mismatch would cache a state
+    # taken at the wrong boundary -- silently, with no shape error.
+    chunk_size = CHUNK_SIZE
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
 
     # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
@@ -897,7 +905,14 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
     )
-    del Aqk, v_new, h
+    del Aqk, v_new
+    if return_intermediate_states:
+        # `h` holds the per-chunk recurrent states the prefix cache needs.  It
+        # is the same tensor GDN returns from chunk_gated_delta_rule (both come
+        # from chunk_gated_delta_rule_fwd_h, shape [B, NT, H, V, K]), so
+        # MambaAttnBackendBase._track_mamba_state_extend consumes it unchanged.
+        return o, h
+    del h
     return o
 
 
@@ -912,6 +927,7 @@ def chunk_kda(
     initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    return_intermediate_states: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -921,7 +937,9 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o = chunk_kda_fwd(
+    # Returns `o` alone by default so every existing caller is unaffected, and
+    # `(o, h)` only when the prefix cache actually needs the chunk states.
+    return chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -931,8 +949,8 @@ def chunk_kda(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        return_intermediate_states=return_intermediate_states,
     )
-    return o
 
 
 @triton.autotune(
@@ -958,12 +976,21 @@ def kda_gate_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    SAFE_GATE: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
+    A_PER_DIM: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
 
-    b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
+    n_d = tl.arange(0, BD)
+    dim_mask = n_d < D
+    if A_PER_DIM:
+        b_a = tl.exp(
+            tl.load(A + n_d, mask=dim_mask, other=0.0).to(tl.float32)
+        )
+    else:
+        b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
 
     stride_row = H * D
     stride_col = 1
@@ -989,20 +1016,23 @@ def kda_gate_fwd_kernel(
     b_g = tl.load(g_ptr, boundary_check=(0, 1)).to(tl.float32)
 
     if HAS_BIAS:
-        n_d = tl.arange(0, BD)
-        bias_mask = n_d < D
-        b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(
+        b_bias = tl.load(g_bias + i_h * D + n_d, mask=dim_mask, other=0.0).to(
             tl.float32
         )
         b_g = b_g + b_bias[None, :]
 
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if SAFE_GATE:
+        b_y = LOWER_BOUND * tl.sigmoid(b_a * b_g)
+    else:
+        # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
+        g_scaled = b_g * beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(
+            use_linear,
+            b_g,
+            (1.0 / beta) * log(1.0 + tl.exp(g_scaled)),
+        )
+        b_y = -b_a * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1014,22 +1044,35 @@ def fused_kda_gate(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """
     Forward pass for KDA gate:
       input g: [..., H*D]
-      param A: [H] or [1, 1, H, 1]
+      param A: one value per head ([H]) or key channel ([D])
       beta: softplus beta parameter
       threshold: softplus threshold parameter
+      lower_bound: optional safe-gate lower bound in [-5, 0)
       return  : [..., H, D]
     """
+    if lower_bound is not None and not (-5.0 <= lower_bound < 0.0):
+        raise ValueError(
+            f"KDA lower_bound must be in [-5, 0), got {lower_bound}"
+        )
     orig_shape = g.shape[:-1]
 
     g = g.view(-1, g.shape[-1])
     T = g.shape[0]
     HD = g.shape[1]
-    H = A.numel()
-    assert H * head_k_dim == HD
+    if HD % head_k_dim != 0:
+        raise ValueError(f"g width {HD} is not divisible by head_k_dim {head_k_dim}")
+    H = HD // head_k_dim
+    if A.numel() not in (H, head_k_dim):
+        raise ValueError(
+            f"A must contain one value per head ({H}) or key channel "
+            f"({head_k_dim}), got {A.numel()}"
+        )
+    a_per_dim = A.numel() == head_k_dim
 
     y = torch.empty_like(g, dtype=torch.float32)
 
@@ -1048,6 +1091,9 @@ def fused_kda_gate(
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        SAFE_GATE=lower_bound is not None,
+        LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
+        A_PER_DIM=a_per_dim,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)

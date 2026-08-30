@@ -172,6 +172,39 @@ class MemoryPoolConfigurator:
         raise NotImplementedError
 
 
+def _packed_mla_latent_enabled(mr: ModelRunner) -> bool:
+    """Whether this run stores the MLA latent as packed INT2 codes.
+
+    Must agree exactly with the routing in ``model_runner_kv_cache_mixin``: a
+    configurator that disagrees with the pool it is sizing either wastes the
+    difference or runs the allocator off the end of the buffers.
+    """
+    from sglang.srt.environ import envs
+
+    base = (
+        mr.use_mla_backend
+        and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+        and bool(envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get())
+    )
+    if not base:
+        return False
+    # The mambaish branch in model_runner_kv_cache_mixin additionally refuses
+    # speculative decoding and disaggregation, and this predicate did not. On
+    # an MLA + mambaish model with either enabled, the configurator sized the
+    # pool at 288 B/token while the router built a BF16 pool at 1152 -- a 4x
+    # under-size, which is the "runs the allocator off the end" case this
+    # docstring warns about rather than the harmless wasteful one.
+    #
+    # Non-mambaish MLA has no such conditions, so it keeps the plain predicate.
+    if getattr(mr, "mambaish_config", None):
+        sa = mr.server_args
+        return (
+            sa.disaggregation_mode in (None, "null")
+            and sa.speculative_algorithm is None
+        )
+    return True
+
+
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, NSA, FP4.
 
@@ -278,11 +311,68 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             bytes_per_head = None
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if _packed_mla_latent_enabled(mr):
+                # Packed INT2 latent: codes + group params + BF16 k_pe. Without
+                # this the pool would be sized as if it still stored 576 BF16
+                # values per token and ``max_total_num_tokens`` would not move
+                # off the BF16 arm's number -- which is exactly the symptom that
+                # says the storage change did not land.
+                from sglang.srt.mem_cache.mla_packed_kv_pool import (
+                    packed_latent_bytes_per_token,
+                )
+
+                cell_size = (
+                    packed_latent_bytes_per_token(
+                        model_config.kv_lora_rank,
+                        model_config.qk_rope_head_dim,
+                        envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        # Must match what _init_packed allocates. A cell_size
+                        # computed at a different width either wastes the
+                        # difference or runs the pool off its end.
+                        bits=envs.SGLANG_OSCAR_MLA_KV_BITS.get(),
+                    )
+                    * num_layers
+                )
+                # The BF16 window arena is a fixed cost, not a per-token one:
+                # (sink + recent) rows per request slot, every layer. Charging
+                # it here keeps the pool inside the mem-fraction budget instead
+                # of overshooting it by a couple of GB at the end of startup.
+                p = (
+                    envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+                    if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+                    else 64
+                )
+                r = (
+                    envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+                    if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+                    else 256
+                )
+                # ``mr.max_running_requests`` does not exist yet -- it is
+                # resolved *from* the pool size this call is computing, and its
+                # default estimate climbs with the pool, so a 3x bigger pool
+                # would silently ask for a 3x bigger window arena. Read the flag
+                # instead, and require it: an unpinned arena is either 60x too
+                # big or quietly leaves requests without windows.
+                max_reqs = mr.server_args.max_running_requests
+                if max_reqs is None:
+                    raise ValueError(
+                        "SGLANG_OSCAR_MLA_KV_PACKED needs --max-running-requests "
+                        "pinned: the BF16 window arena is sized per request slot "
+                        "and the default is derived from the pool size, which "
+                        "this branch changes."
+                    )
+                self._fixed_overhead_bytes = (
+                    (1 + max_reqs * (p + r))
+                    * model_config.kv_lora_rank
+                    * 2
+                    * num_layers
+                )
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -333,6 +423,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes -= getattr(self, "_fixed_overhead_bytes", 0)
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
