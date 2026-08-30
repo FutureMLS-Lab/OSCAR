@@ -449,6 +449,24 @@ class Envs:
     #     bs32 seq20000      0.458      0.407     1.13x
     #
     # Reproduced across three independent runs to within 0.001 ms.
+    #
+    # BUT END TO END IT IS A TIE, and that is the number to quote. Same
+    # harness as the tile A/B, both arms GF ON, stages the only variable:
+    #
+    #     ctx        c1      c8     c32
+    #     4000     1.017   1.011   1.003
+    #     16000    1.000   1.000   0.999
+    #     32000    1.000   1.001   1.000
+    #
+    # GF only auto-enables at ctx>=8192, so the 4000 row does not occur in
+    # production -- and the rows that do are exactly 1.000. Contrast the
+    # tile change, whose 1.6-1.8x in stage-1 DID survive as 1.03-1.33x
+    # end to end: attenuation is not proportional, so a stage-1 win is
+    # never evidence of a serving win on its own.
+    #
+    # Kept at 3 anyway: strictly faster in the kernel, equivalence-verified
+    # (18 MATCH / 0 MISMATCH against the stages=1 control), and nothing has
+    # been scored at either value. Do not cite 1.11x as a user-visible gain.
     SGLANG_OSCAR_MLA_PACKED_GF_STAGES = EnvInt(3)
     # 4, measured, not 8. Swept on the production computed-tile kernel at three
     # batch sizes, seq 20000, BLOCK_N=16 stages=1:
