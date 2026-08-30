@@ -877,7 +877,8 @@ def packed_mla_decode_stage1_gf(
     # smem 46528 -> 83840 and regs 179 -> 190 at BLOCK_H=8, inside budget.
     block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N.get()
     num_warps = num_warps or envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
-    num_stages = num_stages or envs.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
+    # Its own pipeline depth too -- 3, measured, not the computed tile's 1.
+    num_stages = num_stages or envs.SGLANG_OSCAR_MLA_PACKED_GF_STAGES.get()
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = head_num

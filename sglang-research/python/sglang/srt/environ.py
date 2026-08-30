@@ -437,6 +437,19 @@ class Envs:
     # with 64 in between, so the ordering is monotone rather than a single
     # lucky point. Separate knob because one value cannot serve both kernels.
     SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N = EnvInt(32)
+    # The group-factored kernel's own pipeline depth, for the same reason as
+    # the tile above: it read the computed tile's STAGES and shipped at 1,
+    # while every measurement of it in bench_kernel had been taken at 3 --
+    # eight hardcoded call sites that no env could move. Measured three times
+    # at the production shape (heads=8, i.e. 64 heads over TP=8), bn=32
+    # warps=4 BLOCK_H=8, stages the only variable:
+    #
+    #     shape              stages=1   stages=3
+    #     bs16 seq20000      0.230      0.208     1.11x
+    #     bs32 seq20000      0.458      0.407     1.13x
+    #
+    # Reproduced across three independent runs to within 0.001 ms.
+    SGLANG_OSCAR_MLA_PACKED_GF_STAGES = EnvInt(3)
     # 4, measured, not 8. Swept on the production computed-tile kernel at three
     # batch sizes, seq 20000, BLOCK_N=16 stages=1:
     #   bs=8   0.529 ms both        1.00x
