@@ -13,10 +13,12 @@ Two things are measured:
   ``_decode_grouped_att_m_fwd`` reading a real BF16 latent cache. Ratio against
   that is the number that matters; a packed kernel that is 2x faster than a
   badly-configured packed kernel is still losing.
-* **the tile/warp/stage grid**. BLOCK_N 16 / 8 warps / 1 stage was chosen to
-  avoid register spills, not measured, and reverting blindly trades one
-  bottleneck for another -- so sweep and report the whole grid, including the
-  configs that fail to compile or run out of shared memory.
+* **the tile/warp/stage grid**. The original 16 / 8 warps / 1 stage was chosen
+  to avoid register spills, not measured; warps has since been measured to 4
+  and the group-factored kernel has its own BLOCK_N. Sweep and report the
+  whole grid, including configs that fail to compile or run out of shared
+  memory -- and read the launch params from the env, never hardcode them, or
+  the table describes a server nobody is running.
 """
 from __future__ import annotations
 
@@ -38,6 +40,25 @@ R, ROPE, GS = 512, 64, 128
 NG = R // GS
 
 
+
+
+# Read the SHIPPED defaults instead of hardcoding launch params. Two separate
+# measurements in this file were taken at a configuration nothing runs: the
+# whole group-factored section pinned num_stages=3 while GF ships stages=1, and
+# the PARAM_BCAST A/B pinned num_warps=8 while the computed tile's default has
+# been 4 since it was benchmarked. That second one PRODUCED A VERDICT
+# ("7-8% slower, keep it off") from a config nobody serves -- and PARAM_BCAST
+# expands per-group params into REGISTERS, which is precisely what warp count
+# trades. Same bug shape as the GF BLOCK_N one this file already documents for
+# the window kernel; it just was not applied here.
+from sglang.srt.environ import envs as _E
+
+_CT_BN = _E.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
+_CT_W = _E.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
+_CT_ST = _E.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
+_GF_BN = _E.SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N.get()
+# Overridable so the shipped value can be A/B'd against the 3 the sweep used.
+_GF_ST = int(os.environ.get("BENCH_GF_STAGES", _CT_ST))
 
 
 def _err(e) -> str:
@@ -234,7 +255,7 @@ def main() -> None:
         packed_mla_decode_stage1(
             q, ops, logits, lse, kv_indptr, kv_indices,
             num_splits, max_splits, sm, 0.0,
-            block_n=16, num_warps=8, num_stages=1, param_bcast=pb,
+            block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST, param_bcast=pb,
         )
         torch.cuda.synchronize()
         outs[tag] = (logits.clone(), lse.clone())
@@ -407,7 +428,7 @@ def main() -> None:
                     k_gf[0] = packed_mla_decode_stage1_gf(
                         q, ops_nohp, logits, lse, kv_indptr, kv_indices,
                         num_splits, max_splits, sm, 0.0, block_n=bn,
-                        num_warps=w, num_stages=3, block_h=bh)
+                        num_warps=w, num_stages=_GF_ST, block_h=bh)
 
                 t_gf = timeit(_run)
                 kk = k_gf[0]
@@ -441,13 +462,13 @@ def main() -> None:
                 ln = torch.zeros_like(lse)
                 packed_mla_decode_stage1_gf(
                     q, ops_nohp, on, ln, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=_GF_ST,
                     wide_load=False)
                 ow = torch.zeros_like(logits)
                 lw = torch.zeros_like(lse)
                 kw = packed_mla_decode_stage1_gf(
                     q, ops_nohp, ow, lw, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=_GF_ST,
                     wide_load=True)
                 fin = torch.isfinite(on) & torch.isfinite(ow)
                 dev = (on[fin] - ow[fin]).abs().max().item() if fin.any() else float("nan")
@@ -458,11 +479,11 @@ def main() -> None:
                 # change, manufactured by the change itself.
                 t_n = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=_GF_ST,
                     wide_load=False))
                 t_w = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=_GF_ST,
                     wide_load=True))
                 regs = getattr(kw, "n_regs", None)
                 shared = getattr(getattr(kw, "metadata", None), "shared", None)
@@ -495,10 +516,10 @@ def main() -> None:
             try:
                 t_plain = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3))
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=_GF_ST))
                 t_skip = timeit(lambda: packed_mla_decode_stage1_gf(
                     q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=3,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=w, num_stages=_GF_ST,
                     skip_hp=True))
                 print(f"  {bn:>3}/{w} no-arena {t_plain:.3f} ms  "
                       f"arena-aware {t_skip:.3f} ms  "
