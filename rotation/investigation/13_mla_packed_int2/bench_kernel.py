@@ -399,7 +399,7 @@ def main() -> None:
         # smem must differ when BLOCK_H differs, so printing them makes that
         # failure loud instead of invisible.
         seen_res = {}
-        for bn, w, bh in itertools.product((32, 64), (4, 8), (8, 16)):
+        for bn, w, bh in itertools.product((16, 32, 64), (4, 8), (8, 16)):
             try:
                 k_gf = [None]
 
@@ -545,11 +545,22 @@ def main() -> None:
               f"(refuted as the bound)")
 
     if rows:
+        # Read the defaults instead of printing a literal. The literal said
+        # "warps=8" long after the default became 4, so the line that exists to
+        # tell you what you are comparing against was itself wrong.
+        from sglang.srt.environ import envs as _e
+
+        d_bn = _e.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
+        d_w = _e.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
+        d_st = _e.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
         rows.sort()
         ms, bn, w, st = rows[0]
         print(f"\nbest: BLOCK_N={bn} warps={w} stages={st} -> {ms:.3f} ms "
-              f"({base/ms:.2f}x BF16); current default is BLOCK_N=16 warps=8 stages=1")
-        cur = [r for r in rows if r[1:] == (16, 8, 1)]
+              f"({base/ms:.2f}x BF16); computed-tile default is "
+              f"BLOCK_N={d_bn} warps={d_w} stages={d_st}; the group-factored "
+              f"kernel has its OWN tile now, "
+              f"BLOCK_N={_e.SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N.get()}")
+        cur = [r for r in rows if r[1:] == (d_bn, d_w, d_st)]
         if cur:
             print(f"speedup over the current default: {cur[0][0]/ms:.2f}x")
 

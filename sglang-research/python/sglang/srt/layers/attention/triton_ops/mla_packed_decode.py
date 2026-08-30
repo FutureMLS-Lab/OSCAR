@@ -851,7 +851,22 @@ def packed_mla_decode_stage1_gf(
         )
     assert q.shape[-1] == d + d_pe, (q.shape, d, d_pe)
 
-    block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_BLOCK_N.get()
+    # Its OWN block_n, not the computed tile's. Sharing one knob shipped this
+    # kernel at the worst of the three tile widths: the computed tile's optimum
+    # is 16 and that is this kernel's pessimum. warps=4 BLOCK_H=16 held fixed
+    # (what this launcher picks), BLOCK_N the only variable:
+    #
+    #     shape              bn=16     bn=32     bn=64    32 vs 16
+    #     bs16 seq20000      0.377     0.227     0.304     1.66x
+    #     bs32 seq20000      0.749     0.447     0.585     1.68x
+    #     bs16 seq 4000      0.082     0.051     0.065     1.61x
+    #
+    # Monotone and unanimous, and it moves the kernel from 0.34-0.48x of BF16
+    # to 0.58-0.78x. The factored sweep never measured 16 -- its grid was
+    # product((32, 64), ...) -- so the one configuration it skipped was the one
+    # actually serving. smem 55744 -> 93056 and regs 220 -> 232 at the wider
+    # tile, both well inside budget.
+    block_n = block_n or envs.SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N.get()
     num_warps = num_warps or envs.SGLANG_OSCAR_MLA_PACKED_WARPS.get()
     num_stages = num_stages or envs.SGLANG_OSCAR_MLA_PACKED_STAGES.get()
 

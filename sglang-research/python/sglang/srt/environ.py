@@ -430,6 +430,13 @@ class Envs:
     # because the dequant keeps the code byte and the group scale/zero live on
     # top of the output tile.
     SGLANG_OSCAR_MLA_PACKED_BLOCK_N = EnvInt(16)
+    # The group-factored kernel's own tile width. It used to read the knob
+    # above, which meant it shipped at 16 -- the computed tile's optimum and
+    # this kernel's PESSIMUM. Measured at warps=4 BLOCK_H=16, three shapes,
+    # BLOCK_N the only variable: 32 is 1.61-1.68x faster than 16 everywhere,
+    # with 64 in between, so the ordering is monotone rather than a single
+    # lucky point. Separate knob because one value cannot serve both kernels.
+    SGLANG_OSCAR_MLA_PACKED_GF_BLOCK_N = EnvInt(32)
     # 4, measured, not 8. Swept on the production computed-tile kernel at three
     # batch sizes, seq 20000, BLOCK_N=16 stages=1:
     #   bs=8   0.529 ms both        1.00x
@@ -445,7 +452,17 @@ class Envs:
     # a [BLOCK_N, D] tile through gid. Bit-identical -- the pack layout is
     # d = g * GS + j, so the broadcast reproduces gid element for element -- and
     # it removes 128x-redundant address computation, which is the cost that
-    # survived the bandwidth refutation. Off by default until A/B'd on hardware.
+    # survived the bandwidth refutation.
+    #
+    # A/B'd on hardware now, and it is SLOWER, so it stays off:
+    #
+    #     shape              bcast=0   bcast=1
+    #     bs16 seq20000      0.916 ms  0.990 ms   -8%
+    #     bs32 seq20000      1.806 ms  1.936 ms   -7%
+    #
+    # Correctness was fine (0 mismatches), so this is a pure speed refutation:
+    # removing redundant address arithmetic does not pay when it costs the
+    # registers that held it. Do not re-enable without a new measurement.
     SGLANG_OSCAR_MLA_PACKED_PARAM_BCAST = EnvBool(False)
     # Read the packed codes twice, once per dot layout, instead of transposing
     # one tile. The transpose is a shared-memory layout conversion; the second
