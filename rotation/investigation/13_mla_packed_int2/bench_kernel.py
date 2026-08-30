@@ -216,7 +216,7 @@ def main() -> None:
         _l8 = torch.zeros_like(lse)
         packed_mla_decode_stage1(q, ops, _o8, _l8, kv_indptr, kv_indices,
                                  num_splits, max_splits, sm, 0.0,
-                                 block_n=16, num_warps=8, num_stages=1)
+                                 block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST)
         fin = torch.isfinite(_o4) & torch.isfinite(_o8)
         dev = (_o4[fin] - _o8[fin]).abs().max().item() if fin.any() else float("nan")
         print(f"\nserving-default correctness: warps=4 vs warps=8 maxdev={dev:.3e} "
@@ -235,7 +235,7 @@ def main() -> None:
         ms_nohp = timeit(lambda: packed_mla_decode_stage1(
             q, ops_nohp, logits, lse, kv_indptr, kv_indices,
             num_splits, max_splits, sm, 0.0,
-            block_n=16, num_warps=8, num_stages=1,
+            block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST,
         ))
         cur16 = [r[0] for r in rows if r[1:] == (16, 8, 1)]
         print(f"\nablation, window arena OFF (16/8/1): {ms_nohp:.3f} ms "
@@ -266,11 +266,11 @@ def main() -> None:
           f"-> {'BIT-IDENTICAL' if identical else 'DIFFERS -- do not trust the timing'}")
     t_gid = timeit(lambda: packed_mla_decode_stage1(
         q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
-        sm, 0.0, block_n=16, num_warps=8, num_stages=1, param_bcast=False,
+        sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST, param_bcast=False,
     ))
     t_bc = timeit(lambda: packed_mla_decode_stage1(
         q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
-        sm, 0.0, block_n=16, num_warps=8, num_stages=1, param_bcast=True,
+        sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST, param_bcast=True,
     ))
     print(f"  gid-indexed  {t_gid:.3f} ms ({base/t_gid:.2f}x BF16)")
     print(f"  broadcast    {t_bc:.3f} ms ({base/t_bc:.2f}x BF16)  "
@@ -291,7 +291,7 @@ def main() -> None:
         try:
             t_ab = timeit(lambda: packed_mla_decode_stage1(
                 q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
-                max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1,
+                max_splits, sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST,
                 ablate=lvl,
             ))
             print(f"  ABLATE={lvl} {t_ab:.3f} ms ({base/t_ab:.2f}x BF16) "
@@ -312,7 +312,7 @@ def main() -> None:
     logits.zero_(); lse.zero_()
     packed_mla_decode_stage1(
         q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
-        sm, 0.0, block_n=16, num_warps=8, num_stages=1, dual_load=True)
+        sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST, dual_load=True)
     torch.cuda.synchronize()
     o_dl, l_dl = logits.clone(), lse.clone()
     ref_o, ref_l = outs["gid"]
@@ -325,7 +325,7 @@ def main() -> None:
     try:
         t_dl = timeit(lambda: packed_mla_decode_stage1(
             q, ops, logits, lse, kv_indptr, kv_indices, num_splits, max_splits,
-            sm, 0.0, block_n=16, num_warps=8, num_stages=1, dual_load=True,
+            sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST, dual_load=True,
         ))
         print(f"  transpose    {t_gid:.3f} ms ({base/t_gid:.2f}x BF16)")
         print(f"  dual load    {t_dl:.3f} ms ({base/t_dl:.2f}x BF16)  "
@@ -336,8 +336,8 @@ def main() -> None:
             try:
                 t = timeit(lambda: packed_mla_decode_stage1(
                     q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
-                    max_splits, sm, 0.0, block_n=bn, num_warps=8,
-                    num_stages=1, dual_load=True,
+                    max_splits, sm, 0.0, block_n=bn, num_warps=_CT_W,
+                    num_stages=_CT_ST, dual_load=True,
                 ))
                 print(f"  dual load BLOCK_N={bn} {t:.3f} ms ({base/t:.2f}x BF16)")
             except Exception as e:  # noqa: BLE001
@@ -360,7 +360,7 @@ def main() -> None:
                 q2, kv2, kv2[..., :R], lg2, ls2, ind2, idx2, ns2, ms2, sm, 0.0))
             tp = timeit(lambda: packed_mla_decode_stage1(
                 q2, o2, lg2, ls2, ind2, idx2, ns2, ms2, sm, 0.0,
-                block_n=16, num_warps=8, num_stages=1))
+                block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST))
             print(f"{sp:>7} {bs*sp:>9} {tb:>9.3f} {tp:>10.3f} {tb/tp:>6.2f}x")
             del o2, kv2, q2, lg2, ls2
             torch.cuda.empty_cache()
@@ -377,13 +377,13 @@ def main() -> None:
         logits.zero_(); lse.zero_()
         packed_mla_decode_stage1(
             q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-            max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1)
+            max_splits, sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST)
         torch.cuda.synchronize()
         ref_o2, ref_l2 = logits.clone(), lse.clone()
         logits.zero_(); lse.zero_()
         packed_mla_decode_stage1_gf(
             q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-            max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1)
+            max_splits, sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST)
         torch.cuda.synchronize()
         den2 = ref_o2.abs().max().clamp(min=1e-6)
         rel2 = ((logits - ref_o2).abs().max() / den2).item()
@@ -396,7 +396,7 @@ def main() -> None:
               f"{'AGREES' if ok2 else 'DIFFERS -- timing below is meaningless'}")
         t_base2 = timeit(lambda: packed_mla_decode_stage1(
             q, ops_nohp, logits, lse, kv_indptr, kv_indices, num_splits,
-            max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1))
+            max_splits, sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST))
         print(f"  computed-tile  {t_base2:.3f} ms ({base/t_base2:.2f}x BF16)")
         # BLOCK_N was still improving monotonically at 64 (1.34x/1.86x/2.49x over
         # the computed tile), which is the prediction that separates this variant
@@ -542,7 +542,7 @@ def main() -> None:
         try:
             t_bh = timeit(lambda: packed_mla_decode_stage1(
                 q, ops, logits, lse, kv_indptr, kv_indices, num_splits,
-                max_splits, sm, 0.0, block_n=16, num_warps=8, num_stages=1,
+                max_splits, sm, 0.0, block_n=_CT_BN, num_warps=_CT_W, num_stages=_CT_ST,
                 block_h=bh,
             ))
             print(f"  BLOCK_H={bh:>3} {t_bh:.3f} ms ({base/t_bh:.2f}x BF16) "
