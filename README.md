@@ -92,6 +92,54 @@ MiniMax2.7
 </details>
 
 <details>
+<summary><b>MLA models — packed 2-bit latent (GLM-5.2, GLM-5.3, Kimi-K3)</b> </summary>
+
+**What is quantized.** MLA stores one shared latent `c_kv` plus a positional
+`k_pe`. OSCAR quantizes **the latent** and leaves **`k_pe` in BF16** — the
+opposite way round from how it is easy to read. Per token per layer, at
+`kv_lora_rank=512`, `qk_rope_head_dim=64`, group 128:
+
+| buffer | bytes | contents |
+|---|---:|---|
+| `c_codes` | 128 | the 512-dim latent at **2 bits**, 4 per byte |
+| `c_params` | 32 | (scale, zero) fp32 per quantization group |
+| `rope_buf` | 128 | `k_pe`, **BF16, never quantized** |
+| **total** | **288** | vs BF16's `(512+64)·2 = 1152` → **4.00×** |
+
+`k_pe` staying BF16 is load-bearing: it is the positional half of the MLA key
+and 2-bit'ing it destroys the rope term. It is also **44% of the cell**, which
+caps this axis — a latent compressed to zero bits would still leave 256 B, i.e.
+**4.5× is the ceiling**, and the shipped 4.00× already sits just under it.
+
+**GPQA-Diamond, full 198 questions, `max_tokens=32768`, single seed.** Same
+question set and permutations across arms (`Random(0)`), so the rows are paired.
+
+| Model | BF16 | packed 2-bit (4.00×) | Δ |
+|---|---:|---:|---:|
+| GLM-5.2 | 82.32 | 74.75 | −7.57 pp |
+| GLM-5.3 | 82.83 | **77.78** | **−5.05 pp** |
+
+GLM-5.3 required **zero model-code changes** — `GlmMoeDsaForCausalLM` is
+identical to GLM-5.2's — but rotations do **not** transfer between models and
+must be refitted from each model's own `c_kv` dump.
+
+**Ratio / accuracy frontier (GLM-5.2, all end-to-end at n=198).** Every knob
+inside 2 bits has been measured; none closes the 4.00× gap, and bit width buys
+more accuracy per unit of ratio surrendered than group size does:
+
+| config | ratio | GPQA | vs BF16 |
+|---|---:|---:|---:|
+| 2-bit g128 (shipped) | 4.00× | 74.75 | −7.57 |
+| 2-bit g32 | 3.00× | 77.78 | −4.54 |
+| 4-bit g128 | 2.77× | 80.81 | −1.51 |
+| BF16 | — | 82.32 | — |
+
+Kimi-K3 runs the same packed path at 4.00× (TP 8 × PP 2); its GPQA arm is
+reported separately and is not in this table.
+
+</details>
+
+<details>
 <summary><b>Multi-Modal & LongBench</b> </summary>
 Use Rotation and Run Script in zhongzhu/VL branch. Baseline numbers taken from arxiv.org/abs/2605.19660 (Su et al., 2026).
 
@@ -298,6 +346,9 @@ Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int
 | MiniMax-M2.7 | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview |
 | Qwen3.5 (4B, 35B-A3B) | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview (hybrid linear-attn) |
 | GLM-5.1 | SGLang `zhongzhu/glm-mla` | 🧪 experimental (MLA latent) |
+| GLM-5.2 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×) |
+| GLM-5.3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; zero model-code change from GLM-5.2) |
+| Kimi-K3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; TP 8 × PP 2) |
 | Qwen3-VL (4B, 8B) | SGLang `zhongzhu/VL` | 🧪 preview |
 | Qwen3-32B, Qwen3-4B-Thinking, Gemma-4-12B | llama.cpp `zhongzhu/llamacpp` + [GGUF](https://huggingface.co/Zhongzhu) | ✅ supported (Mac / Metal) |
 
