@@ -164,19 +164,41 @@ def main() -> int:
         os.environ["CTX_LEN"] = str(need)
         sp.CTX = str(need)
 
-    infos = {}
-    for tag, gf in (("prod", "0"), ("gf", "1")):
-        infos[tag] = sp.launch(tag, packed=True, extra_env={
-            "SGLANG_OSCAR_MLA_PACKED_GF": gf,
-            "SGLANG_OSCAR_MLA_PACKED_GF_CHECK": "0",
-        })
+    # Arms are env-driven so this harness can A/B any knob, not just GF on/off.
+    # Default is the original comparison, unchanged. Format:
+    #   ARMS="tagA:KEY=VAL;KEY=VAL,tagB:KEY=VAL"
+    # Ratio is always second arm / first arm, so put the BASELINE first.
+    arm_spec = os.environ.get(
+        "ARMS",
+        "prod:SGLANG_OSCAR_MLA_PACKED_GF=0,"
+        "gf:SGLANG_OSCAR_MLA_PACKED_GF=1",
+    )
+    arms = []
+    for chunk in arm_spec.split(","):
+        tag, _, kvs = chunk.partition(":")
+        env = {"SGLANG_OSCAR_MLA_PACKED_GF_CHECK": "0"}
+        for kv in kvs.split(";"):
+            if kv.strip():
+                k, _, v = kv.partition("=")
+                env[k.strip()] = v.strip()
+        arms.append((tag.strip(), env))
+    if len(arms) != 2:
+        print(f"[gf_speed] ARMS must name exactly two arms, got {len(arms)}")
+        return 2
+    tag_a, tag_b = arms[0][0], arms[1][0]
+    print(f"[gf_speed] arm A (baseline) {tag_a}: {arms[0][1]}")
+    print(f"[gf_speed] arm B           {tag_b}: {arms[1][1]}")
 
-    a, b = infos["prod"].get("tps"), infos["gf"].get("tps")
+    infos = {}
+    for tag, env in arms:
+        infos[tag] = sp.launch(tag, packed=True, extra_env=env)
+
+    a, b = infos[tag_a].get("tps"), infos[tag_b].get("tps")
     if not (a and b):
         print("[gf_speed] an arm produced no timings")
         return 2
-    print("\n[gf_speed] decode tok/s, production vs group-factored")
-    print(f"{'ctx':>8} {'conc':>5} {'prod':>10} {'gf':>10} {'ratio':>8}  verdict")
+    print(f"\n[gf_speed] decode tok/s, {tag_a} vs {tag_b}")
+    print(f"{'ctx':>8} {'conc':>5} {tag_a:>10} {tag_b:>10} {'ratio':>8}  verdict")
     worst = None
     for ctx in CTXS:
         for conc in CONCS:
@@ -185,7 +207,8 @@ def main() -> int:
             if not (pa and pb):
                 continue
             r = pb / pa
-            v = "gf faster" if r > 1.02 else ("gf SLOWER" if r < 0.98 else "tie")
+            v = (f"{tag_b} faster" if r > 1.02 else
+                     (f"{tag_b} SLOWER" if r < 0.98 else "tie"))
             if worst is None or r < worst[1]:
                 worst = (k, r)
             print(f"{ctx:>8} {conc:>5} {pa:>10.2f} {pb:>10.2f} {r:>8.3f}  {v}")
@@ -203,14 +226,17 @@ def main() -> int:
                     row.append(f"c{conc}={b[k] / a[k]:.3f}")
             if row:
                 print(f"  ctx={ctx:>6}  " + "  ".join(row))
-    for tag in ("prod", "gf"):
+    # An arm that asked for GF and never entered it measured the wrong kernel
+    # and would report a clean-looking tie. Check per arm against what it asked
+    # for, rather than assuming the second arm is the GF one.
+    for tag, env in arms:
         log = infos[tag].get("log")
         n = (sum(1 for ln in open(log, errors="ignore") if "GF-ENTRY" in ln)
              if log and os.path.exists(log) else 0)
         print(f"[gf_speed] {tag}: GF-ENTRY lines = {n} "
               f"({'live' if n else 'NEVER ENTERED'})")
-        if tag == "gf" and n == 0:
-            print("[gf_speed] !! the kernel under test never ran")
+        if env.get("SGLANG_OSCAR_MLA_PACKED_GF", "1") != "0" and n == 0:
+            print(f"[gf_speed] !! {tag} asked for GF and never entered it")
             return 2
     if worst:
         print(f"\n[gf_speed] worst context for gf: {worst[0]} at {worst[1]:.3f}x")
@@ -218,7 +244,7 @@ def main() -> int:
               "kernel that wins at long context and loses at short is a knob, "
               "not a default.")
     with open(os.path.join(OUT, "summary.json"), "w") as f:
-        json.dump({"prod": a, "gf": b}, f, indent=2)
+        json.dump({tag_a: a, tag_b: b}, f, indent=2)
     return 0
 
 
