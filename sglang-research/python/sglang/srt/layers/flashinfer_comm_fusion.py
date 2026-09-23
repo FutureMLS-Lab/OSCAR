@@ -1,0 +1,391 @@
+import contextlib
+import logging
+import platform
+from typing import Optional, Tuple
+
+import torch
+
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
+)
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.custom_op import register_custom_op
+
+logger = logging.getLogger(__name__)
+
+_flashinfer_comm = None
+_workspace_manager = None
+_flashinfer_allreduce_unavailable = False
+_posix_transport_override_logged = False
+
+
+def _should_force_posix_fd_transport() -> bool:
+    force_posix_env = envs.SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT.get()
+    if force_posix_env is not None:
+        return force_posix_env
+
+    machine = platform.machine().lower()
+    if machine not in ("aarch64", "arm64"):
+        return False
+
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception as e:
+        logger.debug("Failed to get CUDA device capability: %s", e)
+        return False
+
+    return major == 10
+
+
+@contextlib.contextmanager
+def _flashinfer_posix_fd_transport_override_if_needed():
+    # TODO(mmangkad): Remove this temporary override once the
+    # FlashInfer unified allreduce-fusion transport issue on
+    # GB200/GB300 platforms is fixed and verified resolved.
+    global _posix_transport_override_logged
+
+    if not _should_force_posix_fd_transport():
+        yield
+        return
+
+    try:
+        import flashinfer.comm.mnnvl as flashinfer_mnnvl
+    except Exception as e:
+        logger.debug(
+            "Failed to import flashinfer.comm.mnnvl for transport override: %s", e
+        )
+        yield
+        return
+
+    original_checker = getattr(flashinfer_mnnvl, "is_mnnvl_fabric_supported", None)
+    if original_checker is None:
+        yield
+        return
+
+    if not _posix_transport_override_logged:
+        logger.warning(
+            "Applying FlashInfer transport workaround: forcing PosixFD "
+            "symmetric-memory handle exchange on aarch64 + sm10x to avoid "
+            "known data corruption with Fabric handle exchange on GB systems. "
+            "Set SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT=0 to disable."
+        )
+        _posix_transport_override_logged = True
+
+    def _always_disable_fabric(_device_idx: int) -> bool:
+        return False
+
+    flashinfer_mnnvl.is_mnnvl_fabric_supported = _always_disable_fabric
+    try:
+        yield
+    finally:
+        flashinfer_mnnvl.is_mnnvl_fabric_supported = original_checker
+
+
+if is_flashinfer_available():
+    try:
+        import flashinfer.comm as comm
+
+        if hasattr(comm, "allreduce_fusion") and hasattr(
+            comm, "create_allreduce_fusion_workspace"
+        ):
+            _flashinfer_comm = comm
+        else:
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                "flashinfer.comm unified allreduce_fusion API is not available, "
+                "falling back to standard implementation"
+            )
+    except ImportError:
+        _flashinfer_allreduce_unavailable = True
+        logger.warning(
+            "flashinfer.comm is not available, falling back to standard "
+            "implementation"
+        )
+
+
+def is_flashinfer_allreduce_unavailable() -> bool:
+    return _flashinfer_allreduce_unavailable
+
+
+class FlashInferWorkspaceManager:
+    def __init__(self):
+        self.workspace = None
+        self.world_size = None
+        self.rank = None
+        self.max_token_num = None
+        self.hidden_dim = None
+        self.dtype = None
+        self.initialized = False
+
+    def initialize(
+        self,
+        world_size: int,
+        rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        use_oneshot: Optional[bool] = None,
+    ):
+        """Initialize workspace"""
+        if _flashinfer_comm is None:
+            logger.warning(
+                "FlashInfer comm not available, skipping workspace initialization"
+            )
+            return
+
+        self.cleanup()
+        try:
+            with _flashinfer_posix_fd_transport_override_if_needed():
+                self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
+                    backend="trtllm",
+                    world_size=world_size,
+                    rank=rank,
+                    max_token_num=max_token_num,
+                    hidden_dim=hidden_dim,
+                    dtype=dtype,
+                    force_oneshot_support=bool(use_oneshot),
+                )
+        except Exception as e:
+            global _flashinfer_allreduce_unavailable
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                f"Failed to initialize FlashInfer workspace: {e}. "
+                "Disabling flashinfer allreduce fusion permanently."
+            )
+            self.workspace = None
+            self.initialized = False
+            return
+
+        self.world_size = world_size
+        self.rank = rank
+        self.max_token_num = max_token_num
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+        self.initialized = True
+
+        backend = getattr(self.workspace, "backend", "unknown")
+        logger.info(
+            f"FlashInfer workspace initialized for rank {rank}, "
+            f"world_size {world_size}, backend {backend}"
+        )
+
+    def is_buffer_size_sufficient(
+        self,
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        use_oneshot: Optional[bool] = None,
+    ) -> bool:
+        if not self.initialized or self.workspace is None:
+            return False
+        try:
+            return self.workspace.is_buffer_size_sufficient(
+                tp_size=self.world_size,
+                num_tokens=token_num,
+                hidden_dim=hidden_dim,
+                dtype=dtype,
+                use_oneshot=use_oneshot,
+            )
+        except Exception as e:
+            logger.debug(f"FlashInfer workspace size check failed: {e}")
+            return False
+
+    def cleanup(self):
+        """Clean up workspace"""
+        if self.workspace is not None:
+            try:
+                self.workspace.destroy()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
+            finally:
+                self.workspace = None
+                self.initialized = False
+                self.world_size = None
+                self.rank = None
+                self.max_token_num = None
+                self.hidden_dim = None
+                self.dtype = None
+
+
+_workspace_manager = FlashInferWorkspaceManager()
+
+
+def ensure_workspace_initialized(
+    max_token_num: int = 2048,
+    hidden_dim: int = 4096,
+    dtype: torch.dtype = torch.float16,
+    token_num: Optional[int] = None,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
+):
+    """Ensure workspace is initialized"""
+    if _flashinfer_allreduce_unavailable:
+        return False
+
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        return False
+
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+        rank = get_attn_tensor_model_parallel_rank()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+            rank = get_moe_expert_parallel_rank()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+            rank = get_moe_tensor_parallel_rank()
+
+    if world_size <= 1:
+        return False
+
+    token_num = token_num or max_token_num
+
+    if (
+        not _workspace_manager.initialized
+        or _workspace_manager.world_size != world_size
+        or _workspace_manager.rank != rank
+        or not _workspace_manager.is_buffer_size_sufficient(
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            use_oneshot=use_oneshot,
+        )
+    ):
+        _workspace_manager.initialize(
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            use_oneshot=use_oneshot,
+        )
+
+    return _workspace_manager.initialized
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(input_tensor)
+    return norm_out, residual_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
+)
+def flashinfer_allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Use FlashInfer's fused allreduce + residual + RMS norm operation
+
+    Args:
+        input_tensor: Input tensor that needs allreduce
+        residual: Residual tensor
+        weight: RMS norm weight
+        eps: RMS norm epsilon
+        max_token_num: Maximum token number
+        use_oneshot: Whether to use oneshot mode
+        trigger_completion_at_end: Whether to trigger completion at end
+        fp32_acc: Whether to use fp32 precision
+        use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
+    """
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        logger.debug(
+            "FlashInfer not available, falling back to standard implementation"
+        )
+        return None, None
+
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+
+    if world_size <= 1:
+        logger.debug("Single GPU, no need for allreduce fusion")
+        return None, None
+
+    assert input_tensor.shape[0] <= max_token_num
+    if (
+        not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
+        return None, None
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        logger.debug("FlashInfer workspace not available")
+        return None, None
+
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(input_tensor)
+
+    _flashinfer_comm.allreduce_fusion(
+        input=input_tensor,
+        workspace=_workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+
+    return norm_out, residual_out
+
+
+def cleanup_flashinfer_workspace():
+    global _workspace_manager
+    if _workspace_manager is not None:
+        _workspace_manager.cleanup()

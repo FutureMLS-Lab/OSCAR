@@ -1,0 +1,69 @@
+# Example YAML config for benchmark/kernels/quantization/bench_decode_int_kv.py
+#
+# Run with:
+#   python bench_decode_int_kv.py --config bench_decode_int_kv.example.yaml
+#
+# Each entry in `cases` becomes one row in the output table.  Per-case fields
+# override the values in `defaults`.
+
+defaults:
+  model: Qwen/Qwen3-8B
+  batch_size: 128
+  max_kv_splits: 8
+  warmup: 2
+  repeat: 5
+  hp_prefix: 32
+  hp_recent: 128
+  profiling_mode: torch_profiler
+  no_correctness: false
+
+cases:
+  # =========================================================================
+  # seq_len = 8 k
+  # =========================================================================
+  - {id: 11, seq_len: 8192,   backend: triton_bf16}
+  - {id: 12, seq_len: 8192,   backend: flashinfer_bf16,                 baseline_id: 11}
+  - {id: 14, seq_len: 8192,   backend: int2,  group_size: 0,            baseline_id: 11}
+  - {id: 15, seq_len: 8192,   backend: int2,  group_size: 64,       mixed_kv: false,    baseline_id: 11}
+  - {id: 16, seq_len: 8192,   backend: int2,  group_size: 0,       mixed_kv: true,    baseline_id: 11}
+  - {id: 17, seq_len: 8192,   backend: int2,  group_size: 64,       mixed_kv: true,    baseline_id: 11}
+
+  # # =========================================================================
+  # # seq_len = 16 k
+  # # =========================================================================
+  # - {id: 51, seq_len: 16384,   backend: triton_bf16}
+  # - {id: 52, seq_len: 16384,   backend: flashinfer_bf16,                 baseline_id: 51}
+  # - {id: 54, seq_len: 16384,   backend: int2,  group_size: 0,            baseline_id: 51}
+  # - {id: 55, seq_len: 16384,   backend: int2,  group_size: 64,       mixed_kv: false,    baseline_id: 51}
+  # - {id: 56, seq_len: 16384,   backend: int2,  group_size: 0,       mixed_kv: true,    baseline_id: 51}
+  # - {id: 57, seq_len: 16384,   backend: int2,  group_size: 64,       mixed_kv: true,    baseline_id: 51}
+
+  # # =========================================================================
+  # # seq_len = 32 k
+  # # =========================================================================
+  # - {id: 21, seq_len: 32768,  backend: triton_bf16}
+  # - {id: 22, seq_len: 32768,  backend: flashinfer_bf16,                 baseline_id: 21}
+  # - {id: 24, seq_len: 32768,  backend: int2,  group_size: 0,            baseline_id: 21}
+  # - {id: 25, seq_len: 32768,  backend: int2,  group_size: 64,       mixed_kv: false,    baseline_id: 21}
+  # - {id: 26, seq_len: 32768,  backend: int2,  group_size: 0,       mixed_kv: true,    baseline_id: 21}
+  # - {id: 27, seq_len: 32768,  backend: int2,  group_size: 64,       mixed_kv: true,    baseline_id: 21}
+
+  # # =========================================================================
+  # # seq_len = 64 k
+  # # =========================================================================
+  # - {id: 31, seq_len: 65536,  backend: triton_bf16}
+  # - {id: 32, seq_len: 65536,  backend: flashinfer_bf16,                 baseline_id: 31}
+  # - {id: 34, seq_len: 65536,  backend: int2,  group_size: 0,            baseline_id: 31}
+  # - {id: 35, seq_len: 65536,  backend: int2,  group_size: 64,       mixed_kv: false,    baseline_id: 31}
+  # - {id: 36, seq_len: 65536,  backend: int2,  group_size: 0,       mixed_kv: true,    baseline_id: 31}
+  # - {id: 37, seq_len: 65536,  backend: int2,  group_size: 64,       mixed_kv: true,    baseline_id: 31}
+
+  # # =========================================================================
+  # # seq_len = 128 k
+  # # =========================================================================
+  # - {id: 41, seq_len: 131072, backend: triton_bf16}
+  # - {id: 42, seq_len: 131072, backend: flashinfer_bf16,                 baseline_id: 41}
+  # - {id: 44, seq_len: 131072, backend: int2,  group_size: 0,            baseline_id: 41}
+  # - {id: 45, seq_len: 131072, backend: int2,  group_size: 64,       mixed_kv: false,    baseline_id: 41}
+  # - {id: 46, seq_len: 131072, backend: int2,  group_size: 0,       mixed_kv: true,    baseline_id: 41}
+  # - {id: 47, seq_len: 131072, backend: int2,  group_size: 64,       mixed_kv: true,    baseline_id: 41}

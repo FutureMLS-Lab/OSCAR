@@ -1,0 +1,57 @@
+.omc/
+.RUD/
+
+# rotation pipeline artifacts (dump tensors, computed rotation .pt, eval logs).
+# Per-model: track only the .sh / .py source under rotation/<model>/; exclude
+# every kind of generated calibration / eval / investigation byproduct.
+rotation/*/GPQA/
+rotation/*/LCB/
+rotation/*/MATH/
+rotation/*/MMLU/
+rotation/*/Hadamard/
+rotation/*/qkv_dumps*/
+rotation/*/_eval_*/
+rotation/*/investigation/
+rotation/*/bench_matrix/
+rotation/*/results/
+
+# Triton / CUDA JIT caches
+triton_cache/
+deepgemm_cache/
+*.cubin
+*.ptx
+*.llir
+*.ttir
+*.ttgir
+
+# Eval run dirs (smoke tests, wandb run artifacts)
+rotation/*/_*_smoke/
+rotation/*/runs/
+
+# Anonymous mirror dir
+anonymous/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Build output (CMake / Gradle) -- e.g. /build, examples/llama.android/build
+build/
+
+# clangd / compiler index cache -- e.g. /.cache, build/.cache
+.cache/
+
+# Node / frontend deps & build artifacts (tools/ui)
+node_modules/
+.svelte-kit/
+.vite-temp/
+
+# Android / Gradle caches (examples/llama.android)
+.gradle/
