@@ -33,6 +33,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.kv_quant_kernels import _launch_quantize_int2
+
 
 @dataclass
 class FlushPlan:
@@ -169,6 +171,7 @@ def _fused_flush_quant_body(
     BLOCK_TOK: tl.constexpr,
     CLIP_INDEX: tl.constexpr,
     BSEARCH_ITERS: tl.constexpr,
+    LLOYD_MAX: tl.constexpr,
 ):
     """Quantize ``BLOCK_TOK`` (src_hp_slot, head) HP rows into int2 at the
     matching ``dst_quant_slot``s.
@@ -225,23 +228,15 @@ def _fused_flush_quant_body(
             thr[:, None],
         )
 
-    grouped = tl.reshape(acc, (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE))
-    val_min = tl.min(grouped, axis=2)  # [BLOCK_TOK, NUM_GROUPS]
-    val_max = tl.max(grouped, axis=2)
-    scale = tl.maximum(val_max - val_min, 1e-8) / 3.0
-    zero = tl.math.div_rn(-val_min, scale)
-
-    # Quartered split via reshape + permute + split×2. Matches the layout
-    # produced by ``_pretransformed_grouped_int2_set_kv_kernel`` (the
-    # non-fused reference): byte ``i`` packs values at positions
+    # Quartered split of fp32 ``acc`` -> per-lane values (shared by both the
+    # uniform and Lloyd-Max paths). Matches the layout produced by
+    # ``_pretransformed_grouped_int2_set_kv_kernel`` (the non-fused
+    # reference): byte ``i`` packs values at positions
     # ``i, BQ+i, 2*BQ+i, 3*BQ+i``.
     #
     # We split fp32 ``acc`` (not the post-quant uint8 tile): empirically the
     # uint8-permute-reshape-split chain produced wrong q2 lanes on this
-    # Triton/sm90 build, while the fp32 chain matches the bit-level
-    # reference. Per-position scale/zero come from broadcasting the per-
-    # group ``scale``/``zero`` to ``HEAD_DIM`` and feeding them through
-    # the same reshape+permute+split pipeline.
+    # Triton/sm90 build, while the fp32 chain matches the bit-level reference.
     acc_r = tl.reshape(acc, (BLOCK_TOK, 4, BLOCK_QUARTER))
     acc_p = tl.permute(acc_r, (0, 2, 1))
     acc_s = tl.reshape(acc_p, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
@@ -249,33 +244,78 @@ def _fused_flush_quant_body(
     vals0, vals2 = tl.split(a_even)
     vals1, vals3 = tl.split(a_odd)
 
-    scale_3d = tl.broadcast_to(
-        scale[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
-    )
-    zero_3d = tl.broadcast_to(
-        zero[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
-    )
-    scale_flat = tl.reshape(scale_3d, (BLOCK_TOK, HEAD_DIM))
-    zero_flat = tl.reshape(zero_3d, (BLOCK_TOK, HEAD_DIM))
+    if LLOYD_MAX:
+        # Approximate Lloyd-Max INT2, bit-identical to the single-scale set
+        # kernel (``_pretransformed_int2_set_kv_clip_single_kernel`` LM
+        # branch): bucketize standardized ``z`` against LM levels and store
+        # uniform-equivalent (scale, zero) so the legacy ``(q - zero) * scale``
+        # dequant reconstructs at LM-aligned magnitudes (LM_RATIO=1.16 matches
+        # the CLIP=0.96 uniform-asym dynamic range). LM is single-scale: the
+        # launcher requires NUM_GROUPS == 1 so per-row stats == per-group.
+        row_mean = tl.sum(acc, axis=1) / HEAD_DIM
+        row_diff = acc - row_mean[:, None]
+        row_var = tl.sum(row_diff * row_diff, axis=1) / HEAD_DIM
+        row_std = tl.sqrt(row_var + 1e-8)
+        LM_M0: tl.constexpr = -0.9810652732849121
+        LM_M1: tl.constexpr = 0.0
+        LM_M2: tl.constexpr = 0.9810652732849121
+        zl0 = (vals0 - row_mean[:, None]) / row_std[:, None]
+        zl1 = (vals1 - row_mean[:, None]) / row_std[:, None]
+        zl2 = (vals2 - row_mean[:, None]) / row_std[:, None]
+        zl3 = (vals3 - row_mean[:, None]) / row_std[:, None]
+        q0 = ((zl0 >= LM_M0).to(tl.uint8) + (zl0 >= LM_M1).to(tl.uint8)
+              + (zl0 >= LM_M2).to(tl.uint8))
+        q1 = ((zl1 >= LM_M0).to(tl.uint8) + (zl1 >= LM_M1).to(tl.uint8)
+              + (zl1 >= LM_M2).to(tl.uint8))
+        q2 = ((zl2 >= LM_M0).to(tl.uint8) + (zl2 >= LM_M1).to(tl.uint8)
+              + (zl2 >= LM_M2).to(tl.uint8))
+        q3 = ((zl3 >= LM_M0).to(tl.uint8) + (zl3 >= LM_M1).to(tl.uint8)
+              + (zl3 >= LM_M2).to(tl.uint8))
+        LM_C0_EFF: tl.constexpr = -1.5095585584640503
+        LM_C3_EFF: tl.constexpr = 1.5095585584640503
+        LM_SPAN: tl.constexpr = LM_C3_EFF - LM_C0_EFF
+        LM_RATIO: tl.constexpr = 1.16
+        uniform_scale = (LM_SPAN / 3.0) * LM_RATIO * row_std
+        uniform_zero = (-LM_C0_EFF) / (LM_SPAN / 3.0) - row_mean / uniform_scale
+        scale = uniform_scale[:, None]  # [BLOCK_TOK, NUM_GROUPS(==1)]
+        zero = uniform_zero[:, None]
+    else:
+        grouped = tl.reshape(acc, (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE))
+        val_min = tl.min(grouped, axis=2)  # [BLOCK_TOK, NUM_GROUPS]
+        val_max = tl.max(grouped, axis=2)
+        scale = tl.maximum(val_max - val_min, 1e-8) / 3.0
+        zero = tl.math.div_rn(-val_min, scale)
 
-    sr = tl.reshape(scale_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
-    sp = tl.permute(sr, (0, 2, 1))
-    ss = tl.reshape(sp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
-    s_even, s_odd = tl.split(ss)
-    s0, s2 = tl.split(s_even)
-    s1, s3 = tl.split(s_odd)
+        # Per-position scale/zero via broadcasting the per-group scale/zero to
+        # HEAD_DIM and feeding them through the same reshape+permute+split.
+        scale_3d = tl.broadcast_to(
+            scale[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
+        )
+        zero_3d = tl.broadcast_to(
+            zero[:, :, None], (BLOCK_TOK, NUM_GROUPS, GROUP_SIZE)
+        )
+        scale_flat = tl.reshape(scale_3d, (BLOCK_TOK, HEAD_DIM))
+        zero_flat = tl.reshape(zero_3d, (BLOCK_TOK, HEAD_DIM))
 
-    zr = tl.reshape(zero_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
-    zp = tl.permute(zr, (0, 2, 1))
-    zs = tl.reshape(zp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
-    z_even, z_odd = tl.split(zs)
-    z0, z2 = tl.split(z_even)
-    z1, z3 = tl.split(z_odd)
+        sr = tl.reshape(scale_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
+        sp = tl.permute(sr, (0, 2, 1))
+        ss = tl.reshape(sp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
+        s_even, s_odd = tl.split(ss)
+        s0, s2 = tl.split(s_even)
+        s1, s3 = tl.split(s_odd)
 
-    q0 = (tl.math.div_rn(vals0, s0) + z0 + 0.5).to(tl.uint8)
-    q1 = (tl.math.div_rn(vals1, s1) + z1 + 0.5).to(tl.uint8)
-    q2 = (tl.math.div_rn(vals2, s2) + z2 + 0.5).to(tl.uint8)
-    q3 = (tl.math.div_rn(vals3, s3) + z3 + 0.5).to(tl.uint8)
+        zr = tl.reshape(zero_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
+        zp = tl.permute(zr, (0, 2, 1))
+        zs = tl.reshape(zp, (BLOCK_TOK, BLOCK_QUARTER, 2, 2))
+        z_even, z_odd = tl.split(zs)
+        z0, z2 = tl.split(z_even)
+        z1, z3 = tl.split(z_odd)
+
+        q0 = (tl.math.div_rn(vals0, s0) + z0 + 0.5).to(tl.uint8)
+        q1 = (tl.math.div_rn(vals1, s1) + z1 + 0.5).to(tl.uint8)
+        q2 = (tl.math.div_rn(vals2, s2) + z2 + 0.5).to(tl.uint8)
+        q3 = (tl.math.div_rn(vals3, s3) + z3 + 0.5).to(tl.uint8)
+
     packed = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6)
 
     dim_offs_q = tl.arange(0, BLOCK_QUARTER)
@@ -359,6 +399,8 @@ def _fused_flush_quant_kernel(
     V_CLIP_INDEX: tl.constexpr,
     K_BSEARCH_ITERS: tl.constexpr,
     V_BSEARCH_ITERS: tl.constexpr,
+    K_LLOYD_MAX: tl.constexpr,
+    V_LLOYD_MAX: tl.constexpr,
 ):
     """Grid: ``(cdiv(num_flush_tokens, BLOCK_TOK), num_heads, num_layers)``.
 
@@ -435,6 +477,7 @@ def _fused_flush_quant_kernel(
         BLOCK_TOK,
         K_CLIP_INDEX,
         K_BSEARCH_ITERS,
+        K_LLOYD_MAX,
     )
     # V side
     hp_v_base = tl.load(hp_v_ptrs_ptr + layer).to(
@@ -470,6 +513,7 @@ def _fused_flush_quant_kernel(
         BLOCK_TOK,
         V_CLIP_INDEX,
         V_BSEARCH_ITERS,
+        V_LLOYD_MAX,
     )
 
 
@@ -503,6 +547,67 @@ def _flush_remap_kernel(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _launch_flush_remap(
+    plan: "FlushPlan",
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    bs: int,
+    flush_interval: int,
+) -> None:
+    """Point ``req_to_token`` at the quant slot for each flushed position.
+
+    Geometry-independent, so both the fused and unfused quant paths issue it
+    unchanged.
+    """
+    _flush_remap_kernel[(bs, flush_interval)](
+        req_pool_indices,
+        plan.flush_pos,
+        plan.dst_quant_slots,
+        plan.valid_mask,
+        req_to_token,
+        int(req_to_token.stride(0)),
+        FLUSH_INTERVAL=int(flush_interval),
+        num_warps=1,
+        num_stages=1,
+    )
+
+
+def _flush_quant_unfused(
+    *,
+    hp_layers: List[torch.Tensor],
+    quant_layers: List[torch.Tensor],
+    sz_layers: List[torch.Tensor],
+    src_hp_slot: torch.Tensor,
+    dst_quant_slots: torch.Tensor,
+    clip_ratio: float,
+) -> None:
+    """Flush path for head dims the fused kernel cannot express.
+
+    The fused kernel derives the int2 byte layout from
+    ``reshape(BLOCK_TOK, 4, HEAD_DIM // 4)``, which needs a power-of-two
+    ``HEAD_DIM`` (Triton block shapes) -- Kimi's K is 192. Padding to 256 is not
+    an option: it would pack dims ``(b, b+64, b+128, b+192)`` where the real
+    192-wide layout is ``(b, b+48, b+96, b+144)``, and decode reads back exactly
+    what prefill wrote.
+
+    So gather the rows and reuse the same writer prefill uses. Same layout by
+    construction, at the cost of a Python loop over layers and a materialized
+    gather -- correctness path, not a fast path.
+    """
+    for hp, quant, sz in zip(hp_layers, quant_layers, sz_layers):
+        rows = hp[src_hp_slot]  # [n, num_heads, head_dim]
+        if clip_ratio > 0.0:
+            index = _flush_clip_index(clip_ratio, rows.shape[-1])
+            if index >= 0:
+                threshold = rows.abs().sort(dim=-1).values[..., index : index + 1]
+                rows = torch.maximum(torch.minimum(rows, threshold), -threshold)
+        _launch_quantize_int2(rows, dst_quant_slots, quant, sz)
 
 
 def _resolve_kv_quant_config(
@@ -695,12 +800,28 @@ def gpu_flush_int2_apply(
     num_layers: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    lloyd_max: bool = False,
+    apply_remap: bool = True,
+    # Per-layer tensors for this group, needed only when a head dim is not a
+    # power of two and the fused kernel cannot be used (see
+    # ``_flush_quant_unfused``).
+    hp_k_layers: List[torch.Tensor] = None,
+    hp_v_layers: List[torch.Tensor] = None,
+    quant_k_layers: List[torch.Tensor] = None,
+    quant_v_layers: List[torch.Tensor] = None,
+    k_sz_layers: List[torch.Tensor] = None,
+    v_sz_layers: List[torch.Tensor] = None,
 ) -> None:
     """Apply phase: run fused quant + remap kernels using a prepared plan.
 
     Must be issued *after* the schedule-stream wait on the previous forward —
     the remap kernel writes ``req_to_token`` at positions the previous
     forward's attention is concurrently reading.
+
+    ``apply_remap`` lets a multi-group caller (heterogeneous SWA geometry) run
+    the quant kernel once per uniform-geometry group while issuing the
+    geometry-independent ``req_to_token`` remap exactly once (on the final
+    group). Defaults to True so single-group callers are unchanged.
     """
     bs = plan.bs
     flush_interval = plan.flush_interval
@@ -711,12 +832,60 @@ def gpu_flush_int2_apply(
     # caller in the same bulk free as the valid flushes.
     safe_src_hp_slot = plan.src_hp_slot.clamp(min=0)
 
+    if not (_is_pow2(head_dim) and _is_pow2(v_head_dim)):
+        if lloyd_max:
+            raise ValueError(
+                f"lloyd_max is unavailable for non-power-of-two head dims "
+                f"(head_dim={head_dim}, v_head_dim={v_head_dim}); the unfused "
+                f"flush path writes uniform int2 only"
+            )
+        if hp_k_layers is None:
+            raise ValueError(
+                f"head_dim={head_dim} / v_head_dim={v_head_dim} needs the "
+                f"unfused flush path, but the caller passed no per-layer tensors"
+            )
+        # Unlike the fused kernel this writes only the rows that actually flush,
+        # so an invalid row's destination slot is never touched.
+        keep = plan.valid_mask.bool()
+        src = safe_src_hp_slot[keep]
+        dst = plan.dst_quant_slots[keep]
+        if src.numel():
+            _flush_quant_unfused(
+                hp_layers=hp_k_layers,
+                quant_layers=quant_k_layers,
+                sz_layers=k_sz_layers,
+                src_hp_slot=src,
+                dst_quant_slots=dst,
+                clip_ratio=k_clip_ratio,
+            )
+            _flush_quant_unfused(
+                hp_layers=hp_v_layers,
+                quant_layers=quant_v_layers,
+                sz_layers=v_sz_layers,
+                src_hp_slot=src,
+                dst_quant_slots=dst,
+                clip_ratio=v_clip_ratio,
+            )
+        if apply_remap:
+            _launch_flush_remap(plan, req_pool_indices, req_to_token, bs, flush_interval)
+        return
+
     k_block_quarter, k_num_groups, k_group_size = _resolve_kv_quant_config(
         head_dim, k_num_scale_groups
     )
     v_block_quarter, v_num_groups, v_group_size = _resolve_kv_quant_config(
         v_head_dim, v_num_scale_groups
     )
+
+    # Lloyd-Max is single-scale (per-row stats); it mirrors the single-scale
+    # set kernel, which only supports NUM_GROUPS == 1. Guard so a grouped
+    # config can't silently mis-quantize under LM.
+    if lloyd_max and (k_num_groups != 1 or v_num_groups != 1):
+        raise ValueError(
+            f"lloyd_max requires a single scale group (k_num_groups="
+            f"{k_num_groups}, v_num_groups={v_num_groups}); set "
+            f"kv-cache-quant-group-size == head_dim"
+        )
 
     k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
     v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
@@ -780,22 +949,14 @@ def gpu_flush_int2_apply(
         V_CLIP_INDEX=v_clip_index,
         K_BSEARCH_ITERS=(int(head_dim).bit_length() - 1) if head_dim >= 64 else 0,
         V_BSEARCH_ITERS=(int(v_head_dim).bit_length() - 1) if v_head_dim >= 64 else 0,
+        K_LLOYD_MAX=bool(lloyd_max),
+        V_LLOYD_MAX=bool(lloyd_max),
         num_warps=num_warps,
         num_stages=1,
     )
 
-    rtt_stride_row = int(req_to_token.stride(0))
-    _flush_remap_kernel[(bs, flush_interval)](
-        req_pool_indices,
-        plan.flush_pos,
-        plan.dst_quant_slots,
-        plan.valid_mask,
-        req_to_token,
-        rtt_stride_row,
-        FLUSH_INTERVAL=int(flush_interval),
-        num_warps=1,
-        num_stages=1,
-    )
+    if apply_remap:
+        _launch_flush_remap(plan, req_pool_indices, req_to_token, bs, flush_interval)
 
 
 def gpu_flush_int2(
@@ -838,6 +999,7 @@ def gpu_flush_int2(
     flush_interval: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    lloyd_max: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run plan -> fused quant -> remap for one decode flush step.
 
@@ -901,6 +1063,7 @@ def gpu_flush_int2(
         num_layers=num_layers,
         k_clip_ratio=k_clip_ratio,
         v_clip_ratio=v_clip_ratio,
+        lloyd_max=lloyd_max,
     )
 
     return plan.returned_slot_ids, plan.valid_mask

@@ -19,6 +19,7 @@ constexprs (``-1`` disables clip).
 from __future__ import annotations
 
 from typing import Dict, Tuple
+import warnings
 
 import torch
 import triton
@@ -27,6 +28,7 @@ import triton.language as tl
 from sglang.srt.mem_cache.kv_quant_kernels import (
     _get_num_scale_groups,
     _is_power_of_two,
+    _launch_quantize_int2,
 )
 
 
@@ -508,47 +510,80 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
     Pass ``clip_ratio_k = 0.0`` (or ``clip_ratio_v = 0.0``) to disable
     clipping for K (or V) — the in-kernel sort is then skipped entirely.
     """
-    assert cache_k.shape == cache_v.shape, (
-        f"K/V shape mismatch in pretransformed_clip: {cache_k.shape} vs {cache_v.shape}"
+    assert cache_k.shape[:2] == cache_v.shape[:2], (
+        "K/V token and head dimensions must match in pretransformed_clip: "
+        f"{cache_k.shape} vs {cache_v.shape}"
     )
-    num_tokens, _num_heads, head_dim = cache_k.shape
-    assert head_dim % 4 == 0, (
-        f"head_dim must be divisible by 4 for INT2, got {head_dim}"
+    num_tokens, _num_heads, k_head_dim = cache_k.shape
+    v_head_dim = cache_v.shape[-1]
+    assert k_head_dim % 4 == 0 and v_head_dim % 4 == 0, (
+        "K/V head dimensions must be divisible by 4 for INT2, got "
+        f"K={k_head_dim}, V={v_head_dim}"
     )
 
     if num_tokens == 0:
         return
 
-    k_grouped_ok = _can_use_grouped_clip_kernel(head_dim, k_scales_zeros_buffer)
-    v_grouped_ok = _can_use_grouped_clip_kernel(head_dim, v_scales_zeros_buffer)
+    k_grouped_ok = _can_use_grouped_clip_kernel(
+        k_head_dim, k_scales_zeros_buffer
+    )
+    v_grouped_ok = _can_use_grouped_clip_kernel(
+        v_head_dim, v_scales_zeros_buffer
+    )
     if not (k_grouped_ok and v_grouped_ok):
         raise NotImplementedError(
             f"pretransformed_clip int2 kernel requires power-of-two group configs "
-            f"(head_dim={head_dim}, k_num_groups={_get_num_scale_groups(k_scales_zeros_buffer)}, "
+            f"(k_head_dim={k_head_dim}, v_head_dim={v_head_dim}, "
+            f"k_num_groups={_get_num_scale_groups(k_scales_zeros_buffer)}, "
             f"v_num_groups={_get_num_scale_groups(v_scales_zeros_buffer)})"
         )
 
-    if _get_num_scale_groups(k_scales_zeros_buffer) == 1:
-        _launch_single_clip_int2(
-            cache_k, loc, k_cache_buffer, k_scales_zeros_buffer,
-            clip_ratio_k, hp_global_offset, lloyd_max=lloyd_max,
-        )
-    else:
-        _launch_grouped_clip_int2(
-            cache_k, loc, k_cache_buffer, k_scales_zeros_buffer,
-            clip_ratio_k, hp_global_offset,
-        )
+    def launch(
+        data: torch.Tensor,
+        buffer: torch.Tensor,
+        scales_zeros: torch.Tensor,
+        clip_ratio: float,
+    ) -> None:
+        head_dim = data.shape[-1]
+        if not _is_power_of_two(head_dim):
+            # tl.sort requires a power-of-two row. Kimi-K3 uses K=192 and
+            # V=128, so retain OSCAR rotation/clipping for K and use the
+            # generic uniform-int2 writer for that non-power-of-two row.
+            if clip_ratio > 0.0:
+                index = _clip_index(clip_ratio, head_dim)
+                threshold = data.abs().sort(dim=-1).values[..., index : index + 1]
+                data = torch.maximum(torch.minimum(data, threshold), -threshold)
+            if lloyd_max:
+                warnings.warn(
+                    "Lloyd-Max is unavailable for non-power-of-two OSCAR head "
+                    f"dimension {head_dim}; using uniform INT2 for this tensor.",
+                    stacklevel=2,
+                )
+            _launch_quantize_int2(
+                data, loc, buffer, scales_zeros, hp_global_offset
+            )
+        elif _get_num_scale_groups(scales_zeros) == 1:
+            _launch_single_clip_int2(
+                data,
+                loc,
+                buffer,
+                scales_zeros,
+                clip_ratio,
+                hp_global_offset,
+                lloyd_max=lloyd_max,
+            )
+        else:
+            _launch_grouped_clip_int2(
+                data,
+                loc,
+                buffer,
+                scales_zeros,
+                clip_ratio,
+                hp_global_offset,
+            )
 
-    if _get_num_scale_groups(v_scales_zeros_buffer) == 1:
-        _launch_single_clip_int2(
-            cache_v, loc, v_cache_buffer, v_scales_zeros_buffer,
-            clip_ratio_v, hp_global_offset, lloyd_max=lloyd_max,
-        )
-    else:
-        _launch_grouped_clip_int2(
-            cache_v, loc, v_cache_buffer, v_scales_zeros_buffer,
-            clip_ratio_v, hp_global_offset,
-        )
+    launch(cache_k, k_cache_buffer, k_scales_zeros_buffer, clip_ratio_k)
+    launch(cache_v, v_cache_buffer, v_scales_zeros_buffer, clip_ratio_v)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +624,7 @@ def _kv_oscar_rotate_k_clip_single_kernel(
     v_input_stride_token,
     v_input_stride_head,
     v_input_stride_dim,
+    R_stride_head,
     R_stride_in,
     R_stride_out,
     k_cache_stride_loc,
@@ -650,7 +686,14 @@ def _kv_oscar_rotate_k_clip_single_kernel(
 
     r_in = tl.arange(0, HEAD_DIM)
     r_out = tl.arange(0, HEAD_DIM)
-    R_offs = r_in[:, None] * R_stride_in + r_out[None, :] * R_stride_out
+    # ``R_stride_head`` is 0 for a shared (V1) rotation, so every head reads the
+    # same matrix with no branch; for a per-head (V2) rotation it is R.stride(0)
+    # and each program loads its own head's matrix.
+    R_offs = (
+        head_idx * R_stride_head
+        + r_in[:, None] * R_stride_in
+        + r_out[None, :] * R_stride_out
+    )
     R_tile = tl.load(R_ptr + R_offs)
 
     k_rows = tl.dot(k_tile, R_tile, out_dtype=tl.float32)
@@ -843,10 +886,20 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
     assert _is_power_of_two(head_dim), (
         f"oscar rotate+clip int2 kernel requires power-of-two head_dim, got {head_dim}"
     )
-    assert R_k.shape == (head_dim, head_dim), (
-        f"R_k must be [head_dim, head_dim]={head_dim}x{head_dim}, "
-        f"got {tuple(R_k.shape)}"
-    )
+    if R_k.dim() == 3:
+        assert R_k.shape == (num_heads, head_dim, head_dim), (
+            f"per-head R_k must be [num_heads, head_dim, head_dim]="
+            f"{num_heads}x{head_dim}x{head_dim}, got {tuple(R_k.shape)}"
+        )
+        r_stride_head, r_stride_in, r_stride_out = R_k.stride()
+    else:
+        assert R_k.shape == (head_dim, head_dim), (
+            f"R_k must be [head_dim, head_dim]={head_dim}x{head_dim} or "
+            f"[num_heads, head_dim, head_dim], got {tuple(R_k.shape)}"
+        )
+        # zero head stride => every head reads the one shared matrix
+        r_stride_head = 0
+        r_stride_in, r_stride_out = R_k.stride()
     assert R_k.dtype == cache_k_unrotated.dtype, (
         f"R_k dtype ({R_k.dtype}) must match input dtype "
         f"({cache_k_unrotated.dtype})"
@@ -885,8 +938,9 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
         cache_v_rotated.stride(0),
         cache_v_rotated.stride(1),
         cache_v_rotated.stride(2),
-        R_k.stride(0),
-        R_k.stride(1),
+        r_stride_head,
+        r_stride_in,
+        r_stride_out,
         k_cache_buffer.stride(0),
         k_cache_buffer.stride(1),
         k_cache_buffer.stride(2),

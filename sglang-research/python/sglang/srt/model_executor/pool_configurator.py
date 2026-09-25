@@ -151,6 +151,85 @@ def _get_unified_mixed_kv_bytes_per_quant_token(
     return arena_bytes_per_quant_token + scales_zeros_bytes_per_quant_token
 
 
+
+def _mixed_kv_window_arena_bytes(
+    mr, *, heads: int, head_dim: int, v_head_dim: int,
+    hp_dtype_bytes: int, n_q: int, num_layers: int,
+) -> int:
+    """Bytes of the BF16 window arena UnifiedInt2HPKVPool will allocate.
+
+    Mirrors ``UnifiedInt2HPKVPool._create_arenas``: ``hp_total_slots =
+    num_hp_prefix_slots + max_req_slots * (hp_recent + N_Q - 1)``, each slot
+    holding K and V for every layer in hp_dtype. The prefix pool default
+    follows the model-runner call site (``max_reqs * prefix * 16``, rounded
+    up to N_Q) unless SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS pins it.
+
+    ``mr.max_running_requests`` does not exist yet -- it is derived from the
+    pool size this number feeds -- so the flag is read directly. When it is
+    not pinned the arena is sized for 64 slots (the eval harness default) and
+    a warning is logged: over-reserving a few GB is harmless on the GPUs this
+    runs on, under-reserving is the OOM this function exists to prevent.
+    """
+    from sglang.srt.environ import envs
+
+    p = (
+        envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+        else 64
+    )
+    r = (
+        envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+        else 256
+    )
+    max_reqs = mr.server_args.max_running_requests
+    if max_reqs is None:
+        max_reqs = 64
+        logger.warning(
+            "mixed-KV window arena sized for %d request slots because "
+            "--max-running-requests is not pinned; pin it so the reservation "
+            "matches the pool.", max_reqs,
+        )
+    prefix_pool = (
+        envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.is_set()
+        else 0
+    )
+    if prefix_pool <= 0:
+        prefix_pool = max_reqs * p * 16
+    prefix_pool = (prefix_pool + n_q - 1) // n_q * n_q
+    hp_total_slots = prefix_pool + max_reqs * (r + n_q - 1)
+    return hp_total_slots * heads * (head_dim + v_head_dim) * hp_dtype_bytes * num_layers
+
+
+def _mixed_kv_hp_total_slots(mr, n_q: int) -> int:
+    """The window arena's slot count, by the same arithmetic as above. Any
+    per-slot side cache (the MiniMax indexer's key cache) must be reserved for
+    these slots too, since they are page-table slots like any other."""
+    from sglang.srt.environ import envs
+
+    p = (
+        envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+        else 64
+    )
+    r = (
+        envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+        else 256
+    )
+    max_reqs = mr.server_args.max_running_requests or 64
+    prefix_pool = (
+        envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.is_set()
+        else 0
+    )
+    if prefix_pool <= 0:
+        prefix_pool = max_reqs * p * 16
+    prefix_pool = (prefix_pool + n_q - 1) // n_q * n_q
+    return prefix_pool + max_reqs * (r + n_q - 1)
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -170,6 +249,39 @@ class MemoryPoolConfigurator:
     ) -> MemoryPoolConfig:
         """Constraint path: recalculate pool sizes from a constrained max_tokens."""
         raise NotImplementedError
+
+
+def _packed_mla_latent_enabled(mr: ModelRunner) -> bool:
+    """Whether this run stores the MLA latent as packed INT2 codes.
+
+    Must agree exactly with the routing in ``model_runner_kv_cache_mixin``: a
+    configurator that disagrees with the pool it is sizing either wastes the
+    difference or runs the allocator off the end of the buffers.
+    """
+    from sglang.srt.environ import envs
+
+    base = (
+        mr.use_mla_backend
+        and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+        and bool(envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get())
+    )
+    if not base:
+        return False
+    # The mambaish branch in model_runner_kv_cache_mixin additionally refuses
+    # speculative decoding and disaggregation, and this predicate did not. On
+    # an MLA + mambaish model with either enabled, the configurator sized the
+    # pool at 288 B/token while the router built a BF16 pool at 1152 -- a 4x
+    # under-size, which is the "runs the allocator off the end" case this
+    # docstring warns about rather than the harmless wasteful one.
+    #
+    # Non-mambaish MLA has no such conditions, so it keeps the plain predicate.
+    if getattr(mr, "mambaish_config", None):
+        sa = mr.server_args
+        return (
+            sa.disaggregation_mode in (None, "null")
+            and sa.speculative_algorithm is None
+        )
+    return True
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
@@ -264,6 +376,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 n_q,
             )
             kv_size = None
+            # The BF16 window arena is a FIXED cost on top of the per-token
+            # price above: a shared HP-prefix pool plus one recent ring per
+            # request slot, every layer, in hp_dtype. The packed-MLA branch
+            # below already charges its equivalent; this branch did not, so
+            # on a TP=1 dense model the entire static budget went to quant
+            # pages and _create_arenas ran out of memory allocating
+            # hp_v_buffer -- Qwen3-8B/32B/4B-Thinking at 64K, every time,
+            # while BF16 on the same GPU and mem-fraction was fine.
+            self._fixed_overhead_bytes = _mixed_kv_window_arena_bytes(
+                mr,
+                heads=model_config.get_num_kv_heads(tp_size),
+                head_dim=model_config.head_dim,
+                v_head_dim=model_config.v_head_dim,
+                hp_dtype_bytes=hp_dtype_bytes,
+                n_q=n_q,
+                num_layers=num_layers,
+            )
         elif kv_cache_dtype == "int2":
             bytes_per_head = _get_int_kv_bytes_per_head_pair(
                 model_config.head_dim,
@@ -278,11 +407,68 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             bytes_per_head = None
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if _packed_mla_latent_enabled(mr):
+                # Packed INT2 latent: codes + group params + BF16 k_pe. Without
+                # this the pool would be sized as if it still stored 576 BF16
+                # values per token and ``max_total_num_tokens`` would not move
+                # off the BF16 arm's number -- which is exactly the symptom that
+                # says the storage change did not land.
+                from sglang.srt.mem_cache.mla_packed_kv_pool import (
+                    packed_latent_bytes_per_token,
+                )
+
+                cell_size = (
+                    packed_latent_bytes_per_token(
+                        model_config.kv_lora_rank,
+                        model_config.qk_rope_head_dim,
+                        envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        # Must match what _init_packed allocates. A cell_size
+                        # computed at a different width either wastes the
+                        # difference or runs the pool off its end.
+                        bits=envs.SGLANG_OSCAR_MLA_KV_BITS.get(),
+                    )
+                    * num_layers
+                )
+                # The BF16 window arena is a fixed cost, not a per-token one:
+                # (sink + recent) rows per request slot, every layer. Charging
+                # it here keeps the pool inside the mem-fraction budget instead
+                # of overshooting it by a couple of GB at the end of startup.
+                p = (
+                    envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+                    if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+                    else 64
+                )
+                r = (
+                    envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+                    if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+                    else 256
+                )
+                # ``mr.max_running_requests`` does not exist yet -- it is
+                # resolved *from* the pool size this call is computing, and its
+                # default estimate climbs with the pool, so a 3x bigger pool
+                # would silently ask for a 3x bigger window arena. Read the flag
+                # instead, and require it: an unpinned arena is either 60x too
+                # big or quietly leaves requests without windows.
+                max_reqs = mr.server_args.max_running_requests
+                if max_reqs is None:
+                    raise ValueError(
+                        "SGLANG_OSCAR_MLA_KV_PACKED needs --max-running-requests "
+                        "pinned: the BF16 window arena is sized per request slot "
+                        "and the default is derived from the pool size, which "
+                        "this branch changes."
+                    )
+                self._fixed_overhead_bytes = (
+                    (1 + max_reqs * (p + r))
+                    * model_config.kv_lora_rank
+                    * 2
+                    * num_layers
+                )
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -307,7 +493,51 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            if bytes_per_head is not None:
+            if enable_mixed_kv and getattr(model_config, "unified_two_group_kv", False):
+                # gemma4_unified. ModelConfig turns is_hybrid_swa OFF for this
+                # model and the runner builds ONE UnifiedInt2HPKVPool holding two
+                # geometry groups -- full attention (1 head x 512) over 8 layers,
+                # sliding (8 heads x 256) over 40 -- that all draw num_quant_pages
+                # from one allocator. Pricing every layer at the full-group
+                # geometry, as the uniform formula below does, charges a sliding
+                # layer a quarter of what it costs; the derivation then handed
+                # Gemma-4-12B 8.3M tokens against BF16's 458K (18x) and
+                # _create_arenas OOMed on k_buffer. Price each group as allocated
+                # and reserve each group's window arena.
+                full_ids = list(model_config.full_attention_layer_ids)
+                swa_ids = list(model_config.swa_attention_layer_ids)
+                full_heads = model_config.get_num_kv_heads(tp_size)
+                swa_heads = model_config.get_swa_num_kv_heads(tp_size)
+                swa_bytes = _get_unified_mixed_kv_bytes_per_quant_token(
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                    hp_dtype_bytes,
+                    scale_bytes,
+                    _resolve_quant_group_count(model_config.swa_head_dim, kv_quant_group_size),
+                    _resolve_quant_group_count(model_config.swa_v_head_dim, kv_quant_group_size),
+                    n_q,
+                )
+                cell_size = (
+                    full_heads * bytes_per_head * len(full_ids)
+                    + swa_heads * swa_bytes * len(swa_ids)
+                )
+                self._fixed_overhead_bytes = _mixed_kv_window_arena_bytes(
+                    mr, heads=full_heads, head_dim=model_config.head_dim,
+                    v_head_dim=model_config.v_head_dim, hp_dtype_bytes=hp_dtype_bytes,
+                    n_q=n_q, num_layers=len(full_ids),
+                ) + _mixed_kv_window_arena_bytes(
+                    mr, heads=swa_heads, head_dim=model_config.swa_head_dim,
+                    v_head_dim=model_config.swa_v_head_dim, hp_dtype_bytes=hp_dtype_bytes,
+                    n_q=n_q, num_layers=len(swa_ids),
+                )
+                logger.info(
+                    "gemma4_unified pricing: full %d layers x %d heads x %d B/quant-tok, "
+                    "sliding %d layers x %d heads x %d B/quant-tok, window arena %.2f GB",
+                    len(full_ids), full_heads, bytes_per_head,
+                    len(swa_ids), swa_heads, swa_bytes,
+                    self._fixed_overhead_bytes / 2**30,
+                )
+            elif bytes_per_head is not None:
                 cell_size = (
                     model_config.get_num_kv_heads(tp_size) * bytes_per_head * num_layers
                 )
@@ -328,11 +558,48 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
 
+            # MiniMax-M3 sparse attention keeps the lightning indexer's key per
+            # token (index_dim in the model dtype) on every sparse layer, beside
+            # K/V. It is a per-slot cost like K/V and must be priced here, or
+            # the pool is sized as if it were free and the side cache OOMs at
+            # allocation. With 2-bit K/V it is the larger of the two.
+            from sglang.srt.layers.attention.minimax_sparse_backend import (
+                minimax_sparse_enabled,
+                sparse_layers_in_range,
+            )
+
+            if minimax_sparse_enabled(model_config.hf_config):
+                from sglang.srt.configs.model_config import (
+                    get_minimax_sparse_attention_config,
+                )
+
+                sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
+                n_sparse = len(
+                    sparse_layers_in_range(
+                        model_config.hf_config, mr.start_layer, mr.end_layer
+                    )
+                )
+                idx_bytes = int(sparse_cfg["sparse_index_dim"]) * torch.empty(
+                    0, dtype=mr.dtype
+                ).element_size()
+                cell_size += idx_bytes * n_sparse
+                if enable_mixed_kv:
+                    _, n_q_idx = compute_page_geometry(hp_dtype)
+                    self._fixed_overhead_bytes = getattr(
+                        self, "_fixed_overhead_bytes", 0
+                    ) + _mixed_kv_hp_total_slots(mr, n_q_idx) * idx_bytes * n_sparse
+                logger.info(
+                    "MiniMax sparse pricing: index-key cache %d B/token/layer x %d "
+                    "sparse layers added to the cell size",
+                    idx_bytes, n_sparse,
+                )
+
         return cell_size
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes -= getattr(self, "_fixed_overhead_bytes", 0)
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
@@ -407,6 +674,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
+        self._fixed_overhead_bytes = 0
 
         # Full layer per-token memory (bytes)
         self._full_per_token = full_per_token
@@ -473,6 +741,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes -= getattr(self, "_fixed_overhead_bytes", 0)
         max_total_num_tokens = int(available_bytes // self._cell_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 

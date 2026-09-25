@@ -97,11 +97,21 @@ def _pool_uses_oscar_rotation(kv_pool) -> bool:
     return getattr(kv_pool, "_R_k", None) is not None
 
 
-def _apply_oscar_rotation(tensor: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """Apply ``tensor @ R`` along the last dim. Returns a contiguous tensor in
-    ``R.dtype``. Works for shapes ``[*, head_dim]``.
+def _apply_oscar_rotation(
+    tensor: torch.Tensor, R: torch.Tensor, kv_group_num: int = 1
+) -> torch.Tensor:
+    """Apply the Oscar rotation along the last dim; returns contiguous ``R.dtype``.
+
+    ``R`` is ``[hd, hd]`` (V1 shared) or ``[kv_heads, hd, hd]`` (V2 per-head).
+    In the per-head case ``tensor`` must be ``[tokens, heads, hd]``; with GQA the
+    query tensor has ``kv_group_num`` query heads per KV head, so its rotations
+    are repeat-interleaved to line up.
     """
-    return (tensor.to(R.dtype) @ R).contiguous()
+    t = tensor.to(R.dtype)
+    if R.dim() == 2:
+        return (t @ R).contiguous()
+    Rh = R if kv_group_num == 1 else R.repeat_interleave(kv_group_num, dim=0)
+    return torch.einsum("thd,hde->the", t, Rh).contiguous()
 
 
 def prepare_quantized_extend_qkv(
@@ -131,8 +141,11 @@ def prepare_quantized_extend_qkv(
         v_rotation_absorbed = bool(
             getattr(layer, "oscar_v_rotation_absorbed", False)
         )
+        kv_group_num = (
+            q.shape[-2] // k.shape[-2] if R_k.dim() == 3 and k.dim() >= 2 else 1
+        )
         if not q_already_hadamard_transformed:
-            q = _apply_oscar_rotation(q, R_k)
+            q = _apply_oscar_rotation(q, R_k, kv_group_num)
         if not kv_already_hadamard_transformed:
             k = _apply_oscar_rotation(k, R_k)
             if v_rotation_absorbed:
@@ -306,15 +319,25 @@ def dequantize_prefix_kv(
     ``dequantize_kv_int2_triton`` internally.
     """
     device = prefix_indices.device
+    # Per-layer geometry (two-group / heterogeneous SWA). Falls back to the
+    # scalar pool geometry for uniform pools / pools without the accessors.
+    if hasattr(kv_pool, "get_layer_head_dim"):
+        l_head_num = kv_pool.get_layer_head_num(layer_id)
+        l_head_dim = kv_pool.get_layer_head_dim(layer_id)
+        l_v_head_dim = kv_pool.get_layer_v_head_dim(layer_id)
+    else:
+        l_head_num = kv_pool.head_num
+        l_head_dim = kv_pool.head_dim
+        l_v_head_dim = kv_pool.v_head_dim
     if prefix_indices.numel() == 0:
         return (
             torch.empty(
-                (0, kv_pool.head_num, kv_pool.head_dim),
+                (0, l_head_num, l_head_dim),
                 dtype=model_dtype,
                 device=device,
             ),
             torch.empty(
-                (0, kv_pool.head_num, kv_pool.v_head_dim),
+                (0, l_head_num, l_v_head_dim),
                 dtype=model_dtype,
                 device=device,
             ),
@@ -335,7 +358,7 @@ def dequantize_prefix_kv(
                 kv_pool.get_key_scales_zeros(layer_id),
                 kv_pool.get_hp_key_buffer(layer_id),
                 kv_pool.hp_global_offset,
-                kv_pool.head_dim,
+                l_head_dim,
                 model_dtype,
             ),
             _mixed_prefix_dequantize_tensor(
@@ -344,7 +367,7 @@ def dequantize_prefix_kv(
                 kv_pool.get_value_scales_zeros(layer_id),
                 kv_pool.get_hp_value_buffer(layer_id),
                 kv_pool.hp_global_offset,
-                kv_pool.v_head_dim,
+                l_v_head_dim,
                 model_dtype,
             ),
         )
@@ -357,8 +380,8 @@ def dequantize_prefix_kv(
         f"Unsupported quantized KV dtype: {kv_pool.dtype}"
     )
     return (
-        dequantize_kv_int2_triton(raw_k, scales_k, kv_pool.head_dim, model_dtype),
-        dequantize_kv_int2_triton(raw_v, scales_v, kv_pool.v_head_dim, model_dtype),
+        dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype),
+        dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype),
     )
 
 
@@ -380,7 +403,13 @@ def apply_inverse_v_rotation(
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_v = kv_pool._R_v[layer_idx]
-        return (result.to(R_v.dtype) @ R_v.T).contiguous()
+        if R_v.dim() == 2:
+            return (result.to(R_v.dtype) @ R_v.T).contiguous()
+        q_heads = result.shape[-2]
+        Rh = R_v.repeat_interleave(max(1, q_heads // R_v.shape[0]), dim=0)
+        return torch.einsum(
+            "thd,hed->the", result.to(R_v.dtype), Rh
+        ).contiguous()
     return _apply_segmented_hadamard_transform(result)
 
 

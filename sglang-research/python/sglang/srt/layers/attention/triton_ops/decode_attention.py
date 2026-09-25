@@ -39,6 +39,39 @@ logger = logging.getLogger(__name__)
 _MIN_BLOCK_KV = 32
 
 
+def _safe_block_h(block_h: int, kv_group_num: int) -> int:
+    """Clamp a grouped-decode head tile so it never straddles a KV head.
+
+    ``_fwd_grouped_kernel_stage1`` and its INT2 twin address heads as
+
+        VALID_BLOCK_H = min(BLOCK_H, kv_group_num)
+        cur_head      = cur_head_id * VALID_BLOCK_H + arange(BLOCK_H)
+        cur_kv_head   = cur_head_id // cdiv(kv_group_num, BLOCK_H)
+
+    ``cur_head`` is a *flat* query-head index while ``cur_kv_head`` is derived
+    from the block index, so the two only agree when a head block lies wholly
+    inside one KV group -- that is, when ``BLOCK_H >= kv_group_num`` or
+    ``kv_group_num`` is a multiple of ``BLOCK_H``. (The launch grid
+    ``cdiv(q_head_num, VALID_BLOCK_H)`` is exact under the same condition.)
+
+    A hardcoded ``BLOCK_H = 16`` satisfies this for every power-of-two
+    ``kv_group_num``, which is why it has never bitten upstream. A tuned or
+    batch-size-dependent ``BLOCK_H`` does not: ``BLOCK_H=4`` against
+    ``kv_group_num=6`` (MiniMax-M2.7, 48 q heads / 8 KV heads at TP=4) makes
+    head block 1 cover q heads 4..7 while reporting ``cur_kv_head=0``, so q
+    heads 6 and 7 silently attend to KV head 0's cache. Nothing asserts, no
+    shape is wrong, and no NaN appears -- it only shows up as a benchmark
+    score.
+
+    Rounding up to a power of two keeps ``tl.arange(0, BLOCK_H)`` legal and
+    lands on ``VALID_BLOCK_H == kv_group_num``, i.e. one block per KV head.
+    """
+    if block_h < kv_group_num and kv_group_num % block_h != 0:
+        return triton.next_power_of_2(kv_group_num)
+    return block_h
+
+
+
 def _get_scale_group_size(head_dim: int, scales_zeros) -> int:
     """Return the per-group head-dim span for quantized KV scales.
 
@@ -500,7 +533,9 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_H = 16
+    # 16 is exact for every power-of-two kv_group_num; _safe_block_h keeps the
+    # head mapping valid for the ones that are not (e.g. 6 or 24).
+    BLOCK_H = _safe_block_h(16, kv_group_num)
     MAX_KV_SPLITS = max_kv_splits
     grid = (
         batch,
@@ -1402,6 +1437,18 @@ def _fwd_grouped_kernel_stage1_quant_int2(
     split_kv_id = tl.program_id(2)
     GROUPED: tl.constexpr = GROUP_SIZE < L
     FAST: tl.constexpr = (BLOCK_D // 4) >= GROUP_SIZE
+    # Hoisted out of the per-block KV loop: all loop-invariant (depend only on
+    # the BLOCK_D/GROUP_SIZE constexprs). Defining them inside the loop made
+    # newer Triton raise "constexpr cannot be reassigned" on the 2nd iteration.
+    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
+    grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
+    grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
+    grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
+    grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
+    v_grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -1520,7 +1567,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 # path. Otherwise (group spans multiple quarters), fall back
                 # to the per-element load.
                 if FAST:
-                    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
                     offs_grp_k = tl.arange(0, NUM_GROUPS_QUARTER)
                     offs_grp_k_q1 = (BLOCK_D // 4) // GROUP_SIZE + offs_grp_k
                     offs_grp_k_q2 = 2 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_k
@@ -1606,10 +1652,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     # entirely within a single group, so just load 1 (scale,
                     # zero) per (quarter, token) and broadcast across all dims.
                     offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-                    grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
-                    grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
-                    grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
-                    grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
                     k_scale_q0_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0,
                                            mask=offs_n < split_kv_end, other=1.0)
                     k_zero_q0_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0 + 1,
@@ -1728,7 +1770,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             # Load V scales and zeros for dequantization
             if GROUPED:
                 if FAST:
-                    NUM_GROUPS_QUARTER: tl.constexpr = (BLOCK_D // 4) // GROUP_SIZE
                     offs_grp_v = tl.arange(0, NUM_GROUPS_QUARTER)
                     offs_grp_v_q1 = (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
                     offs_grp_v_q2 = 2 * (BLOCK_D // 4) // GROUP_SIZE + offs_grp_v
@@ -1811,10 +1852,6 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 else:
                     # Fallback: group spans multiple quarters.
                     offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
-                    v_grp_q0: tl.constexpr = (0 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_grp_q1: tl.constexpr = (1 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_grp_q2: tl.constexpr = (2 * (BLOCK_D // 4)) // GROUP_SIZE
-                    v_grp_q3: tl.constexpr = (3 * (BLOCK_D // 4)) // GROUP_SIZE
                     v_scale_q0_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0,
                                            mask=offs_n < split_kv_end, other=1.0)
                     v_zero_q0_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0 + 1,
@@ -2088,6 +2125,12 @@ def _decode_grouped_att_m_fwd_quant_int2(
     BLOCK_H = int(os.environ.get("SGL_INT2_BLOCK_H", _bh_default))
     num_warps = int(os.environ.get("SGL_INT2_NUM_WARPS", _nw_default))
     num_stages = int(os.environ.get("SGL_INT2_NUM_STAGES", 3))
+    # The tile heuristic above (and the env overrides) may pick a BLOCK_H that
+    # does not divide kv_group_num; the kernel's head mapping cannot express
+    # that. See _safe_block_h -- without this, MiniMax-M2.7 (kv_group_num=6)
+    # runs the whole INT2 tier of q heads 6 and 7 against KV head 0 at any
+    # batch >= 16.
+    BLOCK_H = _safe_block_h(BLOCK_H, kv_group_num)
 
     grid = (
         batch,

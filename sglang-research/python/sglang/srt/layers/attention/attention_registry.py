@@ -191,6 +191,24 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         runner.hybrid_gdn_config is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
+    from sglang.srt.layers.attention.minimax_sparse_backend import (
+        minimax_sparse_enabled,
+    )
+
+    if minimax_sparse_enabled(runner.model_config.hf_config):
+        # MiniMax-M3: the three dense layers keep the configured backend, the
+        # sparse layers go to the block-sparse MSA backend.
+        from sglang.srt.layers.attention.minimax_sparse_backend import (
+            MiniMaxHybridAttnBackend,
+            MiniMaxSparseAttnBackend,
+        )
+
+        sparse_backend = MiniMaxSparseAttnBackend(runner)
+        logger.info("Using MiniMax sparse attention backend for the sparse layers.")
+        return MiniMaxHybridAttnBackend(
+            full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
+        )
+
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (

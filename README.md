@@ -61,13 +61,25 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 <details>
 <summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
 
-Qwen3.5
-| Model | Mode | GPQA (198) | Δ vs BF16 |
-|-------|------|------------|-----------|
-| Qwen3.5-4B | baseline | **75.25%** | — |
-| Qwen3.5-4B | OSCAR | **74.75%** | −0.50 pp |
-| Qwen3.5-35B-A3B | baseline | **80.30%** | — |
-| Qwen3.5-35B-A3B | OSCAR | **82.32%** | +2.02 pp |
+Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std over 3 seeds (35B-A3B AIME: 8 seeds, N=30 is high-variance). OSCAR quantizer per model best: 4B uniform, 35B-A3B Lloyd-Max.
+
+**Qwen3.5-4B**
+| Benchmark | BF16 | OSCAR | Δ vs BF16 |
+|---|:---:|:---:|:---:|
+| GPQA-Diamond | 76.9 ± 1.3 | **75.8 ± 1.6** | −1.2 |
+| HumanEval | 81.7 ± 1.8 | **83.9 ± 1.0** | +2.2 |
+| AIME 2025 | 47.8 ± 3.1 | **46.7 ± 0.0** | −1.1 |
+| MATH500 | 89.5 ± 0.6 | **88.0 ± 0.6** | −1.5 |
+
+**Qwen3.5-35B-A3B**
+| Benchmark | BF16 | OSCAR | Δ vs BF16 |
+|---|:---:|:---:|:---:|
+| GPQA-Diamond | 83.3 ± 1.8 | **84.0 ± 1.3** | +0.7 |
+| HumanEval | 83.9 ± 0.6 | **86.6 ± 1.8** | +2.6 |
+| AIME 2025 † | 66.7 ± 5.3 | **62.1 ± 4.7** | −4.6 |
+| MATH500 | 92.8 ± 0.2 | **91.7 ± 0.4** | −1.1 |
+
+<sub>† AIME N=30 is high-variance; measured over 8 seeds. The −4.6 gap is not statistically significant (Welch t=1.72). At 3 seeds it read −6.7, inflated by a favorable BF16 draw.</sub>
 
 MiniMax2.7
 | Benchmark | BF16 | OSCAR (LM_RATIO=1.16) | Δ |
@@ -76,6 +88,103 @@ MiniMax2.7
 | HumanEval | 0.8817 | **0.8854** | +0.4 pp |
 | AIME 2025 | 0.7667 | **0.7667** | 0.0 pp |
 | MATH500 | 0.9379 | **0.9279** | −1.0 pp |
+
+</details>
+
+<details>
+<summary><b>MLA models — packed 2-bit latent (GLM-5.2, GLM-5.3, Kimi-K3)</b> </summary>
+
+**What is quantized.** MLA stores one shared latent `c_kv` plus a positional
+`k_pe`. OSCAR quantizes **the latent** and leaves **`k_pe` in BF16** — the
+opposite way round from how it is easy to read. Per token per layer, at
+`kv_lora_rank=512`, `qk_rope_head_dim=64`, group 128:
+
+| buffer | bytes | contents |
+|---|---:|---|
+| `c_codes` | 128 | the 512-dim latent at **2 bits**, 4 per byte |
+| `c_params` | 32 | (scale, zero) fp32 per quantization group |
+| `rope_buf` | 128 | `k_pe`, **BF16, never quantized** |
+| **total** | **288** | vs BF16's `(512+64)·2 = 1152` → **4.00×** |
+
+`k_pe` staying BF16 is load-bearing: it is the positional half of the MLA key
+and 2-bit'ing it destroys the rope term. It is also **44% of the cell**, which
+caps this axis — a latent compressed to zero bits would still leave 256 B, i.e.
+**4.5× is the ceiling**, and the shipped 4.00× already sits just under it.
+
+**GPQA-Diamond, full 198 questions, `max_tokens=32768`, single seed.** Same
+question set and permutations across arms (`Random(0)`), so the rows are paired.
+
+| Model | BF16 | packed 2-bit (4.00×) | Δ |
+|---|---:|---:|---:|
+| GLM-5.2 | 82.32 | 74.75 | −7.57 pp |
+| GLM-5.3 | 82.83 | **77.78** | **−5.05 pp** |
+
+At a **64K** generation budget both models are measured on the same 48-question
+subset (`n=48`, `max_tokens=65536`). Kept as its own table because neither the
+question count nor the budget matches the one above, and the two are not
+comparable — but the rows here are comparable to each other:
+
+| Model | budget | n | BF16 | packed 2-bit (4.00×) | Δ |
+|---|---|---:|---:|---:|---:|
+| GLM-5.2 | 64K | 48 | 87.50 | 83.33 | −4.17 pp |
+| **Kimi-K3** | 64K | 48 | **93.75** | **83.33** | **−10.42 pp** |
+
+The two land on the same 83.33 from very different starting points: K3's BF16 is
+6.25 pp higher, and 2 bits takes all of that back and more. Whatever is costing
+K3 its 10 points is specific to K3, not to the packed path — GLM-5.2 runs the
+identical quantiser for less than half the loss.
+
+GLM-5.3 required **zero model-code changes** — `GlmMoeDsaForCausalLM` is
+identical to GLM-5.2's — but rotations do **not** transfer between models and
+must be refitted from each model's own `c_kv` dump.
+
+**Ratio / accuracy frontier (GLM-5.2, all end-to-end at n=198).** Every knob
+inside 2 bits has been measured; none closes the 4.00× gap, and bit width buys
+more accuracy per unit of ratio surrendered than group size does:
+
+| config | ratio | GPQA | vs BF16 |
+|---|---:|---:|---:|
+| 2-bit g128 (shipped) | 4.00× | 74.75 | −7.57 |
+| 2-bit g32 | 3.00× | 77.78 | −4.54 |
+| 4-bit g128 | 2.77× | 80.81 | −1.51 |
+| BF16 | — | 82.32 | — |
+
+**Where K3's loss actually sits.** Adding stock upstream to the same 48
+questions separates the quantiser from this fork:
+
+| arm | KV | GPQA |
+|---|---|---:|
+| stock upstream sglang | BF16 | 95.83 |
+| this fork, no quantiser | BF16 | **93.75** |
+| this fork, packed 2-bit | 4.00× | **83.33** |
+
+So the serving path costs **2.1 pp** — one question out of 48, inside the noise
+of a single 48-question run — and 2-bit costs **10.4 pp**. Reaching 90 is a
+bit-width question, not a bug hunt.
+
+K3 pays more for 2 bits than the GLM models do (−4.2 pp for GLM-5.2 at the same
+n=48/64K, −5.1 pp for GLM-5.3 at n=198/32K). It is a KDA/MLA hybrid where only
+24 layers carry a latent rotation, so the quantisation error concentrates in
+far fewer layers instead of being spread across all of them.
+
+Both figures are single runs at n=48; the standard error on each is about
+±5 pp, so the 10.4 pp separation is real but its decimals are not.
+
+That gap prompted an attempt to replace K3's model file with upstream's
+wholesale. The attempt is recorded here because it failed instructively: the
+ported file served but produced word salad, and the next 38 commits went to
+repairing its fallout. Two of those repairs were genuine defects in shared
+code and were kept — a use-after-free on the KDA decode metadata, and a
+`gate_up_interleaved` that was threaded through FusedMoE and never read.
+Neither was K3's problem. K3's problem was the replacement. The model line is
+back on the file that scored 70.83.
+
+Worth knowing before trying again: K3's chat format is Python
+(`encoding_k3.py`), not a jinja template, and its expert weights are
+compressed-tensors `mxfp4-pack-quantized` with only the routed experts
+quantized. Its `--reasoning-parser kimi_k3` does not exist in this fork, so
+thinking is not split out of `content` and any length comparison against
+upstream is not like-for-like.
 
 </details>
 
@@ -275,7 +384,119 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
   bash rotation/qwen3-8B/eval_gpqa.sh
 ```
 
+## Prebuilt image
+
+Everything OSCAR needs at runtime, so a new cluster is a `docker pull` rather
+than an afternoon of environment archaeology. **One image serves all twelve
+models**; there is no per-model tag to pick.
+
+```bash
+# Build the runtime image from this tree (see the Dockerfile in your own
+# build context) and push it to a registry you control:
+docker build -t <your-registry>/oscar-env:<tag> .
+docker push <your-registry>/oscar-env:<tag>
+# digest sha256:2eea19e646ffca4f88c16e6c5a161cf83d758dea2ab88211d1b0eaa08189df53
+```
+
+v28 carries `/oscar/src/BUILT_FROM`, naming the branch and commit it was built
+from (`0cc7125fe6`), so an image in a cluster can always be matched back to the
+tree that produced it. Its transformers is **pinned** at 5.16.1 rather than
+floated at `>=5.16`: the floor drifted to 5.17.0 on the first rebuild after
+v27, which would have moved the environment underneath every model the sweep
+had already accepted.
+
+| path in the image | contents |
+|---|---|
+| `/oscar/venv` | the venv — torch 2.9.1+cu128, sgl-kernel 0.3.21, **transformers 5.16.1**, triton 3.5.1 |
+| `/oscar/tf53` | a 112 MB `--target` overlay holding **transformers 5.3.0 + tokenizers 0.22.2**, prepended to `PYTHONPATH` by one recipe only (see below) |
+| `/oscar/src` | the sglang fork this branch tracks, plus `rotation/run/<model>.sh` and `rotation/verify/` |
+| `/oscar/fa2` | flash_attn 2.8.3 built for torch 2.9 / cu12 / cxx11abiTRUE |
+| `/oscar/rotations` | **every rotation**: `zoo/` (per-head K/V) plus per-layer MLA latent sets for GLM-5.2/5.3 (g128 and g32) and Kimi-K3 |
+| `/usr/local/bin/oscar-selfcheck` | GPU-side check: torch.cuda, sgl_kernel, flash_attn, sglang, rotations, and a Triton kernel that actually runs |
+
+Model weights are deliberately **not** included — they are ~2 TB and re-download
+at tens of GB/min, whereas this environment is the part that is slow and
+fragile to rebuild.
+
+### One command per model
+
+Each `rotation/run/<model>.sh` is a thin wrapper over `eval_oscar_gpqa.sh`
+carrying only that model's recipe — the checkpoint id, the rotation set, the
+sink/recent window, the parallelism. Nothing re-implements the launch path, and
+the model id is baked in, so a GPQA run is one command with no arguments:
+
+```bash
+bash /oscar/src/rotation/run/qwen3-8b.sh          # INT2 (default)
+KV_MODE=bf16 bash /oscar/src/rotation/run/qwen3-8b.sh   # the paired control
+bash /oscar/src/verify/all.sh                     # the PASS/FAIL sweep
+```
+
+### Why two transformers in one image
+
+Gemma-4 needs transformers >= 5.5 (`Gemma4UnifiedForConditionalGeneration` does
+not resolve below it). Qwen3.5-35B-A3B degenerates into unbounded repetition
+from 5.5.0 onward and scores ~0. Those two constraints do not intersect, and
+the version ordering is 5.3.0 < 5.4.0 < 5.5.0 < 5.16.1 (minor versions are
+integers, not decimals — 5.16 is *newer* than 5.3).
+
+Rather than fork the image and pay a second 62 GB pull per cluster — plus the
+standing ambiguity of "which tag produced this number" — the base env is 5.16.1
+and `rotation/run/qwen3.5-35b-a3b.sh` puts `/oscar/tf53` on `PYTHONPATH` for
+itself alone. Verified back to back inside one container:
+`gemma-4-12b 0.6458` on 5.16.1, `qwen3.5-35b-a3b 0.8542` on the overlay.
+
+Three things are load-bearing and easy to get wrong if you rebuild it yourself:
+
+* **The base must stay `nvcr.io/nvidia/pytorch:25.01-py3`.** The venv was created
+  against that image's Python 3.12.3 with `include-system-site-packages=true`,
+  so it links against `/usr` *and* inherits the image's dist-packages.
+* **Everything lives under `/oscar`, never `/shared`.** A job that mounts a
+  `/shared` PVC would otherwise shadow the whole image, and it did: a smoke ran
+  with the volume's venv, found no rotations, and still printed
+  `OSCAR_SELFCHECK_OK`.
+* **`sglang` is installed editable**, so its `.pth` resolves to a source tree
+  that does not exist in a venv-only image — `import sglang` would break on
+  pull. That is why `/oscar/src` is baked in and on `PYTHONPATH`.
+
+`TRITON_PTXAS_PATH` points at a CUDA 12.9 `ptxas` because B300 is `sm_103a` and
+the 12.8 `ptxas` shipped in the base stops at `sm_101`/`sm_120`, so every Triton
+JIT there dies *after* the weights load and reads as a model failure. That fixes
+dense models on B300; **MoE and MLA still do not run there** — their kernels die
+on `Cannot select: intrinsic %llvm.nvvm.tcgen05.wait.ld` under Triton 3.5.0,
+3.5.1 and 3.7.0, and none of the four MoE runner backends avoids it. B200 is the
+verified target.
+
+`sgl_kernel` and `flash_attn` link `libcuda.so.1`, which the driver injects at
+run time, so they cannot be imported on a build host with no GPU. Build-time
+checks are structural only; run `oscar-selfcheck` on a GPU node to verify the
+image before trusting a long job to it.
+
 ## Model support
+
+### Garbling sweep (12 models, one image)
+
+`rotation/verify/all.sh` serves every supported model from a single image with
+radix cache and CUDA graphs **on**, and judges the output on four shape checks
+rather than a letter ratio — a letter-ratio judge passed four error strings.
+`PASS` means *did not collapse*, not *answered correctly*: a fluent, off-task
+answer passes.
+
+Last full sweep runs on **v28 itself**, not on the previous image plus an
+overlay — the point is to accept the artefact that ships, not an approximation
+of it. Verdicts append to a file on the volume after each model, so the cluster
+preempting the pod (it did, repeatedly) costs time and not results.
+
+| result | models |
+|---|---|
+| **11 PASS** | qwen3-4b-think, qwen3-8b, qwen3-32b, qwen3-30b-a3b, qwen3.5-4b, qwen3.5-35b-a3b, gemma-4-12b, MiniMax-M2.7, MiniMax-M3, GLM-5.2, GLM-5.3 |
+
+**Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
+two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
+eight, so its row could only ever report `FAIL(no-serve)` — which reads as a
+broken model and means a harness that cannot host it. The row has been removed
+rather than left to mislead. K3 runs from `rotation/run/kimi-k3.sh` as a
+two-node job; on v28 it answers correctly and terminates (`finish_reason=stop`,
+17 × 24 = 408) and its GPQA arm measures **83.33** (n=48, 64K).
 
 Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int2` (full-attention INT2 path); other rows point to feature branches.
 
@@ -286,6 +507,9 @@ Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int
 | MiniMax-M2.7 | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview |
 | Qwen3.5 (4B, 35B-A3B) | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview (hybrid linear-attn) |
 | GLM-5.1 | SGLang `zhongzhu/glm-mla` | 🧪 experimental (MLA latent) |
+| GLM-5.2 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×) |
+| GLM-5.3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; zero model-code change from GLM-5.2) |
+| Kimi-K3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; TP 8 × PP 2) — see the note below |
 | Qwen3-VL (4B, 8B) | SGLang `zhongzhu/VL` | 🧪 preview |
 | Qwen3-32B, Qwen3-4B-Thinking, Gemma-4-12B | llama.cpp `zhongzhu/llamacpp` + [GGUF](https://huggingface.co/Zhongzhu) | ✅ supported (Mac / Metal) |
 
@@ -301,6 +525,24 @@ Calibration-pipeline folders included on this branch (`rotation/<model>/`):
 | `rotation/qwen3-8B/` | `Qwen/Qwen3-8B` | 1 | 1 | |
 | `rotation/qwen3-32B/` | `Qwen/Qwen3-32B` | 2-4 | 4 | |
 | `rotation/GLM-4.7/` | `zai-org/GLM-4.7-FP8` | 8 | 8 | FP8 weights, 92 layers |
+| `rotation/gemma-4-12B-it/` | `google/gemma-4-12B-it` | 1 | 1 | `gemma4_unified` hybrid-SWA, dual head_dim (sliding 8×256 / full 1×512), all INT2; needs transformers ≥5.5; INT2 ≈ BF16 on GPQA (62.63%); optional vision via `--enable-multimodal` |
+
+### Per-model GPQA: BF16 vs OSCAR INT2
+
+Single-seed GPQA-Diamond, full-precision baseline vs OSCAR INT2 KV cache, with
+the calibration tag used. **Every row carries its own `n` and generation
+budget** — they are not all the same, and a Δ is only meaningful within a row.
+
+| Model | Calibration | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
+|---|---|---|---:|---:|---:|
+| `Qwen/Qwen3-4B-Thinking-2507` | `seq20000_prompt83_group128` | 198 / 32K | 67.27 | 67.17 | −0.10 |
+| `google/gemma-4-12B-it` | `seq30000_prompt134_group128` | 198 / 32K | 62.63 | 62.63 | 0.00 |
+| `moonshotai/Kimi-K3` | `k3_latent_rot` (packed 2-bit, 4.00×) | 48 / 64K | **93.75** | **83.33** | **−10.42** |
+
+Kimi-K3 is the MLA-latent path, not the per-head K/V path the two rows above
+use, and it is where 2-bit currently costs the most — see the MLA section for
+the decomposition against stock upstream (95.83) that shows the 10.4 pp is the
+quantiser and not the serving path.
 
 > MiniMax-M2.7 / Qwen3.5 calibration scripts live on `zhongzhu/hybrid-model`; pre-fit rotations for several models are available on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
@@ -371,7 +613,7 @@ Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
 | `MODEL` | per-model HF id | HuggingFace model id |
 | `TP_SIZE` | per-model | Tensor parallel size for dump |
 | `GPU` | per-model | CUDA_VISIBLE_DEVICES |
-| `HF_HOME` | `/shared/huggingface` | HF cache (set to `$HOME/.cache/huggingface` on a fresh machine) |
+| `HF_HOME` | `$HOME/.cache/huggingface` | HF cache (override to a shared cache if you have one) |
 
 ## Troubleshooting
 

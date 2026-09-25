@@ -123,8 +123,14 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_global_dp_buffer(cls, group=None) -> torch.Tensor:
+        # Upstream passes the communication group explicitly; this fork
+        # assumed the TP group. Default to the old behaviour so both
+        # call styles work.
+        with use_symmetric_memory(
+            group if group is not None else get_tp_group(),
+            disabled=not cls._dp_max_padding,
+        ):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -133,8 +139,14 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_local_dp_buffer(cls, group=None) -> torch.Tensor:
+        # Upstream passes the communication group explicitly; this fork
+        # assumed the TP group. Default to the old behaviour so both
+        # call styles work.
+        with use_symmetric_memory(
+            group if group is not None else get_tp_group(),
+            disabled=not cls._dp_max_padding,
+        ):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -190,12 +202,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(group=None) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(group=None) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group)
 
 
 def get_global_dp_buffer_len() -> int:

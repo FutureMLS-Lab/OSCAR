@@ -60,6 +60,39 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+class SituAndMul(MultiPlatformOp):
+    """SituGLU, the activation Kimi-K3's MoE and dense MLPs use.
+
+        beta * tanh(gate / beta) * sigmoid(gate) * up
+
+    and when ``linear_beta`` is set the up branch is softly clipped as
+    ``linear_beta * tanh(up / linear_beta)``. K3's config carries both as
+    ``activation_situ_beta`` (4.0) and ``activation_situ_linear_beta`` (25.0).
+
+    Only the reference implementation is provided. Upstream's CUDA path is a
+    JIT-compiled kernel from a kernels tree this fork does not have, and a
+    slower-but-correct activation is the right trade while the model's accuracy
+    is what is in question; substituting SiLU here would be silently wrong.
+    """
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

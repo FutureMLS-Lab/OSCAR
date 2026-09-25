@@ -16,6 +16,11 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.packed_staging import (
+    build_slot_to_ragged,
+    stage_decode,
+    stage_prefill,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
@@ -69,6 +74,23 @@ else:
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
+
+
+def _packed_latent_pool_of(pool):
+    """The OSCAR packed-INT2 latent pool behind ``pool``, or ``None``.
+
+    Duck-typed on the two methods that define its read contract. A hybrid
+    (KDA + MLA) model hands the ``HybridLinearKVPool`` proxy here; keep the
+    proxy rather than unwrapping it, because ``materialize_rows`` and the
+    rotation hooks take the GLOBAL ``layer.layer_id`` and the inner pool maps
+    it itself -- unwrapping would hand it a global id it refuses, or worse,
+    one it mistakes for a local index.
+    """
+    if pool is None:
+        return None
+    if hasattr(pool, "materialize_rows") and hasattr(pool, "packed_read_operands"):
+        return pool
+    return None
 
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
@@ -322,6 +344,24 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        # OSCAR packed-INT2 latent storage. The sparse kernels gather BF16 rows by
+        # absolute slot out of one buffer; this pool has none to hand out (its
+        # get_key_buffer raises by design), so every forward dequantizes the rows
+        # it attends into a BF16 staging buffer first -- see packed_staging.py.
+        self.packed_pool = _packed_latent_pool_of(model_runner.token_to_kv_pool)
+        self._packed_decode_scratch: Optional[torch.Tensor] = None
+        self._packed_decode_arange: Optional[torch.Tensor] = None
+        self._packed_prefill_scratch: Optional[torch.Tensor] = None
+        self._packed_slot_to_ragged: Optional[torch.Tensor] = None
+        self._packed_prefill_flat: Optional[torch.Tensor] = None
+        if self.packed_pool is not None:
+            inner = getattr(self.packed_pool, "full_kv_pool", self.packed_pool)
+            # The packed arrays are allocated with size + page_size rows, and the
+            # slot space the page table indexes is exactly that.
+            n_slots = int(inner.c_codes[0].shape[0])
+            self._packed_slot_to_ragged = torch.full(
+                (n_slots,), -1, dtype=torch.int32, device=self.device
+            )
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -663,6 +703,105 @@ class NativeSparseAttnBackend(
             token_to_batch_idx=token_to_batch_idx,
         )
         self.forward_metadata = metadata
+        if self.packed_pool is not None and forward_batch.forward_mode.is_extend():
+            self._packed_prepare_prefill(metadata)
+
+    # ── OSCAR packed-INT2 latent: BF16 staging for the sparse kernels ───────
+
+    def _packed_prepare_prefill(self, metadata: NSAMetadata) -> None:
+        """Once per extend batch: every token of every request in ragged order,
+        and the inverse slot -> ragged-position map the top-k tables are
+        remapped through. Prefix tokens are included: a prefix-cache hit is
+        attended from the pool like any other row."""
+        flat = metadata.page_table_1_flattened
+        if flat is None:
+            page_table = metadata.page_table_1
+            flat = torch.cat(
+                [
+                    page_table[i, :kv_len]
+                    for i, kv_len in enumerate(metadata.indexer_seq_lens_cpu.tolist())
+                ]
+            )
+        flat = flat.to(torch.int32)
+        build_slot_to_ragged(flat, self._packed_slot_to_ragged)
+        self._packed_prefill_flat = flat
+
+    def _packed_scratch(self, which: str, n_rows: int) -> torch.Tensor:
+        """A ``[n_rows, 1, D]`` BF16 buffer, grown on demand. Under CUDA graph
+        capture the decode buffer must already be large enough: it is sized in
+        init_cuda_graph_state, and the capture's warmup forward would grow it
+        anyway before the recording starts."""
+        name = f"_packed_{which}_scratch"
+        buf = getattr(self, name)
+        if buf is None or buf.shape[0] < n_rows:
+            buf = torch.empty(
+                (n_rows, 1, self.packed_pool.latent_row_dim()),
+                dtype=self.packed_pool.dtype,
+                device=self.device,
+            )
+            setattr(self, name, buf)
+        return buf
+
+    def _packed_arange(self, n: int) -> torch.Tensor:
+        if self._packed_decode_arange is None or self._packed_decode_arange.numel() < n:
+            self._packed_decode_arange = torch.arange(
+                n, dtype=torch.int32, device=self.device
+            )
+        return self._packed_decode_arange
+
+    def _packed_stage(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        page_table_1: torch.Tensor,
+        is_prefill: bool,
+        k: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Replace (pool buffer, absolute-slot table) by (staging buffer, table
+        into it). ``page_table_1`` is the PAGED-transformed top-k table, i.e.
+        absolute token slots with -1 holes, for decode ``[bs, topk]`` and for
+        prefill ``[num_q, topk]``."""
+        pool = self.packed_pool
+        layer_id = layer.layer_id
+
+        def materialize(slots: torch.Tensor, out: torch.Tensor) -> None:
+            pool.materialize_rows(layer_id, slots, out=out)
+
+        if not is_prefill:
+            bs, topk = page_table_1.shape
+            n = bs * topk
+            return stage_decode(
+                materialize, page_table_1, self._packed_arange(n), self._packed_scratch("decode", n)
+            )
+
+        flat = self._packed_prefill_flat
+        assert flat is not None, "packed prefill staging needs init_forward_metadata"
+        n = flat.numel()
+        n_alloc = -(-n // self.real_page_size) * self.real_page_size
+        fresh_slots = fresh_rows = None
+        if k is not None and k_rope is not None:
+            # This forward's own tokens at full precision, in the pool's stored
+            # (rotated) frame so they sit beside the dequantized rows -- the same
+            # treatment the triton extend path gives them.
+            fresh_slots = forward_batch.out_cache_loc
+            fresh_rows = torch.cat(
+                [
+                    pool.rotate_latent(layer_id, k.reshape(-1, pool.kv_lora_rank)),
+                    k_rope.reshape(-1, pool.qk_rope_head_dim).to(k.dtype),
+                ],
+                dim=-1,
+            )
+        return stage_prefill(
+            materialize,
+            flat,
+            self._packed_slot_to_ragged,
+            page_table_1,
+            self._packed_scratch("prefill", n_alloc),
+            fresh_slots,
+            fresh_rows,
+            row_multiple=self.real_page_size,
+        )
 
     def _cal_indexer_k_start_end(
         self,
@@ -749,6 +888,10 @@ class NativeSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if self.packed_pool is not None:
+            n = max_num_tokens * self.nsa_index_topk
+            self._packed_scratch("decode", n)
+            self._packed_arange(n)
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1336,7 +1479,10 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.packed_pool is None:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        else:
+            kv_cache = None  # staged below, once the top-k table is known
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1387,6 +1533,16 @@ class NativeSparseAttnBackend(
                 forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1
                 )
+            )
+
+        if self.packed_pool is not None:
+            if nsa_impl != "flashmla_sparse" or topk_transform_method != TopkTransformMethod.PAGED:
+                raise NotImplementedError(
+                    f"packed-INT2 latent prefill is staged for flashmla_sparse with "
+                    f"the PAGED top-k transform; got {nsa_impl=} {topk_transform_method=}"
+                )
+            kv_cache, page_table_1 = self._packed_stage(
+                layer, forward_batch, page_table_1, True, k, k_rope
             )
 
         if nsa_impl == "tilelang":
@@ -1519,7 +1675,10 @@ class NativeSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.packed_pool is None:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        else:
+            kv_cache = None  # staged below, once the top-k table is known
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -1548,6 +1707,16 @@ class NativeSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+            )
+
+        if self.packed_pool is not None:
+            if self.nsa_decode_impl != "flashmla_sparse":
+                raise NotImplementedError(
+                    f"packed-INT2 latent decode is staged for flashmla_sparse or trtllm; "
+                    f"got {self.nsa_decode_impl=}"
+                )
+            kv_cache, page_table_1 = self._packed_stage(
+                layer, forward_batch, page_table_1, False, None, None
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
@@ -1977,9 +2146,6 @@ class NativeSparseAttnBackend(
                 layer, cache_loc, k, k_rope
             )
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
-
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
@@ -2008,6 +2174,18 @@ class NativeSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        if self.packed_pool is None:
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        else:
+            # Staged rows: bs*topk for decode (a multiple of the page size by
+            # construction), the padded ragged batch for prefill. The kernel
+            # addresses tokens as (slot // page, slot % page) over a paged view,
+            # which is the flat layout the staging buffer has.
+            k_cache, page_table_1 = self._packed_stage(
+                layer, forward_batch, page_table_1, is_prefill, k, k_rope
+            )
+        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
 
         q_scale = 1.0
         k_scale = (
@@ -2098,6 +2276,11 @@ class NativeSparseAttnBackend(
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
+        if self.packed_pool is not None:
+            # MHA_ONE_SHOT reads a prefix straight out of the BF16 kv_buffer the
+            # packed pool does not have. The sparse MLA path below is staged for
+            # it and is exact for seq <= topk anyway (top-k of <= k is everything).
+            self.use_mha = False
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:

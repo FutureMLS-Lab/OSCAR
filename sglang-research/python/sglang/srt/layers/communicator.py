@@ -244,6 +244,17 @@ class AttnTpContext:
         assert self.attn_inputs_ is not None
         return self.attn_inputs_.fetch_hidden_states()
 
+    def clear_attn_inputs(self) -> None:
+        """Drop the stashed attention inputs.
+
+        Upstream stores them on the forward context (get_forward().set(...));
+        this fork keeps them on the instance, so clearing must touch the same
+        field set_attn_inputs writes and fetch_* read. Copying upstream's body
+        verbatim would null a slot nothing here reads and leave the real one
+        held -- a leak, not an error.
+        """
+        self.attn_inputs_ = None
+
     @contextmanager
     def maybe_input_scattered(self, forward_batch: ForwardBatch):
         flag = self.use_input_scattered(forward_batch)

@@ -30,20 +30,49 @@ assert SE_DIR.is_dir(), (
     "into third_party/ and rename the directory to simple_evals (underscore)"
 )
 sys.path.insert(0, str(SE_DIR.parent))
+sys.path.insert(0, str(HERE))  # for the local aime_eval module
 
 
 def _build_argparser():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", required=True, choices=["gpqa"],
-                   help="simple-evals task; only gpqa wired up for now")
+    p.add_argument("--task", required=True,
+                   choices=["gpqa", "humaneval", "aime25", "math500"],
+                   help="simple-evals task")
     p.add_argument("--model", required=True, help="HF model id served by sglang")
     p.add_argument("--base-url", required=True, help="OpenAI-compatible endpoint")
     p.add_argument("--api-key", default="EMPTY")
     p.add_argument("--max-tokens", type=int, default=32768)
     p.add_argument("--temperature", type=float, default=1.0)
+    # presence_penalty had no route through this script at all. Qwen3.5's own
+    # thinking-mode recommendation is temperature 1.0 / top_p 0.95 / top_k 20 /
+    # presence_penalty 1.5, and its documentation says the penalty is what
+    # "reduces endless repetitions". Without it Qwen3.5-35B-A3B degenerates into
+    # verbatim repetition ("If they have different lifetimes, then the widths
+    # are different." x N) until the token cap, closes </think> in 4 of 198
+    # responses and scores ~0 -- in BF16, at TP 1, on the official checkpoint.
+    p.add_argument("--presence-penalty", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=40)
+    # Kimi-K3 carries its chat template as Python (encoding_k3.py), not a jinja
+    # file, and that template accepts a `thinking_effort` of low/high/max, which
+    # injects a system message telling the model how much to think.
+    # This knob can only LOWER the effort: tokenization_kimi.py already does
+    # `kwargs.setdefault("thinking_effort", "max")`, so every K3 run here was
+    # always at max. Measured, not assumed -- apply_chat_template on the same
+    # message list returns 477 tokens both with and without the kwarg. So
+    # "we never asked for max effort" is NOT an explanation for K3's GPQA gap.
+    p.add_argument("--thinking-effort", default=None,
+                   choices=["low", "high", "max"],
+                   help="chat_template_kwargs.thinking_effort (Kimi-K3)")
     p.add_argument("--n-repeats", type=int, default=1)
+    p.add_argument("--resume-from", type=str, default=None,
+                   help="io_log.jsonl of an interrupted run of the SAME task/config: "
+                        "its answered questions are copied into this run's io_log and "
+                        "skipped, only the rest are generated. metrics.json is then "
+                        "written with score=null -- the run's score comes from regrading "
+                        "the merged io_log (rotation/verify/regrade_gpqa.py --write-metrics).")
+    p.add_argument("--seed", type=int, default=None,
+                   help="sampling seed (run 3+ seeds for mean±variance)")
     p.add_argument("--num-examples", type=int, default=None,
                    help="Restrict to N examples (default: all)")
     p.add_argument("--variant", default="diamond", help="GPQA variant: diamond | main")
@@ -57,6 +86,10 @@ def _build_argparser():
     return p
 
 
+class ServerRejectedRequest(RuntimeError):
+    """The server refused a request (HTTP 400). Not a model output."""
+
+
 class SglangChatSampler:
     """Pass top_p and top_k to the sglang OpenAI-compat endpoint
     (simple_evals' own ChatCompletionSampler only sends temperature)."""
@@ -64,15 +97,25 @@ class SglangChatSampler:
     image_format = "url"
 
     def __init__(self, model, base_url, api_key, system_message,
-                 temperature, top_p, top_k, max_tokens):
+                 temperature, top_p, top_k, max_tokens, seed=None,
+                 presence_penalty=0.0, thinking_effort=None):
+        import httpx
         from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=httpx.Timeout(connect=30, read=28800, write=30, pool=30),
+            max_retries=0,
+        )
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.presence_penalty = presence_penalty
         self.max_tokens = max_tokens
+        self.seed = seed
+        self.thinking_effort = thinking_effort
 
     def _pack_message(self, role, content):
         return {"role": str(role), "content": content}
@@ -88,13 +131,21 @@ class SglangChatSampler:
         trial = 0
         while True:
             try:
+                _extra = {"top_k": self.top_k}
+                if self.presence_penalty:
+                    _extra["presence_penalty"] = self.presence_penalty
+                if self.seed is not None:
+                    _extra["seed"] = self.seed
+                if self.thinking_effort:
+                    _extra["chat_template_kwargs"] = {
+                        "thinking_effort": self.thinking_effort}
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     top_p=self.top_p,
-                    extra_body={"top_k": self.top_k},
+                    extra_body=_extra,
                 )
                 content = resp.choices[0].message.content
                 if content is None:
@@ -105,12 +156,17 @@ class SglangChatSampler:
                     actual_queried_message_list=message_list,
                 )
             except openai.BadRequestError as e:
-                print("Bad Request:", e, flush=True)
-                return SamplerResponse(
-                    response_text="No response (bad request).",
-                    response_metadata={"usage": None},
-                    actual_queried_message_list=message_list,
-                )
+                # A 400 is the SERVER refusing the request -- a context budget
+                # the prompt plus max_tokens does not fit in, a flag the
+                # backend rejects. It is never an answer, and scoring it as
+                # one produced a metrics.json with "score": 0.0 for three
+                # models whose every request had been rejected, indistinguishable
+                # from a model that got 198 questions wrong. It is also
+                # deterministic, so the other 197 would fail identically;
+                # abort now with the server's own message.
+                raise ServerRejectedRequest(
+                    f"server returned 400 Bad Request: {e}"
+                ) from e
             except Exception as e:
                 backoff = 2 ** trial
                 print(f"  sampler retry {trial} in {backoff}s: {e}", flush=True)
@@ -118,6 +174,27 @@ class SglangChatSampler:
                 trial += 1
                 if trial > 8:
                     raise
+
+
+def _messages_text(message_list):
+    """Concatenate the user-visible text of a chat message list. Content may be a
+    plain string or a list of typed parts ({"type": "text", "text": ...}) -- the
+    VL models' samplers write the latter, and a substring test against the
+    Question must see the same text either way."""
+    out = []
+    for m in message_list or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    t = part.get("text") or part.get("content")
+                    if isinstance(t, str):
+                        out.append(t)
+                elif isinstance(part, str):
+                    out.append(part)
+    return " ".join(" ".join(out).split())
 
 
 def main():
@@ -129,6 +206,9 @@ def main():
         model=args.model, base_url=args.base_url, api_key=args.api_key,
         system_message=args.system_message, temperature=args.temperature,
         top_p=args.top_p, top_k=args.top_k, max_tokens=args.max_tokens,
+        thinking_effort=args.thinking_effort,
+        presence_penalty=args.presence_penalty,
+        seed=args.seed,
     )
 
     # Cap simple-evals' map_with_progress concurrency. GPQAEval.__call__
@@ -138,9 +218,9 @@ def main():
     from simple_evals import common as _se_common
     _orig_map = _se_common.map_with_progress
     def _patched_map(f, xs, num_threads=None, pbar=True):
-        if num_threads is None:
-            num_threads = args.num_threads
-        return _orig_map(f, xs, num_threads=num_threads, pbar=pbar)
+        # Force args.num_threads ALWAYS (HumanEval hardcodes num_threads=3).
+        # This INT2 server is fastest single-stream, so honor --num-threads 1.
+        return _orig_map(f, xs, num_threads=args.num_threads, pbar=pbar)
     _se_common.map_with_progress = _patched_map
 
     # Monkey-patch ANSWER_PATTERN_MULTICHOICE back to the permissive `\s*`
@@ -174,6 +254,7 @@ def main():
                     "response": resp.response_text,
                     "model": self.model,
                     "temperature": self.temperature,
+                    "presence_penalty": self.presence_penalty,
                     "top_p": self.top_p,
                     "top_k": self.top_k,
                     "max_tokens": self.max_tokens,
@@ -190,16 +271,127 @@ def main():
             n_repeats=args.n_repeats, variant=args.variant,
             num_examples=args.num_examples,
         )
+    elif args.task == "humaneval":
+        # Local subclass: upstream's find_code falls back to the whole response
+        # when the model emits no ```python fence, which a thinking model does
+        # not, scoring ~0.15 regardless of the model. See humaneval_eval.py.
+        from humaneval_eval import HumanEval
+        # pass@1, single sample/task (this server is single-stream); base HumanEval (164)
+        evaluator = HumanEval(
+            num_examples=args.num_examples,
+            num_samples_per_task=1,
+            ks_passes=[1],
+        )
+    elif args.task == "aime25":
+        import aime_eval
+        evaluator = aime_eval.AIMEEval(
+            num_examples=args.num_examples, n_repeats=args.n_repeats,
+        )
+    elif args.task == "math500":
+        # Deterministic boxed-extraction + sympy grading (no LLM equality-checker,
+        # which fails with a verbose thinking model). See math500_eval.py.
+        import math500_eval
+        evaluator = math500_eval.MATH500Eval(
+            num_examples=args.num_examples, n_repeats=args.n_repeats,
+        )
     else:
         raise ValueError(f"task {args.task} not wired up yet")
 
+    resumed = None
+    if args.resume_from:
+        # A run killed at 195/198 by a wall-clock timeout should cost three
+        # questions, not twenty hours -- and it must be scored EXACTLY like an
+        # uninterrupted run. So the evaluator still sees all 198 examples and
+        # grades every one of them itself; the sampler is wrapped so that a
+        # question the prior run already answered is served from its io_log
+        # row instead of the server. No re-grading tool, no second protocol:
+        # the merged run's metrics.json comes from the same simple_evals code
+        # path as every other run's. GPQA questions are long, unique strings
+        # and every io_log row carries the full prompt, so "already answered"
+        # is a substring test against each example's Question.
+        if args.task != "gpqa":
+            raise SystemExit("--resume-from is implemented for gpqa only")
+        if args.n_repeats != 1:
+            raise SystemExit("--resume-from needs n_repeats=1 (a done row would match every repeat)")
+        from simple_evals.types import SamplerResponse   # simple_evals is importable once the evaluator exists
+        raw_rows = [l for l in open(args.resume_from) if l.strip()]
+        stored = []   # (normalized prompt text, response text)
+        malformed = 0
+        for l in raw_rows:
+            try:
+                r = json.loads(l)
+            except Exception:
+                malformed += 1      # counted and reported, never silently skipped
+                continue
+            txt = _messages_text(r.get("messages", []))
+            resp = r.get("response")
+            stored.append((txt, resp if isinstance(resp, str) else json.dumps(resp)))
+        if malformed:
+            print(f"!!! RESUME: {malformed} io_log row(s) were not valid JSON and are ignored", flush=True)
+        replay = {}   # example Question -> stored response
+        for ex in evaluator.examples:
+            q = " ".join(str(ex["Question"]).split())
+            for txt, resp in stored:
+                if q in txt:
+                    replay[q] = resp
+                    break
+        for l in raw_rows:           # merged io_log: prior rows first, verbatim
+            _io_log_f.write(l if l.endswith("\n") else l + "\n")
+        _io_log_f.flush()
+
+        class _ReplaySampler:
+            """Serve already-answered questions from the prior io_log; forward the rest."""
+            def __init__(self, inner):
+                self._inner = inner
+                self.replayed = 0
+                self.generated = 0
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+            def _pack_message(self, *a, **k):
+                return self._inner._pack_message(*a, **k)
+            def __call__(self, message_list):
+                txt = _messages_text(message_list)
+                for q, resp in replay.items():
+                    if q in txt:
+                        self.replayed += 1
+                        return SamplerResponse(response_text=resp,
+                                               response_metadata={"usage": None, "replayed": True},
+                                               actual_queried_message_list=message_list)
+                self.generated += 1
+                return self._inner(message_list)
+
+        sampler = _ReplaySampler(sampler)
+        resumed = dict(resumed_from=args.resume_from, prior_rows=len(raw_rows),
+                       replayable=len(replay), total=len(evaluator.examples))
+        print(f"=== RESUME: {len(raw_rows)} prior rows match {len(replay)}/{len(evaluator.examples)} "
+              f"examples; those are replayed, the other {len(evaluator.examples) - len(replay)} "
+              f"are generated ===", flush=True)
+        if len(replay) != len(raw_rows):
+            print(f"!!! RESUME: {len(raw_rows)} prior rows but {len(replay)} matched examples -- "
+                  f"a row matched no example or several", flush=True)
     print(f"=== running {args.task} eval ===", flush=True)
     print(f"  model={args.model}  base_url={args.base_url}")
     print(f"  n_repeats={args.n_repeats}  num_examples={args.num_examples}")
     print(f"  temperature={args.temperature} top_p={args.top_p} top_k={args.top_k}")
     print(f"  max_tokens={args.max_tokens}", flush=True)
     t0 = time.time()
-    result = evaluator(sampler)
+    try:
+        result = evaluator(sampler)
+    except BaseException as e:  # noqa: BLE001 -- unwrap pool-wrapped causes
+        cause = e
+        while cause is not None and not isinstance(cause, ServerRejectedRequest):
+            cause = cause.__cause__ or cause.__context__
+        if cause is None:
+            raise
+        # No score. A number here would be read as accuracy.
+        (out / "metrics.json").write_text(json.dumps({
+            "score": None,
+            "aborted": "bad_request",
+            "detail": str(cause),
+        }, indent=2))
+        print(f"\n!!! ABORTED: {cause}\n!!! no score written -- fix the "
+              f"server configuration and rerun", flush=True)
+        sys.exit(2)
     elapsed = time.time() - t0
 
     # simple_evals.EvalResult: top-line `score` lives on the dataclass attribute,
@@ -207,6 +399,12 @@ def main():
     metrics = dict(result.metrics or {})
     if getattr(result, "score", None) is not None:
         metrics["score"] = float(result.score)
+    if resumed is not None:
+        # Every example was graded by the evaluator; the score is the run's
+        # score. Record the provenance so a reader can see it was resumed.
+        resumed.update(replayed=sampler.replayed, generated=sampler.generated)
+        metrics.update(resumed)
+        print(f"=== RESUME: replayed {sampler.replayed}, generated {sampler.generated} ===", flush=True)
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     # Pretty score table; downstream consumers grep

@@ -106,6 +106,7 @@ class WeightsMapper:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    return False  # dump fork: never exercise fused set_kv (no sgl_kernel support; OSCAR dump must go through the pool)
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")

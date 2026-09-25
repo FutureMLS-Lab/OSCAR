@@ -19,7 +19,7 @@ import math
 import time
 from abc import ABC
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
@@ -73,17 +73,26 @@ class ExpertDistributionRecorder(ABC):
         else:
             return _ExpertDistributionRecorderNoop()
 
-    @contextmanager
+    # nullcontext, not @contextmanager, for the three no-op regions.
+    #
+    # A @contextmanager is a _GeneratorContextManager, and dynamo cannot graph
+    # break inside one: with expert-distribution recording OFF (the default),
+    # Kimi-K3's layer loop still enters `with recorder.with_current_layer(i)`,
+    # and the piecewise CUDA-graph warmup dies with
+    #     torch._dynamo.exc.Unsupported: Graph break under
+    #     GenericContextWrappingVariable
+    # taking the whole server with it. These three yield nothing and do nothing,
+    # so nullcontext is exactly equivalent and dynamo traces straight through --
+    # which is what lets K3 run its MLA latent path with CUDA graphs ON instead
+    # of having to disable them.
     def with_current_layer(self, layer_idx):
-        yield
+        return nullcontext()
 
-    @contextmanager
     def with_debug_name(self, debug_name):
-        yield
+        return nullcontext()
 
-    @contextmanager
     def disable_this_region(self):
-        yield
+        return nullcontext()
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):

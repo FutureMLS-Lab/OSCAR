@@ -167,7 +167,7 @@ class NemotronHMoE(nn.Module):
             use_grouped_topk=True,
             topk_group=config.topk_group,
             num_expert_group=config.n_group,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=1.0,

@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    notify_kv_pool_of_forward_batch,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
@@ -117,6 +118,17 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
+def get_pp_proxy_tensor_shapes(model) -> Optional[Dict[str, Tuple[int, ...]]]:
+    """Per-token shapes of the PP proxy tensors this stage receives.
+
+    None means the default (hidden_states, residual). A model whose stages exchange
+    anything else must declare it, because CUDA graph capture allocates the receive
+    buffers ahead of the forward and cannot discover extra keys on its own.
+    """
+    fn = getattr(model, "get_pp_proxy_tensor_shapes", None)
+    return fn() if callable(fn) else None
+
+
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
 
@@ -159,6 +171,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
+        pp_proxy_tensor_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -187,9 +200,18 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # Most models hand the next stage (hidden_states, residual), both
+                # [num_tokens, hidden_size]. Models that carry extra state across the
+                # boundary (e.g. Kimi's stacked `block_residual`) declare their own
+                # per-token shapes; capture must allocate exactly those keys or the
+                # receiving stage raises KeyError inside the graph.
+                shapes = pp_proxy_tensor_shapes or {
+                    "hidden_states": (hidden_size,),
+                    "residual": (hidden_size,),
+                }
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    key: torch.zeros((max_bs, *shape), dtype=dtype)
+                    for key, shape in shapes.items()
                 }
             else:
                 pp_proxy_tensors = None
@@ -541,6 +563,18 @@ class CudaGraphRunner:
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
+        # Graph-vs-eager self-check. ``SGLANG_GRAPH_VERIFY_STEPS=N`` re-runs N
+        # decode replays through the ordinary eager path on the same static
+        # buffers and logs the logit delta, which localises "the graph is wrong
+        # at this batch size" to a forward pass instead of leaving it as a
+        # whole-eval score difference. ``SGLANG_GRAPH_VERIFY_EVERY=K`` spaces
+        # the checks K replays apart, so a defect that only shows up deep into
+        # a generation is still sampled. Zero (the default) is a no-op.
+        self._verify_left = int(os.environ.get("SGLANG_GRAPH_VERIFY_STEPS", "0"))
+        self._verify_every = max(1, int(os.environ.get("SGLANG_GRAPH_VERIFY_EVERY", "1")))
+        self._verify_seen = 0
+        self._verify_forward_batches: Dict[int, ForwardBatch] = {}
+
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
 
@@ -632,6 +666,7 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
+            pp_proxy_tensor_shapes=get_pp_proxy_tensor_shapes(model_runner.model),
         )
         self.buffers.share_buffers()
 
@@ -993,6 +1028,16 @@ class CudaGraphRunner:
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
+        # A position-dependent KV pool has to see the *graph's* static
+        # seq_lens / req_pool_indices tensors, because the ops it builds on
+        # them are what gets captured and replayed.
+        notify_kv_pool_of_forward_batch(forward_batch)
+
+        if self._verify_left > 0:
+            # Every field of this ForwardBatch is a view of a static buffer, so
+            # the stashed object always carries the *current* replay's inputs.
+            self._verify_forward_batches[bs] = forward_batch
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
@@ -1217,6 +1262,9 @@ class CudaGraphRunner:
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
+        if self._verify_left > 0:
+            self._verify_replay_against_eager(output)
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -1246,6 +1294,59 @@ class CudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+
+    def _verify_replay_against_eager(self, output) -> None:
+        """Re-run the step that was just replayed through the eager path.
+
+        The captured ForwardBatch holds views of the static buffers, so it
+        already describes the replay that just ran. Re-deriving the attention
+        metadata eagerly and running the model again therefore compares the two
+        paths on *identical* state. Decode is safe to run twice: the KV write
+        is idempotent (same slot, same value) and attention is pure.
+
+        Every TP rank decrements the same counter on the same code path, so the
+        extra forward's collectives stay symmetric.
+        """
+        if not isinstance(output, LogitsProcessorOutput):
+            return
+        if output.next_token_logits is None:
+            return
+        forward_batch = self._verify_forward_batches.get(self.bs)
+        if forward_batch is None:
+            return
+        self._verify_seen += 1
+        if self._verify_seen % self._verify_every:
+            return
+        self._verify_left -= 1
+
+        n = self.raw_num_token
+        graph_logits = output.next_token_logits[:n].detach().clone()
+
+        forward_batch.batch_size = self.bs
+        forward_batch.seq_lens_sum = int(self.buffers.seq_lens[: self.bs].sum().item())
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        with torch.no_grad():
+            eager = self.model_runner.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
+        eager_logits = eager.next_token_logits[:n].detach()
+
+        delta = (graph_logits.float() - eager_logits.float()).abs()
+        agree = int((graph_logits.argmax(-1) == eager_logits.argmax(-1)).sum())
+        logger.warning(
+            "[graph-verify] bs=%d raw_bs=%d seq_lens_sum=%d max|dlogit|=%.5g "
+            "mean|dlogit|=%.5g argmax_agree=%d/%d",
+            self.bs,
+            self.raw_bs,
+            forward_batch.seq_lens_sum,
+            float(delta.max()),
+            float(delta.mean()),
+            agree,
+            n,
+        )
+        # The eager pass wrote the shared logits buffer; put the graph's answer
+        # back so verification never changes what the server actually samples.
+        output.next_token_logits[:n].copy_(graph_logits)
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

@@ -28,3 +28,6 @@ __all__ = [
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
 ]
+
+# Kimi-K3 imports this as a package attribute.
+from sglang.srt.layers.moe import route_quant_handoff  # noqa: F401

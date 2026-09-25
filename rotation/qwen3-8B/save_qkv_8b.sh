@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Dump post-RoPE Q/K/V tensors for GPQA calibration on Qwen3-8B.
 set -euo pipefail
-export HF_HOME="${HF_HOME:-/shared/huggingface}"
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"

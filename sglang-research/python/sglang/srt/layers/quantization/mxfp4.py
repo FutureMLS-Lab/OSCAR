@@ -239,11 +239,16 @@ class Mxfp4Config(QuantizationConfig):
     def from_config(cls, config):
 
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+        quant_format = config.get("format", "")
+        ignored_layers = config.get("ignore") or config.get("ignored_layers")
+        is_checkpoint_mxfp4_serialized = (
+            "mxfp4" in quant_method or "mxfp4" in quant_format
+        )
 
         if _is_hip:
             if mxfp_supported():
                 return cls(
+                    ignored_layers=ignored_layers,
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
             else:
@@ -253,7 +258,19 @@ class Mxfp4Config(QuantizationConfig):
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        return cls(
+            ignored_layers=ignored_layers,
+            is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+        )
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant):
+        if "mxfp4" in hf_quant_cfg.get("format", "") and user_quant in (
+            None,
+            "mxfp4",
+        ):
+            return "mxfp4"
+        return None
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -291,14 +308,15 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
+            raise NotImplementedError(
+                f"MXFP4 dense linear layer is not implemented: {prefix}"
+            )
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
-        else:
-            if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
+        # Attention and KV-cache quantization are selected independently.
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -441,6 +459,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        # Shard loading leaves large inactive allocator blocks behind. Release
+        # them before layout conversion, whose temporary tensors can otherwise
+        # OOM despite ample reserved-but-unallocated memory.
+        if self.use_triton_kernels:
+            torch.cuda.empty_cache()
+
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
@@ -690,6 +714,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
+            if getattr(
+                layer, "interleave_gate_up_for_fused_activation", False
+            ):
+                def interleave_gate_up(tensor: torch.Tensor) -> torch.Tensor:
+                    num_experts, fused_size, *tail = tensor.shape
+                    if fused_size % 2:
+                        raise ValueError(
+                            "Gate/up tensor must have an even fused dimension, "
+                            f"got shape {tuple(tensor.shape)}"
+                        )
+                    return (
+                        tensor.view(num_experts, 2, fused_size // 2, *tail)
+                        .transpose(1, 2)
+                        .reshape(num_experts, fused_size, *tail)
+                        .contiguous()
+                    )
+
+                layer.w13_weight = Parameter(
+                    interleave_gate_up(layer.w13_weight), requires_grad=False
+                )
+                layer.w13_weight_scale = Parameter(
+                    interleave_gate_up(layer.w13_weight_scale),
+                    requires_grad=False,
+                )
+                layer.w13_weight_bias = Parameter(
+                    interleave_gate_up(layer.w13_weight_bias),
+                    requires_grad=False,
+                )
+
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
 
@@ -697,6 +750,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
             num_warps = 8
+            # Interleaving and bias upcasting leave their replaced tensors in
+            # cached allocator blocks. Reclaim those blocks immediately before
+            # the multi-GiB layout-conversion temporary is allocated.
+            torch.cuda.empty_cache()
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps
@@ -716,6 +773,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+            # The converted scale tensors are retained by PrecisionConfig.
+            # Keeping the pre-swizzle Parameters would duplicate several GiB
+            # for very large MoE checkpoints such as Kimi-K3.
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 

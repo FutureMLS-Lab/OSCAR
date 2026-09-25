@@ -77,6 +77,7 @@ from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
+    maybe_absorb_oscar_v_rotation_into_qkv,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -250,7 +251,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
+            # Qwen3_5MoeTextConfig does not declare norm_topk_prob, so a bare
+            # attribute read raises and the model never loads. True is the
+            # Qwen3-MoE default and the behaviour every config that DOES
+            # declare it uses, so absence means 'renormalize', not 'unknown'.
+            renormalize=getattr(config, "norm_topk_prob", True),
             use_grouped_topk=False,
             layer_id=layer_id,
         )
@@ -535,6 +540,7 @@ class Qwen3MoeAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        self.attn.oscar_v_rotation_absorbed = False
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -1199,6 +1205,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        maybe_absorb_oscar_v_rotation_into_qkv(
+            self.model, quant_config=self.quant_config, model_label="Qwen3Moe"
+        )
 
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(

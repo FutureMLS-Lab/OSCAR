@@ -102,6 +102,8 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
             scatter_indx=None if self.config.no_combine else runner_input.scatter_indx,
             inplace=False,
             activation=self.config.activation,
+            activation_situ_beta=self.config.activation_situ_beta,
+            activation_situ_linear_beta=self.config.activation_situ_linear_beta,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             global_num_experts=quant_info.global_num_experts,
         )
@@ -122,6 +124,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 b2=quant_info.w2_bias,
                 gemm1_alpha=self.config.gemm1_alpha,
                 gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
                 **common_kwargs,
             )
         else:

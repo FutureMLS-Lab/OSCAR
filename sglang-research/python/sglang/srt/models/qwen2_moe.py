@@ -175,7 +175,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             layer_id=layer_id,
         )
 

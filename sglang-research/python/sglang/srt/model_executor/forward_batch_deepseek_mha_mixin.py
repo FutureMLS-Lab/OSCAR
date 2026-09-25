@@ -106,10 +106,18 @@ class ForwardBatchDeepSeekMHAMixin:
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
 
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
 
-        assert isinstance(
-            self.token_to_kv_pool, MLATokenToKVPool
+        # Ported from upstream sglang. A hybrid MLA model (Kimi-K3: MLA layers
+        # among KDA layers) holds its MLA cache inside a HybridLinearKVPool;
+        # the pool that matters for chunked prefix cache is the full-attention
+        # one it wraps. Accepting only a bare MLATokenToKVPool made K3 die on
+        # the trtllm_mla prefill path with this very message -- the second gate
+        # its FlashInfer-family baseline hit after the wrapper's .data_type.
+        pool = self.token_to_kv_pool
+        assert isinstance(pool, MLATokenToKVPool) or (
+            isinstance(pool, HybridLinearKVPool)
+            and isinstance(getattr(pool, "full_kv_pool", None), MLATokenToKVPool)
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):

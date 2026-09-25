@@ -73,6 +73,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    Gemma4UnifiedConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -113,6 +114,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     KimiLinearConfig,
     Qwen3NextConfig,
     FalconH1Config,
+    Gemma4UnifiedConfig,
     GraniteMoeHybridConfig,
     DotsVLMConfig,
     DotsOCRConfig,
@@ -163,6 +165,32 @@ def get_rope_config(config):
     return config.rope_theta, getattr(config, "rope_scaling", None)
 
 
+def _coerce_sub_config(sub):
+    """Turn a sub-config that is still a plain dict into an attribute object.
+
+    transformers only builds sub-configs as objects for model types it knows.
+    For a trust_remote_code architecture it does not recognise, `text_config`
+    stays a dict, and every downstream `config.hidden_size` becomes
+
+        AttributeError: 'dict' object has no attribute 'hidden_size'
+
+    which is what Qwen3.5-35B-A3B (a VL MoE) failed with -- an error that reads
+    like a code bug and is really a config-shape difference.
+    """
+    if not isinstance(sub, dict):
+        return sub
+    # ONLY the sub-config itself. Recursing was wrong: it turned ordinary dict
+    # VALUES into config objects too, and transformers validates several of them
+    # as dicts -- id2label failed with "expected a dict, got PreTrainedConfig",
+    # and other code calls .get() on fields that must stay mappings. The defect
+    # being fixed is that `text_config` arrives as a dict, not that dicts are
+    # bad.
+    cfg = PretrainedConfig()
+    for k, v in sub.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
 def _patch_text_config(parent_config: PretrainedConfig, text_config):
     """Synchronize standard attributes between parent config and text sub-config.
 
@@ -174,6 +202,11 @@ def _patch_text_config(parent_config: PretrainedConfig, text_config):
     so we propagate in both directions when an attribute is missing.
     (See https://github.com/huggingface/transformers/pull/41541)
     """
+    text_config = _coerce_sub_config(text_config)
+    # Write the object form back, or the caller keeps reading the dict off the
+    # parent even though we handed it a config.
+    if isinstance(getattr(parent_config, "text_config", None), dict):
+        parent_config.text_config = text_config
     _ATTRS_TO_PROPAGATE = [
         "pad_token_id",
         "bos_token_id",
@@ -660,6 +693,32 @@ def get_config(
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
         config.update({"architectures": [model_type]})
+
+    # Coerce nested sub-configs here, not only in get_hf_text_config: that helper
+    # is gated on the architecture appearing in a known list, so an unrecognised
+    # trust_remote_code model never reaches it and keeps a dict text_config all
+    # the way into the model, where the first attribute read fails with
+    # "'dict' object has no attribute 'hidden_size'". Fixing it only in the
+    # gated path left Qwen3.5-35B-A3B failing with the identical error.
+    # Rebuild with the class the PARENT declares for that slot. transformers v5
+    # exposes it as PretrainedConfig.sub_configs, so Qwen3_5MoeConfig names
+    # Qwen3_5MoeTextConfig for "text_config". A bare PretrainedConfig carries the
+    # values but none of the class's computed properties, which is how a first
+    # attempt here turned a working class into one missing layers_block_type --
+    # a strictly worse object than the dict it replaced.
+    _subs = getattr(type(config), "sub_configs", None) or {}
+    for _sub in ("text_config", "vision_config", "audio_config", "thinker_config"):
+        _v = getattr(config, _sub, None)
+        if not isinstance(_v, dict):
+            continue
+        _cls = _subs.get(_sub)
+        if _cls is not None:
+            try:
+                setattr(config, _sub, _cls(**_v))
+                continue
+            except Exception:
+                pass
+        setattr(config, _sub, _coerce_sub_config(_v))
 
     return config
 

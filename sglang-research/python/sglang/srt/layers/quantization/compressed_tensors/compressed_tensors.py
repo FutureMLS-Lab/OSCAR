@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.environ import envs
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -177,6 +178,15 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+            # Say out loud which scheme a MoE layer ended up with, including the
+            # None that means "ignored, treat as unquantized" -- the two were
+            # indistinguishable from the logs, which cost a long detour while
+            # diagnosing Kimi-K3 (whose MoE, it turns out, never reaches this
+            # config at all: it is served by Mxfp4Config/Mxfp4MoEMethod).
+            logger.info_once(
+                "compressed-tensors MoE scheme for %s: %s"
+                % (prefix, type(layer.scheme).__name__ if layer.scheme else "None (ignored -> unquantized)")
+            )
             if layer.scheme is None:  # ignored layer
                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
                 use_flashinfer_trtllm_moe = (

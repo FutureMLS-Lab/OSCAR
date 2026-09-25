@@ -52,6 +52,55 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
+def is_minimax_sparse(config) -> bool:
+    """MiniMax-M3 with MiniMax Sparse Attention (block-sparse GQA + lightning indexer)."""
+    architectures = (
+        config.get("architectures")
+        if isinstance(config, dict)
+        else getattr(config, "architectures", None)
+    )
+    arch = (architectures or [None])[0]
+    return arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    )
+
+
+def get_minimax_sparse_attention_config(config) -> dict:
+    text_cfg = getattr(config, "text_config", None)
+    cfg = (
+        getattr(text_cfg, "sparse_attention_config", None)
+        if text_cfg is not None
+        else None
+    )
+    if cfg is None:
+        cfg = getattr(config, "sparse_attention_config", None)
+    if cfg is None:
+        raise ValueError("Could not find sparse_attention_config. Is it a MiniMax-M3 sparse model?")
+    return cfg
+
+
+def get_minimax_sparse_layer_ids(sparse_cfg: dict) -> tuple:
+    """(dense_layer_ids, sparse_layer_ids) from sparse_attention_freq."""
+    sparse_freq = sparse_cfg["sparse_attention_freq"]
+    dense_layer_ids = [i for i, f in enumerate(sparse_freq) if f == 0]
+    sparse_layer_ids = [i for i, f in enumerate(sparse_freq) if f != 0]
+    return dense_layer_ids, sparse_layer_ids
+
+
+def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list:
+    flags = sparse_cfg.get("sparse_disable_index_value")
+    if flags is None:
+        return []
+    return [i for i, f in enumerate(flags) if f != 0]
+
+
+def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
+    score_type = sparse_cfg.get("sparse_score_type", "max")
+    assert score_type in ("max", "lse"), f"sparse_score_type must be 'max' or 'lse', got {score_type!r}"
+    return score_type
+
+
 def is_deepseek_nsa(config) -> bool:
     architectures = (
         config.get("architectures")
@@ -155,8 +204,13 @@ class ModelConfig:
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
+                "Gemma4UnifiedForConditionalGeneration",
+                "KimiK3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                # MiniMax-M3 ships a VL wrapper config but we serve it text-only
+                # (the sglang model def builds only the language model).
+                "MiniMaxM3SparseForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -373,7 +427,24 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
-        if self.is_hybrid_swa:
+        # gemma4_unified + OSCAR INT2 mixed-KV: serve the hybrid-SWA model
+        # through the *single* UnifiedInt2HPKVPool with two uniform geometry
+        # groups (full: 1x512, sliding: 8x256) sharing one head-dim-agnostic
+        # allocator, instead of the SWAKVPool. This forgoes only the
+        # sliding-window *memory* optimization; the per-layer sliding-window
+        # attention mask still applies (it comes from layer.sliding_window_size
+        # in the model, independent of the memory pool). Gated on
+        # SGLANG_ENABLE_MIXED_KV_WINDOWS so BF16 / non-OSCAR serving is
+        # byte-for-byte unchanged (keeps is_hybrid_swa -> SWAKVPool).
+        self.unified_two_group_kv = False
+        if (
+            "Gemma4UnifiedForConditionalGeneration" in self.hf_config.architectures
+            and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+        ):
+            self.is_hybrid_swa = False
+            self.unified_two_group_kv = True
+
+        if self.is_hybrid_swa or self.unified_two_group_kv:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
@@ -386,6 +457,7 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         ]
 
     def _derive_context_length(self, context_length: int):
@@ -506,6 +578,65 @@ class ModelConfig:
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif "KimiK3ForConditionalGeneration" in self.hf_config.architectures:
+            # Kimi-K3 is MLA + KDA linear attention, and it is declared as such.
+            #
+            # It used to declare ``AttentionArch.MHA`` and store expanded
+            # per-head K/V (192/128) purely so the OSCAR packed-INT2 backend
+            # could reach it: the per-head hybrid gate required
+            # ``not use_mla_backend`` while the latent pool's gate requires
+            # ``not mambaish_config``, so a mambaish MLA model was excluded from
+            # both INT2 paths. That is fixed in model_runner_kv_cache_mixin, so
+            # the lie is no longer load-bearing -- and it was expensive: expanded
+            # storage costs (192+128) x 2bit x num_kv_heads per token against one
+            # 288 B latent shared across heads, which is why K3's pool measured
+            # 264,168 tokens where GLM-5.2's measured 1,882,304.
+            #
+            # K3 is latent-only. There used to be a second layout here --
+            # the same weights expanded back into per-head K/V, kept as the
+            # default because it was the arm that had a score. It stored
+            # 96 x 128 x 2 = 24,576 values per token per layer against the
+            # latent's 512 + 64, giving up the compression the cache exists
+            # for, and the reasons for keeping it have both expired: the
+            # latent path is scored (GPQA 83.33 packed 2-bit / 93.75 BF16,
+            # n=48 at 64K) and its 24 per-layer 512x512 rotations exist. It is
+            # removed rather than left as a flag nobody should set.
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            # scaling MUST be set here, and it was not.
+            #
+            # The removed MHA branch set 1/sqrt(head_dim); the DeepSeek MLA
+            # branch sets 1/sqrt(qk_nope + qk_rope) and then applies the
+            # mscale correction for rope scaling; the sibling
+            # KimiLinearForCausalLM branch below does both. This branch set
+            # neither, so the absorbed path ran with whatever scaling was
+            # left over -- a softmax at the wrong temperature, which
+            # produces locally fluent and globally wrong text rather than
+            # anything that looks like a numerical fault. That matches what
+            # the BF16 latent control actually did: coherent prose,
+            # off-task, and never emitting a response section.
+            #
+            # Mirrors the KimiLinear sibling because it is the same family
+            # and the same rope configuration.
+            self.scaling = 1 / math.sqrt(
+                self.hf_text_config.qk_nope_head_dim
+                + self.hf_text_config.qk_rope_head_dim
+            )
+            _rs = getattr(self.hf_text_config, "rope_scaling", None)
+            if _rs:
+                _rt = _rs.get("rope_type") or _rs.get("type") or "default"
+                if _rt != "default":
+                    self.scaling = compute_mla_mscale_scaling(_rs, self.scaling)
+            logger.info(
+                "K3 MLA latent: head_dim=%d v_head_dim=%d scaling=%.6f "
+                "(rope_scaling=%s)",
+                self.head_dim, self.v_head_dim, self.scaling,
+                (_rs or {}).get("rope_type") or (_rs or {}).get("type"),
+            )
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif "KimiLinearForCausalLM" in self.hf_config.architectures:
             self.head_dim = 72
@@ -704,8 +835,28 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None and self.hf_text_config is not self.hf_config:
+            quant_cfg = getattr(self.hf_text_config, "quantization_config", None)
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
+        if (
+            quant_cfg is not None
+            and "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            and "mxfp4" in quant_cfg.get("format", "")
+        ):
+            quant_cfg = dict(quant_cfg)
+            ignored = list(quant_cfg.get("ignore", []))
+            for pattern in (
+                r"re:.*mlp\.gate$",
+                r"re:.*self_attention_res_proj.*",
+                r"re:.*mlp_res_proj.*",
+                r"re:.*output_attn_res_proj.*",
+                r"re:.*routed_expert_down_proj.*",
+                r"re:.*routed_expert_up_proj.*",
+            ):
+                if pattern not in ignored:
+                    ignored.append(pattern)
+            quant_cfg["ignore"] = ignored
         if quant_cfg is not None:
             # Identify modelopt quantization
             if (
@@ -1312,6 +1463,9 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
+    # gemma4_unified is multimodal only when --enable-multimodal is set; when off it
+    # stays in mm_disabled_models above and is served text-only (INT2 OSCAR path).
+    "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -1462,6 +1616,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1515,6 +1670,7 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "Gemma4UnifiedForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [

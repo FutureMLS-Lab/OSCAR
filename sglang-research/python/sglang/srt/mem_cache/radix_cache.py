@@ -24,7 +24,6 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import logging
-import math
 import sys
 import time
 from collections import defaultdict
@@ -41,6 +40,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
 )
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import MixedKVPrefixMixin
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -283,7 +283,7 @@ def split_node_hash_value(
     return new_node_hash, child_hash
 
 
-class RadixCache(BasePrefixCache):
+class RadixCache(MixedKVPrefixMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -337,24 +337,7 @@ class RadixCache(BasePrefixCache):
         # per-request HP-recent slots are excluded by ``_mixed_kv_tail_to_drop``
         # (correctness — they alias across requests) and ``match_prefix`` is
         # capped via ``_mixed_kv_match_cap_overhead``.
-        self._mixed_kv_enabled = False
-        self._mixed_kv_hp_prefix_tokens = 0
-        self._mixed_kv_match_cap_overhead = 0
-        if self.token_to_kv_pool_allocator is not None:
-            kvc_getter = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
-            kvc = kvc_getter() if kvc_getter is not None else None
-            if kvc is not None:
-                mixed_kv_enabled_fn = getattr(kvc, "mixed_kv_enabled", None)
-                if mixed_kv_enabled_fn is not None and mixed_kv_enabled_fn():
-                    self._mixed_kv_enabled = True
-                    self._mixed_kv_hp_prefix_tokens = int(
-                        getattr(kvc, "hp_prefix_tokens", 0)
-                    )
-                    hp_recent = int(getattr(kvc, "hp_recent_tokens", 0))
-                    flush_overflow = max(
-                        0, int(getattr(kvc, "flush_interval", 1)) - 1
-                    )
-                    self._mixed_kv_match_cap_overhead = hp_recent + flush_overflow
+        self._init_mixed_kv()
 
         self.reset()
 
@@ -455,40 +438,25 @@ class RadixCache(BasePrefixCache):
             key = key[:page_aligned_len]
 
         # Mixed-KV: cap the match so positions in the request's HP-recent
-        # window are NEVER returned from cache. A full match would cover
-        # those positions with quant slots from a deeper inserter,
-        # breaking the HP-precision invariant for the recent window.
-        # Cacheable positions = [0, max(hp_prefix, len - hp_recent_overflow))
-        # — for very short requests where the post-prefix region is
-        # entirely HP-recent, only the HP-prefix portion is cacheable;
-        # for long requests, everything before the trailing HP-recent
-        # band is cacheable. Page-aligned to keep the radix tree happy.
+        # window are NEVER returned from cache. See
+        # :meth:`_mixed_kv_tier_cap` for the invariant and why it must hold
+        # for *every* consumer of a match length, internal ones included.
         #
-        # Internal callers (``cache_unfinished_req``'s post-insert
-        # sibling-coverage match) pass ``bypass_mixed_kv_cap=True``: that
-        # call needs the FULL match length to stay consistent with the
-        # ``cache_protected_len`` admission set. Capping it desyncs the
-        # ``prefix_indices`` reconstruction at line ~725 (Python slicing
-        # silently truncates ``new_indices[:cache_protected_len]`` when
-        # ``len(new_indices) < cache_protected_len``), which silently
-        # drops slot ids and leaks them (the leak detector flags it as
-        # ~32-slot per-request residue under stress).
+        # ``bypass_mixed_kv_cap=True`` (``cache_unfinished_req``'s post-insert
+        # sibling-coverage match) skips the cap here because that caller
+        # applies it itself, to its own key length, *before* clamping by the
+        # partial-quant-page cutoff and by what it just inserted — capping
+        # blindly there desyncs the ``prefix_indices`` reconstruction below
+        # (Python slicing silently truncates
+        # ``new_indices[:cache_protected_len]`` when the match came back
+        # shorter), which leaks slot ids.
         if (
             self._mixed_kv_enabled
             and len(key) > 0
             and not params.bypass_mixed_kv_cap
         ):
-            n = len(key)
-            cap = min(
-                n,
-                max(
-                    self._mixed_kv_hp_prefix_tokens,
-                    n - self._mixed_kv_match_cap_overhead,
-                ),
-            )
-            if self.page_size > 1:
-                cap = cap // self.page_size * self.page_size
-            if cap < n:
+            cap = self._mixed_kv_tier_cap(len(key))
+            if cap < len(key):
                 key = key[:cap]
 
         if len(key) == 0:
@@ -724,15 +692,30 @@ class RadixCache(BasePrefixCache):
                 kv_indices[protected_len:free_end]
             )
 
-        # For mixed-KV we match as deeply as it is safe to share. That is
-        # usually the FULL (untrimmed) key so ``cache_protected_len`` never
-        # regresses, but it must stop before a request-owned partial quant
-        # page; otherwise radix can retain the live slots while the request
-        # frees that page's slack later.
+        # For mixed-KV we match as deeply as it is safe to share. Three
+        # bounds, all required:
+        #
+        # 1. ``_mixed_kv_tier_cap``: never past this request's own HP-recent
+        #    start, or the tree serves at 2 bits what the request was supposed
+        #    to keep in BF16 (and the flush can never demote it). This is the
+        #    same cap admission gets; applying it here too is what keeps
+        #    ``cache_protected_len`` tier-stable. Without it a sibling (or, in
+        #    multi-turn, this request's own previous turn) covers the whole
+        #    prompt and pushes ``cache_protected_len`` above the HP-recent
+        #    start, wiping out the recent window.
+        # 2. the request-owned partial quant page cutoff; otherwise radix can
+        #    retain the live slots while the request frees that page's slack.
+        # 3. never below what we just inserted, so ``cache_protected_len`` is
+        #    monotonic and the ``prefix_indices`` rebuild below cannot silently
+        #    truncate (which would leak slot ids).
         match_len = len(keys)
+        tier_cap = self._mixed_kv_tier_cap(match_len)
+        if tier_cap < match_len:
+            match_len = tier_cap
         slack_insert_limit = self._mixed_kv_slack_insert_limit(req, match_len)
         if slack_insert_limit < match_len:
             match_len = slack_insert_limit
+        match_len = max(match_len, len(insert_keys))
         match_key = keys[:match_len]
         full_radix_key = RadixKey(match_key, req.extra_key, is_bigram=self.is_eagle)
         match_result = self.match_prefix(
@@ -913,30 +896,6 @@ class RadixCache(BasePrefixCache):
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
-
-    def _mixed_kv_tail_to_drop(self, committed_len: int) -> int:
-        # HP-recent slot ids are per-request and must not enter the tree.
-        # Trim a fixed ``hp_recent + flush_overflow`` window from the
-        # tail (page-aligned, ceil'd), which fully covers the worst-case
-        # HP-recent span at any time.
-        allocator = self.token_to_kv_pool_allocator
-        if allocator is None:
-            return 0
-        kvcache = allocator.get_kvcache()
-        mixed_kv_enabled_fn = getattr(kvcache, "mixed_kv_enabled", None)
-        if mixed_kv_enabled_fn is None or not mixed_kv_enabled_fn():
-            return 0
-        hp_prefix = int(getattr(kvcache, "hp_prefix_tokens", 0))
-        hp_recent = int(getattr(kvcache, "hp_recent_tokens", 0))
-        flush_overflow = max(1, int(getattr(kvcache, "flush_interval", 1))) - 1
-        if hp_recent <= 0 or committed_len <= hp_prefix:
-            return 0
-        trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
-        if self.page_size > 1:
-            trim = math.ceil(trim / self.page_size) * self.page_size
-        # Clip back if ceil pushed past the available range.
-        trim = min(trim, committed_len - hp_prefix)
-        return trim
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()

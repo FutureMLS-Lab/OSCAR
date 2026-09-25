@@ -48,6 +48,13 @@ def is_layer_skipped(
     ignored_layers: List[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
 ) -> bool:
+    def matches(pattern: str, layer_name: str) -> bool:
+        return (
+            re.search(pattern.removeprefix("re:"), layer_name) is not None
+            if pattern.startswith("re:")
+            else pattern in layer_name
+        )
+
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]
@@ -65,7 +72,7 @@ def is_layer_skipped(
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                ignored in shard_prefix for ignored in ignored_layers
+                matches(ignored, shard_prefix) for ignored in ignored_layers
             )
 
             if is_skipped is None:
@@ -77,7 +84,7 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(ignored in prefix for ignored in ignored_layers)
+        is_skipped = any(matches(ignored, prefix) for ignored in ignored_layers)
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")

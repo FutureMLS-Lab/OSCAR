@@ -129,6 +129,7 @@ class TritonRunnerCore(MoeRunnerCore):
         # TODO: move these functions to the triton runner
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
             _swiglu_gpt_oss_sigmoid_alpha,
+            _swiglu_oai_chunked,
             _swiglu_silu_clamp_mul,
             invoke_fused_moe_kernel,
             moe_sum_reduce_torch_compile,
@@ -228,6 +229,11 @@ class TritonRunnerCore(MoeRunnerCore):
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
+        elif activation == "swigluoai":
+            assert gemm1_alpha is not None and gemm1_limit is not None
+            intermediate_cache2 = _swiglu_oai_chunked(
+                intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
+            )
         elif activation == "gelu":
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"

@@ -73,7 +73,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             device="cuda",
         )
 
-    def run_fused(self):
+    def run_fused(self, lower_bound=None):
         ssm_states = self.ssm_states.clone()
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -90,12 +90,19 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             softplus_beta=self.softplus_beta,
             softplus_threshold=self.softplus_threshold,
             is_kda=True,
+            lower_bound=lower_bound,
         )
         return core_attn_out, ssm_states[self.cache_indices]
 
-    def run_kda(self):
+    def run_kda(self, lower_bound=None):
         b = self.beta.float().sigmoid()
-        g = fused_kda_gate(self.a, self.A_log, self.head_dim, g_bias=self.dt_bias)
+        g = fused_kda_gate(
+            self.a,
+            self.A_log,
+            self.head_dim,
+            g_bias=self.dt_bias,
+            lower_bound=lower_bound,
+        )
         initial_state = self.ssm_states[self.cache_indices].clone()
         core_attn_out, last_state = fused_recurrent_kda(
             q=self.q,
@@ -117,6 +124,35 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
         print(f"{abs_diff_out=}, {abs_diff_state=}")
         self.assertTrue(
             torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
+        )
+        self.assertTrue(torch.allclose(last_state, last_state_ref))
+
+    def test_kda_safe_gate_fused_sigmoid_gating_recurrent(self):
+        core_attn_out, last_state = self.run_fused(lower_bound=-5.0)
+        core_attn_out_ref, last_state_ref = self.run_kda(lower_bound=-5.0)
+        self.assertTrue(
+            torch.allclose(
+                core_attn_out,
+                core_attn_out_ref,
+                rtol=1e-3,
+                atol=1e-4,
+            )
+        )
+        self.assertTrue(torch.allclose(last_state, last_state_ref))
+
+    def test_kda_safe_gate_per_channel_A_log(self):
+        self.A_log = torch.randn(
+            self.head_dim, dtype=torch.float32, device="cuda"
+        )
+        core_attn_out, last_state = self.run_fused(lower_bound=-5.0)
+        core_attn_out_ref, last_state_ref = self.run_kda(lower_bound=-5.0)
+        self.assertTrue(
+            torch.allclose(
+                core_attn_out,
+                core_attn_out_ref,
+                rtol=1e-3,
+                atol=1e-4,
+            )
         )
         self.assertTrue(torch.allclose(last_state, last_state_ref))
 
