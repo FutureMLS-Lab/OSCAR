@@ -718,6 +718,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
         )
+        # OSCAR V-rotation absorption flag (set by
+        # _maybe_absorb_oscar_v_rotation_qwen35 at end of load_weights when
+        # SGLANG_OSCAR_ABSORB_V_ROTATION=1).
+        self.attn.oscar_v_rotation_absorbed = False
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
@@ -889,6 +893,147 @@ ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3_5AttentionDecoderLayer,
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
+
+
+def _maybe_absorb_oscar_v_rotation_qwen35(
+    model: nn.Module,
+    *,
+    quant_config: Optional[QuantizationConfig] = None,
+    model_label: str = "Qwen3.5",
+) -> bool:
+    """Qwen3.5-specific OSCAR V-rotation absorption for full_attention layers.
+
+    The generic ``maybe_absorb_oscar_v_rotation_into_qkv`` in
+    ``sglang.srt.models.utils`` does not handle Qwen3.5 because:
+
+    1. **Hybrid layers.** ``Qwen3_5LinearDecoderLayer`` has no ``qkv_proj`` /
+       ``self_attn``; the generic helper would crash on layer 0.
+    2. **attn_output_gate.** The full-attention layer's ``qkv_proj`` is built
+       with ``head_size=head_dim`` and ``num_heads=total_num_heads * 2``
+       (Q + gate fused), so the output layout is
+       ``[2*q_size + kv_size + kv_size, hidden]``. The generic helper computes
+       ``v_offset = q_size + kv_size``, which would land in the gate region
+       and silently corrupt weights.
+
+    This helper iterates only over ``Qwen3_5AttentionDecoderLayer`` instances
+    and folds R_v into the V slice at the correct offset
+    (``2*q_size + kv_size``). Only dense bf16/fp16/fp32 ``qkv_proj`` is
+    supported (no FP8 paths for Qwen3.5 yet).
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.memory_pool import load_oscar_rotation_config
+
+    if not envs.SGLANG_OSCAR_ABSORB_V_ROTATION.get():
+        return False
+
+    oscar_cfg = load_oscar_rotation_config()
+    start_layer = int(getattr(model, "start_layer", 0))
+    end_layer = int(getattr(model, "end_layer", len(model.layers)))
+    if start_layer >= end_layer:
+        return False
+
+    full_attn_layer_ids = [
+        lid
+        for lid in range(start_layer, end_layer)
+        if isinstance(model.layers[lid], Qwen3_5AttentionDecoderLayer)
+    ]
+
+    if not full_attn_layer_ids:
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1 was requested for {model_label} "
+            f"but no Qwen3_5AttentionDecoderLayer found in layer range "
+            f"[{start_layer}, {end_layer})."
+        )
+
+    first_attn = model.layers[full_attn_layer_ids[0]]
+    qkv_weight = getattr(first_attn.qkv_proj, "weight", None)
+    if qkv_weight is None or qkv_weight.ndim != 2:
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1: {model_label} layer "
+            f"{full_attn_layer_ids[0]} qkv_proj.weight is not 2D — Qwen3.5 "
+            f"OSCAR absorption currently supports only dense (bf16/fp16/fp32) "
+            f"qkv_proj layouts."
+        )
+    if qkv_weight.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1: {model_label} qkv_proj has "
+            f"dtype={qkv_weight.dtype}; only dense float types supported. "
+            f"Extend this helper if FP8 Qwen3.5 weights are needed."
+        )
+
+    head_dim = first_attn.head_dim
+    rot_state = torch.load(oscar_cfg.v_rotation_path, map_location="cpu")
+    if "layers" not in rot_state:
+        raise ValueError(
+            f"OSCAR V-rotation checkpoint at {oscar_cfg.v_rotation_path} "
+            f"missing 'layers' key"
+        )
+    rot_layers = rot_state["layers"]
+
+    folded = 0
+    skipped = 0
+    for layer_id in full_attn_layer_ids:
+        attn = model.layers[layer_id]
+        if getattr(attn.attn, "oscar_v_rotation_absorbed", False):
+            skipped += 1
+            continue
+
+        key = layer_id if layer_id in rot_layers else str(layer_id)
+        if key not in rot_layers:
+            raise ValueError(
+                f"OSCAR V-rotation checkpoint missing entry for "
+                f"{model_label} layer {layer_id} (have keys: "
+                f"{sorted(rot_layers.keys())[:8]}...)"
+            )
+        R = rot_layers[key]["rotation"]
+        if R.shape != (head_dim, head_dim):
+            raise ValueError(
+                f"OSCAR V-rotation layer {layer_id} has shape "
+                f"{tuple(R.shape)}, expected ({head_dim}, {head_dim})"
+            )
+
+        weight = attn.qkv_proj.weight
+        R_v = R.to(dtype=torch.float32, device=weight.device)
+
+        # qkv_proj output layout (with attn_output_gate=True):
+        #   [q_size + gate_size + kv_size + kv_size]
+        # where gate_size == q_size. The generic helper assumes no gate,
+        # so we recompute v_offset here.
+        attn_output_gate = bool(getattr(attn, "attn_output_gate", True))
+        q_block_size = attn.q_size * (2 if attn_output_gate else 1)
+        v_offset = q_block_size + attn.kv_size
+
+        v_weight = weight.data.narrow(0, v_offset, attn.kv_size)
+        v_weight_3d = v_weight.reshape(attn.num_kv_heads, attn.head_dim, -1)
+        folded_weight = torch.matmul(
+            R_v.T, v_weight_3d.to(torch.float32)
+        ).to(dtype=weight.dtype)
+        v_weight.copy_(folded_weight.reshape_as(v_weight))
+
+        # Qwen3.5 qkv_proj has bias=False, so no V-bias absorption needed.
+
+        attn.attn.oscar_v_rotation_absorbed = True
+        folded += 1
+
+    if folded == 0 and skipped == 0:
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1: {model_label} no layers folded."
+        )
+    if folded == 0:
+        # All layers already absorbed (e.g. duplicate call); idempotent no-op.
+        return False
+
+    logger.info(
+        "Absorbed OSCAR V rotation into %s qkv_proj for %d/%d full-attention "
+        "layers (skipped %d already-absorbed; layout=dense, attn_output_gate=%s).",
+        model_label,
+        folded,
+        len(full_attn_layer_ids),
+        skipped,
+        bool(getattr(first_attn, "attn_output_gate", True)),
+    )
+    return True
+
 
 
 class Qwen3_5ForCausalLM(nn.Module):
@@ -1117,6 +1262,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        _maybe_absorb_oscar_v_rotation_qwen35(
+            self, model_label="Qwen3.5"
+        )
         return loaded_params
 
     @classmethod
@@ -1335,6 +1483,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        _maybe_absorb_oscar_v_rotation_qwen35(
+            self, model_label="Qwen3.5-MoE"
+        )
         return loaded_params
 
 
@@ -1470,6 +1621,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        _maybe_absorb_oscar_v_rotation_qwen35(
+            self.model, quant_config=self.quant_config, model_label="Qwen3.5-VL"
+        )
         return loaded_params
 
 
@@ -1734,6 +1888,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             }
         )
 
+        _maybe_absorb_oscar_v_rotation_qwen35(
+            self.model,
+            quant_config=self.quant_config,
+            model_label="Qwen3.5-MoE-VL",
+        )
         return loaded_params
 
     @property

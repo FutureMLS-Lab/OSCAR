@@ -148,8 +148,34 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
+        self._cached_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+
+    def _decode_query_start_loc(self, bs: int) -> torch.Tensor:
+        """arange(0, bs + 1) for decode, from a buffer that outlives the batch.
+
+        Allocating this fresh per forward is only safe while something holds a
+        reference until the GPU has finished reading it. self.forward_metadata
+        is a single slot, so the next microbatch's init drops that reference
+        while the previous one's kernels can still be queued. Under pipeline
+        parallelism K3 decoded with cu_seqlens full of float bit patterns --
+        0.0697, -0.0318, 0.1251 read as int32 -- where offsets belonged: the
+        block had been recycled into an activation. The KDA kernel then walked
+        q out to ~1e9 and faulted, and with CUDA graphs on it corrupted state
+        silently and the model emitted word salad instead.
+
+        The CUDA-graph path already keeps a persistent arange for exactly this
+        tensor (cached_cuda_graph_decode_query_start_loc); the eager path never
+        got one. A persistent buffer is also one fewer allocation per step.
+        """
+        need = bs + 1
+        buf = self._cached_decode_query_start_loc
+        if buf is None or buf.numel() < need:
+            grown = max(need, 2 * (0 if buf is None else buf.numel()), 256)
+            buf = torch.arange(0, grown, dtype=torch.int32, device=self.device)
+            self._cached_decode_query_start_loc = buf
+        return buf[:need]
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -168,9 +194,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            query_start_loc = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=self.device
-            )
+            query_start_loc = self._decode_query_start_loc(bs)
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends

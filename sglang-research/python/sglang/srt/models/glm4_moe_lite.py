@@ -255,7 +255,7 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -311,7 +311,7 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
             )
-            self.renormalize = config.norm_topk_prob
+            self.renormalize = getattr(config, "norm_topk_prob", True)
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
             self.correction_bias = (

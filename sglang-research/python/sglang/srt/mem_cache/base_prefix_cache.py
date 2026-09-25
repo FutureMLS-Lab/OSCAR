@@ -42,13 +42,15 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
-    # Mixed-KV (HP+int2): when True, bypass the HP-recent match cap that
-    # ``RadixCache.match_prefix`` normally applies. Used by internal callers
-    # (``cache_unfinished_req``'s post-insert sibling-coverage match) that
-    # need the FULL coverage to keep ``cache_protected_len`` consistent
-    # with what admission set; capping there causes a silent slot leak in
-    # ``prefix_indices`` reconstruction. Admission paths leave this False
-    # so HP-recent positions remain freshly-allocated HP slots.
+    # Mixed-KV (HP+int2): when True, ``RadixCache.match_prefix`` skips the
+    # HP-recent tier cap because the caller already applied it. The only such
+    # caller is ``cache_unfinished_req``'s post-insert sibling-coverage match,
+    # which caps with ``_mixed_kv_tier_cap`` and then clamps by the
+    # partial-quant-page cutoff and by its own insert length; capping blindly
+    # inside ``match_prefix`` instead would let the match come back shorter
+    # than ``cache_protected_len`` and silently truncate the
+    # ``prefix_indices`` rebuild, leaking slot ids. The cap itself is NOT
+    # optional -- see ``RadixCache._mixed_kv_tier_cap``.
     bypass_mixed_kv_cap: bool = False
 
 

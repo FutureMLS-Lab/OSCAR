@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache import mixed_kv_audit
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -746,6 +747,16 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
     )
 
     if plan is not None:
+        if mixed_kv_audit.audit_enabled():
+            mixed_kv_audit.audit_flush_plan(
+                plan,
+                flush_mask=flush_mask,
+                seq_lens=seq_lens_int32,
+                prefix_lens=prefix_lens_gpu,
+                req_pool_indices=req_pool_indices_int64,
+            )
+            mixed_kv_audit.audit_req_to_token(batch, kv_pool)
+            mixed_kv_audit.audit_kv_content(batch, kv_pool)
         # Free everything returned by the kernel in one call: flushed HP
         # slots (freed from HP tier) and unused quant slots from
         # non-flushing requests (whole pages, since per-request
@@ -763,37 +774,56 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         wait_pending_forward()
 
     if plan is not None:
-        gpu_flush_int2_apply(
-            plan,
-            req_pool_indices=req_pool_indices_int64,
-            req_to_token=batch.req_to_token_pool.req_to_token,
-            hp_k_ptrs=kv_pool._flush_hp_k_ptrs,
-            hp_v_ptrs=kv_pool._flush_hp_v_ptrs,
-            quant_k_ptrs=kv_pool._flush_quant_k_ptrs,
-            quant_v_ptrs=kv_pool._flush_quant_v_ptrs,
-            k_sz_ptrs=kv_pool._flush_k_sz_ptrs,
-            v_sz_ptrs=kv_pool._flush_v_sz_ptrs,
-            hp_k_sample=kv_pool.hp_k_buffer[0],
-            hp_v_sample=kv_pool.hp_v_buffer[0],
-            quant_k_sample=kv_pool.k_buffer[0],
-            quant_v_sample=kv_pool.v_buffer[0],
-            k_sz_sample=kv_pool.k_scales_zeros[0],
-            v_sz_sample=kv_pool.v_scales_zeros[0],
-            hp_k_strides=kv_pool._flush_hp_k_stride,
-            hp_v_strides=kv_pool._flush_hp_v_stride,
-            quant_k_strides=kv_pool._flush_quant_k_stride,
-            quant_v_strides=kv_pool._flush_quant_v_stride,
-            k_sz_strides=kv_pool._flush_k_sz_stride,
-            v_sz_strides=kv_pool._flush_v_sz_stride,
-            num_heads=kv_pool.head_num,
-            head_dim=kv_pool.head_dim,
-            v_head_dim=kv_pool.v_head_dim,
-            k_num_scale_groups=kv_pool.k_num_scale_groups,
-            v_num_scale_groups=kv_pool.v_num_scale_groups,
-            num_layers=kv_pool.layer_num,
-            k_clip_ratio=kv_pool._k_clip_ratio,
-            v_clip_ratio=kv_pool._v_clip_ratio,
-        )
+        # The fused flush kernel requires identical strides across the layers
+        # it spans, so it runs once per uniform-geometry group. For uniform
+        # models ``_flush_groups`` has a single entry covering all layers
+        # (one launch, identical to the previous behavior); for two-group
+        # models (gemma4_unified: full 1x512 + sliding 8x256) it has one entry
+        # per geometry. The plan (slot ids / req_to_token positions) is
+        # geometry-agnostic and shared across groups. The remap kernel only
+        # needs to run once, so it is issued by the LAST group's apply.
+        groups = getattr(kv_pool, "_flush_groups", None)
+        n_groups = len(groups)
+        for gi, g in enumerate(groups):
+            gpu_flush_int2_apply(
+                plan,
+                req_pool_indices=req_pool_indices_int64,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                hp_k_ptrs=g["hp_k_ptrs"],
+                hp_v_ptrs=g["hp_v_ptrs"],
+                quant_k_ptrs=g["quant_k_ptrs"],
+                quant_v_ptrs=g["quant_v_ptrs"],
+                k_sz_ptrs=g["k_sz_ptrs"],
+                v_sz_ptrs=g["v_sz_ptrs"],
+                hp_k_sample=g["hp_k_sample"],
+                hp_v_sample=g["hp_v_sample"],
+                quant_k_sample=g["k_sample"],
+                quant_v_sample=g["v_sample"],
+                k_sz_sample=g["k_sz_sample"],
+                v_sz_sample=g["v_sz_sample"],
+                hp_k_strides=g["hp_k_stride"],
+                hp_v_strides=g["hp_v_stride"],
+                quant_k_strides=g["quant_k_stride"],
+                quant_v_strides=g["quant_v_stride"],
+                k_sz_strides=g["k_sz_stride"],
+                v_sz_strides=g["v_sz_stride"],
+                num_heads=g["head_num"],
+                head_dim=g["head_dim"],
+                v_head_dim=g["v_head_dim"],
+                k_num_scale_groups=g["k_num_scale_groups"],
+                v_num_scale_groups=g["v_num_scale_groups"],
+                num_layers=g["num_layers"],
+                k_clip_ratio=kv_pool._k_clip_ratio,
+                v_clip_ratio=kv_pool._v_clip_ratio,
+                lloyd_max=getattr(kv_pool, "_lloyd_max", False),
+                apply_remap=(gi == n_groups - 1),
+                hp_k_layers=g["hp_k_layers"],
+                hp_v_layers=g["hp_v_layers"],
+                quant_k_layers=g["quant_k_layers"],
+                quant_v_layers=g["quant_v_layers"],
+                k_sz_layers=g["k_sz_layers"],
+                v_sz_layers=g["v_sz_layers"],
+            )
 
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
@@ -917,6 +947,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if _is_mixed_kv_enabled(batch):
         return _alloc_for_decode_mixed(batch, token_per_req)
 
+    # The MLA/NSA latent pool tiers inside one float arena, so it never routes
+    # through _alloc_for_decode_mixed and needs its own audit hook. No-op
+    # unless SGLANG_MIXED_KV_AUDIT=1 and that pool has its windows on.
+    if mixed_kv_audit.audit_enabled():
+        mixed_kv_audit.audit_latent_windows(
+            batch, batch.token_to_kv_pool_allocator.get_kvcache()
+        )
+
     bs = batch.seq_lens.shape[0]
 
     if batch.tree_cache.page_size == 1:
@@ -1006,6 +1044,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     release_slab = getattr(kvcache, "release_req_slab", None)
     if release_slab is not None:
         release_slab(req.req_pool_idx)
+        mixed_kv_audit.audit_release(req.req_pool_idx)
 
     tree_cache.req_to_token_pool.free(req)
 

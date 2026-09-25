@@ -164,5 +164,13 @@ class Qwen3ASRConfig(PretrainedConfig):
         return self.thinker_config.text_config
 
 
-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+# exist_ok=True: transformers >= 5.16 ships its own "qwen3_asr" config, and an
+# unguarded register raises
+#   ValueError: 'qwen3_asr' is already used by a Transformers config
+# at IMPORT time -- which takes down `import sglang` entirely, for every model,
+# because of one architecture nothing in the support table uses. The sibling
+# registry in hf_transformers_utils.py already guards the same way.
+# exist_ok (rather than skipping) keeps the fork's config authoritative, which is
+# what the fork's own qwen3_asr model code expects.
+AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
+AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)

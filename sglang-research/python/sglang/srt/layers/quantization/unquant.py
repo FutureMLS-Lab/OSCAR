@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,48 @@ try:
     from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+
+class Bf16GemmBackend(Enum):
+    """Which bf16 GEMM implementation model code should ask for.
+
+    Ported from upstream alongside kimi_k3.py, which calls
+    get_bf16_gemm_backend() on its fused front. Only the selector lives here;
+    the CUTEDSL kernels it can name are part of upstream's sglang.kernels
+    package, which this fork does not vendor, so the call site checks that the
+    kernel imports before acting on a CUTEDSL answer.
+    """
+
+    AUTO = "auto"
+    CUTEDSL = "cutedsl"
+    FLASHINFER_PR4266 = "flashinfer_pr4266"
+    GEMV = "gemv"
+    TORCH = "torch"
+
+    def is_auto(self) -> bool:
+        return self == Bf16GemmBackend.AUTO
+
+    def is_cutedsl(self) -> bool:
+        return self == Bf16GemmBackend.CUTEDSL
+
+    def is_gemv(self) -> bool:
+        return self == Bf16GemmBackend.GEMV
+
+    def is_flashinfer_pr4266(self) -> bool:
+        return self == Bf16GemmBackend.FLASHINFER_PR4266
+
+    def is_optimized(self) -> bool:
+        return self.is_cutedsl() or self.is_flashinfer_pr4266()
+
+
+_BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+
+
+def get_bf16_gemm_backend() -> Bf16GemmBackend:
+    global _BF16_GEMM_BACKEND
+    if _BF16_GEMM_BACKEND is None:
+        _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
+    return _BF16_GEMM_BACKEND
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):

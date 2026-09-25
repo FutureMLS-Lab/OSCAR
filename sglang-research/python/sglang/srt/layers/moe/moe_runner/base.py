@@ -42,12 +42,18 @@ class MoeRunnerConfig:
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True
+    # False when a checkpoint stores per-expert w1/w3 side by side rather than
+    # interleaved. Kimi-K3 does; every other model here uses the interleaved
+    # layout, so the default preserves their behaviour exactly.
+    gate_up_interleaved: bool = True
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    activation_situ_beta: float = 1.0
+    activation_situ_linear_beta: Optional[float] = None
 
 
 @dataclass

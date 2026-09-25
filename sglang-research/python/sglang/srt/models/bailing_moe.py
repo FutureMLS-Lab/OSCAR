@@ -190,7 +190,7 @@ class BailingMoESparseMoeBlock(nn.Module):
         self.alt_stream = alt_stream
         self.tp_size = get_tensor_model_parallel_world_size()
         self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
         self.hidden_size = config.hidden_size
         self.num_shared_experts = config.num_shared_experts
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)

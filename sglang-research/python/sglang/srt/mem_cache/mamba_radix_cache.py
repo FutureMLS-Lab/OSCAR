@@ -30,6 +30,7 @@ from numpy import float64
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
@@ -46,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import MixedKVPrefixMixin
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -420,11 +422,30 @@ class LRUList:
                 raise Exception(msg)
 
 
-class MambaRadixCache(BasePrefixCache):
+def _allocator_has_mixed_kv(allocator) -> bool:
+    """True when this allocator's pool is an INT2 mixed-KV pool."""
+    if allocator is None:
+        return False
+    kvc_getter = getattr(allocator, "get_kvcache", None)
+    kvc = kvc_getter() if kvc_getter is not None else None
+    fn = getattr(kvc, "mixed_kv_enabled", None) if kvc is not None else None
+    return bool(fn()) if fn is not None else False
+
+
+class MambaRadixCache(MixedKVPrefixMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
+        # The allocator only has to page tokens for us, which every
+        # ``BaseTokenToKVPoolAllocator`` does; naming two concrete subclasses
+        # here rejected ``UnifiedInt2HPKVAllocator`` (a sibling, not a
+        # subclass) with a bare ``AssertionError`` at scheduler init, on every
+        # TP rank, before a single token -- which reads as a crash rather than
+        # as "this cache does not support that allocator".
         assert isinstance(
-            params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
-        ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+            params.token_to_kv_pool_allocator, BaseTokenToKVPoolAllocator
+        ), (
+            "MambaRadixCache needs a BaseTokenToKVPoolAllocator, got "
+            f"{type(params.token_to_kv_pool_allocator).__name__}"
+        )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
@@ -436,6 +457,16 @@ class MambaRadixCache(BasePrefixCache):
             assert (
                 self.page_size == 1
             ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
+
+        # Mixed-KV tiers a sequence as [HP-prefix][quant][HP-recent ring].
+        # Only the HP-prefix window may be shared: the HP-recent ring is
+        # per-request BF16 storage the flush demotes out of, so a match
+        # reaching into it silently serves those positions as packed INT2 and
+        # leaves the borrower with almost no high-precision recent window
+        # (Qwen3-8B BFCL 38.4 -> 14.6 on multi-turn). The cap and the
+        # insert-side tail trim come from MixedKVPrefixMixin so this cache and
+        # RadixCache cannot drift apart.
+        self._init_mixed_kv()
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -484,6 +515,20 @@ class MambaRadixCache(BasePrefixCache):
             than the last node's value.
         """
         key = self._match_pre_processor(params)
+        # ``bypass_mixed_kv_cap=True`` is cache_unfinished_req's post-insert
+        # re-match, which asks for exactly the key it just inserted. Capping it
+        # lands the match inside that node, so _match_prefix_helper splits it
+        # and returns the deepest node that still carries a mamba value (the
+        # root), and the mamba assert downstream compares against None.
+        if (
+            key is not None
+            and self._mixed_kv_enabled
+            and len(key) > 0
+            and not params.bypass_mixed_kv_cap
+        ):
+            cap = self._mixed_kv_tier_cap(len(key))
+            if cap < len(key):
+                key = key[:cap]
         if key is None:
             return MatchResult(
                 device_indices=torch.empty(
@@ -538,6 +583,13 @@ class MambaRadixCache(BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
+            # HP-recent slot ids are per-request and alias across requests, so
+            # they must never enter the tree -- the same trim cache_unfinished_req
+            # applies. mamba_last_track_seqlen is the last 256-boundary seq_len,
+            # so without this the inserted tail is almost always inside the live
+            # HP-recent window.
+            if self._mixed_kv_enabled and cache_len > 0:
+                cache_len = max(0, cache_len - self._mixed_kv_tail_to_drop(cache_len))
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -623,6 +675,13 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
 
+        # HP-recent slot ids are per-request and alias across requests, so
+        # they must never enter the tree.
+        if self._mixed_kv_enabled and cache_len > 0:
+            cache_len -= self._mixed_kv_tail_to_drop(cache_len)
+            if cache_len <= 0:
+                return _skip_cache_unfinished_req(req)
+
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -684,7 +743,15 @@ class MambaRadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                # We ask for exactly what we just inserted; the HP-recent tail
+                # was already dropped from ``cache_len`` above. Capping again
+                # here would return a shorter prefix than the insert, which
+                # both breaks the mamba-value assert below and would truncate
+                # the ``prefix_indices`` rebuild (leaking slot ids).
+                bypass_mixed_kv_cap=True,
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,

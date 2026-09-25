@@ -315,6 +315,18 @@ def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
+@torch.compile
+def _swiglu_oai_chunked(x, gemm1_alpha, gemm1_limit):
+    # Same math as _swiglu_gpt_oss_sigmoid_alpha, but gate/up are CHUNKED
+    # (contiguous halves) rather than interleaved. Used by MiniMax-M3, whose
+    # experts ship separate w1 (gate) / w3 (up) tensors so the fused gate_up
+    # is [gate | up], not GPT-OSS's interleaved layout.
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
 @functools.lru_cache()
 def _down_moe_use_tma():
     return support_tensor_descriptor()
@@ -543,6 +555,11 @@ def fused_experts_impl(
                     x = intermediate_cache1.view(-1, N)
                     d = x.shape[-1] // 2
                     intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+        elif activation == "swigluoai" and is_gated:
+            assert gemm1_alpha is not None and gemm1_limit is not None
+            intermediate_cache2 = _swiglu_oai_chunked(
+                intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
+            )
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"

@@ -132,7 +132,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             layer_id=layer_idx,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             scoring_func="sigmoid",
             correction_bias=self.expert_bias if config.use_expert_bias else None,
         )

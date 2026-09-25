@@ -2816,7 +2816,16 @@ def require_gathered_buffer(server_args: ServerArgs):
     return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
 
 
-def require_mlp_sync(server_args: ServerArgs):
+def require_mlp_sync(server_args: Optional[ServerArgs] = None):
+    """Upstream dropped the argument and reads the global server args itself.
+
+    Kept optional so both spellings work: this fork's existing call sites pass
+    the object, and model files ported from upstream call it bare.
+    """
+    if server_args is None:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
