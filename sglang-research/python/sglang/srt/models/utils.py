@@ -276,11 +276,17 @@ class AutoWeightsLoader:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    pool = forward_batch.token_to_kv_pool
+    mixed_kv = getattr(pool, "mixed_kv_enabled", None)
+    if mixed_kv is not None and mixed_kv():
+        # OSCAR mixed-KV pools rotate/quantize inside set_kv_buffer; the fused
+        # rope-epilogue write would store raw bf16 bytes into the int2 layout.
+        return False
     return (
         _is_cuda
-        and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and hasattr(pool, "dtype")
+        and pool.dtype == torch.bfloat16
+        and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 
@@ -705,6 +711,18 @@ def maybe_absorb_oscar_v_rotation_into_qkv(
             )
 
         R_v = rotations[layer_id - start_layer]
+        # One layer's rotation is 2D for V1 (shared across KV heads) and 3D for
+        # V2 (per head). None of the fold helpers handle per-head: they do
+        # ``R_v.T``, which on a 3D tensor reverses all three axes instead of
+        # transposing a matrix, so the fold would quietly use a wrong matrix.
+        if R_v.dim() == 3:
+            raise RuntimeError(
+                f"SGLANG_OSCAR_ABSORB_V_ROTATION=1: {model_label} layer "
+                f"{layer_id} has a per-head V rotation {tuple(R_v.shape)}. "
+                "Folding a per-head rotation into qkv_proj is not implemented. "
+                "Set SGLANG_OSCAR_ABSORB_V_ROTATION=0 to apply the V rotation "
+                "at runtime instead."
+            )
         if is_fp8_channel and _is_fp8_channelwise_qkv(attn.qkv_proj, weight):
             _absorb_v_fp8_channel(attn, R_v)
         elif is_fp8_per_tensor and _is_fp8_per_tensor_qkv(attn.qkv_proj, weight):

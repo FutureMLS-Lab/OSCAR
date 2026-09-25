@@ -586,3 +586,21 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, input_):
         del input_
         raise RuntimeError("LMHead's weights should be used in the sampler.")
+
+
+def get_embedding_tp_kwargs() -> dict:
+    """Vocab-parallel layout kwargs for a model's input embedding.
+
+    EAGLE/NextN drafts share the target's ``embed_tokens.weight``, so target
+    and draft must use the SAME layout or the draft's index math runs against a
+    differently-laid-out tensor and accept_len silently drops. Routing every
+    such model through one helper is what keeps them from drifting.
+
+    Upstream also honours an embedding-replication switch here; this fork has
+    no such flag, so the table is always sharded along the vocab dim. Under DP
+    attention each rank owns only its local tokens, so the reduction belongs to
+    the attention-TP group rather than the full TP group.
+    """
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}

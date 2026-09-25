@@ -39,7 +39,6 @@ from sglang.srt.configs import (
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
-    KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
@@ -49,6 +48,7 @@ from sglang.srt.configs import (
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
 )
+from sglang.srt.configs.kimi_linear import as_kimi_linear_config
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -126,6 +126,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
+    get_pp_proxy_tensor_shapes,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -1943,9 +1944,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def kimi_linear_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, KimiLinearConfig):
-            return config
+        config = self.model_config.hf_text_config
+        if getattr(config, "model_type", None) == "kimi_linear":
+            if not hasattr(self, "_kimi_linear_config_cache"):
+                self._kimi_linear_config_cache = as_kimi_linear_config(config)
+            return self._kimi_linear_config_cache
         return None
 
     def _get_linear_attn_registry_result(self):
@@ -2252,6 +2255,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            pp_proxy_tensor_shapes=get_pp_proxy_tensor_shapes(self.model),
         )
         buffers.num_token_non_padded[...] = num_tokens
 

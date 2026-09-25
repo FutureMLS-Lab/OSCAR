@@ -2059,5 +2059,12 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 weight_loader(param, loaded_weight)
 
 
-AutoModel.register(config_class=MultiModalityConfig, model_class=MultiModalityCausalLM)
+# exist_ok=True for the same reason as configs/qwen3_asr.py: a module-level
+# register that collides with a newer transformers takes down `import sglang`
+# for every model, not just this one.
+AutoModel.register(
+    config_class=MultiModalityConfig,
+    model_class=MultiModalityCausalLM,
+    exist_ok=True,
+)
 EntryClass = [MultiModalityCausalLM]

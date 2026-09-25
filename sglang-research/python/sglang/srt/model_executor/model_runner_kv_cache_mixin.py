@@ -364,6 +364,114 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+        elif (
+            self.use_mla_backend
+            and not self.mambaish_config
+            and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+            and envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
+        ):
+            # ``not mambaish_config`` is load-bearing, not defensive. Without it
+            # this branch also swallowed hybrid linear-attention MLA models --
+            # they satisfy every other condition -- and handed them a *bare*
+            # MLAPackedInt2KVPool: no HybridLinearKVPool wrapper, so no mamba
+            # state pool and no full-attn layer-id remap, with layer_num set to
+            # every layer instead of the full-attention ones. It shadowed the
+            # hybrid branch below entirely, which is why that branch's log line
+            # never appeared on a Kimi-linear model while a pool reporting
+            # ``layers=8`` (all of them) did.
+            #
+            # Real packed-INT2 latent storage. The fake-quant pools below round
+            # c_kv through INT2 and write the result back into a BF16 cache, so
+            # they measure accuracy at BF16 memory cost; this one stores the
+            # codes. Both branches exist on purpose -- the fake-quant arm is the
+            # accuracy reference the packed arm is paired against.
+            from sglang.srt.mem_cache.mla_packed_kv_pool import (
+                MLAPackedInt2KVPool,
+                NSAPackedInt2KVPool,
+            )
+
+            packed_kwargs = dict(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                # Default ON for the PACKED pools only, unlike the shared
+                # SGLANG_LLOYD_MAX default. Measured paired on GLM-5.2, packed 2-bit
+                # + OSCAR rotation, 30 GPQA questions, the codebook the ONLY variable
+                # and storage byte-identical:
+                #
+                #     uniform grid   76.67%
+                #     Lloyd-Max      83.33%    +6.67 pp at zero cost
+                #
+                # The rotation is what earns it: Rcov P H drives the latent toward
+                # Gaussian and Lloyd-Max puts its four levels at the conditional means
+                # of a normal, so the two compose. Offline on K3's dump the same
+                # pairing is 0.3491 -> 0.2604 at group 128.
+                #
+                # Scoped here rather than flipping SGLANG_LLOYD_MAX, which the
+                # expanded-INT2 K/V path also reads -- a path this evidence says
+                # nothing about. An explicit env setting still wins.
+                # Only at two bits. Lloyd-Max here is a THREE-THRESHOLD
+                # codebook, so the pool refuses to combine it with any other
+                # width -- and defaulting it ON without this check would make
+                # SGLANG_OSCAR_MLA_KV_BITS=4 fail to start a server at all,
+                # breaking the 4-bit path this same change set added.
+                lloyd_max=(
+                    envs.SGLANG_LLOYD_MAX.get()
+                    if envs.SGLANG_LLOYD_MAX.is_set()
+                    else envs.SGLANG_OSCAR_MLA_KV_BITS.get() == 2
+                ),
+                # The window arena is addressed by req_pool_index, so it has to
+                # cover every index the request pool can hand out -- sizing it
+                # from max_running_requests instead would silently drop the
+                # windows for whichever requests landed above the cut.
+                max_reqs=self.req_to_token_pool.size,
+                selfcheck=envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get(),
+            )
+            if is_nsa_model:
+                self.token_to_kv_pool = NSAPackedInt2KVPool(
+                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    **packed_kwargs,
+                )
+            else:
+                self.token_to_kv_pool = MLAPackedInt2KVPool(**packed_kwargs)
+        elif self.use_mla_backend and is_nsa_model and (
+            envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
+            or envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get()
+        ):
+            # MLA / NSA INT2 fake-quant pool for OSCAR latent KV experiments.
+            # Activated by either rotation_path (eval) or dump_dir (calibration).
+            from sglang.srt.mem_cache.mla_int2_kv_pool import NSAInt2HPKVPool
+
+            self.token_to_kv_pool = NSAInt2HPKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                dump_c_kv_dir=envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                dump_max_tokens_per_layer=envs.SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS.get(),
+                lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                hp_subspace_path=envs.SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH.get(),
+            )
         elif self.use_mla_backend and is_nsa_model:
             nsa_pool_kwargs = dict(
                 size=self.max_total_num_tokens,
@@ -403,6 +511,32 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                )
+            elif (
+                envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
+                or envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get()
+            ):
+                # Plain-MLA (non-NSA, e.g. DeepSeek-V2) INT2 fake-quant pool for
+                # OSCAR latent KV experiments. Same activation as the NSA branch.
+                from sglang.srt.mem_cache.mla_int2_kv_pool import MLAInt2HPKVPool
+
+                self.token_to_kv_pool = MLAInt2HPKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                    group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                    dump_c_kv_dir=envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                    dump_max_tokens_per_layer=envs.SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS.get(),
+                    lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                    hp_subspace_path=envs.SGLANG_OSCAR_MLA_KV_HP_SUBSPACE_PATH.get(),
                 )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
@@ -467,6 +601,285 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                full_attention_layer_ids = (
+                    [0]
+                    if self.is_draft_worker
+                    else [
+                        i
+                        for i in config.full_attention_layer_ids
+                        if self.start_layer <= i < self.end_layer
+                    ]
+                )
+                # OSCAR INT2 hybrid path: when SGLANG_ENABLE_MIXED_KV_WINDOWS=1
+                # and kv_cache_dtype=int2 and rotation paths are set, back the
+                # full-attention pool with UnifiedInt2HPKVPool so that mambaish
+                # / hybrid-linear models (Qwen3.5, etc.) get the same INT2 +
+                # OSCAR-rotation KV cache as non-hybrid dense models. The
+                # outer HybridLinearKVPool keeps its layer-id remap for the
+                # full-attn-only allocation.
+                # Conditions common to both hybrid INT2 shapes. The per-head and
+                # latent variants then differ only in which rotation env they
+                # need and which pool class they build.
+                _mixed_kv_hybrid_base = (
+                    envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+                    and _attention_supports_mixed_kv(self.server_args)
+                    and self.kv_cache_dtype == "int2"
+                    and self.server_args.disaggregation_mode in (None, "null")
+                    and self.server_args.speculative_algorithm is None
+                )
+                enable_mixed_kv_hybrid = (
+                    _mixed_kv_hybrid_base
+                    and not self.use_mla_backend
+                    and envs.SGLANG_OSCAR_K_ROTATION_PATH.get() != ""
+                    and envs.SGLANG_OSCAR_V_ROTATION_PATH.get() != ""
+                )
+                # Hybrid + MLA: a mambaish model whose full-attention layers are
+                # MLA. This used to be unreachable -- the per-head gate above
+                # required ``not use_mla_backend`` while the latent pool's own
+                # gate requires ``not mambaish_config`` -- so such a model could
+                # get INT2 only by declaring ``attention_arch = MHA`` and storing
+                # expanded per-head K/V. That override cost Kimi-K3 the latent
+                # compression entirely: its pool measured 264,168 tokens against
+                # GLM-5.2's 1,882,304, because expanded storage is
+                # (192+128) x 2bit x num_kv_heads per token instead of one 288 B
+                # latent shared across heads. Build the real latent pool instead.
+                # Deliberately NOT built on _mixed_kv_hybrid_base: the latent
+                # path is driven by its own env flags, not by
+                # ``--kv-cache-dtype int2``. Its storage dtype is the arena/rope
+                # dtype and must be a float -- MLATokenToKVPool raises
+                # "model_dtype is required for int2 kv cache" if handed the int2
+                # string, which is why eval_oscar_gpqa.sh pins bfloat16 for MLA.
+                # The condition list here must match
+                # pool_configurator._packed_mla_latent_enabled exactly, or the
+                # configurator sizes a pool the runner does not build.
+                enable_mixed_kv_hybrid_mla = (
+                    self.use_mla_backend
+                    and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+                    and envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get() != ""
+                    and self.server_args.disaggregation_mode in (None, "null")
+                    and self.server_args.speculative_algorithm is None
+                )
+                # Calibration dump for a hybrid MLA model. Fitting a latent
+                # rotation needs raw c_kv, and only the fake-quant pool can dump
+                # it -- the packed pool has no BF16 latent to write out and
+                # hardcodes an empty dump dir. Without this branch a mambaish MLA
+                # model can *run* packed INT2 but can never be *calibrated* for
+                # it, which is exactly Kimi-K3's position: its rotations under
+                # /shared/kimi-k3-rotations are per-head k/v matrices, not the
+                # per-layer 512x512 the latent path loads.
+                enable_hybrid_mla_dump = (
+                    self.use_mla_backend
+                    and envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get() != ""
+                )
+                hybrid_full_kv_pool = None
+                if enable_hybrid_mla_dump:
+                    from sglang.srt.mem_cache.mla_int2_kv_pool import (
+                        MLAInt2HPKVPool,
+                        NSAInt2HPKVPool,
+                    )
+
+                    dump_kwargs = dict(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        kv_lora_rank=self.model_config.kv_lora_rank,
+                        qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                        layer_num=len(full_attention_layer_ids),
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=0,
+                        end_layer=len(full_attention_layer_ids),
+                        rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                        group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        dump_c_kv_dir=envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                        dump_max_tokens_per_layer=(
+                            envs.SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS.get()
+                        ),
+                        lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                        # Dumps are keyed by the file id the fitter will emit, so
+                        # the same global-id mapping applies here.
+                        rotation_layer_ids=full_attention_layer_ids,
+                    )
+                    logger.info(
+                        "Enable hybrid MLA c_kv DUMP (fake-quant pool) for "
+                        "mambaish MLA model: full_attn_layers=%s dir=%s",
+                        full_attention_layer_ids,
+                        envs.SGLANG_OSCAR_MLA_KV_DUMP_DIR.get(),
+                    )
+                    if is_nsa_model:
+                        hybrid_full_kv_pool = NSAInt2HPKVPool(
+                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                            index_head_dim=get_nsa_index_head_dim(
+                                self.model_config.hf_config
+                            ),
+                            **dump_kwargs,
+                        )
+                    else:
+                        hybrid_full_kv_pool = MLAInt2HPKVPool(**dump_kwargs)
+                elif enable_mixed_kv_hybrid_mla:
+                    from sglang.srt.mem_cache.mla_packed_kv_pool import (
+                        MLAPackedInt2KVPool,
+                        NSAPackedInt2KVPool,
+                    )
+
+                    hybrid_packed_kwargs = dict(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        kv_lora_rank=self.model_config.kv_lora_rank,
+                        qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                        # Inner pool sees 0..N-1 after HybridLinearKVPool's remap,
+                        # so layer_num is the full-attn count and start_layer=0 --
+                        # the same convention UnifiedInt2HPKVPool uses below.
+                        layer_num=len(full_attention_layer_ids),
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=0,
+                        end_layer=len(full_attention_layer_ids),
+                        rotation_path=envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get(),
+                        group_size=envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                        lloyd_max=envs.SGLANG_LLOYD_MAX.get(),
+                        max_reqs=self.req_to_token_pool.size,
+                        selfcheck=envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get(),
+                        # Rotation files are keyed by GLOBAL layer id while the
+                        # inner pool is indexed locally; without this mapping
+                        # local layer 0 would load layer_0.pt for what is really
+                        # full-attn layer 3. Loading the wrong-but-valid rotation
+                        # does not raise -- it quantizes in the wrong frame.
+                        rotation_layer_ids=full_attention_layer_ids,
+                    )
+                    # start/end_layer are reported because both PP ranks were
+                    # observed claiming all 24 of K3's full-attention layers.
+                    # The list is filtered by start_layer <= i < end_layer, and
+                    # those come from getattr(self.model, ..., <default>) -- so
+                    # a model that does not expose them silently gets the whole
+                    # range on every rank and every rank allocates the whole
+                    # pool. That is not a correctness bug, it is a capacity one:
+                    # this pool exists to hold more tokens, and allocating each
+                    # rank's unused half halves what it can hold. Whether the
+                    # split is real here is unresolved -- K3 does set both via
+                    # make_layers -- so log the inputs rather than guess, and
+                    # let the next run answer it at no extra cost.
+                    logger.info(
+                        "Enable hybrid mixed KV (packed INT2 MLA latent) for "
+                        "mambaish MLA model: full_attn_layers=%d of %d global "
+                        "(rank layer range [%d, %d)) kv_lora_rank=%d "
+                        "qk_rope_head_dim=%d group=%s",
+                        len(full_attention_layer_ids),
+                        len(getattr(config, "full_attention_layer_ids", []) or []),
+                        self.start_layer,
+                        self.end_layer,
+                        self.model_config.kv_lora_rank,
+                        self.model_config.qk_rope_head_dim,
+                        envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                    )
+                    if (
+                        self.end_layer - self.start_layer
+                        >= self.model_config.num_hidden_layers
+                        and self.server_args.pp_size > 1
+                    ):
+                        logger.warning(
+                            "Packed MLA pool: pp_size=%d but this rank's layer "
+                            "range [%d, %d) spans the whole model, so the "
+                            "full-attention filter kept all %d layers and this "
+                            "rank is allocating the other rank's half too. KV "
+                            "capacity is roughly halved.",
+                            self.server_args.pp_size,
+                            self.start_layer,
+                            self.end_layer,
+                            len(full_attention_layer_ids),
+                        )
+                    if is_nsa_model:
+                        hybrid_full_kv_pool = NSAPackedInt2KVPool(
+                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                            index_head_dim=get_nsa_index_head_dim(
+                                self.model_config.hf_config
+                            ),
+                            **hybrid_packed_kwargs,
+                        )
+                    else:
+                        hybrid_full_kv_pool = MLAPackedInt2KVPool(
+                            **hybrid_packed_kwargs
+                        )
+                if enable_mixed_kv_hybrid:
+                    hp_window_tokens_h = (
+                        envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+                        + envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+                    )
+                    if hp_window_tokens_h <= 0:
+                        logger.warning(
+                            "Hybrid mixed KV requested but both prefix/recent "
+                            "windows are zero. Falling back to BF16 hybrid pool."
+                        )
+                    else:
+                        hp_dtype_h = resolve_hp_dtype(
+                            envs.SGLANG_MIXED_KV_HP_DTYPE.get()
+                        )
+                        scale_dtype_h = resolve_scale_dtype(
+                            envs.SGLANG_MIXED_KV_SCALE_DTYPE.get()
+                        )
+                        _, n_q_h = compute_page_geometry(hp_dtype_h)
+                        assert self.page_size == n_q_h, (
+                            f"Hybrid mixed KV requires page_size={n_q_h} "
+                            f"(= N_Q), got page_size={self.page_size}"
+                        )
+                        num_quant_pages_h = (
+                            self.max_total_num_tokens + n_q_h - 1
+                        ) // n_q_h + 1
+                        p_tokens_h = envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+                        hp_prefix_pool_h = (
+                            envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
+                        )
+                        if hp_prefix_pool_h <= 0:
+                            hp_prefix_pool_h = (
+                                self.req_to_token_pool.size * p_tokens_h * 16
+                            )
+                        hp_prefix_pool_h = (
+                            (hp_prefix_pool_h + n_q_h - 1) // n_q_h * n_q_h
+                        )
+                        logger.info(
+                            "Enable hybrid mixed KV (int2) for mambaish model: "
+                            "full_attn_layers=%d prefix=%s recent=%s N_Q=%s "
+                            "num_quant_pages=%s hp_prefix_pool_tokens=%s",
+                            len(full_attention_layer_ids),
+                            p_tokens_h,
+                            envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
+                            n_q_h,
+                            num_quant_pages_h,
+                            hp_prefix_pool_h,
+                        )
+                        hybrid_full_kv_pool = UnifiedInt2HPKVPool(
+                            num_quant_pages=num_quant_pages_h,
+                            num_hp_prefix_slots=hp_prefix_pool_h,
+                            hp_dtype=hp_dtype_h,
+                            hp_prefix_tokens=envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get(),
+                            hp_recent_tokens=envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            v_head_dim=self.model_config.v_head_dim,
+                            # Inner pool sees indices 0..N-1 after the outer
+                            # HybridLinearKVPool remap, so layer_num is the
+                            # full-attn count (not the total layer count).
+                            layer_num=len(full_attention_layer_ids),
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            max_req_slots=self.req_to_token_pool.size,
+                            # start_layer=0 so _layer_index(local_id) == local_id.
+                            start_layer=0,
+                            end_layer=len(full_attention_layer_ids),
+                            model_dtype=self.dtype,
+                            kv_cache_quant_group_size=(
+                                self.server_args.kv_cache_quant_group_size
+                            ),
+                            scale_dtype=scale_dtype_h,
+                            # Rotation file is keyed by global layer id (the
+                            # full-attn indices); pass the mapping so each
+                            # local index loads the right per-layer matrix.
+                            rotation_layer_ids=full_attention_layer_ids,
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -475,22 +888,24 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
+                    v_head_dim=self.model_config.v_head_dim,
+                    full_attention_layer_ids=full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    full_kv_pool=hybrid_full_kv_pool,
+                    model_dtype=self.dtype,
+                    kv_cache_quant_group_size=(
+                        self.server_args.kv_cache_quant_group_size
+                    ),
+                    scale_dtype=(
+                        resolve_scale_dtype(envs.SGLANG_MIXED_KV_SCALE_DTYPE.get())
+                        if self.kv_cache_dtype == "int2"
+                        else None
+                    ),
                     **extra_args,
                 )
             else:
@@ -577,6 +992,42 @@ class ModelRunnerKVCacheMixin:
                         self.req_to_token_pool.size,
                         hp_prefix_pool,
                     )
+                    # Heterogeneous-SWA two-group geometry (gemma4_unified):
+                    # one UnifiedInt2HPKVPool storing buffers as TWO uniform
+                    # groups (full: 1x512 over the full-attention layers;
+                    # sliding: 8x256 over the rest), sharing one head-dim-
+                    # agnostic allocator. ``layer_groups`` holds global layer
+                    # ids; the pool maps them to local indices. None for every
+                    # other (uniform) OSCAR model -> unchanged single-group path.
+                    layer_groups = None
+                    if getattr(self.model_config, "unified_two_group_kv", False):
+                        tp = get_attention_tp_size()
+                        full_ids = list(self.model_config.full_attention_layer_ids)
+                        swa_ids = list(self.model_config.swa_attention_layer_ids)
+                        layer_groups = [
+                            {
+                                "head_num": self.model_config.get_num_kv_heads(tp),
+                                "head_dim": self.model_config.head_dim,
+                                "v_head_dim": self.model_config.v_head_dim,
+                                "layer_ids": full_ids,
+                            },
+                            {
+                                "head_num": self.model_config.get_swa_num_kv_heads(tp),
+                                "head_dim": self.model_config.swa_head_dim,
+                                "v_head_dim": self.model_config.swa_v_head_dim,
+                                "layer_ids": swa_ids,
+                            },
+                        ]
+                        logger.info(
+                            "Unified two-group KV (gemma4_unified): full=%d layers "
+                            "(%dx%d), sliding=%d layers (%dx%d)",
+                            len(full_ids),
+                            self.model_config.get_num_kv_heads(tp),
+                            self.model_config.head_dim,
+                            len(swa_ids),
+                            self.model_config.get_swa_num_kv_heads(tp),
+                            self.model_config.swa_head_dim,
+                        )
                     self.token_to_kv_pool = UnifiedInt2HPKVPool(
                         num_quant_pages=num_quant_pages,
                         num_hp_prefix_slots=hp_prefix_pool,
@@ -600,6 +1051,7 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.kv_cache_quant_group_size
                         ),
                         scale_dtype=scale_dtype,
+                        layer_groups=layer_groups,
                     )
                 else:
                     # For int2 KV cache, scale/zero dtype is configurable via
@@ -705,23 +1157,29 @@ class ModelRunnerKVCacheMixin:
                         and self.token_to_kv_pool.mixed_kv_enabled()
                     ):
                         pool = self.token_to_kv_pool
+                        # For hybrid mambaish models the outer pool is
+                        # HybridLinearKVPool wrapping a UnifiedInt2HPKVPool.
+                        # The unified-pool sizing attributes live on the inner
+                        # pool; the outer pool stays the allocator's kvcache so
+                        # its layer-id remap runs on every set_kv_buffer.
+                        inner = getattr(pool, "full_kv_pool", pool)
                         self.token_to_kv_pool_allocator = (
                             UnifiedInt2HPKVAllocator(
-                                num_quant_pages=pool.num_quant_pages,
-                                quant_tokens_per_page=pool.N_Q,
-                                hp_prefix_tokens=pool.hp_prefix_tokens,
-                                hp_recent_tokens=pool.hp_recent_tokens,
-                                hp_recent_ring_size=pool.hp_recent_ring_size,
-                                max_req_slots=pool.max_req_slots,
-                                num_hp_prefix_slots=pool.num_hp_prefix_slots,
+                                num_quant_pages=inner.num_quant_pages,
+                                quant_tokens_per_page=inner.N_Q,
+                                hp_prefix_tokens=inner.hp_prefix_tokens,
+                                hp_recent_tokens=inner.hp_recent_tokens,
+                                hp_recent_ring_size=inner.hp_recent_ring_size,
+                                max_req_slots=inner.max_req_slots,
+                                num_hp_prefix_slots=inner.num_hp_prefix_slots,
                                 dtype=self.kv_cache_dtype,
-                                hp_dtype=pool.hp_dtype,
+                                hp_dtype=inner.hp_dtype,
                                 device=self.device,
                                 kvcache=pool,
                                 need_sort=need_sort,
                                 scheduler_size=(
                                     self.max_total_num_tokens
-                                    + pool.num_hp_prefix_slots
+                                    + inner.num_hp_prefix_slots
                                 ),
                             )
                         )

@@ -31,11 +31,6 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
-except ImportError:
-    pass
-
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -49,6 +44,13 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+)
+from sglang.srt.layers.moe.triton_kernels_compat import (
+    GatherIndx,
+    RoutingData,
+    ScatterIndx,
+    build_routing_from_standard,
+    routing,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -327,12 +329,27 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # renormalize=True is equivalent to sm_first=False
-            routing_data, gather_idx, scatter_idx = routing(
-                router_logits,
-                self.topk_config.top_k,
-                sm_first=not self.topk_config.renormalize,
-            )
+            if routing is not None:
+                # renormalize=True is equivalent to sm_first=False
+                routing_data, gather_idx, scatter_idx = routing(
+                    router_logits,
+                    self.topk_config.top_k,
+                    sm_first=not self.topk_config.renormalize,
+                )
+            else:
+                standard_topk = select_experts(
+                    hidden_states=hidden_states,
+                    layer_id=self.layer_id,
+                    router_logits=router_logits,
+                    topk_config=self.topk_config,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                )
+                routing_data, gather_idx, scatter_idx = build_routing_from_standard(
+                    standard_topk,
+                    num_experts=router_logits.shape[-1],
+                    top_k=self.topk_config.top_k,
+                )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
@@ -1231,3 +1248,51 @@ if _is_cuda:
             dtype=torch.int32,
         )
         return topk_weights, topk_ids
+
+
+def precomputed_topk_postprocess_is_noop(
+    topk_config: TopKConfig,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+) -> bool:
+    """Whether :func:`build_precomputed_topk_output` may stand in for the
+    post-processing :func:`select_experts` does.
+
+    A router that emits (weights, ids) itself -- Kimi-K3's fused gate+top-k --
+    skips select_experts, so it must not skip the work select_experts does
+    AFTER the top-k: the EPLB logical->physical remap, the padded-region mask
+    and the shared-expert append. Return True only when each of those is a
+    no-op.
+
+    Upstream also excludes two expert-simulation env switches here. This fork
+    has neither, so there is nothing to exclude; if they are ever added they
+    must be added to this condition too, or K3 will silently bypass them.
+    """
+    return (
+        _is_cuda
+        and topk_config.num_fused_shared_experts == 0
+        and num_token_non_padded is None
+        and expert_location_dispatch_info is None
+    )
+
+
+def build_precomputed_topk_output(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_config: TopKConfig,
+    layer_id: int,
+) -> StandardTopKOutput:
+    """Wrap a router's own (weights, ids) as a STANDARD top-k output, still
+    running the expert-distribution recorder that select_experts would.
+
+    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
+
+    Upstream additionally calls a routed-expert capture hook here, for its
+    --enable-return-routed-experts path. This fork has no such hook, so the
+    recorder is the whole of the post-processing that survives.
+    """
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    # router_logits is read only by the BYPASSED formats and by the
+    # shared-expert append, both excluded above; STANDARD consumers take
+    # ids/weights.
+    return StandardTopKOutput(topk_weights, topk_ids, None)

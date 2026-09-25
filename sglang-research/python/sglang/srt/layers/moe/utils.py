@@ -27,6 +27,11 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
     CUSTOMIZED = "customized"
+    # Upstream's MegaMoE all-to-all. Not implemented here, but the member and
+    # its predicate have to exist: model files ported from upstream branch on
+    # `is_megamoe()`, and an absent attribute is an AttributeError 40 minutes
+    # into a load rather than a backend that simply is not selected.
+    MEGAMOE = "megamoe"
 
     @classmethod
     def _missing_(cls, value):
@@ -39,6 +44,9 @@ class MoeA2ABackend(Enum):
 
     def is_none(self):
         return self == MoeA2ABackend.NONE
+
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP

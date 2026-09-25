@@ -173,6 +173,79 @@ class PretransformedClipKernelTest(unittest.TestCase):
         torch.testing.assert_close(k_sz_a, k_sz_b, atol=0, rtol=0)
         torch.testing.assert_close(v_sz_a, v_sz_b, atol=0, rtol=0)
 
+    def test_kimi_k3_unequal_head_dims(self):
+        """Kimi-K3's non-power-of-two K=192 fallback and V=128 fused path
+        both preserve the requested row clipping and produce valid INT2 cache.
+        """
+        from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
+            quantized_set_kv_int2_pretransformed_clip_triton,
+        )
+        from sglang.srt.mem_cache.kv_quant_kernels import (
+            _groupwise_dequantize_int2_torch,
+        )
+
+        num_tokens, num_heads = 5, 3
+        k_head_dim, v_head_dim = 192, 128
+        clip_ratio_k, clip_ratio_v = 0.96, 0.92
+        num_pages = 8
+        torch.manual_seed(3)
+        k = torch.randn(
+            (num_tokens, num_heads, k_head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        v = torch.randn(
+            (num_tokens, num_heads, v_head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        k_cache = torch.zeros(
+            (num_pages, num_heads, k_head_dim // 4),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        v_cache = torch.zeros(
+            (num_pages, num_heads, v_head_dim // 4),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        k_sz = torch.zeros(
+            (num_pages, num_heads, 2), dtype=torch.float32, device="cuda"
+        )
+        v_sz = torch.zeros_like(k_sz)
+        loc = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+
+        quantized_set_kv_int2_pretransformed_clip_triton(
+            k,
+            v,
+            loc,
+            k_cache,
+            v_cache,
+            k_sz,
+            v_sz,
+            clip_ratio_k,
+            clip_ratio_v,
+        )
+
+        k_threshold = _ref_threshold(k, clip_ratio_k)[..., None]
+        v_threshold = _ref_threshold(v, clip_ratio_v)[..., None]
+        k_ref = torch.maximum(
+            torch.minimum(k.float(), k_threshold), -k_threshold
+        )
+        v_ref = torch.maximum(
+            torch.minimum(v.float(), v_threshold), -v_threshold
+        )
+        k_ref = _ref_groupwise_int2_quant_dequant(k_ref, 1)
+        v_ref = _ref_groupwise_int2_quant_dequant(v_ref, 1)
+        k_out = _groupwise_dequantize_int2_torch(
+            k_cache[:num_tokens], k_sz[:num_tokens], k_head_dim, torch.float32
+        )
+        v_out = _groupwise_dequantize_int2_torch(
+            v_cache[:num_tokens], v_sz[:num_tokens], v_head_dim, torch.float32
+        )
+        torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=5e-2)
+        torch.testing.assert_close(v_out, v_ref, atol=2e-2, rtol=5e-2)
+
 
 class OscarRotationRoundTripTest(unittest.TestCase):
     """End-to-end correctness proxy: ``rotate -> clip -> pack -> dequant

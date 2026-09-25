@@ -120,7 +120,7 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
             ), f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
             self.mlp.topk = TopK(
                 top_k=config.num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
+                renormalize=getattr(config, "norm_topk_prob", True),
                 use_grouped_topk=False,
                 layer_id=layer_id,
                 custom_routing_function=self._custom_routing_function,
