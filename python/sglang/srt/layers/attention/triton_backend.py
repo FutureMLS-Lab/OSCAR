@@ -2537,6 +2537,17 @@ class TritonAttnBackend(AttentionBackend):
             and (not layer_is_sliding or mixed_pool_active)
             and self.forward_metadata.custom_mask is None
         )
+        if _is_int2_pool(kv_pool) and not use_quantized_dense_prefill:
+            # The generic extend kernel cannot read the int2-packed buffers; it
+            # would die inside Triton with "only int8 supported!", far from the
+            # cause. Name the gate that failed instead.
+            raise RuntimeError(
+                "int2 KV pool reached the generic extend kernel: "
+                f"layer_id={layer.layer_id} sliding_window_size={layer.sliding_window_size} "
+                f"mixed_pool_active={mixed_pool_active} "
+                f"custom_mask={'set' if self.forward_metadata.custom_mask is not None else 'none'} "
+                f"pool={type(kv_pool).__name__}"
+            )
         kv_from_pool = False
         if k is None and v is None and _is_int2_pool(kv_pool):
             # A KV-shared layer (Gemma-4's last layers) attends with the K/V its
