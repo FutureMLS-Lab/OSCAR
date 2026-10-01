@@ -716,12 +716,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * indexer_dtype_size
             )
             if int2 is not None and int2.mixed:
-                # MiniMax-M3 sparse attention keeps the lightning indexer's key per
-                # token (index_dim in the model dtype) on every sparse layer, beside
-                # K/V. It is a per-slot cost like K/V, so the BF16 window arena's
-                # slots need it too, or the pool is sized as if it were free and
-                # the side cache OOMs at allocation. With 2-bit K/V it is the
-                # larger of the two.
+                # MiniMaxInt2SparseKVPool keeps the indexer's key cache with one
+                # row per slot of the unified pool, window slots included, so the
+                # index rows are priced per token above and per window slot here;
+                # otherwise the side cache OOMs at allocation.
                 request_slots = _mixed_kv_request_slots(
                     get_schedule().max_running_requests
                 )

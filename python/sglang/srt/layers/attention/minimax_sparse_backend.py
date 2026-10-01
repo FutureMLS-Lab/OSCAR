@@ -5,6 +5,7 @@ import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
@@ -19,8 +20,21 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.minimax_sparse_staging import (
+    build_slot_to_ragged,
+    decode_block_rows,
+    fill_decode_fake_table,
+    prefill_fake_table,
+)
+from sglang.srt.layers.attention.quantized_kv_prefill import (
+    apply_inverse_v_rotation,
+    build_prefix_indices_from_req_to_token,
+    dequantize_prefix_kv,
+    prepare_quantized_extend_qkv,
+)
 from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.minimax_int2_kv_pool import MiniMaxInt2SparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -111,9 +125,42 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
     return q.to(torch.float8_e4m3fn)
 
 
+def _is_int2_mixed_pool(pool) -> bool:
+    # The OSCAR per-head INT2 pool with BF16 windows, probed on the pool
+    # contract the way the triton backend selects its int2 paths.
+    return pool.dtype == "int2" and pool.mixed_kv_enabled() is True
+
+
+
+class _Int2DecodeBuffers(msgspec.Struct, frozen=True):
+    """Persistent decode staging for the int2 pool, sized for ``max_bs``."""
+
+    max_bs: int
+    fake: torch.Tensor  # [max_bs, req_to_token cols + 1] int32; last col = dump
+    rows: torch.Tensor  # [max_bs, n_blocks, block_size] int32 staged row ids
+    slot_ids: torch.Tensor  # [max_bs] int32 = arange
+    k: torch.Tensor  # [max_bs * n_blocks * block_size, kv_heads, head_dim]
+    v: torch.Tensor  # [max_bs * n_blocks * block_size, kv_heads, v_head_dim]
+
+
+class _Int2PrefillStaging(msgspec.Struct, frozen=True):
+    """Per-ForwardBatch prefill staging tables for the int2 pool."""
+
+    owner: object  # the ForwardBatch these were built for
+    flat: torch.Tensor  # [sum(seq_lens)] int64 slots in ragged request order
+    fake: torch.Tensor  # [bs, max_seqlen_k] int32 = cu_seqlens_k[b] + pos
+    slot_ids: torch.Tensor  # [bs] int32 = arange
+
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
-        assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
+        # The sparse kernels gather K/V rows by slot id out of a BF16 (or fp8)
+        # cache. The OSCAR int2 pool has no such cache, so on it every
+        # sparse layer dequantizes the rows a forward attends into a staging
+        # buffer and the kernels read that through a fake page table; see the
+        # "OSCAR INT2 pool" section below.
+        self.int2 = _is_int2_mixed_pool(runner.token_to_kv_pool)
+        if not self.int2:
+            assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
         self.kv_pool = runner.token_to_kv_pool
         self.hisparse_coordinator = runner.hisparse_coordinator
@@ -177,6 +224,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 local_tokens + self.block_size_k - 1
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
+        if self.int2:
+            self._init_int2(
+                model_dtype=runner.dtype, device=runner.device, sparse_cfg=sparse_cfg
+            )
         if self.hisparse_coordinator is not None:
             selected_tokens = self.topk_blocks * self.block_size_k
             assert selected_tokens <= self.hisparse_coordinator.device_buffer_size, (
@@ -220,8 +271,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.fp8_attn_gemm
                 and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
             )
+            # The int2 pool is staged into per-token rows (page_size 1 in the
+            # kernels' terms), which the 128-token-page MSA kernel cannot read.
             self.use_msa = (
-                not envs.SGLANG_DISABLE_MSA.get()
+                not self.int2
+                and not envs.SGLANG_DISABLE_MSA.get()
                 and self.hisparse_coordinator is None
                 and msa_available()
                 and self.block_size_k == 128
@@ -231,6 +285,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             if (
                 not self.use_msa
+                and not self.int2
                 and not envs.SGLANG_DISABLE_MSA.get()
                 and msa_available()
                 and self.block_size_k == 128
@@ -257,8 +312,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._msa_cg: dict[int, tuple] = {}
 
         self.page_size = self.kv_pool.page_size
+        # The dense-main decode runs trtllm over the real paged cache, which
+        # the int2 pool does not have.
         self.use_dense_sparse_decode = (
             (not self.is_npu)
+            and not self.int2
             and self.hisparse_coordinator is None
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
@@ -298,9 +356,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
+        # Top-k reuse across layers is not wired into the int2 staging path.
         self.index_topk_freq = (
             max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
             if is_hip() and is_gfx95_supported() and not is_tbo_enabled()
+            and not self.int2
             else 1
         )
         self.index_cache_enabled = self.index_topk_freq > 1
@@ -333,6 +393,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
+            f"kv={'int2 (BF16 staging)' if self.int2 else str(self.kv_pool.main_pool.dtype)}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
             f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
@@ -484,6 +545,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     // self.page_size
                 ).to(torch.int32)
 
+        if self.int2:
+            # Prefill staging tables are rebuilt per ForwardBatch by the first
+            # sparse layer that sees it; decode staging buffers are grown here,
+            # outside any capture, so forward_decode never allocates them.
+            self._int2_ext = None
+            if forward_batch.forward_mode.is_decode_or_idle():
+                self._ensure_int2_decode_buffers(forward_batch.seq_lens.shape[0])
+
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
         """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
@@ -570,7 +639,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        pass
+        if self.int2:
+            # Decode staging (fake page table, row ids, dequantized K/V) is
+            # preallocated for the largest captured batch so capture and
+            # replay only ever write into fixed addresses.
+            self._ensure_int2_decode_buffers(max(int(max_bs), int(max_num_tokens)))
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1399,43 +1472,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta_key = id(forward_batch)
         return cu_seqlens, seq_lens, prefix_lens
 
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer,
-        forward_batch: ForwardBatch,
-        save_kv_cache=True,
-        *,
-        idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
-        idx_v: Optional[torch.Tensor],
-    ):
-        disable_value = layer.layer_id in self.disable_value_layer_ids
-        kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
-            forward_batch, layer.layer_id
-        )
-        if not kv_cached_by_fusion:
-            self.kv_pool.set_fused_kv_index_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                k,
-                v,
-                idx_k,
-                None if disable_value else idx_v,
-                layer.k_scale_float,
-                layer.v_scale_float,
-                layer.idx_k_scale_float,
-                layer.idx_v_scale_float,
-            )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
-        if disable_value:
-            idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
-            idx_v_cache = None
-        else:
-            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
-
+    def _prefill_seqblock_meta_for(self, forward_batch: ForwardBatch, q: torch.Tensor):
+        """Layer-invariant prefill metadata, built once per ForwardBatch object."""
         cached = self._prefill_seqblock_meta
         if cached is None or cached[0] is not forward_batch:
             cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
@@ -1467,15 +1505,67 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 all_seqblock_q,
             )
             self._prefill_seqblock_meta = cached
+        return cached[1:]
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        *,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+    ):
+        disable_value = layer.layer_id in self.disable_value_layer_ids
+        kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
+            forward_batch, layer.layer_id
+        )
+        if self.int2:
+            return self._forward_extend_int2(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                idx_q=idx_q,
+                idx_k=idx_k,
+                idx_v=idx_v,
+                disable_value=disable_value,
+                kv_cached_by_fusion=kv_cached_by_fusion,
+            )
+        if not kv_cached_by_fusion:
+            self.kv_pool.set_fused_kv_index_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                idx_k,
+                None if disable_value else idx_v,
+                layer.k_scale_float,
+                layer.v_scale_float,
+                layer.idx_k_scale_float,
+                layer.idx_v_scale_float,
+            )
+        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        if disable_value:
+            idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
+            idx_v_cache = None
+        else:
+            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
+
         (
-            _,
             cu_seqlens,
             seq_lens,
             prefix_lens,
             cu_seqblocks_q,
             max_seqblock_q,
             all_seqblock_q,
-        ) = cached
+        ) = self._prefill_seqblock_meta_for(forward_batch, q)
 
         # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
         if forward_batch.extend_seq_lens_cpu is not None:
@@ -1657,6 +1747,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        if self.int2:
+            return self._forward_decode_int2(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                idx_q=idx_q,
+                idx_k=idx_k,
+                idx_v=idx_v,
+                disable_value=disable_value,
+            )
         if not self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id):
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
@@ -1783,6 +1886,566 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),
+        )
+
+    # ------------------------------------------------------------------
+    # OSCAR INT2 pool: the sparse kernels read staged BF16 rows
+    # ------------------------------------------------------------------
+    # The kernels gather ``cache[req_to_token[slot_ids[b], pos]]``; the int2
+    # pool has no BF16 cache, so each sparse layer dequantizes the rows a
+    # forward attends (both tiers, rotated frame) into a staging buffer that the
+    # kernels read through a fake req_to_token keeping the REAL positions, so
+    # their causal / seq_len masking is untouched. Prefill stages every token of
+    # the batch in ragged order; decode stages the selected blocks into
+    # persistent buffers (static shapes, graph-capturable). The index cache has
+    # one row per slot and is read over the real table.
+
+    def _init_int2(
+        self, *, model_dtype: torch.dtype, device, sparse_cfg: dict
+    ) -> None:
+        pool = self.kv_pool
+        if not isinstance(pool, MiniMaxInt2SparseKVPool):
+            raise TypeError(
+                "MiniMax sparse attention on int2 KV needs the index-key cache "
+                "beside the pool (MiniMaxInt2SparseKVPool); the configurator "
+                f"built {type(pool).__name__}."
+            )
+        if self.is_npu:
+            raise NotImplementedError(
+                "MiniMax sparse attention on the int2 KV pool runs the CUDA/ROCm "
+                "Triton sparse kernels only."
+            )
+        if self.hisparse_coordinator is not None:
+            raise NotImplementedError(
+                "MiniMax sparse attention on the int2 KV pool does not support "
+                "HiSparse offload."
+            )
+        if get_spec().speculative_algorithm is not None:
+            raise NotImplementedError(
+                "MiniMax sparse attention on the int2 KV pool does not support "
+                "speculative decoding."
+            )
+        if self.fp8_attn_gemm:
+            raise NotImplementedError(
+                "fp8 attention GEMMs cannot be combined with the int2 KV pool."
+            )
+        n_kv = int(pool.head_num)
+        if n_kv != 1:
+            raise NotImplementedError(
+                "int2 staging keeps one selected-block set per request, which "
+                f"needs exactly one KV head per rank; this rank holds {n_kv}. "
+                "Raise the attention TP size."
+            )
+        self.model_dtype = model_dtype
+        # Index heads per rank follow the model's split (replicated when there
+        # are fewer index heads than ranks); the block set per KV head is the
+        # union over the index heads sharing it, hence group * topk blocks.
+        total_idx_heads = int(sparse_cfg["sparse_num_index_heads"])
+        tp = get_parallel().attn_tp_size
+        n_idx = total_idx_heads // max(1, min(tp, total_idx_heads))
+        self._int2_group = max(1, n_idx // n_kv)
+        self._int2_n_blocks = self._int2_group * self.topk_blocks
+        self._int2_ar_block = torch.arange(
+            self.block_size_k, device=device, dtype=torch.int64
+        )
+        self._int2_slot_to_ragged = torch.full(
+            (pool.index_cache_slots,), -1, dtype=torch.int32, device=device
+        )
+        # The decode fake table has one spare column past every legal position.
+        self._int2_dump_col = int(self.req_to_token.shape[1])
+        self._int2_ext: Optional[_Int2PrefillStaging] = None
+        self._int2_dec: Optional[_Int2DecodeBuffers] = None
+        logger.info(
+            "[MiniMaxSparse] int2 staging: block %d, %d blocks per request "
+            "(group %d x topk %d), index cache slots %d, fake-table columns %d",
+            self.block_size_k,
+            self._int2_n_blocks,
+            self._int2_group,
+            self.topk_blocks,
+            int(self._int2_slot_to_ragged.numel()),
+            self._int2_dump_col + 1,
+        )
+
+    def _ensure_int2_decode_buffers(self, bs: int) -> None:
+        bs = int(bs)
+        dec = self._int2_dec
+        if bs <= 0 or (dec is not None and dec.max_bs >= bs):
+            return
+        # Growing here would hand out graph-pool memory; init_cuda_graph_state
+        # sizes the buffers for the largest captured batch beforehand.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "int2 decode staging buffers hold "
+                f"{0 if dec is None else dec.max_bs} requests but a captured "
+                f"batch has {bs}; init_cuda_graph_state must size them first."
+            )
+        pool = self.kv_pool
+        device = self.req_to_token.device
+        n_rows = bs * self._int2_n_blocks * self.block_size_k
+        self._int2_dec = _Int2DecodeBuffers(
+            max_bs=bs,
+            fake=torch.zeros(
+                (bs, self._int2_dump_col + 1), dtype=torch.int32, device=device
+            ),
+            # ``rows[:bs]`` enumerates exactly the row order decode_block_rows
+            # produces for bs requests.
+            rows=torch.arange(n_rows, dtype=torch.int32, device=device).view(
+                bs, self._int2_n_blocks, self.block_size_k
+            ),
+            slot_ids=torch.arange(bs, dtype=torch.int32, device=device),
+            k=torch.empty(
+                (n_rows, pool.head_num, pool.head_dim),
+                dtype=self.model_dtype,
+                device=device,
+            ),
+            v=torch.empty(
+                (n_rows, pool.head_num, pool.v_head_dim),
+                dtype=self.model_dtype,
+                device=device,
+            ),
+        )
+
+    def _int2_extend_staging(
+        self, forward_batch: ForwardBatch, seq_lens: torch.Tensor
+    ) -> _Int2PrefillStaging:
+        # Per ForwardBatch, not per layer (keyed like _prefill_seqblock_meta).
+        ext = self._int2_ext
+        if ext is not None and ext.owner is forward_batch:
+            return ext
+        device = seq_lens.device
+        seq_lens_cpu = [int(x) for x in forward_batch.seq_lens_cpu.tolist()]
+        bs = len(seq_lens_cpu)
+        # Every token of every request (prefix and this chunk) in ragged order.
+        flat = build_prefix_indices_from_req_to_token(
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            cache_seqlens=seq_lens,
+            cache_seqlens_cpu=seq_lens_cpu,
+        )
+        build_slot_to_ragged(flat_slots=flat, slot_to_ragged=self._int2_slot_to_ragged)
+        cu_k_cpu = torch.zeros((bs + 1,), dtype=torch.int32)
+        cu_k_cpu[1:] = torch.cumsum(torch.tensor(seq_lens_cpu, dtype=torch.int32), 0)
+        ext = _Int2PrefillStaging(
+            owner=forward_batch,
+            flat=flat,
+            fake=prefill_fake_table(
+                cu_seqlens_k=cu_k_cpu.to(device, non_blocking=True),
+                max_seqlen_k=self._max_seqlen_k,
+            ),
+            slot_ids=torch.arange(bs, dtype=torch.int32, device=device),
+        )
+        self._int2_ext = ext
+        return ext
+
+    def _int2_write_index(
+        self,
+        *,
+        layer,
+        loc: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+        disable_value: bool,
+    ) -> None:
+        if disable_value:
+            self.kv_pool.set_index_k_buffer(
+                layer=layer, loc=loc, cache_idx_k=idx_k, k_scale=layer.idx_k_scale_float
+            )
+        else:
+            self.kv_pool.set_index_kv_buffer(
+                layer=layer,
+                loc=loc,
+                cache_idx_k=idx_k,
+                cache_idx_v=idx_v,
+                k_scale=layer.idx_k_scale_float,
+                v_scale=layer.idx_v_scale_float,
+            )
+
+    def _int2_index_caches(self, *, layer_id: int, disable_value: bool):
+        if disable_value:
+            return self.kv_pool.get_index_k_buffer(layer_id), None
+        return self.kv_pool.get_index_kv_buffer(layer_id)
+
+    def _int2_reduce_topk(
+        self, *, topk_idx: torch.Tensor, num_kv_heads: int
+    ) -> torch.Tensor:
+        n_idx = topk_idx.shape[0]
+        if n_idx == num_kv_heads:
+            return topk_idx
+        from sglang.kernels.ops.attention.minimax_sparse.common.index import (
+            topk_index_reduce,
+        )
+
+        return topk_index_reduce(
+            topk_idx.view(num_kv_heads, n_idx // num_kv_heads, -1, topk_idx.shape[-1]),
+            dim=1,
+        )
+
+    def _int2_prefill_topk(
+        self,
+        *,
+        layer,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        meta: tuple,
+        disable_value: bool,
+        num_kv_heads: int,
+    ):
+        from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
+            flash_prefill_with_topk_index,
+        )
+
+        cu_seqlens, seq_lens, prefix_lens, cu_seqblocks_q, max_seqblock_q, all_seqblock_q = (
+            meta
+        )
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=None,
+            req_to_token=self.req_to_token,
+            slot_ids=forward_batch.req_pool_indices,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=self._max_seqlen_q,
+            max_seqlen_k=self._max_seqlen_k,
+            block_size_q=self.block_size_q,
+            block_size_k=self.block_size_k,
+            topk=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            # int2 slot ids are per token (window slots are not page-contiguous).
+            page_size=1,
+            q_scale=layer.idx_q_scale_float,
+            k_scale=layer.idx_k_scale_float,
+            v_scale=layer.idx_v_scale_float,
+        )
+        return idx_o, self._int2_reduce_topk(topk_idx=topk_idx, num_kv_heads=num_kv_heads)
+
+    def _int2_decode_topk(
+        self,
+        *,
+        layer,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        disable_value: bool,
+        num_kv_heads: int,
+    ):
+        from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
+            flash_decode_with_topk_idx,
+        )
+
+        idx_o, topk_idx, _ = flash_decode_with_topk_idx(
+            q=idx_q,
+            sink=None,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            req_to_token=self.req_to_token,
+            seq_lens=forward_batch.seq_lens,
+            max_seqlen=self._max_seqlen_k,
+            slot_ids=forward_batch.req_pool_indices,
+            block_size=self.block_size_k,
+            topk=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            use_dense_main_attn=False,
+            page_size=1,
+            q_scale=layer.idx_q_scale_float,
+            k_scale=layer.idx_k_scale_float,
+            v_scale=layer.idx_v_scale_float,
+        )
+        return idx_o, self._int2_reduce_topk(topk_idx=topk_idx, num_kv_heads=num_kv_heads)
+
+    def _int2_stage_decode_blocks(
+        self, *, layer_id: int, topk_idx: torch.Tensor, forward_batch: ForwardBatch, bs: int
+    ):
+        # Device-side only, static shapes, writes into the preallocated buffers.
+        dec = self._int2_dec
+        if dec is None or dec.max_bs < bs:
+            raise RuntimeError(
+                "int2 decode staging buffers were not sized for this batch "
+                f"(have {0 if dec is None else dec.max_bs}, need {bs}); "
+                "init_forward_metadata_out_graph did not run for this forward."
+            )
+        n_blocks = topk_idx.shape[-1]
+        if n_blocks != self._int2_n_blocks:
+            raise RuntimeError(
+                f"reduced top-k width {n_blocks} != {self._int2_n_blocks} the "
+                "decode staging buffers were sized for"
+            )
+        slots, pos, valid = decode_block_rows(
+            topk_blk=topk_idx[0],
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            block_size=self.block_size_k,
+            ar_block=self._int2_ar_block,
+        )
+        n_rows = bs * n_blocks * self.block_size_k
+        k_st, v_st = dec.k[:n_rows], dec.v[:n_rows]
+        dequantize_prefix_kv(
+            kv_pool=self.kv_pool,
+            layer_id=layer_id,
+            prefix_indices=slots.reshape(-1),
+            model_dtype=self.model_dtype,
+            out_k=k_st,
+            out_v=v_st,
+        )
+        fake = dec.fake[:bs]
+        fill_decode_fake_table(
+            fake=fake, pos=pos, valid=valid, rows=dec.rows[:bs], dump_col=self._int2_dump_col
+        )
+        return k_st, v_st, fake, dec.slot_ids[:bs]
+
+    def _int2_prefill_main(
+        self,
+        *,
+        layer,
+        q3: torch.Tensor,
+        own_loc: torch.Tensor,
+        own_k: torch.Tensor,
+        own_v: torch.Tensor,
+        topk_idx: torch.Tensor,
+        staging: _Int2PrefillStaging,
+        meta: tuple,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
+            flash_prefill_with_gqa_share_sparse,
+        )
+
+        cu_seqlens, seq_lens, prefix_lens, cu_seqblocks_q, max_seqblock_q, _ = meta
+        k_st, v_st = dequantize_prefix_kv(
+            kv_pool=self.kv_pool,
+            layer_id=layer.layer_id,
+            prefix_indices=staging.flat,
+            model_dtype=self.model_dtype,
+        )
+        # This forward's own tokens attend to their exact rows, as in the
+        # triton extend path.
+        own = self._int2_slot_to_ragged[own_loc.to(torch.int64)].to(torch.int64)
+        k_st[own] = own_k
+        v_st[own] = own_v
+        return flash_prefill_with_gqa_share_sparse(
+            q=q3.contiguous(),
+            k_cache=k_st,
+            v_cache=v_st,
+            sink=None,
+            req_to_token=staging.fake,
+            slot_ids=staging.slot_ids,
+            topk_idx=topk_idx,
+            block_size_q=self.block_size_q,
+            block_size_k=self.block_size_k,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=self._max_seqlen_q,
+            sm_scale=layer.scaling,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+        )
+
+    def _forward_extend_int2(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        *,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+        disable_value: bool,
+        kv_cached_by_fusion: bool,
+    ):
+        if kv_cached_by_fusion:
+            raise RuntimeError(
+                "The fused norm+rope+cache kernel wrote bf16 K/V rows into the "
+                "int2 pool's packed buffers; the int2 pool must not take that path."
+            )
+        pool = self.kv_pool
+        num_tokens = q.shape[0]
+        n_q_heads, head_dim = layer.tp_q_head_num, layer.qk_head_dim
+        n_kv_heads, v_head_dim = layer.tp_k_head_num, layer.v_head_dim
+        # One rotation serves the cache write and the staged rows.
+        q3, k3, v3, need_v_inverse = prepare_quantized_extend_qkv(
+            kv_pool=pool,
+            layer=layer,
+            q=q.reshape(num_tokens, n_q_heads, head_dim),
+            k=k.reshape(-1, n_kv_heads, head_dim),
+            v=v.reshape(-1, n_kv_heads, v_head_dim),
+        )
+        q3 = q3.to(self.model_dtype)
+        k3 = k3.to(self.model_dtype)
+        v3 = v3.to(self.model_dtype)
+
+        loc = forward_batch.out_cache_loc
+        if save_kv_cache:
+            pool.set_kv_buffer(
+                layer=layer,
+                loc=loc,
+                cache_k=k3,
+                cache_v=v3,
+                already_hadamard_transformed=True,
+                is_decode=False,
+            )
+            self._int2_write_index(
+                layer=layer, loc=loc, idx_k=idx_k, idx_v=idx_v, disable_value=disable_value
+            )
+        idx_k_cache, idx_v_cache = self._int2_index_caches(
+            layer_id=layer.layer_id, disable_value=disable_value
+        )
+        meta = self._prefill_seqblock_meta_for(forward_batch, q)
+        cu_seqlens, seq_lens = meta[0], meta[1]
+        staging = self._int2_extend_staging(forward_batch, seq_lens)
+
+        # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
+        # k/v and out_cache_loc keep the padded length for the cache write.
+        if forward_batch.extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        else:
+            actual_num_tokens = int(cu_seqlens[-1].item())
+        q3 = q3[:actual_num_tokens]
+        idx_q = idx_q[:actual_num_tokens].reshape(actual_num_tokens, -1, self.idx_head_dim)
+
+        idx_o, topk_idx = self._int2_prefill_topk(
+            layer=layer,
+            idx_q=idx_q,
+            idx_k_cache=idx_k_cache,
+            idx_v_cache=idx_v_cache,
+            forward_batch=forward_batch,
+            meta=meta,
+            disable_value=disable_value,
+            num_kv_heads=n_kv_heads,
+        )
+        o = self._int2_prefill_main(
+            layer=layer,
+            q3=q3,
+            own_loc=loc[:actual_num_tokens],
+            own_k=k3[:actual_num_tokens],
+            own_v=v3[:actual_num_tokens],
+            topk_idx=topk_idx,
+            staging=staging,
+            meta=meta,
+        )
+        o = apply_inverse_v_rotation(
+            result=o.view(actual_num_tokens, n_q_heads, v_head_dim),
+            kv_pool=pool,
+            layer=layer,
+            need_v_inverse=need_v_inverse,
+        ).to(q.dtype)
+        o = o.reshape(actual_num_tokens, -1)
+        if idx_o is not None:
+            idx_o = idx_o.reshape(actual_num_tokens, -1)
+        if actual_num_tokens < num_tokens:
+            pad_len = num_tokens - actual_num_tokens
+            o = torch.cat([o, o.new_zeros(pad_len, o.shape[1])], dim=0)
+            if idx_o is not None:
+                idx_o = torch.cat([idx_o, idx_o.new_zeros(pad_len, idx_o.shape[1])], dim=0)
+        return (
+            None if idx_o is None else idx_o.contiguous(),
+            o.contiguous(),
+        )
+
+    def _forward_decode_int2(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        *,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+        disable_value: bool,
+    ):
+        if self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id):
+            raise RuntimeError(
+                "The fused norm+rope+cache kernel wrote bf16 K/V rows into the "
+                "int2 pool's packed buffers; the int2 pool must not take that path."
+            )
+        from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
+            flash_decode_with_gqa_share_sparse,
+        )
+
+        pool = self.kv_pool
+        bs = q.shape[0]
+        n_q_heads, head_dim = layer.tp_q_head_num, layer.qk_head_dim
+        n_kv_heads, v_head_dim = layer.tp_k_head_num, layer.v_head_dim
+        q3, k3, v3, need_v_inverse = prepare_quantized_extend_qkv(
+            kv_pool=pool,
+            layer=layer,
+            q=q.reshape(bs, n_q_heads, head_dim),
+            k=k.reshape(bs, n_kv_heads, head_dim),
+            v=v.reshape(bs, n_kv_heads, v_head_dim),
+        )
+        q3 = q3.to(self.model_dtype)
+
+        loc = forward_batch.out_cache_loc
+        if save_kv_cache:
+            # is_decode=True: the unified pool routes a single-token write to
+            # the HP-recent ring with no boolean masking (capture-safe).
+            pool.set_kv_buffer(
+                layer=layer,
+                loc=loc,
+                cache_k=k3,
+                cache_v=v3,
+                already_hadamard_transformed=True,
+                is_decode=True,
+            )
+            self._int2_write_index(
+                layer=layer, loc=loc, idx_k=idx_k, idx_v=idx_v, disable_value=disable_value
+            )
+        idx_k_cache, idx_v_cache = self._int2_index_caches(
+            layer_id=layer.layer_id, disable_value=disable_value
+        )
+        idx_o, topk_idx = self._int2_decode_topk(
+            layer=layer,
+            idx_q=idx_q.reshape(bs, -1, self.idx_head_dim),
+            idx_k_cache=idx_k_cache,
+            idx_v_cache=idx_v_cache,
+            forward_batch=forward_batch,
+            disable_value=disable_value,
+            num_kv_heads=n_kv_heads,
+        )
+        k_st, v_st, fake, slot_ids = self._int2_stage_decode_blocks(
+            layer_id=layer.layer_id, topk_idx=topk_idx, forward_batch=forward_batch, bs=bs
+        )
+        o = flash_decode_with_gqa_share_sparse(
+            q=q3.contiguous(),
+            sink=None,
+            k_cache=k_st,
+            v_cache=v_st,
+            req_to_token=fake,
+            seq_lens=forward_batch.seq_lens,
+            slot_ids=slot_ids,
+            block_size=self.block_size_k,
+            topk_idx=topk_idx,
+            sm_scale=layer.scaling,
+        )
+        o = apply_inverse_v_rotation(
+            result=o.view(bs, n_q_heads, v_head_dim),
+            kv_pool=pool,
+            layer=layer,
+            need_v_inverse=need_v_inverse,
+        ).to(q.dtype)
+        return (
+            None if idx_o is None else idx_o.reshape(bs, -1).contiguous(),
+            o.reshape(bs, -1).contiguous(),
         )
 
 

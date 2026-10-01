@@ -258,14 +258,24 @@ def _mixed_prefix_dequantize_tensor(
     hp_offset: int,
     head_dim: int,
     model_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = prefix_indices.shape[0]
     num_heads = quantized.shape[1]
-    out = torch.empty(
-        (num_tokens, num_heads, head_dim),
-        dtype=model_dtype,
-        device=prefix_indices.device,
-    )
+    if out is None:
+        out = torch.empty(
+            (num_tokens, num_heads, head_dim),
+            dtype=model_dtype,
+            device=prefix_indices.device,
+        )
+    else:
+        # Caller-owned destination (a persistent staging buffer that a CUDA
+        # graph can capture against); must already be the exact row count.
+        assert out.shape == (num_tokens, num_heads, head_dim), (
+            f"dequant out buffer {tuple(out.shape)} != "
+            f"{(num_tokens, num_heads, head_dim)}"
+        )
+        assert out.dtype == model_dtype
     if num_tokens == 0:
         return out
     num_groups = _get_num_scale_groups(scales_zeros)
@@ -306,6 +316,8 @@ def dequantize_prefix_kv(
     layer_id: int,
     prefix_indices: torch.Tensor,
     model_dtype: torch.dtype,
+    out_k: Optional[torch.Tensor] = None,
+    out_v: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dequantize the prefix slots referenced by ``prefix_indices`` into dense
     ``[num_tokens, head_num, head_dim]`` tensors in ``model_dtype``.
@@ -317,7 +329,14 @@ def dequantize_prefix_kv(
 
     Grouped scales (``scales.shape[-1] > 2``) are handled by
     ``dequantize_kv_int2_triton`` internally.
+
+    ``out_k`` / ``out_v``, when given, receive the rows instead of freshly
+    allocated tensors (both or neither; exact ``[num_tokens, heads, dim]``
+    shape). Staging paths that run under CUDA-graph capture pass persistent
+    buffers here so the captured kernels write to fixed addresses.
     """
+    if (out_k is None) != (out_v is None):
+        raise ValueError("dequantize_prefix_kv: pass both out_k and out_v or neither")
     device = prefix_indices.device
     # Per-layer geometry (two-group / heterogeneous SWA). Falls back to the
     # scalar pool geometry for uniform pools / pools without the accessors.
@@ -330,6 +349,8 @@ def dequantize_prefix_kv(
         l_head_dim = kv_pool.head_dim
         l_v_head_dim = kv_pool.v_head_dim
     if prefix_indices.numel() == 0:
+        if out_k is not None:
+            return out_k, out_v
         return (
             torch.empty(
                 (0, l_head_num, l_head_dim),
@@ -360,6 +381,7 @@ def dequantize_prefix_kv(
                 kv_pool.hp_global_offset,
                 l_head_dim,
                 model_dtype,
+                out=out_k,
             ),
             _mixed_prefix_dequantize_tensor(
                 prefix_indices,
@@ -369,6 +391,7 @@ def dequantize_prefix_kv(
                 kv_pool.hp_global_offset,
                 l_v_head_dim,
                 model_dtype,
+                out=out_v,
             ),
         )
 
@@ -379,10 +402,13 @@ def dequantize_prefix_kv(
     assert kv_pool.dtype == "int2", (
         f"Unsupported quantized KV dtype: {kv_pool.dtype}"
     )
-    return (
-        dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype),
-        dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype),
-    )
+    k = dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype)
+    v = dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype)
+    if out_k is not None:
+        out_k.copy_(k)
+        out_v.copy_(v)
+        return out_k, out_v
+    return k, v
 
 
 def apply_inverse_v_rotation(

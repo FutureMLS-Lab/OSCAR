@@ -1038,11 +1038,14 @@ class MiniMaxM3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
-        # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
-        main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        # The fused kernel writes normed bf16 K/V straight into the paged cache, so a
+        # main K/V cache that is not stored as bf16 rows (--kv-cache-dtype fp8_* or
+        # the OSCAR int2 pool) can't use it; fall back to norm+rope.
+        main_kv_not_bf16_rows = kv_pool is not None and (
+            kv_pool.dtype in _FP8_KV_DTYPES or kv_pool.dtype == "int2"
+        )
         can_use_cache_fusion = (
-            not main_kv_is_fp8
+            not main_kv_not_bf16_rows
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k

@@ -77,6 +77,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
+from sglang.srt.mem_cache.minimax_int2_kv_pool import MiniMaxInt2SparseKVPool
 from sglang.srt.mem_cache.unified_kv_pool import (
     UnifiedInt2HPKVPool,
     compute_page_geometry,
@@ -1334,13 +1335,17 @@ class KVCacheConfigurator:
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 if oscar_mixed_kv:
-                    raise NotImplementedError(
-                        "OSCAR INT2 KV for MiniMax sparse-attention models is not "
-                        "wired into the native MiniMaxSparseKVPool on this tree yet."
+                    # Per-head INT2 K/V for every layer plus the indexer's
+                    # slot-indexed key cache; the MSA backend stages the
+                    # rows the sparse kernels read.
+                    token_to_kv_pool = self._build_minimax_int2_sparse_kv_pool(
+                        max_total_num_tokens=sizes.max_total_num_tokens,
+                        req_to_token_pool=req_to_token_pool,
                     )
-                token_to_kv_pool = self._build_minimax_sparse_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
-                )
+                else:
+                    token_to_kv_pool = self._build_minimax_sparse_kv_pool(
+                        max_total_num_tokens=sizes.max_total_num_tokens,
+                    )
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -2178,6 +2183,70 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             layer_groups=layer_groups,
+            **geometry,
+        )
+
+    def _build_minimax_int2_sparse_kv_pool(
+        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
+    ) -> KVCache:
+        # Same arena geometry as _build_oscar_unified_kv_pool plus the indexer's
+        # key cache (one row per slot, window slots included); the MiniMax branch
+        # of pool_configurator prices exactly this layout.
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
+        if get_memory().enable_hisparse:
+            raise NotImplementedError(
+                "HiSparse offload is not supported together with the OSCAR INT2 "
+                "KV pool for MiniMax sparse attention."
+            )
+        hf_config = self.model_config.hf_config
+        sparse_cfg = get_minimax_sparse_attention_config(hf_config)
+        dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+        disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
+            sparse_cfg
+        )
+        geometry = self._oscar_unified_pool_geometry(
+            max_total_num_tokens=max_total_num_tokens,
+            req_to_token_pool=req_to_token_pool,
+        )
+        tp = get_parallel().attn_tp_size
+        dcp = get_parallel().attn_dcp_size
+        logger.info(
+            "Enable unified mixed KV (int2) for MiniMax sparse attention: "
+            "prefix=%s recent=%s num_quant_pages=%s N_Q=%s hp_dtype=%s "
+            "max_total_num_tokens=%s max_req_slots=%s hp_prefix_pool_tokens=%s "
+            "dense_layers=%d sparse_layers=%d",
+            geometry["hp_prefix_tokens"],
+            geometry["hp_recent_tokens"],
+            geometry["num_quant_pages"],
+            self.page_size,
+            envs.SGLANG_MIXED_KV_HP_DTYPE.get(),
+            max_total_num_tokens,
+            req_to_token_pool.req_to_token.shape[0],
+            geometry["num_hp_prefix_slots"],
+            len(dense_layer_ids),
+            len(sparse_layer_ids),
+        )
+        return MiniMaxInt2SparseKVPool(
+            head_num=self.model_config.get_num_kv_heads(tp, dcp),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=self.layer_info.num_effective_layers,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            idx_head_dim=sparse_cfg["sparse_index_dim"],
+            dense_layer_ids=dense_layer_ids,
+            sparse_layer_ids=sparse_layer_ids,
+            disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+            # Same resolution as the dense pool and as the pricing: the model
+            # dtype unless an fp8 index cache is requested.
+            index_dtype=get_minimax_sparse_index_dtype(
+                fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                    resolving_view(self.server_args)
+                ),
+                kv_cache_dtype=self.kv_cache_dtype,
+                model_dtype=self.model_dtype,
+            ),
             **geometry,
         )
 

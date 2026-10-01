@@ -22,6 +22,7 @@ MODULES = [
     "test_hybrid_layer_id_translation.py",
     "test_perhead_rotation.py",
     "test_mixed_kv_radix.py",
+    "test_minimax_staging.py",
 ]
 
 failures = []

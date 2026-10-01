@@ -8,6 +8,11 @@ forward attends into a BF16 staging buffer and hands the kernels a *fake*
 (the table is still indexed by sequence position), so the kernels' causal and
 seq_len masking is untouched.
 
+Prefill stages every token of the batch in ragged request order
+(``prefill_fake_table`` / ``build_slot_to_ragged``); decode stages only the
+selected blocks at their real positions (``decode_block_rows`` /
+``fill_decode_fake_table``).
+
 Pure tensor arithmetic, static shapes -- decode is CUDA-graph capturable -- and
 no sglang imports, so it is unit-tested on CPU.
 """
@@ -23,6 +28,17 @@ def prefill_fake_table(cu_seqlens_k: torch.Tensor, max_seqlen_k: int) -> torch.T
     are never read (the kernels mask by seq_len), so no masking is needed."""
     ar = torch.arange(max_seqlen_k, dtype=torch.int32, device=cu_seqlens_k.device)
     return (cu_seqlens_k[:-1].to(torch.int32)[:, None] + ar[None, :]).contiguous()
+
+
+def build_slot_to_ragged(flat_slots: torch.Tensor, slot_to_ragged: torch.Tensor) -> None:
+    """``slot_to_ragged[flat_slots[i]] = i``: where a pool slot landed in the
+    ragged staging buffer. Used to overwrite this forward's own tokens with
+    their exact rows. Entries for slots outside the batch are left stale;
+    nothing in the batch can reference them."""
+    n = flat_slots.numel()
+    slot_to_ragged[flat_slots.to(torch.int64)] = torch.arange(
+        n, dtype=slot_to_ragged.dtype, device=slot_to_ragged.device
+    )
 
 
 def decode_block_rows(
