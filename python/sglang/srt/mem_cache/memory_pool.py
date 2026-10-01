@@ -4332,7 +4332,7 @@ class HybridLinearKVPool(KVCache):
         UnifiedInt2HPKVAllocator instead of the standard paged allocator."""
         inner = self.__dict__.get("full_kv_pool")
         fn = getattr(inner, "mixed_kv_enabled", None)
-        return bool(fn()) if callable(fn) else False
+        return callable(fn) and fn() is True
 
     @property
     def _R_k(self):

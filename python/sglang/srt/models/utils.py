@@ -298,7 +298,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """
     pool = get_token_to_kv_pool()
     mixed_kv = getattr(pool, "mixed_kv_enabled", None)
-    if callable(mixed_kv) and mixed_kv():
+    if callable(mixed_kv) and mixed_kv() is True:
         # OSCAR mixed-KV pools rotate/quantize inside set_kv_buffer; the fused
         # rope-epilogue write would store raw bf16 bytes into the int2 layout.
         return False

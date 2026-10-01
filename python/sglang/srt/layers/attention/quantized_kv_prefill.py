@@ -346,7 +346,7 @@ def dequantize_prefix_kv(
     prefix_indices = prefix_indices.to(torch.int64)
     if (
         getattr(kv_pool, "mixed_kv_enabled", None) is not None
-        and kv_pool.mixed_kv_enabled()
+        and kv_pool.mixed_kv_enabled() is True
     ):
         assert kv_pool.dtype == "int2", (
             f"Unsupported quantized KV dtype: {kv_pool.dtype}"

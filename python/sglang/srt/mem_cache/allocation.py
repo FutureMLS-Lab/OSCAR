@@ -347,14 +347,19 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
 
 
 def _is_mixed_kv_enabled(batch: ScheduleBatch) -> bool:
+    # The pool answers first: only the OSCAR mixed pool returns True, and the
+    # comparison is against True itself so a test double (whose attributes are
+    # truthy mocks) never routes here.
+    get_kvcache = getattr(batch.token_to_kv_pool_allocator, "get_kvcache", None)
+    kvcache = get_kvcache() if get_kvcache is not None else None
+    if kvcache is None or kvcache.mixed_kv_enabled() is not True:
+        return False
     # Speculative decoding allocates through ``alloc_for_spec_decode`` and the
     # draft worker's own paths, which the mixed HP+int2 layout does not cover.
-    spec = batch.spec_algorithm
+    spec = getattr(batch, "spec_algorithm", None)
     if spec is not None and not spec.is_none():
         return False
-    allocator = batch.token_to_kv_pool_allocator
-    kvcache = allocator.get_kvcache()
-    return getattr(kvcache, "mixed_kv_enabled", None) is not None and kvcache.mixed_kv_enabled()
+    return True
 
 
 def _mixed_window_lengths(

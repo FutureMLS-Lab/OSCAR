@@ -3298,12 +3298,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
+        get_kvcache = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+        kvcache = get_kvcache() if get_kvcache is not None else None
         if (
-            self.spec_algorithm.is_none()
-            and mixed_kv_enabled is not None
-            and mixed_kv_enabled()
+            kvcache is not None
+            and kvcache.mixed_kv_enabled() is True
+            and self.spec_algorithm.is_none()
         ):
             # Worst-case: every req flushes this step -> bs*N_Q quant slots.
             num_tokens = len(requests) * int(kvcache.flush_interval)

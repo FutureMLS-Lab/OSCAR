@@ -1050,7 +1050,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         pool = self.model_runner.token_to_kv_pool
         fn = getattr(pool, "mixed_kv_enabled", None)
-        if callable(fn) and fn():
+        if callable(fn) and fn() is True:
             return int(pool.hp_global_offset)
         return None
 

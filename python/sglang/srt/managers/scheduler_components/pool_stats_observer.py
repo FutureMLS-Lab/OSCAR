@@ -226,10 +226,11 @@ class SchedulerPoolStatsObserver:
         check must use it.
         """
         allocator = self.token_to_kv_pool_allocator
-        # Only UnifiedInt2HPKVPool exposes mixed_kv_enabled(); KVCache does not.
-        kvcache = allocator.get_kvcache()
-        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
-        if mixed_kv_enabled is not None and mixed_kv_enabled():
+        # Only the OSCAR mixed pool answers True; compared against True itself so
+        # a test double never changes the accounting.
+        get_kvcache = getattr(allocator, "get_kvcache", None)
+        kvcache = get_kvcache() if get_kvcache is not None else None
+        if kvcache is not None and kvcache.mixed_kv_enabled() is True:
             return int(allocator.size)
         return None
 

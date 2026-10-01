@@ -334,10 +334,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # Mixed-KV: reset the per-req HP-recent cursor before the req_pool_idx
     # is recycled, so the next request starts fresh.
-    kvcache = tree_cache.token_to_kv_pool_allocator.get_kvcache()
-    release_slab = getattr(kvcache, "release_req_slab", None)
-    if release_slab is not None:
-        release_slab(req.kv.req_pool_idx)
+    get_kvcache = getattr(tree_cache.token_to_kv_pool_allocator, "get_kvcache", None)
+    kvcache = get_kvcache() if get_kvcache is not None else None
+    if kvcache is not None and kvcache.mixed_kv_enabled() is True:
+        kvcache.release_req_slab(req.kv.req_pool_idx)
         mixed_kv_audit.audit_release(req.kv.req_pool_idx)
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the

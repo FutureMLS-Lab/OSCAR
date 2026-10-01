@@ -522,12 +522,10 @@ class RadixCache(MixedKVPrefixMixin, BasePrefixCache):
         return radix_key, kv_indices, result.prefix_len
 
     def _committed_fill_ids(self, req: Req):
-        # ``get_fill_ids`` is the admitted extend range and ``kv_committed_len``
-        # what alloc_for_extend committed for it; they agree after a normal
-        # extend, and the min keeps a lagging commit out of the tree.
-        fill_ids = req.get_fill_ids()
-        committed_len = min(int(req.kv.kv_committed_len), len(fill_ids))
-        return fill_ids[:committed_len]
+        # The admitted extend range, exactly as upstream caches it: the
+        # decode-disaggregation path already truncates ``extend_range`` to what
+        # was committed before a request reaches the tree.
+        return req.get_fill_ids()
 
     def insert_req(self, req: Req, *, up_to: int):
         if self.disable:

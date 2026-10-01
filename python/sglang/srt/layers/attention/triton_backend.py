@@ -113,7 +113,7 @@ def _pool_mixed_kv_active(pool) -> bool:
     hybrid-SWA path.
     """
     probe = getattr(pool, "mixed_kv_enabled", None)
-    return probe is not None and bool(probe())
+    return probe is not None and probe() is True
 
 
 @triton.jit

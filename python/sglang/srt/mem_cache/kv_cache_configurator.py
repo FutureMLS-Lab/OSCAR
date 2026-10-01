@@ -2548,7 +2548,7 @@ class KVCacheConfigurator:
                     )
             else:
                 mixed_kv = getattr(token_to_kv_pool, "mixed_kv_enabled", None)
-                if callable(mixed_kv) and mixed_kv():
+                if callable(mixed_kv) and mixed_kv() is True:
                     # OSCAR mixed-KV. For hybrid mambaish models the outer pool
                     # is HybridLinearKVPool wrapping a UnifiedInt2HPKVPool. The
                     # unified-pool sizing attributes live on the inner pool; the

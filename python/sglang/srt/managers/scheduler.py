@@ -2345,11 +2345,12 @@ class Scheduler(
 
     def init_mixed_kv_stream_wait(self) -> None:
         """Whether run_batch stashes forward_done on the mixed HP+int2 KV pool."""
-        # Only UnifiedInt2HPKVPool exposes mixed_kv_enabled(); KVCache does not.
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
+        # Only the OSCAR mixed pool answers True; compared against True itself so
+        # a test double never enables the wait.
+        get_kvcache = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+        kvcache = get_kvcache() if get_kvcache is not None else None
         self.enable_mixed_kv_stream_wait = (
-            mixed_kv_enabled is not None and mixed_kv_enabled()
+            kvcache is not None and kvcache.mixed_kv_enabled() is True
         )
 
     def init_pool_stats_observer(self) -> None:
