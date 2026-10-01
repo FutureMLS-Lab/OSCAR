@@ -96,18 +96,40 @@ verify_wait_serve() {
   return 1
 }
 
-verify_gen() {  # port prompt max_new -> raw JSON
+verify_gen() {  # port prompt max_new -> JSON with a "text" field (the judge's shape)
   local port=$1 prompt=$2 n=${3:-48}
+  # Through the chat template, never raw /generate. An instruct checkpoint without
+  # its template can collapse on its own: Gemma-4's tokenizer (transformers 5.12)
+  # prepends no <bos> to raw text, and the model then echoes the prompt tail
+  # (" Answer in. Answer in.") -- in HF transformers exactly as in sglang. That
+  # read as a serving bug for four GPU cycles. The template is what every client
+  # and the GPQA eval send, so it is also the only thing worth judging.
   local body
   body=$(python3 -c "
 import json, sys
-print(json.dumps({'text': sys.argv[1],
-                  'sampling_params': {'max_new_tokens': int(sys.argv[2]),
-                                      'temperature': 0.7, 'top_p': 0.95}}))" "$prompt" "$n")
+print(json.dumps({'model': 'default',
+                  'messages': [{'role': 'user', 'content': sys.argv[1]}],
+                  'max_tokens': int(sys.argv[2]), 'temperature': 0.7, 'top_p': 0.95}))" "$prompt" "$n")
   # 2048 tokens at a slow model's rate does not fit in 240s -- GLM-5.2 would
   # time out and the probe would read as a failure of the model.
-  curl -sS -m 900 -X POST "http://127.0.0.1:$port/generate" \
-    -H 'Content-Type: application/json' -d "$body" 2>/dev/null
+  curl -sS -m 900 -X POST "http://127.0.0.1:$port/v1/chat/completions" \
+    -H 'Content-Type: application/json' -d "$body" 2>/dev/null |
+  python3 -c "
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    print(raw); raise SystemExit
+if isinstance(d, dict) and d.get('error'):
+    print(json.dumps({'text': '', 'error': d['error']})); raise SystemExit
+try:
+    choice = d['choices'][0]
+    m = choice['message']
+    text = (m.get('reasoning_content') or '') + (m.get('content') or '')
+    print(json.dumps({'text': text, 'finish_reason': choice.get('finish_reason')}))
+except Exception:
+    print(json.dumps({'text': '', 'error': {'message': 'unexpected chat response: ' + raw[:200]}}))"
 }
 
 # Two families of check, because broken low-bit output has two shapes.
