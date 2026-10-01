@@ -45,7 +45,7 @@ trap cleanup EXIT INT TERM
 
 COMMON_ARGS=( --model-path "${MODEL}" --tensor-parallel-size "${TP_SIZE}"
     --mem-fraction-static "${MEM_FRAC}" --max-running-requests 32 --enable-cache-report
-    --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}" --host 127.0.0.1 --port "${PORT}"
+    --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS}" --host 127.0.0.1 --port "${PORT}"
     --dist-init-addr "127.0.0.1:${DIST_PORT}" --trust-remote-code )
 
 if [[ "${MODE}" == "bf16" ]]; then

@@ -33,13 +33,13 @@ SGLANG_MIXED_KV_PREFIX_TOKENS=$SINK SGLANG_MIXED_KV_RECENT_TOKENS=$RECENT \
 SGLANG_OSCAR_K_ROTATION_PATH=$KROT SGLANG_OSCAR_V_ROTATION_PATH=$VROT \
 CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP-1))) \
 python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
-  --tp "$TP" --port $PORT --host 127.0.0.1 \
+  --tp-size "$TP" --port $PORT --host 127.0.0.1 \
   --attention-backend triton --prefill-attention-backend triton \
   --decode-attention-backend triton --mm-attention-backend triton_attn \
   --kv-cache-dtype int2 --kv-cache-quant-group-size "$GS" \
   --mem-fraction-static "$MF" --context-length "${CTX:-8192}" \
-  --max-running-requests 2 --cuda-graph-max-bs 2 \
-  ${MAMBA_STRATEGY:+--mamba-scheduler-strategy $MAMBA_STRATEGY} \
+  --max-running-requests 2 --cuda-graph-max-bs-decode 2 \
+  ${MAMBA_STRATEGY:+--mamba-radix-cache-strategy $MAMBA_STRATEGY} \
   ${NO_AUTOTUNE:+--disable-flashinfer-autotune} \
   $EXTRA > "$LOG" 2>&1 &
 SRV=$!

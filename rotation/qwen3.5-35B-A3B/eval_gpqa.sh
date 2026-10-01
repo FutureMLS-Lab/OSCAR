@@ -37,7 +37,7 @@ if [[ "${MODE}" == "hadamard" || "${MODE}" == "calibrated" ]]; then
     # measured indistinguishable from cache-OFF across four paired arms.
     # Set DISABLE_RADIX=1 to A/B it. Note that on a mamba/linear-attention
     # model --disable-radix-cache is not merely a downgrade: it raises
-    # ValueError together with --mamba-scheduler-strategy extra_buffer, which
+    # ValueError together with --mamba-radix-cache-strategy extra_buffer, which
     # is what INT2 needs for page_size 8.
     export EXTRA_SERVER_ARGS
     export RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/_eval_gpqa_${MODE}}"
@@ -97,7 +97,7 @@ SERVER_ARGS=(
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
     --enable-cache-report
-    --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
+    --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS}"
     --host 127.0.0.1
     --port "${PORT}"
     --dist-init-addr "127.0.0.1:${DIST_PORT}"

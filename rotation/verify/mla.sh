@@ -33,12 +33,12 @@ SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=64 SGLANG_MIXED_KV_RECENT_TOKENS=512 \
 CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP-1))) \
 python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
-  --tp "$TP" --port $PORT --host 127.0.0.1 \
+  --tp-size "$TP" --port $PORT --host 127.0.0.1 \
   --attention-backend "${ATTN_BACKEND:-triton}" --prefill-attention-backend "${ATTN_BACKEND:-triton}" \
   --decode-attention-backend "${ATTN_BACKEND:-triton}" \
   --kv-cache-dtype bfloat16 \
   --mem-fraction-static "$MF" --context-length "$CTX" \
-  --max-running-requests 4 --cuda-graph-max-bs 4 > "$LOG" 2>&1 &
+  --max-running-requests 4 --cuda-graph-max-bs-decode 4 > "$LOG" 2>&1 &
 SRV=$!
 if ! verify_wait_serve $SRV $PORT 260; then
   grep -aE "Error|assert|OutOfMemory|Traceback" "$LOG" | grep -avE "Ignore import" | tail -5

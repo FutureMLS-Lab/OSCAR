@@ -69,7 +69,7 @@ export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND
 # K3 is a linear-attention hybrid, so it selects MambaRadixCache, which asserts
 # page_size == 1 unless the extra buffer is enabled.
 export MAMBA_SCHEDULER_STRATEGY="${MAMBA_SCHEDULER_STRATEGY:-extra_buffer}"
-# --disable-piecewise-cuda-graph, NOT --disable-cuda-graph. Ordinary CUDA graph
+# --disable-prefill-cuda-graph, NOT --disable-cuda-graph. Ordinary CUDA graph
 # capture stays ON; only the torch.compile-based PIECEWISE variant is off, and it
 # has to be: piecewise graphs trace the model with dynamo, and the
 # triton_kernel MoE routing kernel takes a custom object argument that dynamo
@@ -79,5 +79,5 @@ export MAMBA_SCHEDULER_STRATEGY="${MAMBA_SCHEDULER_STRATEGY:-extra_buffer}"
 # That backend is not optional here -- without it mxfp4.py upcasts w13/w2 to
 # bfloat16 and 1.4 TB does not fit on 16 GPUs -- so the compile layer is what
 # gives way, not the graphs and not the packing.
-export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --pipeline-parallel-size ${PP_SIZE} --moe-runner-backend triton_kernel --disable-piecewise-cuda-graph --model-loader-extra-config {\"num_threads\":6}"
+export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --pipeline-parallel-size ${PP_SIZE} --moe-runner-backend triton_kernel --disable-prefill-cuda-graph --model-loader-extra-config {\"num_threads\":6}"
 launch

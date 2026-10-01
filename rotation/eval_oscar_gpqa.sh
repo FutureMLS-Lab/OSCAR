@@ -55,7 +55,7 @@ CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
     CUDA_GRAPH_ARGS=(--disable-cuda-graph)
 else
-    CUDA_GRAPH_ARGS=(--cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}")
+    CUDA_GRAPH_ARGS=(--cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS}")
 fi
 # V-rotation absorption folds R_v into o_proj. It assumes one rotation per
 # layer, so it is invalid for per-head (format_version 2) checkpoints -- with
@@ -248,7 +248,7 @@ SERVER_ARGS=(
     # qwen3_vl.py, so it dies at the first forward even for a text-only eval.
     #
     # This was the THIRD flag that existed only in rotation/verify/. The first
-    # two (--disable-flashinfer-autotune, --mamba-scheduler-strategy) were added
+    # two (--disable-flashinfer-autotune, --mamba-radix-cache-strategy) were added
     # above after three models failed GPQA having passed the smoke harness. Any
     # flag added to verify/mha.sh from here on belongs in this list too --
     # otherwise the harness that says a model works and the harness that scores
@@ -287,7 +287,7 @@ fi
 # `if not self.enable_mamba_extra_buffer`, so extra_buffer keeps the prefix cache
 # on. The run scripts exported this variable and nothing read it.
 if [[ -n "${MAMBA_SCHEDULER_STRATEGY:-}" ]]; then
-    SERVER_ARGS+=(--mamba-scheduler-strategy "${MAMBA_SCHEDULER_STRATEGY}")
+    SERVER_ARGS+=(--mamba-radix-cache-strategy "${MAMBA_SCHEDULER_STRATEGY}")
 fi
 if [[ -n "${REASONING_PARSER:-}" ]]; then
     SERVER_ARGS+=(--reasoning-parser "${REASONING_PARSER}")

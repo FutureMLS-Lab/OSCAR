@@ -5,7 +5,7 @@
 # asserts page_size==1 while the INT2 KV path uses page 8:
 #     AssertionError: Page size must be 1 for MambaRadixCache v1, got 8
 # That assertion is guarded by `if not self.enable_mamba_extra_buffer`, so
-# --mamba-scheduler-strategy extra_buffer lifts it and the cache (worth ~4.7%
+# --mamba-radix-cache-strategy extra_buffer lifts it and the cache (worth ~4.7%
 # here) keeps working. An earlier version of this file disabled the cache and
 # called that mandatory -- a workaround written before the guard was read.
 #

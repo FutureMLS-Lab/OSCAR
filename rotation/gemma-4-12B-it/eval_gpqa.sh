@@ -7,8 +7,8 @@
 set -euo pipefail
 # CUDA graph on by default -- the published GPQA numbers use it and INT2 decode
 # is launch-bound without it. Set GRAPH_ARGS='--disable-cuda-graph
-# --disable-piecewise-cuda-graph' to reproduce the older graph-off runs.
-GRAPH_ARGS="${GRAPH_ARGS:---cuda-graph-max-bs 16}"
+# --disable-prefill-cuda-graph' to reproduce the older graph-off runs.
+GRAPH_ARGS="${GRAPH_ARGS:---cuda-graph-max-bs-decode 16}"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
