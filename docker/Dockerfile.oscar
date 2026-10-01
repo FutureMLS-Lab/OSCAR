@@ -1,0 +1,35 @@
+# OSCAR on upstream sglang.
+#
+# The official image installs sglang editable from /sgl-workspace/sglang/python,
+# so laying this repository over /sgl-workspace/sglang makes `import sglang`
+# resolve to the code in this tree -- upstream plus the OSCAR low-bit KV cache.
+# Rotations (RotationZoo .pt files) are not in git; they are copied from the
+# build context's rotations/ directory, as the previous image did.
+#
+#   docker build -f docker/Dockerfile.oscar -t oscar-env:<tag> <context>
+#
+# where <context> holds this repository under ./oscar-src and the rotations
+# under ./rotations.
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.21-cu130
+FROM ${BASE_IMAGE}
+
+ARG IMAGE_TAG=dev
+ENV OSCAR_ROOT=/oscar OSCAR_ROTATIONS=/oscar/rotations
+
+RUN rm -rf /sgl-workspace/sglang
+COPY oscar-src /sgl-workspace/sglang
+COPY rotations /oscar/rotations
+
+# Paths the harness scripts were written against.
+RUN mkdir -p /oscar && ln -sfn /sgl-workspace/sglang /oscar/src \
+ && echo "${IMAGE_TAG}" > /oscar/IMAGE_TAG \
+ && cp /sgl-workspace/sglang/BUILT_FROM /oscar/BUILT_FROM 2>/dev/null || true
+
+# The editable install already points at /sgl-workspace/sglang/python; confirm
+# the import resolves to this tree and that the OSCAR modules are importable
+# without a GPU (structure only; kernels need libcuda at run time).
+RUN python3 -c "import sglang, os; p=os.path.realpath(sglang.__file__); assert p.startswith('/sgl-workspace/sglang/python'), p; print('sglang from', p)" \
+ && python3 -c "import ast,sys,glob; [ast.parse(open(f).read()) for f in glob.glob('/sgl-workspace/sglang/python/sglang/srt/mem_cache/unified_kv*.py')]; print('oscar modules parse')" \
+ && printf '#!/bin/sh\necho "OSCAR_ROOT=$OSCAR_ROOT image=$(cat /oscar/IMAGE_TAG) built_from=$(cat /oscar/BUILT_FROM 2>/dev/null)"\npython3 -c "import torch, sglang; print(\\"torch\\", torch.__version__, \\"cuda\\", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else \\"-\\")"\necho OSCAR_SELFCHECK_OK\n' > /usr/local/bin/oscar-selfcheck && chmod +x /usr/local/bin/oscar-selfcheck
+
+WORKDIR /sgl-workspace/sglang
