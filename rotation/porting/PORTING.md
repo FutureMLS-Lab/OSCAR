@@ -85,3 +85,35 @@ to be re-measured on this stack; the numbers in PR #26 are the old tree's.
   `RadixCache`, while upstream serves Qwen3.5 / Kimi-K3 through
   `UnifiedRadixCache` (which tracks the mamba states); the factory raises for
   that combination today.
+
+## Phase 2/3 plan (from the code surveys, 2026-10-01)
+
+**Hybrid SSM + mixed KV + prefix cache.** Upstream serves Qwen3.5 (GDN) and
+Kimi-K3 (KDA) through `UnifiedRadixCache` (FULL + MAMBA components); the
+mixed-KV tier semantics live on `RadixCache`. The port puts them on the unified
+cache too: the tier cap at the cache level of `match_prefix` (the Rust tree-core
+adapter forwards only key/extra_key/cache_salt, so the core cannot see a new
+param), the HP-recent trim and the slack cutoff through the per-component
+`prepare_for_caching_req` / `floor_cache_len` pair, the slack drop in
+`on_release` before its `inserted` early return, the `insert_req` early return,
+and `max()` on the two `cache_protected_len` writes. `MambaComponent` requires
+`enable_mamba_extra_buffer` once page_size > 1 (`--mamba-radix-cache-strategy
+auto` already resolves to `extra_buffer` then). Until that lands the factory
+raises for the combination.
+
+**Packed MLA latent on the DSA backend.** `dsa_backend.py` fetches the layer's
+KV exactly once per phase (`get_key_buffer` in forward_extend, forward_decode
+and `_forward_trtllm`) and the packed pool refuses that call, so the staging
+hook has one insertion point per phase. The top-k table is PAGED (absolute
+slots, -1 padded) for a bf16 pool because the RAGGED transform is gated on an
+fp8 cache; at decode `metadata.page_table_1` may be None (fused top-k drops the
+wide table), so the slots come from the per-layer top-k table itself. The
+staging buffers (`max_num_tokens x index_topk` rows) are preallocated in
+`init_cuda_graph_state`. Rows materialised from the packed pool are in the
+ROTATED frame, so `forward_mla.py` rotates `q_nope_out` with
+`rotate_latent` before attention and un-rotates `attn_output` before the
+`w_vc` bmm, on both the absorbed path and the concat (triton) path, refusing
+the fused-bmm / fused-rope producers that bypass the plain `q_nope_out`.
+GLM-5.2/5.3 on Blackwell with a bf16 cache resolve to prefill
+`flashmla_sparse`, decode `trtllm`; the dense one-shot MHA prefill never reads
+the pool.
