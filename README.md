@@ -458,47 +458,45 @@ tabulates them.
 
 ## Model support
 
-### Garbling sweep (12 models, one image)
+Every model below runs from this tree with `--kv-cache-dtype int2` and the
+per-model recipe in `rotation/run/<model>.sh`; there are no feature branches.
+Per-head K/V models use the mixed INT2 pool with BF16 sink/recent windows;
+MLA models (GLM-5.2, GLM-5.3, Kimi-K3) store the packed 2-bit latent
+(288 B/token/layer, 4.00× against BF16) and are served through upstream's own
+sparse attention (DSA for GLM, `trtllm_mla` for Kimi-K3); MiniMax-M3 runs its
+native MSA sparse attention with the INT2 rows staged into BF16 per layer.
+
+### Garbling sweep (one image, radix cache and CUDA graphs on)
 
 `rotation/verify/all.sh` serves every supported model from a single image with
-radix cache and CUDA graphs **on**, and judges the output on four shape checks
-rather than a letter ratio — a letter-ratio judge passed four error strings.
-`PASS` means *did not collapse*, not *answered correctly*: a fluent, off-task
-answer passes.
+radix cache and CUDA graphs **on**, sends the probe through the chat template,
+and judges the output on four shape checks rather than a letter ratio (a
+letter-ratio judge passed four error strings). `PASS` means *did not collapse*,
+not *answered correctly*: a fluent, off-task answer passes. Verdicts append to
+a file on the volume after each model, so a pre-empted pod costs time and not
+results.
 
-Last full sweep runs on **v28 itself**, not on the previous image plus an
-overlay — the point is to accept the artefact that ships, not an approximation
-of it. Verdicts append to a file on the volume after each model, so the cluster
-preempting the pod (it did, repeatedly) costs time and not results.
+The probe goes through the chat template on purpose. Gemma-4-12B-it on a raw
+`/generate` prompt echoes the prompt tail (" Answer in. Answer in.") in HF
+transformers exactly as in sglang, because its tokenizer under transformers 5.12
+prepends no `<bos>` to raw text; the template carries the token and the model
+answers. A probe that bypasses the model's real input path measures the probe.
 
-| result | models |
+| model | smoke on this tree |
 |---|---|
-| **11 PASS** | qwen3-4b-think, qwen3-8b, qwen3-32b, qwen3-30b-a3b, qwen3.5-4b, qwen3.5-35b-a3b, gemma-4-12b, MiniMax-M2.7, MiniMax-M3, GLM-5.2, GLM-5.3 |
+| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | PASS |
+| Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid GatedDeltaNet) | PASS |
+| Gemma-4-12B-it (hybrid SWA, dual head_dim) | PASS |
+| MiniMax-M2.7 | PASS |
+| GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | PASS |
+| MiniMax-M3 (MSA + INT2 staging) | pending |
+| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | pending |
 
 **Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
 two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
 eight, so its row could only ever report `FAIL(no-serve)` — which reads as a
-broken model and means a harness that cannot host it. The row has been removed
-rather than left to mislead. K3 runs from `rotation/run/kimi-k3.sh` as a
-two-node job; on v28 it answers correctly and terminates (`finish_reason=stop`,
-17 × 24 = 408) and its GPQA arm measures **83.33** (n=48, 64K).
-
-Where each model runs today. **`main`** = this branch with `--kv-cache-dtype int2` (full-attention INT2 path); other rows point to feature branches.
-
-| Model | Backend / branch | Status |
-|---|---|---|
-| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B | SGLang `main` | ✅ supported (paper results) |
-| GLM-4.7-FP8 (358B) | SGLang `main` | ✅ supported (paper results) |
-| MiniMax-M2.7 | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview |
-| Qwen3.5 (4B, 35B-A3B) | SGLang `zhongzhu/hybrid-model` (`SGLANG_LLOYD_MAX=1`) | 🧪 preview (hybrid linear-attn) |
-| GLM-5.1 | SGLang `zhongzhu/glm-mla` | 🧪 experimental (MLA latent) |
-| GLM-5.2 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×) |
-| GLM-5.3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; zero model-code change from GLM-5.2) |
-| Kimi-K3 | SGLang `zhongzhu/hybrid-model` | 🧪 experimental (packed MLA latent, 4.00×; TP 8 × PP 2) — see the note below |
-| Qwen3-VL (4B, 8B) | SGLang `zhongzhu/VL` | 🧪 preview |
-| Qwen3-32B, Qwen3-4B-Thinking, Gemma-4-12B | llama.cpp `zhongzhu/llamacpp` + [GGUF](https://huggingface.co/Zhongzhu) | ✅ supported (Mac / Metal) |
-
-> INT2 on `main` targets **full-attention** models. MLA models (GLM-5.1 / DeepSeek-style) and hybrid linear-attention models (Qwen3.5 GatedDeltaNet) are not on `main` yet — use the branches above.
+broken model and means a harness that cannot host it. K3 runs from
+`rotation/run/kimi-k3.sh` as a two-node job.
 
 ## All configured models
 
