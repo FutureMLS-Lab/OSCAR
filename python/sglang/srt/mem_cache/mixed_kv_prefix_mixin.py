@@ -44,6 +44,26 @@ def mixed_kv_pool_of(allocator) -> object | None:
     return kvc
 
 
+def mixed_kv_prefill_insert_ceiling(
+    tree_cache, *, req: Req, seq_end: int
+) -> int | None:
+    """The deepest position of a request's row the tree may own after the
+    prefill chunk ending at ``seq_end``, or None when ``tree_cache`` does not
+    front the mixed-KV pool.
+
+    The same bound ``cache_unfinished_req`` inserts up to (its key is the
+    page-aligned extend range, so the length is floored to the page first);
+    the scheduler clamps the mamba checkpoint it tracks to it, because a
+    checkpoint past this bound could never be donated.
+    """
+    if not isinstance(tree_cache, MixedKVPrefixMixin):
+        return None
+    if not tree_cache._mixed_kv_enabled:
+        return None
+    key_len = seq_end // tree_cache.page_size * tree_cache.page_size
+    return tree_cache._mixed_kv_insert_ceiling(req, key_len)
+
+
 class MixedKVPrefixMixin:
     # Class-level defaults: a host built without ``__init__`` (unit tests
     # construct the cache through ``__new__``) reads a plain-pool configuration.

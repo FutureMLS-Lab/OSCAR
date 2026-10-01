@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParam
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import mixed_kv_prefill_insert_ceiling
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.registry import (
     TreeCacheBuildContext,
@@ -335,8 +336,17 @@ def _new_req(rid, token_ids):
 class MixedSim:
     """Prefill / decode / finish driver over the real unified cache."""
 
-    def __init__(self, *, hybrid: bool, disable: bool = False):
+    def __init__(
+        self,
+        *,
+        hybrid: bool,
+        disable: bool = False,
+        clamp_prefill_checkpoint: bool = True,
+    ):
         self.hybrid = hybrid
+        # False models a scheduler that tracks the end-of-prefill checkpoint
+        # (the pre-clamp behaviour / DCP), i.e. the FULL-only fallback path.
+        self.clamp_prefill_checkpoint = clamp_prefill_checkpoint
         self.pool = _MixedPool()
         if hybrid:
             self.rtt = _HybridRTT(
@@ -500,14 +510,28 @@ class MixedSim:
     def _mamba_prefill_track(self, live, pre_len, seq_end):
         """``_mamba_radix_cache_v2_req_prepare_for_extend`` (non-DCP): the
         tracked snapshot lands on the checkpoint grid relative to the prefix,
-        or on the branching point the admission match asked for."""
+        clamped to the mixed-KV insert ceiling, or on the branching point the
+        admission match asked for."""
         req = live.req
         extend_len = seq_end - pre_len
         live_slot = int(req.kv.mamba_pool_idx.item())
         self.mamba_shadow[live_slot] = (self._sig(live, seq_end), seq_end)
-        if extend_len < self.grid:
-            return
+        mask = extend_len >= self.grid
         aligned = pre_len + (extend_len // self.grid) * self.grid
+        if self.clamp_prefill_checkpoint:
+            ceiling = mixed_kv_prefill_insert_ceiling(
+                self.tree, req=req, seq_end=seq_end
+            )
+            assert ceiling is not None
+            capped = pre_len
+            if ceiling > pre_len:
+                capped += ((ceiling - pre_len) // self.grid) * self.grid
+            if capped <= pre_len:
+                mask = False
+            else:
+                aligned = min(aligned, capped)
+        if not mask:
+            return
         req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
         req.kv.mamba_next_track_idx = self.rtt.get_mamba_ping_pong_other_idx(
             req.kv.mamba_next_track_idx
@@ -1015,10 +1039,57 @@ def test_finish_does_not_populate_tree_and_forgets_slack(hybrid):
     sim.evict_all_and_check()
 
 
-def test_mamba_checkpoint_past_ceiling_is_not_donated():
-    """A fresh prefill's checkpoint lands inside the HP-recent window; the FULL
-    KV below the window is cached alone and the state stays with the request."""
+def _expected_prefill_checkpoint(sim, req, seq_end, prefix_len=0):
+    """The scheduler's clamped checkpoint: the deepest grid position at or
+    below the mixed-KV insert ceiling."""
+    ceiling = mixed_kv_prefill_insert_ceiling(sim.tree, req=req, seq_end=seq_end)
+    return prefix_len + ((ceiling - prefix_len) // sim.grid) * sim.grid
+
+
+def test_first_request_donates_full_and_mamba_at_ceiling():
+    """A fresh prefill's checkpoint is clamped to the insert ceiling, so the
+    very first request donates FULL + mamba and its immediate repeat hits the
+    whole shareable prefix with the state at exactly that depth."""
     sim = MixedSim(hybrid=True)
+    first = sim.admit("first", _prompt(3, 1400))
+    checkpoint = _expected_prefill_checkpoint(sim, first, 1400)
+    assert HP_PREFIX < checkpoint <= sim.tree._mixed_kv_tier_cap(1399)
+    assert first.kv.cache_protected_len == checkpoint
+    assert len(sim.tree_mamba_states()) == 1
+    sim.admit("repeat", _prompt(3, 1400))
+    assert sim.live["repeat"].admit_match_len == checkpoint
+    assert not sim.violations, "\n".join(sim.violations[:8])
+    _, _, recent = _tier_counts(sim, sim.live["repeat"])
+    assert recent >= HP_RECENT
+    sim.assert_no_leak()
+    for live in list(sim.admitted):
+        sim.release(live)
+    sim.assert_no_leak()
+    sim.evict_all_and_check()
+
+
+def test_short_prompt_repeat_hits_hp_prefix_window():
+    """The GPU smoke shape: a prompt shorter than hp_prefix + hp_recent, sent
+    twice, must hit the HP-prefix window on the repeat (not 0 cached tokens)."""
+    sim = MixedSim(hybrid=True)
+    first = sim.admit("first", _prompt(5, 253))
+    assert _expected_prefill_checkpoint(sim, first, 253) == HP_PREFIX
+    assert first.kv.cache_protected_len == HP_PREFIX
+    assert len(sim.tree_mamba_states()) == 1
+    sim.admit("repeat", _prompt(5, 253))
+    assert sim.live["repeat"].admit_match_len == HP_PREFIX
+    assert not sim.violations, "\n".join(sim.violations[:8])
+    sim.assert_no_leak()
+    for live in list(sim.admitted):
+        sim.release(live)
+    sim.evict_all_and_check()
+
+
+def test_mamba_checkpoint_past_ceiling_is_not_donated():
+    """Fallback path (an unclamped end-of-prefill checkpoint, as DCP tracks):
+    the FULL KV below the window is cached alone and the state stays with the
+    request."""
+    sim = MixedSim(hybrid=True, clamp_prefill_checkpoint=False)
     req = sim.admit("first", _prompt(3, 1400))
     live = sim.live["first"]
     key_len = len(live.tokens) // N_Q * N_Q
@@ -1034,10 +1105,10 @@ def test_mamba_checkpoint_past_ceiling_is_not_donated():
 
 
 def test_mamba_bootstrap_via_branching_point():
-    """The FULL-only cache yields a branching point inside the shareable region;
-    the next request checkpoints there and later requests hit FULL + mamba with
-    the state at exactly that depth."""
-    sim = MixedSim(hybrid=True)
+    """Fallback path: a FULL-only cache yields a branching point inside the
+    shareable region; the next request checkpoints there and later requests hit
+    FULL + mamba with the state at exactly that depth."""
+    sim = MixedSim(hybrid=True, clamp_prefill_checkpoint=False)
     sim.admit("donor", _prompt(3, 1400))
     borrower = sim.admit("borrower", _prompt(3, 700))
     cap = sim.tree._mixed_kv_tier_cap(699)

@@ -605,17 +605,21 @@ class MambaComponent(TreeComponent):
             if insert_limit is not None and cache_len > insert_limit:
                 # Mixed-KV (OSCAR HP+int2): the tracked checkpoint sits past
                 # what the tree may hold for this request -- inside its
-                # HP-recent window or a request-owned partial quant page. A
-                # recurrent state is valid only for its exact prefix, so it
-                # cannot be re-keyed at the shorter FULL insert; leave it in
-                # the request's ping-pong buffer (no donation, no fresh slot)
-                # and let the FULL KV be cached alone, with this component a
-                # tombstone on the inserted node (``mamba_value`` stays None,
-                # see ``commit_insert_component_data``). "No opinion" rather
-                # than 0: the FULL side still inserts up to the ceiling. The
-                # next request's ``full_kv_hit_length`` then yields a
-                # branching point inside the shareable region, and the
-                # checkpoint it tracks there fills the tombstone.
+                # HP-recent window or a request-owned partial quant page. The
+                # scheduler normally clamps the prefill checkpoint to that
+                # ceiling (``_mamba_radix_cache_v2_req_prepare_for_extend``),
+                # so this is the fallback for a checkpoint it could not place
+                # there (DCP's absolute grid). A recurrent state is valid only
+                # for its exact prefix, so it cannot be re-keyed at the shorter
+                # FULL insert; leave it in the request's ping-pong buffer (no
+                # donation, no fresh slot) and let the FULL KV be cached alone,
+                # with this component a tombstone on the inserted node
+                # (``mamba_value`` stays None, see
+                # ``commit_insert_component_data``). "No opinion" rather than
+                # 0: the FULL side still inserts up to the ceiling. The next
+                # request's ``full_kv_hit_length`` then yields a branching
+                # point inside the shareable region, and the checkpoint it
+                # tracks there fills the tombstone.
                 return None
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:

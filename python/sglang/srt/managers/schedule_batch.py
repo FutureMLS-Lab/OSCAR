@@ -118,6 +118,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import mixed_kv_prefill_insert_ceiling
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
@@ -3068,6 +3069,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_len
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
+            # Mixed-KV (OSCAR HP+int2): the tree may own this request's row only
+            # up to the insert ceiling (below its HP-recent window and any
+            # request-owned partial page), and a recurrent state is valid only
+            # for its exact prefix, so a checkpoint past the ceiling could never
+            # be donated. Track the deepest grid position at or below it; an
+            # earlier-than-end position goes through the +1 rule below and is
+            # read from the intermediate h, exactly as a branching point is.
+            # None for every other pool: that path is unchanged.
+            insert_ceiling = mixed_kv_prefill_insert_ceiling(
+                self.tree_cache, req=req, seq_end=seq_end
+            )
+            if insert_ceiling is not None:
+                capped = prefix_len
+                if insert_ceiling > prefix_len:
+                    capped += (
+                        (insert_ceiling - prefix_len) // checkpoint_grid
+                    ) * checkpoint_grid
+                if capped <= prefix_len:
+                    mask = False
+                else:
+                    mamba_track_seqlen_aligned = min(mamba_track_seqlen_aligned, capped)
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
