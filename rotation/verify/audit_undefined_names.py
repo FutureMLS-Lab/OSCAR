@@ -35,9 +35,9 @@ _BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__package_
 # Paths worth scanning: the model and attention code a serving run executes.
 # Widening this to the whole fork buries a real finding under vendored code.
 DEFAULT_SCOPE = [
-    "sglang-research/python/sglang/srt/models",
-    "sglang-research/python/sglang/srt/layers/attention",
-    "sglang-research/python/sglang/srt/mem_cache",
+    "python/sglang/srt/models",
+    "python/sglang/srt/layers/attention",
+    "python/sglang/srt/mem_cache",
 ]
 
 

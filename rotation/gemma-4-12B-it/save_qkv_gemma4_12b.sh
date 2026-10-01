@@ -5,7 +5,7 @@
 # geometry (40 sliding layers @ 8 KV heads x head_dim 256; 8 full layers @ 1 KV
 # head x head_dim 512). It is served via this fork's `Gemma4UnifiedForConditionalGeneration`
 # shim. Unlike the other OSCAR models, the calibration dump runs in the EVAL fork
-# (sglang-research) using the DUMP_KVCACHE hook ported into triton_backend.py
+# (the sglang tree) using the DUMP_KVCACHE hook ported into triton_backend.py
 # forward_extend — the legacy dump fork has no gemma4 at all.
 #
 # ENV PREREQUISITE: transformers >= 5.5 (has Gemma4TextConfig; the env's default
@@ -15,7 +15,7 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
+SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}}"
 
 MODEL="${MODEL:-google/gemma-4-12B-it}"
 PY="${PY:?Set PY to a python with transformers>=5.5 + sglang deps (e.g. the oscar-g4 venv)}"

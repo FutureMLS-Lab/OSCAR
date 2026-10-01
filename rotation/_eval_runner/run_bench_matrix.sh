@@ -15,7 +15,7 @@ export HF_DATASETS_CACHE="${HF_HOME:-$HOME/.cache/huggingface}/datasets"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
+SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}}"
 
 : "${MODE:?MODE=bf16|calibrated}"; : "${MODEL:?MODEL required}"; : "${OUT_BASE:?OUT_BASE required}"
 TP_SIZE="${TP_SIZE:-1}"

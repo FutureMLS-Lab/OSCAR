@@ -19,5 +19,5 @@ export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
 # DSA sparse attention (`nsa`: flashmla_sparse prefill, trtllm sparse decode) is
 # the model's deployed form; the packed pool is staged into BF16 for those
 # kernels per layer. ATTN_BACKEND=triton gives the dense fallback.
-export ATTN_BACKEND="${ATTN_BACKEND:-nsa}" PREFILL_BACKEND="${PREFILL_BACKEND:-nsa}" DECODE_BACKEND="${DECODE_BACKEND:-nsa}"
+export ATTN_BACKEND="${ATTN_BACKEND:-dsa}" PREFILL_BACKEND="${PREFILL_BACKEND:-dsa}" DECODE_BACKEND="${DECODE_BACKEND:-dsa}"
 launch

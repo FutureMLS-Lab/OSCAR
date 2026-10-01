@@ -20,7 +20,7 @@ export K_CLIP="${K_CLIP:-0.96}"
 export V_CLIP="${V_CLIP:-0.92}"
 export GROUP_SIZE="${GROUP_SIZE:-128}"
 export NAME="${NAME:-gpqa_qwen35_4b}"
-export SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
+export SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}}"
 
 if [[ "${MODE}" == "hadamard" || "${MODE}" == "calibrated" ]]; then
     export ROT_DIR="${SCRIPT_DIR}/rotations/${MODE}"

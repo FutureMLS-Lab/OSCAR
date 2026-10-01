@@ -30,7 +30,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 : "${ROT_DIR:?ROT_DIR is required}"
 : "${RUN_DIR:?RUN_DIR is required}"
 
-SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
+SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}}"
 TP_SIZE="${TP_SIZE:-4}"
 # Default to EVERY visible GPU, not the first four. The old default of 0,1,2,3
 # is invisible on a 4-GPU launch and fatal on an 8-GPU one: a tp=8 model gets
@@ -326,7 +326,6 @@ else
 fi
 SGLANG_ENABLE_MIXED_KV_WINDOWS="$([[ "${KV_MODE:-int2}" == "bf16" ]] && echo 0 || echo 1)" \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
-SGLANG_COQUANT_ROTATION_MODE=coquant \
 SGLANG_OSCAR_ABSORB_V_ROTATION="${ABSORB_V:-0}" \
 SGLANG_MIXED_KV_HP_MAX_SPLITS=8 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \

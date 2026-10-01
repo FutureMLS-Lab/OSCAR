@@ -1035,11 +1035,29 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
+
+        # gemma4_unified + OSCAR INT2 mixed-KV: serve the hybrid-SWA model
+        # through the *single* UnifiedInt2HPKVPool with two uniform geometry
+        # groups (full: 1x512, sliding: 8x256) sharing one head-dim-agnostic
+        # allocator, instead of the SWAKVPool. This forgoes only the
+        # sliding-window *memory* optimization; the per-layer sliding-window
+        # attention mask still applies (it comes from layer.sliding_window_size
+        # in the model, independent of the memory pool). Gated on
+        # SGLANG_ENABLE_MIXED_KV_WINDOWS so BF16 / non-OSCAR serving is
+        # byte-for-byte unchanged (keeps is_hybrid_swa -> SWAKVPool).
+        self.unified_two_group_kv = False
+        if (
+            "Gemma4UnifiedForConditionalGeneration" in self.hf_config.architectures
+            and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+        ):
+            self.is_hybrid_swa = False
+            self.unified_two_group_kv = True
+
         # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
         self.swa_attention_layer_ids: Optional[List[int]] = None
         self.full_attention_layer_ids: Optional[List[int]] = None
 
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self.unified_two_group_kv:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
             self.is_deepseek_v4_arch = any(

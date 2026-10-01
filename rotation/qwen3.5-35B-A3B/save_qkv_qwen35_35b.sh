@@ -6,13 +6,13 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-# Use sglang-research directly: the DUMP_KVCACHE hook has been ported into
-# sglang-research's attention/triton_backend.py, so the dump runs natively
+# Use the sglang tree directly: the DUMP_KVCACHE hook has been ported into
+# its attention/triton_backend.py, so the dump runs natively
 # without the stale fork's model definitions. Override SGLANG_DUMP_DIR to
 # point at a different sglang checkout.
-SGLANG_DUMP_DIR="${SGLANG_DUMP_DIR:-${REPO_ROOT}/sglang-research}"
+SGLANG_DUMP_DIR="${SGLANG_DUMP_DIR:-${REPO_ROOT}}"
 if [[ ! -d "${SGLANG_DUMP_DIR}" ]]; then
-    SGLANG_DUMP_DIR="${REPO_ROOT}/sglang-research"
+    SGLANG_DUMP_DIR="${REPO_ROOT}"
 fi
 
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"

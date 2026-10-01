@@ -67,7 +67,7 @@ while IFS='|' read -r name kind repo tp a rot sink recent mf; do
     case "$name" in
       # DSA models are served sparse (the packed pool is staged into BF16 for
       # the nsa kernels); everything else packed-MLA stays on triton.
-      glm52|glm53) export ATTN_BACKEND="${ATTN_BACKEND:-nsa}" ;;
+      glm52|glm53) export ATTN_BACKEND="${ATTN_BACKEND:-dsa}" ;;
       *)           unset ATTN_BACKEND ;;
     esac
     bash "$D/mla.sh" "$name" "$repo" "$a" "$tp" "$mf" \

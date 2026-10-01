@@ -68,6 +68,7 @@ from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
+    maybe_absorb_oscar_v_rotation_into_qkv,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
@@ -602,6 +603,7 @@ class Qwen3MoeAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        self.attn.oscar_v_rotation_absorbed = False
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -1276,6 +1278,11 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        if not is_mtp:
+            maybe_absorb_oscar_v_rotation_into_qkv(
+                self.model, quant_config=self.quant_config, model_label="Qwen3Moe"
+            )
 
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(

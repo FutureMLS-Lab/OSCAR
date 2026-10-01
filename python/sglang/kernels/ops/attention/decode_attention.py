@@ -111,9 +111,47 @@ def _keep_scheduler_splits() -> bool:
     return _KEEP_SCHEDULER_SPLITS
 
 
+def _safe_block_h(block_h: int, kv_group_num: int) -> int:
+    """Clamp a grouped-decode head tile so it never straddles a KV head.
+
+    ``_fwd_grouped_kernel_stage1`` and its INT2 twin address heads as
+
+        VALID_BLOCK_H = min(BLOCK_H, kv_group_num)
+        cur_head      = cur_head_id * VALID_BLOCK_H + arange(BLOCK_H)
+        cur_kv_head   = cur_head_id // cdiv(kv_group_num, BLOCK_H)
+
+    ``cur_head`` is a *flat* query-head index while ``cur_kv_head`` is derived
+    from the block index, so the two only agree when a head block lies wholly
+    inside one KV group -- that is, when ``BLOCK_H >= kv_group_num`` or
+    ``kv_group_num`` is a multiple of ``BLOCK_H``. (The launch grid
+    ``cdiv(q_head_num, VALID_BLOCK_H)`` is exact under the same condition.)
+
+    A hardcoded ``BLOCK_H = 16`` satisfies this for every power-of-two
+    ``kv_group_num``, which is why it has never bitten upstream. A tuned or
+    batch-size-dependent ``BLOCK_H`` does not: ``BLOCK_H=4`` against
+    ``kv_group_num=6`` (MiniMax-M2.7, 48 q heads / 8 KV heads at TP=4) makes
+    head block 1 cover q heads 4..7 while reporting ``cur_kv_head=0``, so q
+    heads 6 and 7 silently attend to KV head 0's cache. Nothing asserts, no
+    shape is wrong, and no NaN appears -- it only shows up as a benchmark
+    score.
+
+    Rounding up to a power of two keeps ``tl.arange(0, BLOCK_H)`` legal and
+    lands on ``VALID_BLOCK_H == kv_group_num``, i.e. one block per KV head.
+    """
+    if block_h < kv_group_num and kv_group_num % block_h != 0:
+        return triton.next_power_of_2(kv_group_num)
+    return block_h
+
+
+def _grouped_block_h(kv_group_num: int) -> int:
+    # 16 is exact for every power-of-two kv_group_num; _safe_block_h keeps the
+    # head mapping valid for the ones that are not (e.g. 6 or 24).
+    return _safe_block_h(_GROUPED_BLOCK_H, kv_group_num)
+
+
 def _grouped_head_tiles(head_num: int, kv_group_num: int) -> int:
     """Stage-1's grid extent along heads."""
-    return triton.cdiv(head_num, min(_GROUPED_BLOCK_H, kv_group_num))
+    return triton.cdiv(head_num, min(_grouped_block_h(kv_group_num), kv_group_num))
 
 
 def _mla_bucket(batch: int) -> _MlaBucket:
@@ -811,7 +849,7 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // kv_head_num
 
-    BLOCK_H = _GROUPED_BLOCK_H
+    BLOCK_H = _grouped_block_h(kv_group_num)
     MAX_KV_SPLITS = max_kv_splits
     head_tiles = _grouped_head_tiles(head_num, kv_group_num)
 

@@ -22,7 +22,7 @@ export GROUP_SIZE="${GROUP_SIZE:-128}"
 # This model's recipe uses Lloyd-Max; the shared driver defaults it off.
 export LLOYD_MAX="${LLOYD_MAX:-1}"
 export NAME="${NAME:-gpqa_qwen35_35b_a3b}"
-export SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
+export SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}}"
 
 if [[ "${MODE}" == "hadamard" || "${MODE}" == "calibrated" ]]; then
     export ROT_DIR="${SCRIPT_DIR}/rotations/${MODE}"

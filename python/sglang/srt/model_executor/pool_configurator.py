@@ -13,9 +13,10 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import attention_backends_of, resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -45,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -139,6 +141,282 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def _attention_supports_mixed_kv(server_args) -> bool:
+    """Return True when the active attention-backend configuration can run
+    the unified HP+int2 KV pool end-to-end.
+
+    The pool's read-path (dequant + rotation + int2 decode) lives in the
+    Triton backend today. The FA3 prefill backend gained a rotation-aware
+    int2 prefill path in
+    ``python/sglang/srt/layers/attention/quantized_kv_prefill.py``, so the
+    hybrid ``prefill=fa3 + decode=triton`` configuration is supported too.
+    Any other combination stays on the plain ``MHATokenToKVPool`` int2 path.
+
+    ``prefill_attention_backend`` and ``decode_attention_backend`` can both
+    be unset (``None``), in which case the model runner falls back to
+    ``attention_backend`` for both roles. ``attention_backends_of`` applies
+    that resolution over the resolved record (declarations before raw input),
+    so partially-specified configurations (e.g. only ``--attention-backend
+    triton``, or only ``--prefill-attention-backend fa3`` with
+    ``--attention-backend triton``) are recognized correctly.
+    """
+    prefill_backend, decode_backend = attention_backends_of(resolving_view(server_args))
+    if prefill_backend == "triton" and decode_backend == "triton":
+        return True
+    if prefill_backend == "fa3" and decode_backend == "triton":
+        return True
+    return False
+
+
+def _resolve_quant_group_count(head_dim: int, group_size: Optional[int]) -> int:
+    effective_group_size = head_dim if group_size is None else group_size
+    if effective_group_size <= 0:
+        raise ValueError(
+            f"kv_cache_quant_group_size must be positive, got {effective_group_size}"
+        )
+    if head_dim % effective_group_size != 0:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be divisible by "
+            f"kv_cache_quant_group_size ({effective_group_size})"
+        )
+    return head_dim // effective_group_size
+
+
+def _get_int_kv_bytes_per_head_pair(
+    *,
+    k_head_dim: int,
+    v_head_dim: int,
+    kv_cache_dtype: str,
+    group_size: Optional[int],
+    scale_dtype_bytes: int = 4,
+) -> int:
+    """Bytes per *quant-token* per head-pair for the int2 KV cache.
+
+    Used by both the non-mixed path and the mixed path: the scheduler's
+    ``max_total_num_tokens`` is denominated in quant tokens (= slot ids on the
+    int2 tier), and the mixed allocator's ``size`` = ``(num_pages - 1) * N_Q``
+    is also in quant tokens, so the leak check
+    ``size - available - evictable - protected`` closes in a single unit.
+    """
+    assert kv_cache_dtype == "int2", (
+        f"Only int2 quant KV is supported, got {kv_cache_dtype}"
+    )
+    pack_factor = 4
+    k_groups = _resolve_quant_group_count(k_head_dim, group_size)
+    v_groups = _resolve_quant_group_count(v_head_dim, group_size)
+    packed_k_bytes = k_head_dim // pack_factor
+    packed_v_bytes = v_head_dim // pack_factor
+    # Interleaved (scale, zero) per group in ``scale_dtype``.
+    scales_zeros_bytes = 2 * scale_dtype_bytes * (k_groups + v_groups)
+    return packed_k_bytes + packed_v_bytes + scales_zeros_bytes
+
+
+def _get_unified_mixed_kv_bytes_per_quant_token(
+    *,
+    k_head_dim: int,
+    v_head_dim: int,
+    hp_dtype_bytes: int,
+    scale_dtype_bytes: int,
+    k_groups: int,
+    v_groups: int,
+    n_q: int,
+) -> int:
+    """Shared-arena bytes per *quant token* in the unified pool.
+
+    A page of the shared K/V arena is sized to host either 1 HP token or N_Q
+    quant tokens; its byte size is therefore ``(head_dim + v_head_dim) *
+    hp_dtype_bytes``. Per quant token that is this over ``N_Q``. Scales/zeros
+    live in a parallel arena (one entry per quant slot) and are included
+    here so the scheduler's cell-size matches the actual allocator size.
+    """
+    arena_bytes_per_page = (k_head_dim + v_head_dim) * hp_dtype_bytes
+    arena_bytes_per_quant_token = arena_bytes_per_page // n_q
+    scales_zeros_bytes_per_quant_token = 2 * scale_dtype_bytes * (k_groups + v_groups)
+    return arena_bytes_per_quant_token + scales_zeros_bytes_per_quant_token
+
+
+def _int2_scale_dtype_bytes() -> int:
+    from sglang.srt.mem_cache.unified_kv_pool import resolve_scale_dtype
+
+    scale_dtype = resolve_scale_dtype(envs.SGLANG_MIXED_KV_SCALE_DTYPE.get())
+    return torch.empty(0, dtype=scale_dtype).element_size()
+
+
+def _mixed_kv_request_slots(max_running_requests: Optional[int]) -> int:
+    """Request slots the BF16 window arena is sized for.
+
+    ``max_running_requests`` does not exist yet when the configurator runs --
+    it is derived from the pool size this number feeds -- so the flag is read
+    directly. When it is not pinned the arena is sized for 64 slots (the eval
+    harness default) and a warning is logged: over-reserving a few GB is
+    harmless on the GPUs this runs on, under-reserving is the OOM the
+    reservation exists to prevent.
+    """
+    if max_running_requests is not None:
+        return max_running_requests
+    logger.warning(
+        "mixed-KV window arena sized for %d request slots because "
+        "--max-running-requests is not pinned; pin it so the reservation "
+        "matches the pool.",
+        64,
+    )
+    return 64
+
+
+def _mixed_kv_hp_total_slots(*, request_slots: int, n_q: int) -> int:
+    """The window arena's slot count.
+
+    Mirrors ``UnifiedInt2HPKVPool._create_arenas``: ``hp_total_slots =
+    num_hp_prefix_slots + max_req_slots * (hp_recent + N_Q - 1)``. The prefix
+    pool default follows the model-runner call site (``max_reqs * prefix *
+    16``, rounded up to N_Q) unless SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS pins
+    it. Any per-slot side cache (the MiniMax indexer's key cache) must be
+    reserved for these slots too, since they are page-table slots like any
+    other.
+    """
+    p = (
+        envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+        else 64
+    )
+    r = (
+        envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+        else 256
+    )
+    prefix_pool = (
+        envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
+        if envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.is_set()
+        else 0
+    )
+    if prefix_pool <= 0:
+        prefix_pool = request_slots * p * 16
+    prefix_pool = (prefix_pool + n_q - 1) // n_q * n_q
+    return prefix_pool + request_slots * (r + n_q - 1)
+
+
+def _mixed_kv_window_arena_bytes(
+    *,
+    request_slots: int,
+    heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    hp_dtype_bytes: int,
+    n_q: int,
+    num_layers: int,
+) -> int:
+    """Bytes of the BF16 window arena UnifiedInt2HPKVPool will allocate: each
+    window slot holds K and V for every layer in hp_dtype."""
+    hp_total_slots = _mixed_kv_hp_total_slots(request_slots=request_slots, n_q=n_q)
+    return (
+        hp_total_slots * heads * (head_dim + v_head_dim) * hp_dtype_bytes * num_layers
+    )
+
+
+def _packed_mla_latent_enabled(kvc: KVCacheConfigurator) -> bool:
+    """Whether this run stores the MLA latent as packed INT2 codes.
+
+    Must agree exactly with the routing in ``model_runner_kv_cache_mixin``: a
+    configurator that disagrees with the pool it is sizing either wastes the
+    difference or runs the allocator off the end of the buffers.
+    """
+    base = (
+        kvc.use_mla_backend
+        and envs.SGLANG_OSCAR_MLA_KV_PACKED.get()
+        and bool(envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get())
+    )
+    if not base:
+        return False
+    # The mambaish branch in model_runner_kv_cache_mixin additionally refuses
+    # speculative decoding and disaggregation, and this predicate did not. On
+    # an MLA + mambaish model with either enabled, the configurator sized the
+    # pool at 288 B/token while the router built a BF16 pool at 1152 -- a 4x
+    # under-size, which is the "runs the allocator off the end" case this
+    # docstring warns about rather than the harmless wasteful one.
+    #
+    # Non-mambaish MLA has no such conditions, so it keeps the plain predicate.
+    if kvc.mambaish_config:
+        return (
+            get_disagg().disaggregation_mode in (None, "null")
+            and get_spec().speculative_algorithm is None
+        )
+    return True
+
+
+class _Int2Pricing(msgspec.Struct, frozen=True):
+    """Geometry-independent inputs of the int2 per-quant-token price.
+
+    ``mixed`` selects the unified HP+int2 pool (shared arena priced per quant
+    token, BF16 window arena as a fixed overhead); otherwise the plain packed
+    int2 pool price applies. ``hp_dtype_bytes`` / ``n_q`` are set only when
+    ``mixed``.
+    """
+
+    mixed: bool
+    group_size: Optional[int]
+    scale_bytes: int
+    hp_dtype_bytes: Optional[int] = None
+    n_q: Optional[int] = None
+
+    def bytes_per_head(self, *, head_dim: int, v_head_dim: int) -> int:
+        """Bytes per quant token for one K/V head pair of this geometry."""
+        if self.mixed:
+            return _get_unified_mixed_kv_bytes_per_quant_token(
+                k_head_dim=head_dim,
+                v_head_dim=v_head_dim,
+                hp_dtype_bytes=self.hp_dtype_bytes,
+                scale_dtype_bytes=self.scale_bytes,
+                k_groups=_resolve_quant_group_count(head_dim, self.group_size),
+                v_groups=_resolve_quant_group_count(v_head_dim, self.group_size),
+                n_q=self.n_q,
+            )
+        return _get_int_kv_bytes_per_head_pair(
+            k_head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            kv_cache_dtype="int2",
+            group_size=self.group_size,
+            scale_dtype_bytes=self.scale_bytes,
+        )
+
+
+def _resolve_int2_pricing(kvc: KVCacheConfigurator) -> Optional[_Int2Pricing]:
+    """None unless ``kvc.kv_cache_dtype`` is the int2 string."""
+    if kvc.kv_cache_dtype != "int2":
+        return None
+    group_size = get_model().kv_cache_quant_group_size
+    scale_bytes = _int2_scale_dtype_bytes()
+    # Mixed HP+quant pool: the shared arena bytes per logical token are
+    # ``(head_dim + v_head_dim) * hp_dtype_bytes`` (== 1 HP token worth).
+    # Plus the scales/zeros arena sized for every page's quant view.
+    # max_total_num_tokens is then denominated in *quant tokens* (slot ids
+    # on the int2 tier), matching the unified allocator's scheduler-facing
+    # ``size = (num_pages - 1) * N_Q``.
+    mixed = (
+        envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+        and _attention_supports_mixed_kv(kvc.server_args)
+        and not kvc.is_hybrid_swa
+        and get_disagg().disaggregation_mode in (None, "null")
+        and get_spec().speculative_algorithm is None
+    )
+    if not mixed:
+        return _Int2Pricing(mixed=False, group_size=group_size, scale_bytes=scale_bytes)
+    from sglang.srt.mem_cache.unified_kv_pool import (
+        compute_page_geometry,
+        resolve_hp_dtype,
+    )
+
+    hp_dtype = resolve_hp_dtype(envs.SGLANG_MIXED_KV_HP_DTYPE.get())
+    hp_dtype_bytes = torch.empty(0, dtype=hp_dtype).element_size()
+    _, n_q = compute_page_geometry(hp_dtype)
+    return _Int2Pricing(
+        mixed=True,
+        group_size=group_size,
+        scale_bytes=scale_bytes,
+        hp_dtype_bytes=hp_dtype_bytes,
+        n_q=int(n_q),
+    )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -202,6 +480,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
+        # Bytes the pool allocates besides the per-token cells (the OSCAR
+        # mixed-KV BF16 window arena); subtracted from the budget in
+        # calculate_pool_sizes. Set by _compute_cell_size.
+        self._fixed_overhead_bytes = 0
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
@@ -290,9 +572,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
-        kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
+        # None unless --kv-cache-dtype int2; the int2 branches price per quant
+        # token, and the int2 string has no torch element size.
+        int2 = _resolve_int2_pricing(kvc)
+        kv_size = (
+            None if int2 is not None else torch._utils._element_size(kv_cache_dtype)
+        )
 
         if kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
@@ -310,18 +597,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 if offload_cell_size is not None:
                     return offload_cell_size
 
-            from sglang.srt.mem_cache.kv_cache_configurator import (
-                calculate_mla_kv_cache_dim,
-            )
-
-            cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
+            if _packed_mla_latent_enabled(kvc):
+                cell_size = self._packed_mla_latent_cell_size(
+                    kvc, num_layers=num_layers
                 )
-                * effective_num_layers
-                * kv_size
-            )
+            elif kv_size is None:
+                # The OSCAR latent path keeps the MLA cache in a float dtype
+                # (rotation-fake-quant, or packed via SGLANG_OSCAR_MLA_KV_PACKED)
+                # and is driven by its own env flags, not by the int2 tag.
+                raise ValueError(
+                    "--kv-cache-dtype int2 has no MLA pool. Use a float "
+                    "--kv-cache-dtype (e.g. bfloat16) with "
+                    "SGLANG_OSCAR_MLA_KV_ROTATION_PATH, plus "
+                    "SGLANG_OSCAR_MLA_KV_PACKED=1 for packed INT2 latent storage."
+                )
+            else:
+                from sglang.srt.mem_cache.kv_cache_configurator import (
+                    calculate_mla_kv_cache_dim,
+                )
+
+                cell_size = (
+                    calculate_mla_kv_cache_dim(
+                        model_config=model_config,
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
+                    * effective_num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -387,29 +689,103 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
                 full_pool_ratio = parse_hisparse_config().host_to_device_ratio
 
-            main_pool_bytes = (
-                (num_dense * full_pool_ratio + num_sparse)
-                * 2
-                * kv_heads
-                * head_dim
-                * kv_size
-            )
+            if int2 is not None:
+                # The int2 head-pair price already covers K and V (head_dim +
+                # v_head_dim) plus the scale/zero groups: no factor of 2.
+                main_pool_bytes = (
+                    (num_dense * full_pool_ratio + num_sparse)
+                    * kv_heads
+                    * int2.bytes_per_head(
+                        head_dim=head_dim, v_head_dim=model_config.v_head_dim
+                    )
+                )
+            else:
+                main_pool_bytes = (
+                    (num_dense * full_pool_ratio + num_sparse)
+                    * 2
+                    * kv_heads
+                    * head_dim
+                    * kv_size
+                )
             indexer_bytes = (
                 (num_indexer_kv * 2 + num_indexer_k_only)
                 * indexer_head_dim
                 * indexer_dtype_size
             )
+            if int2 is not None and int2.mixed:
+                # MiniMax-M3 sparse attention keeps the lightning indexer's key per
+                # token (index_dim in the model dtype) on every sparse layer, beside
+                # K/V. It is a per-slot cost like K/V, so the BF16 window arena's
+                # slots need it too, or the pool is sized as if it were free and
+                # the side cache OOMs at allocation. With 2-bit K/V it is the
+                # larger of the two.
+                request_slots = _mixed_kv_request_slots(
+                    get_schedule().max_running_requests
+                )
+                self._fixed_overhead_bytes += _mixed_kv_window_arena_bytes(
+                    request_slots=request_slots,
+                    heads=kv_heads,
+                    head_dim=head_dim,
+                    v_head_dim=model_config.v_head_dim,
+                    hp_dtype_bytes=int2.hp_dtype_bytes,
+                    n_q=int2.n_q,
+                    num_layers=num_layers,
+                )
+                self._fixed_overhead_bytes += (
+                    _mixed_kv_hp_total_slots(request_slots=request_slots, n_q=int2.n_q)
+                    * indexer_bytes
+                    * full_pool_ratio
+                )
+                logger.info(
+                    "MiniMax sparse pricing: index-key cache %d B/token across the "
+                    "sparse layers added to the cell size and reserved for the "
+                    "mixed-KV window arena",
+                    indexer_bytes,
+                )
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
-            cell_size = (
-                n
-                * (model_config.head_dim + model_config.v_head_dim)
-                * effective_num_layers
-                * kv_size
-            )
+            if int2 is not None and int2.mixed and model_config.unified_two_group_kv:
+                cell_size = self._gemma4_unified_cell_size(kvc, int2=int2, full_heads=n)
+            elif int2 is not None:
+                cell_size = (
+                    n
+                    * int2.bytes_per_head(
+                        head_dim=model_config.head_dim,
+                        v_head_dim=model_config.v_head_dim,
+                    )
+                    * effective_num_layers
+                )
+                if int2.mixed:
+                    # The BF16 window arena is a FIXED cost on top of the
+                    # per-token price above: a shared HP-prefix pool plus one
+                    # recent ring per request slot, every layer, in hp_dtype.
+                    # The packed-MLA branch already charges its equivalent;
+                    # this branch did not, so on a TP=1 dense model the entire
+                    # static budget went to quant pages and _create_arenas ran
+                    # out of memory allocating hp_v_buffer -- Qwen3-8B/32B/
+                    # 4B-Thinking at 64K, every time, while BF16 on the same
+                    # GPU and mem-fraction was fine.
+                    self._fixed_overhead_bytes += _mixed_kv_window_arena_bytes(
+                        request_slots=_mixed_kv_request_slots(
+                            get_schedule().max_running_requests
+                        ),
+                        heads=n,
+                        head_dim=model_config.head_dim,
+                        v_head_dim=model_config.v_head_dim,
+                        hp_dtype_bytes=int2.hp_dtype_bytes,
+                        n_q=int2.n_q,
+                        num_layers=num_layers,
+                    )
+            else:
+                cell_size = (
+                    n
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * effective_num_layers
+                    * kv_size
+                )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -445,6 +821,121 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_config, num_layers=num_layers
+        )
+        return cell_size
+
+    def _packed_mla_latent_cell_size(
+        self, kvc: KVCacheConfigurator, *, num_layers: int
+    ) -> int:
+        # Packed INT2 latent: codes + group params + BF16 k_pe. Without
+        # this the pool would be sized as if it still stored 576 BF16
+        # values per token and ``max_total_num_tokens`` would not move
+        # off the BF16 arm's number -- which is exactly the symptom that
+        # says the storage change did not land.
+        from sglang.srt.mem_cache.mla_packed_kv_pool import (
+            packed_latent_bytes_per_token,
+        )
+
+        model_config = kvc.model_config
+        cell_size = (
+            packed_latent_bytes_per_token(
+                model_config.kv_lora_rank,
+                model_config.qk_rope_head_dim,
+                envs.SGLANG_OSCAR_MLA_KV_GROUP_SIZE.get(),
+                # Must match what _init_packed allocates. A cell_size
+                # computed at a different width either wastes the
+                # difference or runs the pool off its end.
+                bits=envs.SGLANG_OSCAR_MLA_KV_BITS.get(),
+            )
+            * num_layers
+        )
+        # The BF16 window arena is a fixed cost, not a per-token one:
+        # (sink + recent) rows per request slot, every layer. Charging
+        # it here keeps the pool inside the mem-fraction budget instead
+        # of overshooting it by a couple of GB at the end of startup.
+        p = (
+            envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+            if envs.SGLANG_MIXED_KV_PREFIX_TOKENS.is_set()
+            else 64
+        )
+        r = (
+            envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+            if envs.SGLANG_MIXED_KV_RECENT_TOKENS.is_set()
+            else 256
+        )
+        # ``max_running_requests`` does not exist yet -- it is resolved *from*
+        # the pool size this call is computing, and its default estimate
+        # climbs with the pool, so a 3x bigger pool would silently ask for a
+        # 3x bigger window arena. Read the flag instead, and require it: an
+        # unpinned arena is either 60x too big or quietly leaves requests
+        # without windows.
+        max_reqs = get_schedule().max_running_requests
+        if max_reqs is None:
+            raise ValueError(
+                "SGLANG_OSCAR_MLA_KV_PACKED needs --max-running-requests "
+                "pinned: the BF16 window arena is sized per request slot "
+                "and the default is derived from the pool size, which "
+                "this branch changes."
+            )
+        self._fixed_overhead_bytes += (
+            (1 + max_reqs * (p + r)) * model_config.kv_lora_rank * 2 * num_layers
+        )
+        return cell_size
+
+    def _gemma4_unified_cell_size(
+        self, kvc: KVCacheConfigurator, *, int2: _Int2Pricing, full_heads: int
+    ) -> int:
+        # gemma4_unified. ModelConfig turns is_hybrid_swa OFF for this
+        # model and the runner builds ONE UnifiedInt2HPKVPool holding two
+        # geometry groups -- full attention (1 head x 512) over 8 layers,
+        # sliding (8 heads x 256) over 40 -- that all draw num_quant_pages
+        # from one allocator. Pricing every layer at the full-group
+        # geometry, as the uniform formula does, charges a sliding
+        # layer a quarter of what it costs; the derivation then handed
+        # Gemma-4-12B 8.3M tokens against BF16's 458K (18x) and
+        # _create_arenas OOMed on k_buffer. Price each group as allocated
+        # and reserve each group's window arena.
+        model_config = kvc.model_config
+        full_ids = list(kvc.layer_info.full_attention_layer_ids)
+        swa_ids = list(kvc.layer_info.swa_attention_layer_ids)
+        swa_heads = model_config.get_swa_num_kv_heads(get_parallel().attn_tp_size)
+        full_bytes = int2.bytes_per_head(
+            head_dim=model_config.head_dim, v_head_dim=model_config.v_head_dim
+        )
+        swa_bytes = int2.bytes_per_head(
+            head_dim=model_config.swa_head_dim, v_head_dim=model_config.swa_v_head_dim
+        )
+        full_cell = full_heads * full_bytes * len(full_ids)
+        swa_cell = swa_heads * swa_bytes * len(swa_ids)
+        cell_size = full_cell + swa_cell
+        request_slots = _mixed_kv_request_slots(get_schedule().max_running_requests)
+        self._fixed_overhead_bytes += _mixed_kv_window_arena_bytes(
+            request_slots=request_slots,
+            heads=full_heads,
+            head_dim=model_config.head_dim,
+            v_head_dim=model_config.v_head_dim,
+            hp_dtype_bytes=int2.hp_dtype_bytes,
+            n_q=int2.n_q,
+            num_layers=len(full_ids),
+        ) + _mixed_kv_window_arena_bytes(
+            request_slots=request_slots,
+            heads=swa_heads,
+            head_dim=model_config.swa_head_dim,
+            v_head_dim=model_config.swa_v_head_dim,
+            hp_dtype_bytes=int2.hp_dtype_bytes,
+            n_q=int2.n_q,
+            num_layers=len(swa_ids),
+        )
+        logger.info(
+            "gemma4_unified pricing: full %d layers x %d heads x %d B/quant-tok, "
+            "sliding %d layers x %d heads x %d B/quant-tok, window arena %.2f GB",
+            len(full_ids),
+            full_heads,
+            full_bytes,
+            len(swa_ids),
+            swa_heads,
+            swa_bytes,
+            self._fixed_overhead_bytes / 2**30,
         )
         return cell_size
 
@@ -552,7 +1043,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -575,8 +1066,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
-        kv_size = torch._utils._element_size(kv_cache_dtype)
+        # The int2 string has no torch element size; its branch below prices
+        # per quant token. Hybrid SWA never takes the unified mixed-KV pool,
+        # so there is no window arena to reserve.
+        is_int2 = kv_cache_dtype == "int2"
+        kv_size = None if is_int2 else torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        self._fixed_overhead_bytes = 0
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
@@ -590,6 +1086,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._enable_unified_memory = get_memory().enable_unified_memory
 
         if model_config.attention_arch == AttentionArch.MLA:
+            if is_int2:
+                raise ValueError(
+                    "--kv-cache-dtype int2 has no hybrid-SWA MLA pool; use a "
+                    "float --kv-cache-dtype with the OSCAR MLA latent env flags."
+                )
             # MLA pool sizing uses latent dimensions rather than MHA heads.
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -614,6 +1115,32 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._swa_per_token = (
                 model_config.swa_kv_lora_rank + model_config.swa_qk_rope_head_dim
             ) * kv_size
+        elif is_int2:
+            if get_model().kv_cache_quant_group_size is not None:
+                raise ValueError(
+                    "--kv-cache-quant-group-size is only supported for the "
+                    "full-attention Triton int2 KV cache path and is not supported "
+                    "with hybrid SWA models"
+                )
+            scale_bytes = _int2_scale_dtype_bytes()
+            self._full_per_token = model_config.get_num_kv_heads(
+                tp_size
+            ) * _get_int_kv_bytes_per_head_pair(
+                k_head_dim=model_config.head_dim,
+                v_head_dim=model_config.v_head_dim,
+                kv_cache_dtype="int2",
+                group_size=None,
+                scale_dtype_bytes=scale_bytes,
+            )
+            self._swa_per_token = model_config.get_swa_num_kv_heads(
+                tp_size
+            ) * _get_int_kv_bytes_per_head_pair(
+                k_head_dim=model_config.swa_head_dim,
+                v_head_dim=model_config.swa_v_head_dim,
+                kv_cache_dtype="int2",
+                group_size=None,
+                scale_dtype_bytes=scale_bytes,
+            )
         else:
             # Full layer per-token memory (bytes)
             self._full_per_token = (
@@ -795,6 +1322,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes -= self._fixed_overhead_bytes
         if self._enable_unified_memory and self._full_layers_num > 0:
             max_total_num_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size

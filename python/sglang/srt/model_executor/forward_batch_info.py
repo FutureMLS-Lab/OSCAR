@@ -1172,6 +1172,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions % model_runner.attn_dcp_size == model_runner.attn_dcp_rank
             )
 
+        notify_kv_pool_of_forward_batch(ret)
         return ret
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
@@ -2169,3 +2170,25 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def notify_kv_pool_of_forward_batch(forward_batch: "ForwardBatch") -> None:
+    """Hand a finished ``ForwardBatch`` to a KV pool that needs per-forward state.
+
+    A KV pool whose tiering depends on a token's *position in its sequence*
+    cannot get that from ``set_kv_buffer(layer, loc, ...)``; only the batch
+    knows it. The OSCAR MLA latent pools (``MLAInt2HPKVPool`` /
+    ``NSAInt2HPKVPool`` and the packed variants) use it to place their BF16
+    sink and BF16 recent windows over the shared latent. Every other pool has
+    no ``note_forward_batch`` and is untouched.
+
+    Must be called after ``positions`` is filled in, and from every place a
+    ``ForwardBatch`` is built that will then run the model -- notably the CUDA
+    graph runner, which constructs one directly and captures the ops built on
+    it. A pool that is handed stale metadata detects the shape mismatch and
+    falls back to quantizing every token.
+    """
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    hook = getattr(pool, "note_forward_batch", None)
+    if hook is not None:
+        hook(forward_batch)

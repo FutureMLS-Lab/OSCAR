@@ -592,6 +592,7 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.init_mixed_kv_stream_wait()
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
@@ -2342,6 +2343,15 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
+    def init_mixed_kv_stream_wait(self) -> None:
+        """Whether run_batch stashes forward_done on the mixed HP+int2 KV pool."""
+        # Only UnifiedInt2HPKVPool exposes mixed_kv_enabled(); KVCache does not.
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
+        self.enable_mixed_kv_stream_wait = (
+            mixed_kv_enabled is not None and mixed_kv_enabled()
+        )
+
     def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
@@ -2376,6 +2386,9 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_waiting_queue=lambda: self.waiting_queue,
+            # result_queue exists only in the overlap event loop.
+            get_result_queue=lambda: self.result_queue if self.enable_overlap else (),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -4438,6 +4451,18 @@ class Scheduler(
                                 forward_done,
                                 batch.out_cache_loc,
                             )
+                        if self.enable_mixed_kv_stream_wait:
+                            # Stash the event on the kv_pool. The wait is issued
+                            # later, inside ``_alloc_for_decode_mixed`` at the
+                            # apply-quant-and-remap boundary, so host-syncing
+                            # pre-flush work (radix eviction, retract free,
+                            # plan-kernel free) does not stall behind the previous
+                            # forward. See plan-for-a-fix-starry-russell.md.
+                            forward_done = self.device_module.Event()
+                            forward_done.record(stream=self.forward_stream)
+                            self.token_to_kv_pool_allocator.get_kvcache().stash_pending_forward(
+                                forward_done
+                            )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
@@ -6039,6 +6064,15 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    # OSCAR: route Triton's on-disk cache into a rank-specific subdirectory
+    # so TP workers in the same job do not race on launcher .so / metadata
+    # files when compiling the same kernel hash concurrently.
+    _oscar_triton_base = os.environ.get("OSCAR_TRITON_PER_RANK_BASE")
+    if _oscar_triton_base:
+        _oscar_target = os.path.join(_oscar_triton_base, f"rank{tp_rank}")
+        os.makedirs(_oscar_target, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = _oscar_target
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)

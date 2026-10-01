@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import MixedKVPrefixMixin
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ChunkCache(BasePrefixCache):
+class ChunkCache(MixedKVPrefixMixin, BasePrefixCache):
     """
     ChunkCache is used when radix cache is disabled.
 
@@ -50,6 +51,11 @@ class ChunkCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.protected_size_ = 0
+
+        # Mixed-KV: no tree here, so no tier cap or tail trim; the mixin's
+        # ``on_release`` still forgets a finished request's quant slack after
+        # the whole-row free returned its pages.
+        self._init_mixed_kv()
 
     def is_chunk_cache(self) -> bool:
         return True

@@ -338,3 +338,7 @@ node_modules/
 
 # Android / Gradle caches (examples/llama.android)
 .gradle/
+
+# OSCAR figures referenced by README.md
+!materials/*.png
+!materials/*.pdf

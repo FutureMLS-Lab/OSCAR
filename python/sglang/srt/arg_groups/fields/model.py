@@ -196,7 +196,8 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"int2" uses the Triton quantized KV cache path.'
             ),
             choices=[
                 "auto",
@@ -207,10 +208,19 @@ class Model(msgspec.Struct):
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
+                "int2",
             ],
             resolvable=True,
         ),
     ] = "auto"
+    kv_cache_quant_group_size: A[
+        Optional[int],
+        (
+            "Optional head-dimension group size for Triton int2 KV cache "
+            "quantization. Only applies to --kv-cache-dtype int2. "
+            "By default, KV scales are shared across the full head."
+        ),
+    ] = None
     modelopt_quant: A[
         Optional[Union[str, Dict]],
         (

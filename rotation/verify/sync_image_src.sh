@@ -30,26 +30,18 @@ rsync -a --delete \
 printf '%s %s\n' "$BRANCH" "$REV" > "$DEST/BUILT_FROM"
 echo "synced $BRANCH@$REV -> $DEST"
 
-# Spot-check the fixes the Dockerfile asserts, here rather than 40 minutes into
-# a build.
-#
-# The gate-rebase check is a PAIR on purpose: the caller must scale the gate
-# into log2 space (RCP_LN2 in kda.py) and the kernels must read it with exp2.
-# Having one without the other was the original defect -- decay applied as
-# exp(0.693*g) instead of exp(g), too weak and compounding with length. An
-# earlier hand-fix put the literal in chunk_intra.py; porting upstream's
-# kernels moved it to the caller, so pinning the old location would have
-# failed a build over a constant that had simply relocated.
+# Spot-check that the context carries this tree's OSCAR hooks, here rather than
+# 40 minutes into a build. Each pair is <file>:<needle>.
 for pat in \
-  'sglang-research/python/sglang/srt/layers/attention/fla/kda.py:RCP_LN2' \
-  'sglang-research/python/sglang/srt/layers/attention/fla/chunk_intra.py:exp2' \
-  'sglang-research/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py:_decode_query_start_loc' \
-  'sglang-research/python/sglang/srt/models/kimi_k3.py:local_num_heads' \
-  'sglang-research/python/sglang/srt/environ.py:SGLANG_K3_AR_FUSION' \
+  'python/sglang/srt/mem_cache/unified_kv_pool.py:class UnifiedInt2HPKVPool' \
+  'python/sglang/srt/mem_cache/kv_cache_configurator.py:_build_oscar_unified_kv_pool' \
+  'python/sglang/srt/environ.py:SGLANG_ENABLE_MIXED_KV_WINDOWS' \
+  'python/sglang/srt/layers/attention/triton_backend.py:mixed_kv_enabled' \
+  'python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py:notify_kv_pool_of_forward_batch' \
   'rotation/eval_oscar_gpqa.sh:DECODE_BACKEND'; do
   f=${pat%%:*}; needle=${pat#*:}
   grep -q "$needle" "$DEST/$f" || { echo "MISSING in context: $f -> $needle" >&2; exit 1; }
 done
-test -f "$DEST/sglang-research/python/sglang/srt/runtime_context.py"
+test -f "$DEST/python/sglang/srt/runtime_context.py"
 test -x "$DEST/rotation/verify/preflight_port.py"
 echo "build context carries this branch's fixes"

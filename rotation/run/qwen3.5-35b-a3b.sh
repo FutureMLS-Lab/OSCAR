@@ -18,7 +18,7 @@ export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND
 # model's recommended configuration, and Qwen3.5 documents the penalty as the
 # knob that "reduces endless repetitions" -- exactly the failure seen here.
 export TOP_K="${TOP_K:-20}" PRESENCE_PENALTY="${PRESENCE_PENALTY:-1.5}"
-# THIS MODEL REQUIRES transformers 5.3.0. sglang-research's own pyproject.toml
+# THIS MODEL REQUIRES transformers 5.3.0. the sglang tree's own pyproject.toml
 # pins that version; the image ships 5.16.1 because Gemma-4 needs >= 5.5 for
 # Gemma4UnifiedForConditionalGeneration. On 5.16.1 this model never stops
 # reasoning on GPQA -- </think> closes in 1-4 of 198 responses and the score is

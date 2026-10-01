@@ -61,7 +61,7 @@ export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --context-length $((TOK + 2048)
 #   others    flashinfer (Gemma-4's 512-wide global heads are the one MHA
 #             geometry it has no tile for, and that is reported as such).
 case "$MODEL_KEY" in
-  glm-5*)  FI_BACKEND="${FI_BACKEND:-nsa}" ;;
+  glm-5*)  FI_BACKEND="${FI_BACKEND:-dsa}" ;;
   kimi-k3) FI_BACKEND="${FI_BACKEND:-trtllm_mla}" ;;
   *)       if grep -qE 'MLA_ROT_PATH|MLA_PACKED' "$RUN" 2>/dev/null; then FI_BACKEND="${FI_BACKEND:-trtllm_mla}"; else FI_BACKEND="${FI_BACKEND:-flashinfer}"; fi ;;
 esac

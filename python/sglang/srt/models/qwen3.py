@@ -35,7 +35,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    maybe_absorb_oscar_v_rotation_into_qkv,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -158,6 +161,9 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        # OSCAR: set by maybe_absorb_oscar_v_rotation_into_qkv at the end of
+        # load_weights when the V rotation is folded into qkv_proj.
+        self.attn.oscar_v_rotation_absorbed = False
         self.alt_stream = alt_stream
 
         self.use_fused_qk_norm_mrope = (
@@ -702,6 +708,10 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+        maybe_absorb_oscar_v_rotation_into_qkv(
+            self.model, quant_config=self.quant_config, model_label="Qwen3"
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

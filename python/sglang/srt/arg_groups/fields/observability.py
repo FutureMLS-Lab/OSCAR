@@ -224,6 +224,15 @@ class Observability(msgspec.Struct):
         Optional[str],
         "The input filename for dumping tensors",
     ] = None
+    # Explicit calibration-only Q/K/V capture for OSCAR rotations.
+    oscar_qkv_dump_path: A[
+        Optional[str],
+        "Calibration-only directory for expanded-attention Q/K/V tensors.",
+    ] = None
+    oscar_qkv_dump_tokens: A[
+        int,
+        "Maximum Q/K/V tokens captured per attention layer.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins

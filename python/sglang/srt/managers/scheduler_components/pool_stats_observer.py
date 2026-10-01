@@ -217,11 +217,31 @@ class SchedulerPoolStatsObserver:
 
         return pool_stats
 
+    def mixed_kv_total_capacity(self) -> Optional[int]:
+        """Pooled capacity of the mixed HP+int2 pool, or None when not mixed.
+
+        ``max_total_num_tokens`` is sized for a uniform pool; the unified
+        allocator's ``size`` is the quant + shared HP-prefix capacity that
+        ``available_size`` is measured against, so usage and the idle leak
+        check must use it.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        # Only UnifiedInt2HPKVPool exposes mixed_kv_enabled(); KVCache does not.
+        kvcache = allocator.get_kvcache()
+        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
+        if mixed_kv_enabled is not None and mixed_kv_enabled():
+            return int(allocator.size)
+        return None
+
     def _get_token_info(self) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        # mixed-KV: allocator.size includes the shared HP-prefix pool.
+        total_capacity = self.mixed_kv_total_capacity()
+        if total_capacity is None:
+            total_capacity = self.max_total_num_tokens
+        num_used = total_capacity - (available_size + evictable_size)
+        token_usage = num_used / total_capacity if total_capacity else 0.0
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,

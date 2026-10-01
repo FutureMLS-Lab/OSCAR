@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
-export PYTHONPATH="${REPO_ROOT}/sglang-research/python:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 
 DATASET="${DATASET:-GPQA}"
 if [[ -z "${CAL:-}" ]]; then

@@ -29,7 +29,7 @@ def configure_kv_cache_dtype(
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
-) -> tuple[Optional[str], torch.dtype]:
+) -> tuple[Optional[str], torch.dtype | str]:
     resolved_kv_cache_dtype: Optional[str] = None
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
@@ -62,6 +62,14 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int2":
+        # OSCAR INT2 KV cache. Packed 2-bit codes have no torch dtype; the
+        # quantized pools (UnifiedInt2HPKVPool, the int2 MHATokenToKVPool) take
+        # the string "int2" as their storage dtype and derive the real storage
+        # dtypes from SGLANG_MIXED_KV_HP_DTYPE / SGLANG_MIXED_KV_SCALE_DTYPE, so
+        # both the resolved tag and the dtype value are the string.
+        kv_cache_dtype = "int2"
+        resolved_kv_cache_dtype = "int2"
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2

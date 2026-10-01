@@ -71,6 +71,17 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Mixed-KV (HP+int2): when True, ``RadixCache.match_prefix`` skips the
+    # HP-recent tier cap because the caller already applied it. The only such
+    # caller is ``cache_unfinished_req``'s post-insert sibling-coverage match,
+    # which caps with ``_mixed_kv_tier_cap`` and then clamps by the
+    # partial-quant-page cutoff and by its own insert length; capping blindly
+    # inside ``match_prefix`` instead would let the match come back shorter
+    # than ``cache_protected_len`` and silently truncate the
+    # ``prefix_indices`` rebuild, leaking slot ids. The cap itself is NOT
+    # optional -- see ``RadixCache._mixed_kv_tier_cap``.
+    bypass_mixed_kv_cap: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -523,6 +534,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def evictable_size(self):
         return 0
+
+    def recoverable_size(self):
+        # Page-equivalent recoverable capacity for the scheduler. Defaults
+        # to ``evictable_size`` for caches whose evictable units already
+        # match the allocator's ``size`` denomination. The mixed-KV
+        # ``RadixCache`` overrides this; today that override is also an alias
+        # of ``evictable_size`` because HP slots never enter the tree.
+        return self.evictable_size()
 
     def full_evictable_size(self):
         return 0

@@ -6,7 +6,7 @@ that also carries a broken omegaconf), so the smoke harness cannot rely on it.
 This runner imports each module -- picking up module-level asserts -- and then
 calls every ``test_*`` function it defines.
 
-Usage: PYTHONPATH=sglang-research/python python3 tests/run_cpu_checks.py
+Usage: PYTHONPATH=python python3 tests/run_cpu_checks.py
 """
 import importlib.util
 import os
@@ -15,7 +15,7 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, os.path.join(ROOT, "sglang-research", "python"))
+sys.path.insert(0, os.path.join(ROOT, "python"))
 os.chdir(ROOT)  # test_perhead_rotation.py inserts a relative sys.path entry
 
 MODULES = [

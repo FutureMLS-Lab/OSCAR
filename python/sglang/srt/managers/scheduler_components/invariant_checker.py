@@ -67,6 +67,9 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # its uncached tokens must still be counted.
     get_chunked_req: Callable = field(default=lambda: None)
+    # Mixed-KV idle-leak dump only: every owner that can still hold slots.
+    get_waiting_queue: Callable = field(default=lambda: ())
+    get_result_queue: Callable = field(default=lambda: ())
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -94,6 +97,7 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
+        mixed_kv_total = self.pool_stats_observer.mixed_kv_total_capacity()
         if self.is_hybrid_swa and not ps.full_capacity:
             return False, ""
         if self.is_hybrid_swa:
@@ -118,6 +122,9 @@ class SchedulerInvariantChecker:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
+            # mixed-KV: allocator.size includes the shared HP-prefix pool.
+            if mixed_kv_total is not None:
+                total = mixed_kv_total
         full_evictable_size = ps.full_evictable_size
         full_available = ps.full_available_size
         class_watermark_msg = ""
@@ -149,6 +156,8 @@ class SchedulerInvariantChecker:
             uncached,
         )
         msg += class_watermark_msg
+        if leak and mixed_kv_total is not None:
+            msg += "\n" + self._mixed_kv_leak_debug_msg()
         if kv_shard_size > 1:
             # Partial active pages are already rounded in
             # _get_total_uncached_sizes. Rounding cached counts or accepting
@@ -175,6 +184,73 @@ class SchedulerInvariantChecker:
             # compatibility path separate from exact KV-shard conservation.
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
+
+    def _mixed_kv_leak_debug_msg(self) -> str:
+        allocator = self.token_to_kv_pool_allocator
+
+        def summarize_req(req, source: str) -> str:
+            slack = req.mixed_kv_quant_slack_indices
+            extend_range = req.extend_range
+            return (
+                f"{source}:rid={req.rid},pool={req.kv.req_pool_idx},"
+                f"kv={req.kv.kv_committed_len}/{req.kv.kv_allocated_len},"
+                f"released={req.kv.is_kv_released},"
+                f"inflight_chunks={req.inflight_middle_chunks},"
+                f"retracted={req.is_retracted},"
+                f"lens(origin/output/extend/prefix/protected)="
+                f"{len(req.origin_input_ids)}/{len(req.output_ids)}/"
+                f"{extend_range.length if extend_range is not None else 0}/"
+                f"{len(req.prefix_indices)}/{req.kv.cache_protected_len},"
+                f"slack={slack.numel()}"
+            )
+
+        summaries = []
+        seen = set()
+
+        def add_req(req, source: str):
+            if req is None or id(req) in seen:
+                return
+            seen.add(id(req))
+            if (
+                req.kv.holds_kv
+                or req.kv.kv_committed_len
+                or req.kv.kv_allocated_len
+                or req.mixed_kv_quant_slack_indices.numel() > 0
+            ):
+                summaries.append(summarize_req(req, source))
+
+        for source, batch in (
+            ("running", self.get_running_batch()),
+            ("last", self.get_last_batch()),
+        ):
+            if batch is not None:
+                for req in batch.reqs:
+                    add_req(req, source)
+
+        add_req(self.get_chunked_req(), "chunked")
+
+        for req in self.get_waiting_queue():
+            add_req(req, "waiting")
+
+        for i, item in enumerate(self.get_result_queue()):
+            batch = item[0]
+            for req in batch.reqs:
+                add_req(req, f"result{i}")
+
+        owner_msg = "; ".join(summaries[:32])
+        if len(summaries) > 32:
+            owner_msg += f"; ... +{len(summaries) - 32} more"
+        if not owner_msg:
+            owner_msg = "none"
+
+        # Only reached for UnifiedInt2HPKVAllocator, which owns these free lists.
+        return (
+            "MIXED_KV_IDLE_LEAK "
+            f"allocator=({allocator.debug_print()}), "
+            f"free_pages={allocator.free_pages.numel()}, "
+            f"release_pages={allocator.release_pages.numel()}, "
+            f"owners=[{owner_msg}]\n"
+        )
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator

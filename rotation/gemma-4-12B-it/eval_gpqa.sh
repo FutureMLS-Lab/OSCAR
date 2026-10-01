@@ -13,7 +13,7 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}/sglang-research}"
+SGLANG_RESEARCH_DIR="${SGLANG_RESEARCH_DIR:-${REPO_ROOT}}"
 
 MODEL="${MODEL:-google/gemma-4-12B-it}"
 PY="${PY:?Set PY to a python with transformers>=5.5 + sglang/flashinfer/sgl_kernel}"

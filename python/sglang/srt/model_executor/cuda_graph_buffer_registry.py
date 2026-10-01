@@ -534,6 +534,7 @@ def build_decode_registry(
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
+    out_cache_loc_pad_value: Optional[int] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
     buffers, with the per-slot padding policy that resets the padded tail on
@@ -541,6 +542,10 @@ def build_decode_registry(
 
       - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
       - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
+        (``out_cache_loc`` -> FILL_SENTINEL(out_cache_loc_pad_value) when a
+        pool reserves a specific dummy slot for padded writes; the OSCAR
+        mixed-KV pool does, because slot 0 is a quant slot and a decode write
+        must land in the HP tier)
       - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
         plan reads the padded tail, so leaving stale out-of-range values there
         triggers an illegal memory access (issue #24361).
@@ -583,7 +588,12 @@ def build_decode_registry(
             _tokens,
             cache_loc_dtype,
             axis="tokens",
-            padding_policy=PaddingPolicy.ZERO,
+            padding_policy=(
+                PaddingPolicy.ZERO
+                if out_cache_loc_pad_value is None
+                else PaddingPolicy.FILL_SENTINEL
+            ),
+            pad_value=out_cache_loc_pad_value,
         ),
         GraphSlot(
             "req_pool_indices",

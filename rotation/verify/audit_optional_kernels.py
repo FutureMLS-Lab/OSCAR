@@ -167,7 +167,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--root",
-        default=str(pathlib.Path(__file__).resolve().parents[2] / "sglang-research/python/sglang"),
+        default=str(pathlib.Path(__file__).resolve().parents[2] / "python/sglang"),
     )
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()

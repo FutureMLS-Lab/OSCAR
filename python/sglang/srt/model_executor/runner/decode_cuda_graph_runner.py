@@ -73,6 +73,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
+    notify_kv_pool_of_forward_batch,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -460,6 +461,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             dp_size=self.dp_size,
             source=self.buffers,
+            out_cache_loc_pad_value=self._padded_write_slot(),
         )
 
         # Captures the per-replay attention-metadata prep into a small CUDA
@@ -900,6 +902,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         seq_lens = _slot("seq_lens")
         seq_lens_cpu = _slot("seq_lens_cpu")
         out_cache_loc = _slot("out_cache_loc")
+        padded_write_slot = self._padded_write_slot()
+        if (
+            padded_write_slot is not None
+            and self.capture_forward_mode.is_decode_or_idle()
+        ):
+            # Capture writes every token's dummy K/V to the reserved slot; replay
+            # refills [:raw_n] with real slots and the registry pads the tail
+            # with the same value.
+            out_cache_loc.fill_(padded_write_slot)
         positions = _slot("positions")
         encoder_lens = (
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
@@ -1012,6 +1023,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
+        # A position-dependent KV pool has to see the *graph's* static
+        # seq_lens / req_pool_indices tensors, because the ops it builds on
+        # them are what gets captured and replayed.
+        notify_kv_pool_of_forward_batch(forward_batch)
+
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
@@ -1022,6 +1038,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
         return forward_batch, attn_backend, pp_proxy_tensors
+
+    def _padded_write_slot(self) -> Optional[int]:
+        """Slot every padded decode token writes its dummy K/V into.
+
+        None keeps upstream's behaviour (slot 0). The OSCAR mixed-KV pool
+        returns its reserved HP-prefix page 0 instead: its slot 0 is a quant
+        slot, and a decode write there would go through the quantized path
+        and corrupt page 0 of the quant arena. The allocator reserves that
+        HP page for exactly this purpose (see ``UnifiedInt2HPKVAllocator``).
+        """
+        pool = self.model_runner.token_to_kv_pool
+        fn = getattr(pool, "mixed_kv_enabled", None)
+        if callable(fn) and fn():
+            return int(pool.hp_global_offset)
+        return None
 
     def capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the

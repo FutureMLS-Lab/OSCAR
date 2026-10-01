@@ -292,7 +292,7 @@ def main():
                     metavar="MODULE",
                     help="a SHARED module replaced with upstream's copy; every "
                          "fork file importing from it must still resolve")
-    ap.add_argument("--root", default="sglang-research/python/sglang",
+    ap.add_argument("--root", default="python/sglang",
                     help="tree to scan for --consumers")
     ap.add_argument("--skip-kernel-audit", action="store_true",
                     help="skip the optional-kernel import audit")

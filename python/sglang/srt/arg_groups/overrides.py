@@ -1142,9 +1142,16 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
+        # "bfloat16" is a documented spelling of "bf16" (see the
+        # --kv-cache-dtype choices) and the DSA path already normalises one
+        # to the other, but that normalisation runs in a different branch,
+        # so this check saw the raw string and rejected a value the parser
+        # accepts. The effect was that a BF16 control could not be put on
+        # this backend at all.
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "bfloat16", "auto"]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of "
+                "fp8_e4m3, bf16/bfloat16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"

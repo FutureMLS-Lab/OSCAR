@@ -77,6 +77,14 @@ def registered_radix_cache_backends() -> list[str]:
     return list(_RADIX_CACHE_REGISTRY.keys())
 
 
+def _is_oscar_mixed_kv(params: CacheInitParams) -> bool:
+    allocator = params.token_to_kv_pool_allocator
+    if allocator is None:
+        return False
+    kvcache = allocator.get_kvcache()
+    return kvcache is not None and kvcache.mixed_kv_enabled()
+
+
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
     params = ctx.params
@@ -99,6 +107,23 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if _is_oscar_mixed_kv(params):
+        # OSCAR mixed-KV pool (2-bit codes + BF16 prefix / recent windows):
+        # the two-tier tree semantics -- tier cap on matches, HP-recent tail
+        # trim before insert, request-owned partial quant pages -- live in
+        # RadixCache through MixedKVPrefixMixin. UnifiedRadixCache has no
+        # equivalent yet, so a hybrid SSM model (whose mamba states the unified
+        # cache tracks) cannot combine prefix caching with mixed KV on this tree.
+        if ctx.is_hybrid_ssm:
+            raise NotImplementedError(
+                "OSCAR mixed KV with the prefix cache is not available for hybrid "
+                "SSM models on this tree (UnifiedRadixCache tracks the mamba states "
+                "but has no mixed-KV tiering). Serve with --disable-radix-cache."
+            )
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        return RadixCache(params)
 
     if get_memory().enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (

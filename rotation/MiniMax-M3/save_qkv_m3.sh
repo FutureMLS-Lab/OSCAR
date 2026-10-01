@@ -33,7 +33,7 @@ CALIB_DIR="${CALIB_DIR:-${SCRIPT_DIR}/${DATASET}/latest}"
 export DUMP_M3_QKV_DIR="${DUMP_M3_QKV_DIR:-${CALIB_DIR}/qkv_dumps_perrank}"
 mkdir -p "${DUMP_M3_QKV_DIR}"
 
-export PYTHONPATH="${REPO_ROOT}/sglang-research/python:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 LOG="${DUMP_M3_QKV_DIR}/server_rank${NODE_RANK}.log"
 
 REV_ARG=()

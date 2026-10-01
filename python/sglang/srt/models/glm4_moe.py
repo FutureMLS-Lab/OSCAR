@@ -84,7 +84,11 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
-from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
+from sglang.srt.models.utils import (
+    WeightsMapper,
+    apply_qk_norm,
+    maybe_absorb_oscar_v_rotation_into_qkv,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
@@ -299,6 +303,7 @@ class Glm4MoeAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        self.attn.oscar_v_rotation_absorbed = False
 
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -1399,6 +1404,11 @@ class Glm4MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        if not is_nextn:
+            maybe_absorb_oscar_v_rotation_into_qkv(
+                self.model, quant_config=self.quant_config, model_label="GLM-4 MoE"
+            )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

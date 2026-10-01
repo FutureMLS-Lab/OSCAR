@@ -309,14 +309,14 @@ rotation/
         _eval_gpqa_oscar/   eval results from this rotation
         _eval_lcb_v6_128k/  ...
 
-sglang-research/            vendored sglang fork — INT2 KV eval
+python/sglang/              sglang (upstream main + the OSCAR low-bit KV cache) — INT2 KV eval
 sglang-dump-qkv/            vendored older sglang fork — QKV dump (loaded via shim)
 third_party/simple_evals/   git submodule — eval harness (needs git clone --recursive)
 ```
 
 ## Setup
 
-OSCAR vendors a snapshot of the upstream SGLang `main` fork (~May 2026; `torch==2.9.1`, `transformers==5.3.0`, `flashinfer==0.6.7.post3`). Both `sglang-research/` (INT2 eval) and `sglang-dump-qkv/` (QKV dump) ship in the repo — no separate SGLang install is needed.
+The repository root is upstream SGLang `main` with the OSCAR low-bit KV cache added (`python/sglang/`, built and served from the official `lmsysorg/sglang` image; see `docker/Dockerfile.oscar`). The QKV-dump fork `sglang-dump-qkv/` also ships in the repo — no separate SGLang install is needed.
 
 ### Requirements
 
@@ -346,7 +346,7 @@ conda create -n oscar python=3.12 -y
 conda activate oscar
 
 # Eval-side sglang (editable so future patches stick)
-pip install -e sglang-research/python
+pip install -e python
 
 # CUDA-12.8/12.9 compatible flashinfer + sgl_kernel build
 # (see https://github.com/sgl-project/sglang for matching wheels)

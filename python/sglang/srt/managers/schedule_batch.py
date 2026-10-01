@@ -1173,6 +1173,16 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # Unused slots owned by partially occupied atomic quant pages in the
+        # mixed HP+int2 KV path. They are not logical token positions, but must
+        # be freed with the request-owned live tail slots to return the page.
+        self.mixed_kv_quant_slack_indices: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int64
+        )
+        # Smallest logical token position whose atomic quant page has
+        # request-owned slack. Radix insertion must stay below this boundary
+        # until the request frees the page as a whole.
+        self.mixed_kv_quant_slack_cutoff_len: Optional[int] = None
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
@@ -1964,6 +1974,8 @@ class Req(ReqDllmMixin):
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
+        self.mixed_kv_quant_slack_cutoff_len = None
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
@@ -3281,12 +3293,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         the retract loop converges on this same check, so allocator-side
         shortfalls retract gracefully instead of tripping fail-loud alloc
         errors."""
-        num_tokens = self.new_tokens_required_next_decode(selected_indices)
         requests = (
             self.reqs
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
+        if (
+            self.spec_algorithm.is_none()
+            and mixed_kv_enabled is not None
+            and mixed_kv_enabled()
+        ):
+            # Worst-case: every req flushes this step -> bs*N_Q quant slots.
+            num_tokens = len(requests) * int(kvcache.flush_interval)
+        else:
+            num_tokens = self.new_tokens_required_next_decode(selected_indices)
         return self.token_to_kv_pool_allocator.check_decode_capacity(
             num_tokens=num_tokens,
             tree_cache=self.tree_cache,

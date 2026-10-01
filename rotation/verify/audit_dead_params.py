@@ -71,7 +71,7 @@ def main() -> int:
         "--root",
         default=str(
             pathlib.Path(__file__).resolve().parents[2]
-            / "sglang-research/python/sglang/srt"
+            / "python/sglang/srt"
         ),
     )
     a = ap.parse_args()

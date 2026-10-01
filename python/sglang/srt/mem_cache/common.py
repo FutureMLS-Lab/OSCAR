@@ -10,6 +10,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.mem_cache import mixed_kv_audit
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
@@ -330,6 +331,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             "mamba state is freed while the tree cache does not manage mamba states"
         )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+
+    # Mixed-KV: reset the per-req HP-recent cursor before the req_pool_idx
+    # is recycled, so the next request starts fresh.
+    kvcache = tree_cache.token_to_kv_pool_allocator.get_kvcache()
+    release_slab = getattr(kvcache, "release_req_slab", None)
+    if release_slab is not None:
+        release_slab(req.kv.req_pool_idx)
+        mixed_kv_audit.audit_release(req.kv.req_pool_idx)
+
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)

@@ -10,7 +10,7 @@ and only the BF16 arm degenerates. So the question is whether this kernel is
 correct at these dims. Compared against a plain torch softmax attention.
 """
 import sys, torch
-sys.path.insert(0, "/oscar/src/sglang-research/python")
+sys.path.insert(0, "/oscar/src/python")
 from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
 
 dev = "cuda"

@@ -1,6 +1,6 @@
 """CPU equivalence tests for the per-head rotation plumbing (no GPU needed)."""
 import sys, torch
-sys.path.insert(0, "sglang-research/python")
+sys.path.insert(0, "python")
 from sglang.srt.mem_cache.unified_kv_pool import _rotate_heads
 from sglang.srt.layers.attention.quantized_kv_prefill import _apply_oscar_rotation
 

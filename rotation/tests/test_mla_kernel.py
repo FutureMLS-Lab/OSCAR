@@ -11,7 +11,7 @@ import argparse, os, sys, time
 import torch
 
 sys.path.insert(
-    0, str(pathlib.Path(__file__).resolve().parents[1] / "sglang-research" / "python")
+    0, str(pathlib.Path(__file__).resolve().parents[1] / "python")
 )
 from sglang.QuantKernel.mla_latent_int2 import quantize_pack, dequantize, bytes_per_value
 from sglang.srt.mem_cache.mla_int2_kv_pool import _fake_quant_int2_groupwise
