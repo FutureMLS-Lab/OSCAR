@@ -741,20 +741,29 @@ class _PackedLatentMixin(_Int2HPMixin):
         )
 
     def materialize_rows(self, layer_id: int, slots: torch.Tensor,
-                         out: Optional[torch.Tensor] = None) -> torch.Tensor:
+                         out: Optional[torch.Tensor] = None,
+                         scratch: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Dequantize ``slots`` into a dense ``[n, 1, R+rope]`` BF16 block.
 
         This is the reference read: whatever a fused kernel does, it must agree
         with this. It is also the production path for extend-with-prefix, where
         the row set is small (the reused prefix) and a dense staging buffer is
         cheaper than a second specialised kernel.
+
+        ``scratch`` is an optional ``[>= n, kv_lora_rank]`` buffer for the
+        dequantized latent before the rope / window assembly. The default is a
+        grow-only internal buffer, which is fine for eager callers but not for a
+        CUDA graph: a later, larger eager call would reallocate it under the
+        captured kernels. A capturing caller passes its own static buffer, as it
+        already does for ``out``.
         """
         return self._materialize_rows_li(
-            self._local_layer_index(layer_id), slots, out
+            self._local_layer_index(layer_id), slots, out, scratch
         )
 
     def _materialize_rows_li(self, li: int, slots: torch.Tensor,
-                             out: Optional[torch.Tensor] = None):
+                             out: Optional[torch.Tensor] = None,
+                             scratch: Optional[torch.Tensor] = None):
         """materialize_rows by LOCAL index.
 
         The public entry point is reached from the attention backend with a
@@ -775,11 +784,18 @@ class _PackedLatentMixin(_Int2HPMixin):
         n = slots.numel()
         slots32 = slots.to(torch.int32)
 
-        if self._deq_scratch is None or self._deq_scratch.shape[0] < n:
-            self._deq_scratch = torch.empty(
-                (max(n, 1024), R), dtype=self.dtype, device=self.device
+        if scratch is not None:
+            assert scratch.shape[0] >= n and scratch.shape[1] == R, (
+                f"materialize_rows scratch {tuple(scratch.shape)} cannot hold "
+                f"{n} rows of width {R}"
             )
-        c_rot = self._deq_scratch[:n]
+            c_rot = scratch[:n]
+        else:
+            if self._deq_scratch is None or self._deq_scratch.shape[0] < n:
+                self._deq_scratch = torch.empty(
+                    (max(n, 1024), R), dtype=self.dtype, device=self.device
+                )
+            c_rot = self._deq_scratch[:n]
         gather_dequant_rows(
             slots32, self.c_codes[li], self.c_params[li], c_rot,
             self._group_size, self._lloyd_max, self._bits,

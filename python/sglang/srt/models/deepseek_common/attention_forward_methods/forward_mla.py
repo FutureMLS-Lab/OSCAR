@@ -127,6 +127,27 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
+def _packed_latent_pool():
+    """The OSCAR packed-INT2 latent pool behind the active attention backend,
+    or ``None`` for every other pool.
+
+    Duck-typed on the methods that define the contract, so this file keeps no
+    import dependency on the OSCAR pools and nothing that merely looks like an
+    MLA pool can qualify. Read off the backend (through the TBO wrapper's
+    ``primary`` when present) rather than the ForwardBatch, which no longer
+    carries the pool. A hybrid model's ``HybridLinearKVPool`` proxy forwards
+    these methods and maps the global layer id itself, so it is kept as-is.
+    """
+    backend = get_attn_backend()
+    backend = getattr(backend, "primary", backend)
+    pool = getattr(backend, "token_to_kv_pool", None)
+    if pool is None or not hasattr(pool, "packed_read_operands"):
+        return None
+    if not (hasattr(pool, "rotate_latent") and hasattr(pool, "unrotate_output")):
+        return None
+    return pool
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -158,6 +179,11 @@ class DeepseekMLAForwardMixin:
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
         if getattr(self, "_kimi_split_gguf_kv_b", False):
+            return False
+        # The fused op runs the absorb bmm straight into attention with no
+        # q_nope_out in between to rotate; the packed latent pool needs the
+        # query in its rotated frame (see forward_absorb_core).
+        if _packed_latent_pool() is not None:
             return False
         # Shared activation surface with the DSA indexer graph dispatch
         # (in piecewise/breakable graph + non-speculative extend). Like the indexer
@@ -233,6 +259,11 @@ class DeepseekMLAForwardMixin:
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if llama_4_scaling is not None:
+            return None
+        # Born-fp8 q writes the absorbed query straight into the backend's
+        # fp8 buffer; there is no bf16 q_nope_out to rotate into the packed
+        # pool's frame, and the pool is bf16 anyway.
+        if _packed_latent_pool() is not None:
             return None
         if _is_hip or _is_cpu:
             return None
@@ -686,6 +717,25 @@ class DeepseekMLAForwardMixin:
     ):
         save_kv_cache = True
 
+        # OSCAR packed-INT2 latent: the pool stores the latent in a calibrated
+        # rotated frame (it rotates on the write) and the backends hand the
+        # kernels rows in that frame, so the query side is rotated into it
+        # here and the attention output rotated back before w_vc. The fused
+        # bmm+attention op bypasses q_nope_out and the fused-rope kernels write
+        # the cache from inside a kernel; neither is staged, so refuse both
+        # rather than serve a half-rotated cache.
+        packed_pool = _packed_latent_pool()
+        if packed_pool is not None:
+            if fusion_plan is not None or self._fuse_rope_for_trtllm_mla(
+                forward_batch
+            ):
+                raise NotImplementedError(
+                    "packed-INT2 MLA latent is not staged for the fused bmm / "
+                    f"fused-rope kernels of the {self.current_attention_backend} "
+                    "backend"
+                )
+            q_nope_out = packed_pool.rotate_latent(self.attn_mqa.layer_id, q_nope_out)
+
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if getattr(self, "learnable_sink_param", None) is not None:
@@ -754,6 +804,21 @@ class DeepseekMLAForwardMixin:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe], dim=-1)
 
+            if packed_pool is not None:
+                # Backends on this branch take this forward's k/v as given and
+                # stage only the reused prefix out of the pool, in the pool's
+                # rotated frame. Write the cache here with the unrotated rows
+                # (the pool rotates and packs on the write), then hand the
+                # kernel k/v in the rotated frame beside the already-rotated q,
+                # and keep the backend from writing the cache a second time.
+                layer_id = self.attn_mqa.layer_id
+                packed_pool.set_kv_buffer(
+                    self.attn_mqa, forward_batch.out_cache_loc, k, k_nope
+                )
+                save_kv_cache = False
+                k_nope = packed_pool.rotate_latent(layer_id, k_nope)
+                k = torch.cat([k_nope, k_pe], dim=-1)
+
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
@@ -803,6 +868,13 @@ class DeepseekMLAForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
+        if packed_pool is not None:
+            # Back to the model's frame before w_vc; the rotation is per layer
+            # and linear, so this commutes with the DCP combine above.
+            attn_output = packed_pool.unrotate_output(
+                self.attn_mqa.layer_id,
+                attn_output.view(-1, self.num_local_heads, self.kv_lora_rank),
+            )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

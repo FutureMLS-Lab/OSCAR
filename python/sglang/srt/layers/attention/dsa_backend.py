@@ -78,12 +78,18 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.nsa.packed_staging import (
+    build_slot_to_ragged,
+    stage_decode,
+    stage_prefill,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -324,6 +330,25 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
+def _packed_latent_pool_of(pool):
+    """The OSCAR packed-INT2 latent pool behind ``pool``, or ``None``.
+
+    Duck-typed on the two methods that define its read contract (the same
+    predicate the triton backend uses), so this module keeps no import of the
+    OSCAR pools and a pool that only partly implements the contract cannot
+    half-qualify. A hybrid (linear + MLA) model hands the ``HybridLinearKVPool``
+    proxy here; keep the proxy rather than unwrapping it, because
+    ``materialize_rows`` and the rotation hooks take the GLOBAL
+    ``layer.layer_id`` and the inner pool maps it itself -- unwrapping would
+    hand it a global id it refuses, or worse, one it mistakes for a local index.
+    """
+    if pool is None:
+        return None
+    if hasattr(pool, "packed_read_operands") and hasattr(pool, "materialize_rows"):
+        return pool
+    return None
+
+
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -400,8 +425,51 @@ class DeepseekSparseAttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
+        # OSCAR packed-INT2 latent storage (NSAPackedInt2KVPool, possibly behind
+        # a HybridLinearKVPool proxy). The sparse kernels gather BF16 rows by
+        # absolute slot out of one buffer and this pool has none to hand out --
+        # its get_key_buffer raises by design -- so every forward dequantizes
+        # the rows it attends into a BF16 staging buffer and the top-k table is
+        # remapped into it (see the staging block before init_cuda_graph_state).
+        # None for every other pool; each packed branch is keyed on it so the
+        # stock paths are untouched.
+        self.packed_pool = _packed_latent_pool_of(model_runner.token_to_kv_pool)
+        # Decode staging is static -- the rows, the arange the table is
+        # remapped to, and the dequantizer's [rows, kv_lora_rank] intermediate
+        # -- sized in init_cuda_graph_state so a captured graph never sees a
+        # reallocation. Prefill staging is eager and grows on demand.
+        self._packed_decode_rows: Optional[torch.Tensor] = None
+        self._packed_decode_arange: Optional[torch.Tensor] = None
+        self._packed_decode_deq: Optional[torch.Tensor] = None
+        self._packed_decode_static: bool = False
+        self._packed_prefill_rows: Optional[torch.Tensor] = None
+        self._packed_slot_to_ragged: Optional[torch.Tensor] = None
+        self._packed_prefill_flat: Optional[torch.Tensor] = None
+        if self.packed_pool is not None:
+            if self.hisparse_coordinator is not None:
+                raise NotImplementedError(
+                    "packed-INT2 latent staging does not support hisparse: its "
+                    "slot translation targets the pool's own buffer"
+                )
+            if self.dsa_index_kpool > 1:
+                raise NotImplementedError(
+                    "packed-INT2 latent staging sizes its decode buffers for "
+                    "index_topk rows per query; kpool tail columns are not staged"
+                )
+            if is_dsa_enable_prefill_cp() or get_parallel().dcp_enabled:
+                raise NotImplementedError(
+                    "packed-INT2 latent staging assumes this rank holds every "
+                    "token of the batch; context / decode parallel attention is "
+                    "not supported"
+                )
+            assert self.dsa_index_topk is not None
+
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
+        # MHA_ONE_SHOT reads a reused prefix through get_mla_kv_buffer, i.e.
+        # straight out of the BF16 kv_buffer the packed pool does not have. The
+        # staged sparse path serves short prefills too: top-k of at most topk
+        # tokens is every token, so it is exact there.
+        self.supports_mha_one_shot: bool = self.packed_pool is None
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -1193,6 +1261,16 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        if (
+            self.packed_pool is not None
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            # Prefill rows carry per-token top-k over the whole batch, so the
+            # staging is every token of every request: build the ragged order
+            # and its inverse map once per batch here, not once per layer.
+            # Verify rows carry their own top-k and stage decode-style.
+            self._packed_prepare_prefill(metadata)
 
     def _cal_indexer_k_start_end(
         self,
@@ -1271,6 +1349,220 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    # -- OSCAR packed-INT2 latent: BF16 staging for the sparse kernels --------
+    #
+    # The kernels dispatched from forward_extend / forward_decode /
+    # _forward_trtllm gather KV rows by absolute token slot out of one BF16
+    # buffer. The packed pool stores 2-bit codes (plus a BF16 window arena) and
+    # has no such buffer, so each layer dequantizes exactly the rows this
+    # forward attends into a staging buffer and the top-k table is remapped to
+    # index it (nsa/packed_staging.py). Shapes are static per forward, so the
+    # decode path is CUDA-graph capturable.
+
+    _PACKED_STAGED_IMPLS = frozenset(
+        {"flashmla_sparse", "fa3", "flashinfer_sparse_mla", "tilelang", "triton"}
+    )
+
+    def _packed_round_rows(self, n: int) -> int:
+        """Round a staged row count up to the page size, so a paged view of
+        the buffer is legal for the kernels that address it as pages (trtllm,
+        flashinfer). Padding rows are never referenced by a table entry."""
+        p = self.real_page_size
+        return -(-n // p) * p
+
+    def _packed_alloc_decode_staging(self, max_num_tokens: int) -> None:
+        """Static decode staging for graph capture: one top-k row set per
+        query row, which covers decode, target-verify and draft-extend rows
+        alike (``max_num_tokens`` already counts draft tokens)."""
+        pool = self.packed_pool
+        n = self._packed_round_rows(max_num_tokens * self.dsa_index_topk)
+        self._packed_decode_rows = torch.empty(
+            (n, 1, pool.latent_row_dim()), dtype=pool.dtype, device=self.device
+        )
+        self._packed_decode_arange = torch.arange(
+            n, dtype=torch.int32, device=self.device
+        )
+        self._packed_decode_deq = torch.empty(
+            (n, self.kv_lora_rank), dtype=pool.dtype, device=self.device
+        )
+        self._packed_decode_static = True
+
+    def _packed_decode_buffers(
+        self, n_rows: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(rows, arange, deq)`` able to hold ``n_rows`` staged rows.
+
+        The static buffers are returned whenever they fit. A larger eager
+        batch gets temporaries rather than a rebind: the captured graphs
+        replay into the static buffers, and freeing those underneath them is
+        exactly the silent corruption this guards against. Without graphs
+        (init_cuda_graph_state never ran) there is nothing to protect and the
+        buffers simply grow.
+        """
+        rows = self._packed_decode_rows
+        if rows is not None and rows.shape[0] >= n_rows:
+            return rows, self._packed_decode_arange, self._packed_decode_deq
+        pool = self.packed_pool
+        n = self._packed_round_rows(n_rows)
+        fresh = (
+            torch.empty(
+                (n, 1, pool.latent_row_dim()), dtype=pool.dtype, device=self.device
+            ),
+            torch.arange(n, dtype=torch.int32, device=self.device),
+            torch.empty((n, self.kv_lora_rank), dtype=pool.dtype, device=self.device),
+        )
+        if self._packed_decode_static:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"packed-INT2 decode staging needs {n_rows} rows under CUDA graph "
+                f"capture but init_cuda_graph_state sized it for {rows.shape[0]}"
+            )
+            return fresh
+        (
+            self._packed_decode_rows,
+            self._packed_decode_arange,
+            self._packed_decode_deq,
+        ) = fresh
+        return fresh
+
+    def _packed_prefill_buffer(self, n_rows: int) -> torch.Tensor:
+        """Grow-only prefill staging. Prefill attention runs eagerly (it is a
+        split op under the piecewise graphs), so a rebind here is safe."""
+        buf = self._packed_prefill_rows
+        if buf is None or buf.shape[0] < n_rows:
+            pool = self.packed_pool
+            buf = torch.empty(
+                (n_rows, 1, pool.latent_row_dim()),
+                dtype=pool.dtype,
+                device=self.device,
+            )
+            self._packed_prefill_rows = buf
+        return buf
+
+    def _packed_prepare_prefill(self, metadata: DSAMetadata) -> None:
+        """Once per extend batch: every token of every request in ragged order,
+        and the inverse slot -> ragged-position map the per-token top-k tables
+        are remapped through. Prefix tokens are included: a prefix-cache hit
+        is attended from the pool like any other row."""
+        flat = metadata.page_table_1_flattened
+        if flat is None:
+            # Upstream only flattens for the fp8 RAGGED transform; the packed
+            # pool is bf16 (PAGED), so build the same flattening here.
+            page_table = metadata.page_table_1
+            seq_lens_cpu = metadata.indexer_seq_lens_cpu
+            assert page_table is not None and seq_lens_cpu is not None
+            flat = torch.cat(
+                [
+                    page_table[i, :kv_len]
+                    for i, kv_len in enumerate(seq_lens_cpu.tolist())
+                ]
+            )
+        flat = flat.to(torch.int32)
+        # The slot space the tables index is the packed arrays' row count
+        # (size + page_size). Read it off the pool each time rather than
+        # caching it, so a pool whose backing is finalised after construction
+        # is still covered; this runs once per prefill batch, eagerly.
+        n_slots = int(self.packed_pool.c_codes[0].shape[0])
+        slot_map = self._packed_slot_to_ragged
+        if slot_map is None or slot_map.numel() < n_slots:
+            slot_map = torch.full(
+                (n_slots,), -1, dtype=torch.int32, device=self.device
+            )
+            self._packed_slot_to_ragged = slot_map
+        build_slot_to_ragged(flat, slot_map)
+        self._packed_prefill_flat = flat
+
+    def _packed_check_impl(
+        self,
+        dsa_impl: str,
+        topk_transform_method: TopkTransformMethod,
+        phase: str,
+    ) -> None:
+        """Refuse the kernels the staging cannot serve, before any row is
+        dequantized: ``flashmla_kv`` requantizes the whole cache to fp8 and
+        reads it by sequence rather than by table, the q8 / aiter / XPU paths
+        read the pool's own layout, and a RAGGED table holds offsets into a
+        gathered buffer rather than slots."""
+        if topk_transform_method != TopkTransformMethod.PAGED:
+            raise NotImplementedError(
+                "packed-INT2 latent staging needs absolute-slot (PAGED) top-k "
+                f"tables; got {topk_transform_method}"
+            )
+        if dsa_impl not in self._PACKED_STAGED_IMPLS:
+            raise NotImplementedError(
+                f"packed-INT2 latent {phase} is not staged for the {dsa_impl!r} "
+                f"DSA kernel; staged: {sorted(self._PACKED_STAGED_IMPLS)} and trtllm"
+            )
+
+    def _packed_stage(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        page_table_1: torch.Tensor,
+        ragged_prefill: bool,
+        k: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Replace (pool buffer, absolute-slot table) by (staging buffer, table
+        into it).
+
+        ``page_table_1`` is ``[rows, topk]`` of absolute token slots with -1
+        holes, one row per query token. Decode-style staging (decode, verify
+        and draft-extend rows) dequantizes each row's own top-k into the static
+        buffer. A prefill (``ragged_prefill``) stages every token of the batch
+        once in ragged order, then overwrites this forward's own tokens with
+        their exact rows -- in the pool's rotated frame, since the kernel sees
+        that frame everywhere -- so the current chunk attends to itself at full
+        precision, as the triton extend path does.
+        """
+        pool = self.packed_pool
+        layer_id = layer.layer_id
+
+        if not ragged_prefill:
+            rows_q, topk = page_table_1.shape
+            rows, arange_i32, deq = self._packed_decode_buffers(rows_q * topk)
+
+            def materialize(slots: torch.Tensor, out: torch.Tensor) -> None:
+                pool.materialize_rows(layer_id, slots, out=out, scratch=deq)
+
+            return stage_decode(
+                materialize,
+                page_table_1,
+                arange_i32,
+                rows,
+                row_multiple=self.real_page_size,
+            )
+
+        flat = self._packed_prefill_flat
+        if flat is None:
+            raise RuntimeError(
+                "packed-INT2 latent prefill staging was not prepared for this "
+                "batch; init_forward_metadata must run before forward_extend"
+            )
+        rows = self._packed_prefill_buffer(self._packed_round_rows(flat.numel()))
+        fresh_slots = fresh_rows = None
+        if k is not None and k_rope is not None:
+            fresh_slots, _, _ = unwrap_write_loc(forward_batch.out_cache_loc)
+            parts = [pool.rotate_latent(layer_id, k.reshape(-1, self.kv_lora_rank))]
+            if self.qk_rope_head_dim > 0:
+                parts.append(
+                    k_rope.reshape(-1, self.qk_rope_head_dim).to(parts[0].dtype)
+                )
+            fresh_rows = torch.cat(parts, dim=-1)
+
+        def materialize_prefill(slots: torch.Tensor, out: torch.Tensor) -> None:
+            pool.materialize_rows(layer_id, slots, out=out)
+
+        return stage_prefill(
+            materialize_prefill,
+            flat,
+            self._packed_slot_to_ragged,
+            page_table_1,
+            rows,
+            fresh_slots,
+            fresh_rows,
+            row_multiple=self.real_page_size,
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1330,6 +1622,11 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_decode_impl == "flashmla_kv"
                 else None
             )
+            if self.packed_pool is not None:
+                # Every captured decode / verify shape stages at most
+                # max_num_tokens * topk rows; size the static buffers for that
+                # here so no replay ever depends on a later growth.
+                self._packed_alloc_decode_staging(max_num_tokens)
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -2026,7 +2323,11 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.packed_pool is None:
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        else:
+            # Staged below, once the top-k table is known.
+            kv_cache = None
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2087,6 +2388,17 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
             ).to(torch.int32)
+
+        if self.packed_pool is not None:
+            # OSCAR packed-INT2 latent: the kernels below gather BF16 rows by
+            # absolute slot, so dequantize this forward's rows into the staging
+            # buffer and point the table at it. Prefill rows stage the whole
+            # batch once per layer; verify / draft-extend rows carry their own
+            # top-k like decode rows and take the decode-style staging.
+            self._packed_check_impl(dsa_impl, topk_transform_method, phase)
+            kv_cache, page_table_1 = self._packed_stage(
+                layer, forward_batch, page_table_1, phase == "prefill", k, k_rope
+            )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2328,7 +2640,11 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.packed_pool is None:
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        else:
+            # Staged below, once the top-k table is known.
+            kv_cache = None
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -2365,6 +2681,20 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+            )
+
+        if self.packed_pool is not None:
+            # OSCAR packed-INT2 latent: each request's top-k rows are
+            # dequantized into the static staging buffer and the table is
+            # remapped into it; static shapes, so this captures into the
+            # decode CUDA graph like the rest of the step.
+            self._packed_check_impl(
+                dsa_impl,
+                self.get_topk_transform_method(forward_batch.forward_mode),
+                "decode",
+            )
+            kv_cache, page_table_1 = self._packed_stage(
+                layer, forward_batch, page_table_1, False, None, None
             )
 
         if dsa_impl == "flashmla_sparse":
@@ -3469,8 +3799,14 @@ class DeepseekSparseAttnBackend(
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        if self.packed_pool is None:
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = k_cache.view(
+                -1, self.real_page_size, self.kv_cache_dim
+            ).unsqueeze(1)
+        else:
+            # Staged below, once the top-k table is known.
+            kv_cache = None
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -3519,6 +3855,23 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+        if self.packed_pool is not None:
+            # OSCAR packed-INT2 latent. Staged rows are a multiple of the page
+            # size by construction, so the paged view the kernel expects is
+            # legal: it addresses a token as (slot // page, slot % page) over
+            # that view, which is exactly the flat layout of the staging
+            # buffer. Verify / draft-extend rows arrive with is_prefill=True
+            # but carry decode-style per-row top-k, so they stage decode-style.
+            ragged_prefill = is_prefill and not (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            k_cache, page_table_1 = self._packed_stage(
+                layer, forward_batch, page_table_1, ragged_prefill, k, k_rope
+            )
+            kv_cache = k_cache.view(
+                -1, self.real_page_size, self.kv_cache_dim
+            ).unsqueeze(1)
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )

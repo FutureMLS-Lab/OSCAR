@@ -31,16 +31,21 @@ def stage_decode(
     page_table_1: torch.Tensor,
     arange_i32: torch.Tensor,
     out: torch.Tensor,
+    row_multiple: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dequantize each request's top-k rows into ``out`` and remap the table.
 
     ``page_table_1``: ``[bs, topk]`` int32 absolute token slots, -1 where a
     request holds fewer than ``topk`` tokens. ``out``: at least ``bs*topk``
-    rows of ``[rows, 1, D]``. Returns ``(buf, table)`` with ``buf`` the first
-    ``bs*topk`` rows and ``table`` an arange into it, -1 kept where it was.
+    rows of ``[rows, 1, D]``, rounded up to ``row_multiple``. Returns
+    ``(buf, table)`` with ``buf`` the first ``bs*topk`` rows -- padded to a
+    multiple of ``row_multiple`` so a paged view of it is legal for the
+    kernels that address the buffer as pages; the padding rows are never
+    referenced -- and ``table`` an arange into it, -1 kept where it was.
     """
     bs, topk = page_table_1.shape
     n = bs * topk
+    n_alloc = -(-n // row_multiple) * row_multiple
     page_table_1 = page_table_1.to(torch.int32)
     valid = page_table_1 >= 0
     # -1 would read before the buffer; row 0 is a real row and is simply
@@ -49,7 +54,7 @@ def stage_decode(
     buf = out[:n]
     materialize(safe.reshape(-1), buf)
     table = torch.where(valid, arange_i32[:n].view(bs, topk), page_table_1)
-    return buf, table
+    return out[:n_alloc], table
 
 
 def build_slot_to_ragged(flat_slots: torch.Tensor, slot_to_ragged: torch.Tensor) -> None:
