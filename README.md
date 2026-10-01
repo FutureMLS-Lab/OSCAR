@@ -316,14 +316,24 @@ third_party/simple_evals/   git submodule — eval harness (needs git clone --re
 
 ## Setup
 
-The repository root is upstream SGLang `main` with the OSCAR low-bit KV cache added (`python/sglang/`, built and served from the official `lmsysorg/sglang` image; see `docker/Dockerfile.oscar`). The QKV-dump fork `sglang-dump-qkv/` also ships in the repo — no separate SGLang install is needed.
+The repository root is upstream SGLang `main` with the OSCAR low-bit KV cache
+added under `python/sglang/`. It is served from the official `lmsysorg/sglang`
+image with this tree laid over the image's editable `sglang` install, so there
+is no OSCAR-specific environment to assemble: `docker/Dockerfile.oscar` is the
+whole recipe. The QKV-dump fork `sglang-dump-qkv/` ships in the repo for
+calibration.
 
 ### Requirements
 
-- 1 × H100 80 GB (for 4B/8B), 4 × H100 (for 32B / MiniMax-M2.7), 8 × H100 (for GLM-4.7-FP8)
-- CUDA 12.8 or 12.9 (nvcc on `$PATH`)
-- Python 3.12 + Conda
-- HuggingFace access for the relevant model weights
+- NVIDIA GPUs with the memory the model needs: 1 × 80 GB for the 4B/8B models,
+  4 for Qwen3-32B / MiniMax-M2.7 / Gemma-4-12B, 8 for GLM-5.2 / GLM-5.3 /
+  MiniMax-M3, 16 across two nodes for Kimi-K3. The verification sweep below
+  runs on B200.
+- Docker with the NVIDIA container runtime. The base image carries CUDA 13.0,
+  torch 2.13, transformers 5.12, flashinfer and sgl-kernel; nothing is
+  installed on the host.
+- HuggingFace access for the model weights, and the pre-fit rotations from the
+  [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
 ### Clone
 
@@ -332,29 +342,54 @@ git clone --recursive https://github.com/FutureMLS-Lab/OSCAR.git
 cd OSCAR
 ```
 
-### Conda env (single env, dump + eval)
+`--recursive` matters: `third_party/simple_evals` is the GPQA scorer, and the
+eval driver stops with an explicit error when it is missing instead of scoring
+a harness failure as a model result.
 
-OSCAR uses **one** conda env for both dump and eval. The dump-side sglang
-(vendored as `sglang-dump-qkv/`) was originally built against an older
-`sgl_kernel`; OSCAR ships a thin `rotation/_dump_compat/` shim that stubs
-the dropped legacy symbols at import time and falls back to PyTorch for
-the runtime sampling kernels it references, so a single eval-side env
-suffices.
+### Build the image
+
+The build context holds this tree as `./oscar-src` and the rotations as
+`./rotations`; `git archive` leaves submodules out, so the scorer is archived
+separately.
 
 ```bash
-conda create -n oscar python=3.12 -y
-conda activate oscar
-
-# Eval-side sglang (editable so future patches stick)
-pip install -e python
-
-# CUDA-12.8/12.9 compatible flashinfer + sgl_kernel build
-# (see https://github.com/sgl-project/sglang for matching wheels)
+mkdir -p ctx/oscar-src
+git archive --format=tar HEAD | tar -x -C ctx/oscar-src
+git -C third_party/simple_evals archive --format=tar HEAD \
+  | tar -x -C ctx/oscar-src/third_party/simple_evals
+hf download Zhongzhu/OSCAR-RotationZoo --local-dir ctx/rotations/zoo
+docker build -f docker/Dockerfile.oscar \
+  --build-arg IMAGE_TAG="$(git rev-parse --short HEAD)" \
+  -t oscar-env:local ctx
 ```
 
-If `nvcc` and PyTorch's CUDA versions diverge (e.g. nvcc 12.6 but torch
-built for 12.8), the JIT kernels in flashinfer may fail to compile. Pin
-`CUDA_HOME` to the matching `cuda-12.x` directory before launching.
+The build asserts that `import sglang` inside the image resolves to
+`/sgl-workspace/sglang/python`, i.e. to this tree, and that the OSCAR modules
+parse. GPU kernels are Triton and compile at first use, so the build needs no
+GPU.
+
+### Run
+
+```bash
+docker run --gpus all --rm -it --shm-size 32g \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" -e HF_TOKEN \
+  oscar-env:local bash
+
+oscar-selfcheck                                        # tag, commit, torch + device
+bash /oscar/src/rotation/run/qwen3-8b.sh               # GPQA under INT2 (default)
+KV_MODE=bf16 bash /oscar/src/rotation/run/qwen3-8b.sh  # the paired BF16 control
+bash /oscar/src/rotation/verify/all.sh qwen3-8b        # PASS/FAIL smoke, radix + graph on
+```
+
+To serve a model directly rather than through a recipe, see
+[Serving with the rotation](#serving-with-the-rotation).
+
+### Without Docker
+
+Any environment that runs upstream SGLang at this commit runs OSCAR:
+`pip install -e python` replaces the `sglang` package with this tree. Match the
+sgl-kernel and flashinfer builds the official image pins for this version;
+OSCAR adds no compiled extension of its own.
 
 ## Quick start (Qwen3-8B example)
 
@@ -384,39 +419,24 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
   bash rotation/qwen3-8B/eval_gpqa.sh
 ```
 
-## Prebuilt image
+## The image
 
-Everything OSCAR needs at runtime, so a new cluster is a `docker pull` rather
-than an afternoon of environment archaeology. **One image serves all twelve
-models**; there is no per-model tag to pick.
-
-```bash
-# Build the runtime image from this tree (see the Dockerfile in your own
-# build context) and push it to a registry you control:
-docker build -t <your-registry>/oscar-env:<tag> .
-docker push <your-registry>/oscar-env:<tag>
-# digest sha256:2eea19e646ffca4f88c16e6c5a161cf83d758dea2ab88211d1b0eaa08189df53
-```
-
-v28 carries `/oscar/src/BUILT_FROM`, naming the branch and commit it was built
-from (`0cc7125fe6`), so an image in a cluster can always be matched back to the
-tree that produced it. Its transformers is **pinned** at 5.16.1 rather than
-floated at `>=5.16`: the floor drifted to 5.17.0 on the first rebuild after
-v27, which would have moved the environment underneath every model the sweep
-had already accepted.
+**One image serves every model**; there is no per-model tag to pick. Model
+weights are deliberately not included: they are ~2 TB and re-download at tens
+of GB/min, whereas the environment is the part that is slow and fragile to
+rebuild.
 
 | path in the image | contents |
 |---|---|
-| `/oscar/venv` | the venv — torch 2.9.1+cu128, sgl-kernel 0.3.21, **transformers 5.16.1**, triton 3.5.1 |
-| `/oscar/tf53` | a 112 MB `--target` overlay holding **transformers 5.3.0 + tokenizers 0.22.2**, prepended to `PYTHONPATH` by one recipe only (see below) |
-| `/oscar/src` | the sglang fork this branch tracks, plus `rotation/run/<model>.sh` and `rotation/verify/` |
-| `/oscar/fa2` | flash_attn 2.8.3 built for torch 2.9 / cu12 / cxx11abiTRUE |
-| `/oscar/rotations` | **every rotation**: `zoo/` (per-head K/V) plus per-layer MLA latent sets for GLM-5.2/5.3 (g128 and g32) and Kimi-K3 |
-| `/usr/local/bin/oscar-selfcheck` | GPU-side check: torch.cuda, sgl_kernel, flash_attn, sglang, rotations, and a Triton kernel that actually runs |
+| `/sgl-workspace/sglang` (also `/oscar/src`) | this tree; the image's editable `sglang` install resolves here |
+| `/oscar/rotations/zoo/<model>/` | per-head K/V rotations from the RotationZoo |
+| `/oscar/rotations/glm52-rotations/`, `glm53-rotations/`, `k3_latent_rot/` | per-layer MLA latent rotation sets for GLM-5.2, GLM-5.3 and Kimi-K3 |
+| `/oscar/IMAGE_TAG`, `/oscar/BUILT_FROM` | the tag, and the branch + commit the tree came from, so a number from a cluster can be matched to the tree that produced it |
+| `/usr/local/bin/oscar-selfcheck` | prints tag and commit, torch and the CUDA device, and `OSCAR_SELFCHECK_OK` once `import sglang` resolves to this tree |
 
-Model weights are deliberately **not** included — they are ~2 TB and re-download
-at tens of GB/min, whereas this environment is the part that is slow and
-fragile to rebuild.
+Run `oscar-selfcheck` on a GPU node before trusting a long job to an image: it
+is the one check that exercises the driver, which a build host without a GPU
+cannot.
 
 ### One command per model
 
@@ -426,50 +446,15 @@ sink/recent window, the parallelism. Nothing re-implements the launch path, and
 the model id is baked in, so a GPQA run is one command with no arguments:
 
 ```bash
-bash /oscar/src/rotation/run/qwen3-8b.sh          # INT2 (default)
-KV_MODE=bf16 bash /oscar/src/rotation/run/qwen3-8b.sh   # the paired control
-bash /oscar/src/verify/all.sh                     # the PASS/FAIL sweep
+bash /oscar/src/rotation/run/qwen3-8b.sh                 # INT2 (default)
+KV_MODE=bf16 bash /oscar/src/rotation/run/qwen3-8b.sh    # the paired control
+bash /oscar/src/rotation/verify/all.sh                   # the PASS/FAIL sweep
 ```
 
-### Why two transformers in one image
-
-Gemma-4 needs transformers >= 5.5 (`Gemma4UnifiedForConditionalGeneration` does
-not resolve below it). Qwen3.5-35B-A3B degenerates into unbounded repetition
-from 5.5.0 onward and scores ~0. Those two constraints do not intersect, and
-the version ordering is 5.3.0 < 5.4.0 < 5.5.0 < 5.16.1 (minor versions are
-integers, not decimals — 5.16 is *newer* than 5.3).
-
-Rather than fork the image and pay a second 62 GB pull per cluster — plus the
-standing ambiguity of "which tag produced this number" — the base env is 5.16.1
-and `rotation/run/qwen3.5-35b-a3b.sh` puts `/oscar/tf53` on `PYTHONPATH` for
-itself alone. Verified back to back inside one container:
-`gemma-4-12b 0.6458` on 5.16.1, `qwen3.5-35b-a3b 0.8542` on the overlay.
-
-Three things are load-bearing and easy to get wrong if you rebuild it yourself:
-
-* **The base must stay `nvcr.io/nvidia/pytorch:25.01-py3`.** The venv was created
-  against that image's Python 3.12.3 with `include-system-site-packages=true`,
-  so it links against `/usr` *and* inherits the image's dist-packages.
-* **Everything lives under `/oscar`, never `/shared`.** A job that mounts a
-  `/shared` PVC would otherwise shadow the whole image, and it did: a smoke ran
-  with the volume's venv, found no rotations, and still printed
-  `OSCAR_SELFCHECK_OK`.
-* **`sglang` is installed editable**, so its `.pth` resolves to a source tree
-  that does not exist in a venv-only image — `import sglang` would break on
-  pull. That is why `/oscar/src` is baked in and on `PYTHONPATH`.
-
-`TRITON_PTXAS_PATH` points at a CUDA 12.9 `ptxas` because B300 is `sm_103a` and
-the 12.8 `ptxas` shipped in the base stops at `sm_101`/`sm_120`, so every Triton
-JIT there dies *after* the weights load and reads as a model failure. That fixes
-dense models on B300; **MoE and MLA still do not run there** — their kernels die
-on `Cannot select: intrinsic %llvm.nvvm.tcgen05.wait.ld` under Triton 3.5.0,
-3.5.1 and 3.7.0, and none of the four MoE runner backends avoids it. B200 is the
-verified target.
-
-`sgl_kernel` and `flash_attn` link `libcuda.so.1`, which the driver injects at
-run time, so they cannot be imported on a build host with no GPU. Build-time
-checks are structural only; run `oscar-selfcheck` on a GPU node to verify the
-image before trusting a long job to it.
+The recipes differ in ways that matter (per-head rotation for Qwen3-30B-A3B,
+Lloyd-Max codebook, group size 256 for Qwen3.5, packed 2-bit latent for the MLA
+models, the Mamba radix-cache strategy for the hybrids); `rotation/examples/`
+tabulates them.
 
 ## Model support
 

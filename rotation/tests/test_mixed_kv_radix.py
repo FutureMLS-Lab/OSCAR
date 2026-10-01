@@ -33,7 +33,7 @@ import types
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import _mixed_extend_layout_counts
+from sglang.srt.mem_cache.allocation import _mixed_extend_layout_counts
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -101,6 +101,19 @@ class _Pool:
         self.ring_cursor[rpi] = (self.ring_cursor[rpi] + n) % RING
         return out
 
+    page_size = N_Q
+
+    def free_segment(self, kv_indices, start_pos=0):
+        self.free(kv_indices)
+
+    def free_segments(self, segments):
+        # ``free_kv_row_segments`` hands (kv_indices, start_pos) pieces of one row.
+        for kv_indices, _start in segments:
+            self.free(kv_indices)
+
+    def free_full_segments(self, segments):
+        raise AssertionError("no SWA dead range in a mixed-KV pool")
+
     def free(self, free_index):
         """Mirrors ``UnifiedInt2HPKVAllocator.free``: whole-page aggregation."""
         if isinstance(free_index, torch.Tensor):
@@ -154,11 +167,27 @@ class _Req:
         self.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
         self.mixed_kv_quant_slack_cutoff_len = None
         self.priority = 0
+        self.cache_salt = None
         # sim-only bookkeeping
         self.seq_len = 0
 
+    @property
+    def kv(self):
+        # Upstream reads req_pool_idx / cache_protected_len through ``req.kv``;
+        # the stub keeps them on the request so the sim's own checks see one value.
+        return self
+
+    def get_evicted_seqlen(self, component_type):
+        return 0
+
+    def swa_dead_lo(self, page_size):
+        return 0
+
     def pop_committed_kv_cache(self):
         return self.kv_committed_len
+
+    def get_fill_ids(self):
+        return self.fill_ids
 
 
 class Sim:
@@ -301,7 +330,14 @@ class Sim:
         return len(used)
 
     def finish(self, req):
-        self.tree.cache_finished_req(req)
+        # The steps of ``release_kv_cache`` that touch the tree: insert (a
+        # no-op under mixed KV), free the unprotected tail of the row, drop the
+        # lock, then the mixin forgets the request-owned slack.
+        owned = req.seq_len
+        self.tree.insert_req(req, up_to=owned)
+        self.tree.free_kv_row(req.kv, [(req.cache_protected_len, owned)])
+        self.tree.unpin(req)
+        self.tree.on_release(req, inserted=True)
         self.free_rpi.append(req.req_pool_idx)
         self.pool.ring_cursor[req.req_pool_idx] = 0
         self.pool.flush_counter[req.req_pool_idx] = 0
