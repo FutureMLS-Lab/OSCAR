@@ -2093,7 +2093,7 @@ class KVCacheConfigurator:
         p_tokens = envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
         hp_prefix_pool = envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
         if hp_prefix_pool <= 0:
-            hp_prefix_pool = req_to_token_pool.size * p_tokens * 16
+            hp_prefix_pool = req_to_token_pool.req_to_token.shape[0] * p_tokens * 16
         hp_prefix_pool = (hp_prefix_pool + n_q - 1) // n_q * n_q
         return dict(
             num_quant_pages=num_quant_pages,
@@ -2104,7 +2104,10 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            max_req_slots=req_to_token_pool.size,
+            # Every index the request pool can hand out, including the padding
+            # row 0 it reserves (so this is ``size + 1``, not ``size``): the
+            # per-request ring cursors and flush counters are indexed by it.
+            max_req_slots=req_to_token_pool.req_to_token.shape[0],
             model_dtype=self.model_dtype,
             kv_cache_quant_group_size=get_model().kv_cache_quant_group_size,
             scale_dtype=scale_dtype,
@@ -2130,7 +2133,7 @@ class KVCacheConfigurator:
             envs.SGLANG_MIXED_KV_HP_DTYPE.get(),
             envs.SGLANG_MIXED_KV_SCALE_DTYPE.get(),
             max_total_num_tokens,
-            req_to_token_pool.size,
+            req_to_token_pool.req_to_token.shape[0],
             geometry["num_hp_prefix_slots"],
         )
         # Heterogeneous-SWA two-group geometry (gemma4_unified): one
@@ -2277,7 +2280,7 @@ class KVCacheConfigurator:
                 # cover every index the request pool can hand out -- sizing it
                 # from max_running_requests instead would silently drop the
                 # windows for whichever requests landed above the cut.
-                max_reqs=req_to_token_pool.size,
+                max_reqs=req_to_token_pool.req_to_token.shape[0],
                 selfcheck=envs.SGLANG_OSCAR_MLA_PACKED_SELFCHECK.get(),
             )
         else:

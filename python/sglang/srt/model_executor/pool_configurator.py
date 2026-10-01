@@ -252,8 +252,11 @@ def _mixed_kv_request_slots(max_running_requests: Optional[int]) -> int:
     harmless on the GPUs this runs on, under-reserving is the OOM the
     reservation exists to prevent.
     """
+    # The request pool allocates one row more than --max-running-requests: row
+    # 0 is reserved as the padding row CUDA-graph padded batches point at, and
+    # the per-request rings are indexed by the row, so the arena covers it too.
     if max_running_requests is not None:
-        return max_running_requests
+        return max_running_requests + 1
     logger.warning(
         "mixed-KV window arena sized for %d request slots because "
         "--max-running-requests is not pinned; pin it so the reservation "
