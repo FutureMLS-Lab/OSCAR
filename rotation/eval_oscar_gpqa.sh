@@ -185,12 +185,15 @@ NAME="${NAME:-gpqa_oscar}"
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
     echo "[eval-oscar] using pre-activated venv ${VIRTUAL_ENV}"
     export PATH="${VIRTUAL_ENV}/bin:${PATH}"
-else
+elif [[ -f "${CONDA_BASE:-${HOME}/miniconda3}/etc/profile.d/conda.sh" ]]; then
     CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
     CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
     source "${CONDA_BASE}/etc/profile.d/conda.sh"
     conda activate "${CONDA_ENV_NAME}"
     export PATH="${CONDA_PREFIX}/bin:${PATH}"
+else
+    # The sglang image ships its interpreter on PATH with no conda; use it.
+    echo "[eval-oscar] using the interpreter on PATH: $(command -v python3)"
 fi
 # Prepend per-rank Triton cache redirector so TP workers don't race on shared
 # launcher .so / metadata files in TRITON_CACHE_DIR.

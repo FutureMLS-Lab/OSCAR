@@ -29,8 +29,10 @@ MEM_FRAC="${MEM_FRAC:-0.85}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-32}"
 
 CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"; conda activate "${CONDA_ENV_NAME:-oscar}"
-export PATH="${CONDA_PREFIX}/bin:${PATH}"
+if [[ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
+  source "${CONDA_BASE}/etc/profile.d/conda.sh"; conda activate "${CONDA_ENV_NAME:-oscar}"
+  export PATH="${CONDA_PREFIX}/bin:${PATH}"
+fi
 export PYTHONPATH="${REPO_ROOT}/rotation/_triton_per_rank:${SGLANG_RESEARCH_DIR}/python:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
