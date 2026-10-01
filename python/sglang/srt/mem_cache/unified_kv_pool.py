@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.kv_quant_kernels import _get_num_scale_groups
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.mem_cache.memory_pool import (
     _shard_rotation_heads,
     KVCache,
@@ -384,7 +384,7 @@ class UnifiedInt2HPKVPool(KVCache):
             layer_ids=self._rotation_layer_ids,
         )
         # Per-head rotations ship every KV head; keep only this rank's slice.
-        _tp_rank = get_attention_tp_rank()
+        _tp_rank = get_parallel().attn_tp_rank
 
         def _rot_shape(R):
             if isinstance(R, (list, tuple)):

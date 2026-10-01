@@ -77,7 +77,7 @@ DEFAULT_LATENT_RECENT_TOKENS = 256
 def _dump_is_capturing() -> bool:
     """True while sglang is capturing a CUDA graph."""
     try:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         return bool(get_is_capture_mode())
     except Exception:

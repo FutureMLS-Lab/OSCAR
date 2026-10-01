@@ -118,7 +118,7 @@ def _is_capturing() -> bool:
     CUDA call and dynamo cannot trace it, so on a compiled attention layer it
     is a graph break, not a branch.
     """
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner import get_is_capture_mode
 
     return bool(get_is_capture_mode())
 
