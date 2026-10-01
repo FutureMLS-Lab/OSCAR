@@ -29,10 +29,10 @@ to be re-measured on this stack; the numbers in PR #26 are the old tree's.
 
 | phase | content | smoke | status |
 |---|---|---|---|
-| 0 | repository layout, porting reference, image base | image boots upstream models | layout committed; base image pulling |
-| 1 | KV-quant core: `--kv-cache-dtype int2`, `UnifiedInt2HPKVPool` + allocator, mixed HP windows, radix-cache tiers, scheduler flush, triton INT2 prefill/decode, QuantKernel, pool pricing, env knobs | Qwen3-8B INT2 at 8K ctx, radix + graph on | ported (63 files compile + undefined-name audit clean); image v51 + smoke pending |
+| 0 | repository layout, porting reference, image base | image boots upstream models | done (`docker/Dockerfile.oscar` on `lmsysorg/sglang:v0.5.21-cu130`) |
+| 1 | KV-quant core: `--kv-cache-dtype int2`, `UnifiedInt2HPKVPool` + allocator, mixed HP windows, radix-cache tiers, scheduler flush, triton INT2 prefill/decode, QuantKernel, pool pricing, env knobs | Qwen3-8B INT2 at 8K ctx, radix + graph on | **PASS** (image v55: prefix-cache hit, 62 captured graph shapes, 2048-token probe clean) |
 | 2 | MHA/GQA models: qwen3, qwen3_5 (hybrid GDN), qwen3_moe, gemma4_unified (two-group), minimax_m2.7 | each model's smoke | hooks ported (V-rotation absorption, hybrid inner pool, two-group geometry); smokes pending |
-| 3 | MLA packed latent (`MLAPackedInt2KVPool`, `NSAPackedInt2KVPool`, packed decode kernels) on upstream's DSA backend for GLM-5.2/5.3, trtllm_mla for Kimi-K3; MSA for MiniMax-M3 on upstream's native backend | GLM-5.2 recall probe past 2K tokens, then smoke | not started |
+| 3 | MLA packed latent (`MLAPackedInt2KVPool`, `NSAPackedInt2KVPool`, packed decode kernels) on upstream's DSA backend for GLM-5.2/5.3, trtllm_mla for Kimi-K3; MSA for MiniMax-M3 on upstream's native backend | GLM-5.2 recall probe past 2K tokens, then smoke | DSA staging + MLA rotation hooks ported (not yet run on a GPU); M3 pending |
 | 4 | harness: `rotation/` paths (`sglang-research/python` -> `python`), run scripts, verify sweep, bench | 12-model sweep | not started |
 | 5 | GPQA @64K + 64K decode speed for all 12, table and README | | not started |
 
