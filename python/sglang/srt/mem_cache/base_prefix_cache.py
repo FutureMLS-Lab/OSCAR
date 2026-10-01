@@ -71,15 +71,16 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
-    # Mixed-KV (HP+int2): when True, ``RadixCache.match_prefix`` skips the
-    # HP-recent tier cap because the caller already applied it. The only such
-    # caller is ``cache_unfinished_req``'s post-insert sibling-coverage match,
-    # which caps with ``_mixed_kv_tier_cap`` and then clamps by the
-    # partial-quant-page cutoff and by its own insert length; capping blindly
-    # inside ``match_prefix`` instead would let the match come back shorter
-    # than ``cache_protected_len`` and silently truncate the
-    # ``prefix_indices`` rebuild, leaking slot ids. The cap itself is NOT
-    # optional -- see ``RadixCache._mixed_kv_tier_cap``.
+    # Mixed-KV (HP+int2): when True, ``match_prefix`` (``RadixCache`` and
+    # ``UnifiedRadixCache`` alike) skips the HP-recent tier cap because the
+    # caller already applied it. The only such caller is
+    # ``cache_unfinished_req``'s post-insert sibling-coverage match, which caps
+    # with ``_mixed_kv_tier_cap`` and then clamps by the partial-quant-page
+    # cutoff and by its own insert length; capping blindly inside
+    # ``match_prefix`` instead would let the match come back shorter than
+    # ``cache_protected_len`` and silently truncate the ``prefix_indices``
+    # rebuild, leaking slot ids. The cap itself is NOT optional -- see
+    # ``MixedKVPrefixMixin._mixed_kv_tier_cap``.
     bypass_mixed_kv_cap: bool = False
 
 
@@ -99,6 +100,17 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_branching_seqlen: Optional[int] = None
+
+    # Mixed-KV (HP+int2): cache-level ceiling, in raw tokens, on how much of
+    # the request's row ``cache_unfinished_req`` may hand to the tree -- below
+    # the per-request HP-recent tail and below any request-owned partial
+    # quant page (see ``MixedKVPrefixMixin._mixed_kv_insert_ceiling``).
+    # ``UnifiedRadixCache`` sets it before the components'
+    # ``prepare_for_caching_req`` pass; a component whose checkpoint lies past
+    # it must not donate that checkpoint (a recurrent state is valid only for
+    # its exact prefix) and leaves its slot of the inserted node a tombstone
+    # instead. None = no ceiling (plain pools, RadixCache).
+    mixed_kv_insert_limit: Optional[int] = None
 
     # General
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(

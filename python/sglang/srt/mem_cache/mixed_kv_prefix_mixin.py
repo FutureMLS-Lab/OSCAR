@@ -1,15 +1,17 @@
 """Shared mixed-KV prefix-cache invariants.
 
-Both :class:`RadixCache` and :class:`ChunkCache` (and ``MambaRadixCache`` in
-the tree this was ported from) must honour the same tier rules, and they must
-honour them at *every* call site. Bug 2 in this project was exactly one call
-site missing the cap while the other had it, so these live in one place rather
-than being copied: a copy that drifts is the failure mode this file exists to
-prevent.
+:class:`RadixCache`, :class:`ChunkCache` and :class:`UnifiedRadixCache` (and
+``MambaRadixCache`` in the tree this was ported from) must honour the same tier
+rules, and they must honour them at *every* call site. Bug 2 in this project
+was exactly one call site missing the cap while the other had it, so these
+live in one place rather than being copied: a copy that drifts is the failure
+mode this file exists to prevent.
 
 Requirements on the host class: ``self.page_size``,
 ``self.token_to_kv_pool_allocator``, and a ``BasePrefixCache`` further down the
-MRO (``on_release`` chains to it).
+MRO (``on_release`` chains to it; a host that defines its own ``on_release``
+must call :meth:`_mixed_kv_drop_quant_slack` itself, as ``UnifiedRadixCache``
+does).
 """
 
 from __future__ import annotations
@@ -23,7 +25,34 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+def mixed_kv_pool_of(allocator) -> object | None:
+    """The OSCAR mixed-KV pool behind ``allocator``, or None.
+
+    The one probe every cache and the registries share. Duck-typed on
+    purpose: stock allocators and pools, the mock allocator of
+    ``create_simulated`` and SimpleNamespace test stubs know nothing about
+    mixed KV. ``is True`` rather than truthiness: a ``Mock`` answers every
+    attribute probe with a callable, truthy ``Mock``.
+    """
+    if allocator is None:
+        return None
+    kvc_getter = getattr(allocator, "get_kvcache", None)
+    kvc = kvc_getter() if kvc_getter is not None else None
+    mixed_kv_enabled_fn = getattr(kvc, "mixed_kv_enabled", None)
+    if mixed_kv_enabled_fn is None or mixed_kv_enabled_fn() is not True:
+        return None
+    return kvc
+
+
 class MixedKVPrefixMixin:
+    # Class-level defaults: a host built without ``__init__`` (unit tests
+    # construct the cache through ``__new__``) reads a plain-pool configuration.
+    _mixed_kv_enabled: bool = False
+    _mixed_kv_hp_prefix_tokens: int = 0
+    _mixed_kv_hp_recent_tokens: int = 0
+    _mixed_kv_flush_overflow: int = 0
+    _mixed_kv_match_cap_overhead: int = 0
+
     def _init_mixed_kv(self) -> None:
         """Probe the allocator's pool for mixed-KV geometry (duck-typed).
 
@@ -35,17 +64,8 @@ class MixedKVPrefixMixin:
         self._mixed_kv_hp_recent_tokens = 0
         self._mixed_kv_flush_overflow = 0
         self._mixed_kv_match_cap_overhead = 0
-        allocator = self.token_to_kv_pool_allocator
-        if allocator is None:
-            return
-        # Duck-typed on purpose: stock allocators and pools (and the mock
-        # allocator of ``create_simulated``) know nothing about mixed KV.
-        kvc_getter = getattr(allocator, "get_kvcache", None)
-        kvc = kvc_getter() if kvc_getter is not None else None
+        kvc = mixed_kv_pool_of(self.token_to_kv_pool_allocator)
         if kvc is None:
-            return
-        mixed_kv_enabled_fn = getattr(kvc, "mixed_kv_enabled", None)
-        if mixed_kv_enabled_fn is None or not mixed_kv_enabled_fn():
             return
         # Every pool that answers True is a UnifiedInt2HPKVPool, directly or
         # behind HybridLinearKVPool's attribute forwarding.
@@ -138,6 +158,59 @@ class MixedKVPrefixMixin:
         if cutoff_len is None:
             return key_len
         return max(0, min(key_len, int(cutoff_len)))
+
+    def _mixed_kv_insert_ceiling(self, req: Req, key_len: int) -> int:
+        """Longest page-aligned prefix of a ``key_len``-unit committed key that
+        ``cache_unfinished_req`` may hand to the tree.
+
+        Two bounds, both required: the HP-recent tail is dropped
+        (:meth:`_mixed_kv_tail_to_drop` -- those slot ids are per-request and
+        alias across requests, so they must never enter the tree) and radix
+        ownership stays below any request-owned partial quant page
+        (:meth:`_mixed_kv_slack_insert_limit`). ``insert`` page-aligns its key
+        anyway; aligning here too makes the free ranges derived from the
+        result start on a page boundary.
+        """
+        if not self._mixed_kv_enabled:
+            return key_len
+        limit = key_len - self._mixed_kv_tail_to_drop(key_len)
+        limit = self._mixed_kv_slack_insert_limit(req, limit)
+        if self.page_size > 1:
+            limit = limit // self.page_size * self.page_size
+        return max(0, limit)
+
+    def _mixed_kv_share_ceiling(self, req: Req, key_len: int, insert_len: int) -> int:
+        """How deep ``cache_unfinished_req``'s post-insert match may let the
+        tree cover this request. Three bounds, all required:
+
+        1. :meth:`_mixed_kv_tier_cap`: never past this request's own HP-recent
+           start, or the tree serves at 2 bits what the request was supposed
+           to keep in BF16 (and the flush can never demote it). This is the
+           same cap admission gets; applying it here too is what keeps
+           ``cache_protected_len`` tier-stable. Without it a sibling (or, in
+           multi-turn, this request's own previous turn) covers the whole
+           prompt and pushes ``cache_protected_len`` above the HP-recent
+           start, wiping out the recent window.
+        2. the request-owned partial quant page cutoff; otherwise radix can
+           retain the live slots while the request frees that page's slack.
+        3. never below what was just inserted (``insert_len``), so
+           ``cache_protected_len`` is monotonic and the ``prefix_indices``
+           rebuild cannot silently truncate (which would leak slot ids).
+
+        The caller passes the result with ``bypass_mixed_kv_cap=True``: the cap
+        was applied here, to this key length, before the other two clamps.
+        """
+        match_len = key_len
+        tier_cap = self._mixed_kv_tier_cap(match_len)
+        if tier_cap < match_len:
+            match_len = tier_cap
+        slack_insert_limit = self._mixed_kv_slack_insert_limit(req, match_len)
+        if slack_insert_limit < match_len:
+            match_len = slack_insert_limit
+        match_len = max(match_len, insert_len)
+        if self.page_size > 1:
+            match_len = match_len // self.page_size * self.page_size
+        return match_len
 
     def on_release(self, req: Req, *, inserted: bool) -> None:
         # ``release_kv_cache`` calls this after ``free_kv_row`` gave back

@@ -225,7 +225,19 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        assert params.mamba_value is not None
+        if params.mamba_value is None:
+            # Mixed-KV FULL-only insert (see ``prepare_for_caching_req``): the
+            # checkpoint stayed with the request, so the node keeps whatever
+            # mamba data it had -- a tombstone for a new leaf. An auxiliary
+            # tombstone is a legitimate node state (splits and mamba eviction
+            # produce them too); the match walk reports such nodes through
+            # ``full_kv_hit_length`` / ``mamba_branching_seqlen`` rather than
+            # ``device_indices``, and the cache hands ownership over at the
+            # FULL level (``UnifiedRadixCache._cache_unfinished_req_mixed_kv``).
+            assert params.mixed_kv_insert_limit is not None, (
+                "mamba_value is only optional under the mixed-KV insert ceiling"
+            )
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -561,6 +573,15 @@ class MambaComponent(TreeComponent):
                     write_pos_buf[req.kv.mamba_pool_idx] = 0
 
         if is_finished:
+            # Mixed-KV never gets here: under that pool the tree is populated
+            # only by ``cache_unfinished_req`` and ``insert_req`` returns before
+            # the prepare pass, so the insert ceiling below is an
+            # unfinished-request rule (the finished cleanup keeps the ping-pong
+            # slot it believes was inserted, which a declined donation would
+            # leak).
+            assert insert_params.mixed_kv_insert_limit is None, (
+                "the mixed-KV insert ceiling applies to unfinished requests only"
+            )
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
@@ -580,6 +601,22 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
+            insert_limit = insert_params.mixed_kv_insert_limit
+            if insert_limit is not None and cache_len > insert_limit:
+                # Mixed-KV (OSCAR HP+int2): the tracked checkpoint sits past
+                # what the tree may hold for this request -- inside its
+                # HP-recent window or a request-owned partial quant page. A
+                # recurrent state is valid only for its exact prefix, so it
+                # cannot be re-keyed at the shorter FULL insert; leave it in
+                # the request's ping-pong buffer (no donation, no fresh slot)
+                # and let the FULL KV be cached alone, with this component a
+                # tombstone on the inserted node (``mamba_value`` stays None,
+                # see ``commit_insert_component_data``). "No opinion" rather
+                # than 0: the FULL side still inserts up to the ceiling. The
+                # next request's ``full_kv_hit_length`` then yields a
+                # branching point inside the shareable region, and the
+                # checkpoint it tracks there fills the tombstone.
+                return None
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:

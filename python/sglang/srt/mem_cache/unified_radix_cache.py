@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import MixedKVPrefixMixin
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -162,7 +163,7 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(BasePrefixCache):
+class UnifiedRadixCache(MixedKVPrefixMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -170,6 +171,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+
+        # Mixed-KV (OSCAR HP+int2 pool, duck-typed off the allocator's pool):
+        # the tree caches the shared HP-prefix pool + quant slots; per-request
+        # HP-recent slots are excluded by ``_mixed_kv_tail_to_drop``
+        # (correctness -- they alias across requests) and ``match_prefix`` is
+        # capped via ``_mixed_kv_match_cap_overhead``. Every hook below is a
+        # no-op for a plain pool. ``self.page_size`` resolves through the tree
+        # core built further down; the mixin only reads it at call time.
+        self._init_mixed_kv()
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -301,7 +311,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.reset()
         logger.info(
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
-            f"Tree Core: {type(self.tree_core).__name__}"
+            f"Tree Core: {type(self.tree_core).__name__}. "
+            f"Mixed KV: {self._mixed_kv_enabled}"
         )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
@@ -555,6 +566,30 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         if self.disable:
             return self.tree_core.empty_match_result
+        if self._mixed_kv_enabled and not params.bypass_mixed_kv_cap:
+            # Mixed-KV: cap the match so positions in the request's HP-recent
+            # window are NEVER returned from cache. See
+            # :meth:`MixedKVPrefixMixin._mixed_kv_tier_cap` for the invariant
+            # and why it must hold for *every* consumer of a match length,
+            # internal ones included. The cap is applied here, at the cache
+            # level, because the tree cores only ever see the key (the Rust
+            # adapter forwards key / extra_key / cache_salt and nothing else),
+            # and this is the one method every caller passes through:
+            # scheduler admission (``match_prefix_for_req``),
+            # ``Req.init_next_round_input``, the disaggregation decode side
+            # and the in-tree re-match of ``cache_unfinished_req``.
+            #
+            # ``bypass_mixed_kv_cap=True`` (``cache_unfinished_req``'s
+            # post-insert sibling-coverage match) skips the cap here because
+            # that caller applies it itself, to its own key length, *before*
+            # clamping by the partial-quant-page cutoff and by what it just
+            # inserted -- capping blindly there desyncs the ``prefix_indices``
+            # reconstruction in ``cache_unfinished_req`` (Python slicing
+            # silently truncates ``new_indices[:cache_protected_len]`` when
+            # the match came back shorter), which leaks slot ids.
+            params = self._mixed_kv_cap_match_params(params)
+            if len(params.key) == 0:
+                return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
@@ -566,6 +601,23 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
+
+    def _mixed_kv_cap_match_params(
+        self, params: MatchPrefixParams
+    ) -> MatchPrefixParams:
+        """``params`` with its key cut at the mixed-KV tier cap.
+
+        The key is first brought to the shape the tree core matches on (bigram
+        view for EAGLE, page-aligned) so the cap counts the same logical units
+        the core does; both steps are idempotent, so the core redoing them is
+        a no-op.
+        """
+        key, _ = params.key.maybe_to_bigram_view(self.tree_core.is_eagle)
+        key = key.page_aligned(self.page_size)
+        cap = self._mixed_kv_tier_cap(len(key))
+        if cap < len(key):
+            key = key[:cap]
+        return replace(params, key=key)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -997,6 +1049,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "inserted"])
     def on_release(self, req: Req, *, inserted: bool) -> None:
+        # ``release_kv_cache`` calls this after ``free_kv_row`` gave back
+        # ``[cache_protected_len, owned_kv_len)`` and ``unpin`` dropped the lock.
+        if self._mixed_kv_enabled:
+            # Forget -- never free -- the request-owned partial-page slack;
+            # ``MixedKVPrefixMixin._mixed_kv_drop_quant_slack`` explains why a
+            # second free would push the same page onto the free list twice.
+            # Before the ``inserted`` early return: the slack is request
+            # state, not component state, and goes with the request either
+            # way.
+            self._mixed_kv_drop_quant_slack(req)
         if inserted:
             return
         for comp in self._components_tuple:
@@ -1005,6 +1067,40 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid", "up_to"])
     def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
         if self.disable:
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(req, is_finished=True)
+            return
+        if self._mixed_kv_enabled:
+            # Mixed-KV: the radix tree is populated ONLY by
+            # ``cache_unfinished_req`` (called once after each request's
+            # prefill from the scheduler's batch-result processor).
+            # ``insert_req`` deliberately inserts nothing, for a natural
+            # finish as well as for the retract path (which never calls it):
+            # finished/retracted requests just free their tail slots
+            # (``release_kv_cache`` -> ``free_kv_row`` from
+            # ``cache_protected_len``) and ``dec_lock_ref`` (``unpin``) --
+            # they do NOT extend the tree.
+            #
+            # The naive "insert + bypass-cap re-match + inc_lock_ref(new)
+            # -> dec_lock_ref(old)" pattern is unsafe under mixed-KV +
+            # retract: the new leaf has ``lock_ref=0`` immediately and
+            # gets evicted under concurrent retract memory pressure,
+            # freeing slot ids that other live requests' ``req_to_token``
+            # mappings still reference -> corrupted reads -> gibberish
+            # (~0.5% rate at this batch size, confirmed against the
+            # mixed-pool reference implementation which has the same
+            # early-return).
+            #
+            # Upstream's contracts for a finished request still hold: the
+            # ``cache_protected_len`` watermark is written (the caller frees
+            # ``[cache_protected_len, up_to)`` right after this) and the
+            # components release what they hold for the request -- the mamba
+            # state and its ping-pong slots -- exactly as on the disabled
+            # path: no prepare pass ran, so there is nothing to keep. No leaf
+            # was produced, so there is no session ref to register.
+            protected_len = min(req.kv.cache_protected_len, up_to)
+            if protected_len != req.kv.cache_protected_len:
+                req.kv.cache_protected_len = protected_len
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -1099,7 +1195,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"{free_from=} {len(kv_indices)=} {req.kv.cache_protected_len=}"
             )
             free_from = tail_free_start
-        req.kv.cache_protected_len = free_from
+        # Never regress: positions in ``[free_from, cache_protected_len)``
+        # hold tree-owned slot ids (written into req_to_token by
+        # cache_unfinished_req's match_prefix step). The tree releases them
+        # when it evicts their node; letting ``release_kv_cache`` free them
+        # from a regressed ``cache_protected_len`` would be a double-free,
+        # visible to the scheduler as a phantom-slot leak.
+        req.kv.cache_protected_len = max(req.kv.cache_protected_len, free_from)
 
         # cleanup
         for comp in self._components_tuple:
@@ -1160,6 +1262,9 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+            return
+        if self._mixed_kv_enabled and not self.disable:
+            self._cache_unfinished_req_mixed_kv(req, chunked=chunked)
             return
 
         token_ids = req.get_fill_ids()
@@ -1288,7 +1393,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         else:
             req.prefix_indices = new_indices
-        req.kv.cache_protected_len = len(new_indices)
+        # Only advance the protected region; never regress. Positions in
+        # ``[len(new_indices), cache_protected_len)`` are tree-owned slot ids
+        # this request already adopted; a regressed watermark would let
+        # ``release_kv_cache`` free them a second time.
+        req.kv.cache_protected_len = max(req.kv.cache_protected_len, len(new_indices))
         req.last_node = new_last_node
         # Carry the receipt so this node's dec releases only what we locked.
         req.lock_receipt = lock_result.to_dec_params()
@@ -1303,6 +1412,280 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+    def _cache_unfinished_req_mixed_kv(self, req: Req, chunked: bool) -> None:
+        """``cache_unfinished_req`` over the OSCAR mixed-KV pool.
+
+        The plain path's shape (component prepare -> insert -> re-match ->
+        repoint -> re-lock -> component cleanup) with the tier rules of
+        :class:`MixedKVPrefixMixin` folded in: the inserted key stops below
+        the HP-recent tail and any request-owned partial quant page, the
+        re-match is bounded by ``_mixed_kv_share_ceiling``,
+        ``cache_protected_len`` only ever advances, and the own-slot frees for
+        positions the tree now covers stay below the partial-page cutoff.
+
+        Hybrid SSM: the mamba checkpoint depth normally sits inside the
+        HP-recent window, where the tree may not hold this request's KV. The
+        mamba component then declines to donate and the FULL KV is inserted
+        alone, leaving a mamba tombstone on the leaf. The all-valid re-match
+        stops at the deepest node every component validates, which can be
+        *above* that leaf -- but the leaf now owns this request's slot ids, so
+        ownership is handed over at the FULL level: the inserted node is the
+        anchor, its root path supplies the tree's ids, and that is what gets
+        locked (``_mixed_kv_tree_coverage``).
+        """
+        # The admitted extend range, exactly as the plain path caches it (the
+        # decode-disaggregation path truncates ``extend_range`` to what was
+        # committed before a request reaches the tree).
+        token_ids = req.get_fill_ids()
+        kv_indices_orig = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        protected_len = min(req.kv.cache_protected_len, len(kv_indices_orig))
+        if protected_len != req.kv.cache_protected_len:
+            req.kv.cache_protected_len = protected_len
+
+        # Bigram view for EAGLE, then page-align; ``len(keys)`` counts logical
+        # units (bigram keys cache len - 1 kv indices) from here on.
+        keys = RadixKey(
+            token_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        insert_params, radix_key = self._mixed_kv_prepare_insert(
+            req=req, token_ids=token_ids, key_len=len(keys), chunked=chunked
+        )
+        insert_len = len(radix_key)
+        if insert_len == 0:
+            # Nothing the tree may take yet (no committed page below the
+            # HP-recent tail, or no mamba checkpoint): a monotonic no-op, which
+            # is also what a repeated call with no new KV must be.
+            self._mixed_kv_keep_row(
+                req=req, kv_indices_orig=kv_indices_orig, insert_params=insert_params
+            )
+            return
+
+        insert_params.key = radix_key
+        insert_params.value = kv_indices_orig[:insert_len].to(
+            dtype=torch.int64, copy=True
+        )
+        # Radix Cache takes one ref in memory pool. The walk dup-frees this
+        # request's own slots where the tree already held FULL KV above
+        # ``prev_prefix_len``; the key stops below the partial-page cutoff, so
+        # every page it frees is wholly this request's.
+        result = self.insert(insert_params)
+        if result.rotation_tail_declined:
+            # Rotation-base discontinuity with the matched chain: keep the
+            # request entirely on its own pages (see the plain path).
+            self._mixed_kv_keep_row(
+                req=req, kv_indices_orig=kv_indices_orig, insert_params=insert_params
+            )
+            return
+
+        new_indices, new_last_node = self._mixed_kv_tree_coverage(
+            req=req, keys=keys, insert_len=insert_len, result=result
+        )
+        self._mixed_kv_adopt_coverage(
+            req=req,
+            kv_indices_orig=kv_indices_orig,
+            protected_len=protected_len,
+            new_prefix_len=result.prefix_len,
+            insert_len=insert_len,
+            new_indices=new_indices,
+            new_last_node=new_last_node,
+        )
+        req.prefix_indices = self._mixed_kv_prefix_indices(
+            req=req, kv_indices_orig=kv_indices_orig, new_indices=new_indices
+        )
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req,
+                is_finished=False,
+                insert_result=result,
+                insert_params=insert_params,
+            )
+
+    def _mixed_kv_prepare_insert(
+        self, *, req: Req, token_ids, key_len: int, chunked: bool
+    ) -> tuple[InsertParams, RadixKey]:
+        """The components' prepare pass under the mixed-KV insert ceiling;
+        returns the params and the page-aligned key to insert (empty when the
+        tree may take nothing)."""
+        is_eagle = self.tree_core.is_eagle
+        insert_ceiling = self._mixed_kv_insert_ceiling(req, key_len)
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            chunked=chunked,
+            priority=req.priority or 0,
+            session_id=req.session_id,
+            rotation_base=req.kv_rotation_base,
+            # Raw tokens for the components: a bigram key of N units spans
+            # N + 1 raw tokens.
+            mixed_kv_insert_limit=insert_ceiling + int(is_eagle),
+        )
+        effective_cache_len = min(len(token_ids), insert_params.mixed_kv_insert_limit)
+        for comp in self._components_tuple:
+            cl = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+        for comp in self._components_tuple:
+            effective_cache_len = comp.floor_cache_len(effective_cache_len)
+
+        radix_key = RadixKey(
+            token_ids[: max(effective_cache_len, 0)],
+            req.extra_key,
+            is_bigram=is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            # The plain path's contract: the frontier is measured on the key
+            # before page alignment (a no-op for FULL / MAMBA).
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+        radix_key = radix_key.page_aligned(self.page_size)
+        assert len(radix_key) <= insert_ceiling, (len(radix_key), insert_ceiling)
+        return insert_params, radix_key
+
+    def _mixed_kv_keep_row(
+        self, *, req: Req, kv_indices_orig: torch.Tensor, insert_params: InsertParams
+    ) -> None:
+        """Nothing entered the tree: the row stays request-owned, ownership and
+        the lock untouched."""
+        req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
+            )
+
+    def _mixed_kv_tree_coverage(
+        self, *, req: Req, keys: RadixKey, insert_len: int, result: InsertResult
+    ) -> tuple[torch.Tensor, NodeId]:
+        """The tree's ids for this request's key up to the share ceiling, and
+        the node to lock for them."""
+        key_len = len(keys)
+        match_len = self._mixed_kv_share_ceiling(req, key_len, insert_len)
+        match_key = keys[:match_len] if match_len < key_len else keys
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=match_key, req=req, bypass_mixed_kv_cap=True)
+        )
+        new_indices = match_result.device_indices
+        new_last_node = match_result.last_device_node
+        if len(new_indices) < insert_len:
+            # The all-valid match stopped above the inserted node (a hybrid
+            # leaf without a mamba state): anchor on the inserted node and
+            # take the FULL ids along its root path.
+            new_last_node = result.last_device_node
+            new_indices = self.tree_core.collect_full_device_indices(
+                new_last_node, self.tree_core.root_node_handle(req.extra_key)
+            )
+        full_match_len = len(new_indices)
+        # The tree must contain at least what we just inserted; sibling
+        # coverage may extend the match, bounded by ``match_len``.
+        assert full_match_len >= insert_len >= result.prefix_len, (
+            f"{full_match_len=} regressed below {insert_len=} / "
+            f"{result.prefix_len=}; tree must cover at least what we inserted"
+        )
+        assert full_match_len <= match_len, f"{full_match_len=}, {match_len=}"
+        return new_indices, new_last_node
+
+    def _mixed_kv_adopt_coverage(
+        self,
+        *,
+        req: Req,
+        kv_indices_orig: torch.Tensor,
+        protected_len: int,
+        new_prefix_len: int,
+        insert_len: int,
+        new_indices: torch.Tensor,
+        new_last_node: NodeId,
+    ) -> None:
+        """Hand ``[cache_protected_len, len(new_indices))`` to the tree: free
+        the duplicate own slots, repoint the row, advance the watermark, move
+        the lock."""
+        full_match_len = len(new_indices)
+        # Only advance the protected region; never regress. ``cache_protected_len``
+        # MUST be monotonic across calls to cache_unfinished_req for a given
+        # request: if the tree's full match is not strictly greater than the
+        # current value, the current state is already at least as conservative
+        # and we must leave it (and ``last_node``) alone. Regressing it -- as
+        # a blind ``cache_protected_len = len(new_indices)`` does when the
+        # HP-recent trim is in effect -- causes a downstream cross-request
+        # double-free at release time.
+        if full_match_len <= req.kv.cache_protected_len:
+            return
+        # Free our-own slots at positions that became tree-covered AFTER
+        # our insert (i.e., via a sibling-added node past
+        # ``max(new_prefix_len, insert_len)``). For those positions,
+        # kv_indices holds our extend-allocated slots (admission only
+        # wrote tree ids up to the old cache_protected_len), and we are
+        # about to overwrite req_to_token with tree's ids, so the
+        # originals must be reclaimed to avoid a leak. Positions in
+        # ``[protected_len, new_prefix_len)`` were dup-freed by the insert walk
+        # and ``[new_prefix_len, insert_len)`` were adopted into new nodes
+        # (the tree's ids there ARE ours).
+        extra_free_start = max(protected_len, new_prefix_len, insert_len)
+        # The free range must not cross the slack boundary, or it will
+        # release slots in a page the request still owns via
+        # ``mixed_kv_quant_slack_indices``: the page would go back to
+        # ``free_pages`` while the request still writes its slack, the next
+        # ``alloc_quant`` would re-issue it to another request, and on their
+        # finish the same page gets added to ``free_pages`` twice.
+        extra_free_end = self._mixed_kv_slack_insert_limit(req, full_match_len)
+        if extra_free_start < extra_free_end:
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices_orig[extra_free_start:extra_free_end],
+                start_pos=extra_free_start,
+            )
+        self.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(protected_len, full_match_len)),
+            new_indices[protected_len:],
+        )
+        # With page_size > 1 the partial page sits in req.prefix_indices but
+        # not in the tree; cache_protected_len marks the tree-owned part so
+        # the next cache_unfinished_req or release_kv_cache frees the rest.
+        req.kv.cache_protected_len = full_match_len
+        # New lock first, then the old one off, so no node this request
+        # references is unlocked in between.
+        lock_result = self.inc_lock_ref(
+            new_last_node,
+            skip_lock_components=(
+                (ComponentType.MAMBA,)
+                if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+                else ()
+            ),
+        )
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        req.last_node = new_last_node
+        # Carry the receipt so this node's dec releases only what we locked.
+        req.lock_receipt = lock_result.to_dec_params()
+        # The rematch acquired a new SWA prefix lock.
+        req.swa_prefix_lock_released = False
+
+    def _mixed_kv_prefix_indices(
+        self, *, req: Req, kv_indices_orig: torch.Tensor, new_indices: torch.Tensor
+    ) -> torch.Tensor:
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # - page_size != 1: there is a partial page at the end, keep the full kv_indices
+        # - eagle case: bigram keys will only cache len - 1 kv indices
+        # - mixed-KV: the HP-recent tail and any request-owned partial page stay
+        #   addressable through the request's own kv_indices
+        protected_len = req.kv.cache_protected_len
+        if protected_len <= len(new_indices):
+            protected_indices = new_indices[:protected_len]
+        else:
+            protected_indices = kv_indices_orig[:protected_len]
+        protected_indices = protected_indices.to(dtype=torch.int64)
+        if protected_len >= len(kv_indices_orig):
+            return protected_indices
+        return torch.cat(
+            [protected_indices, kv_indices_orig[protected_len:].to(dtype=torch.int64)]
+        )
 
     # ---- Internal Helpers ----
 
@@ -3625,6 +4008,16 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.session.session_held_mamba_slots(active_pool_idxs)
 
     def evictable_size(self) -> int:
+        return self.tree_core.evictable_size()
+
+    def recoverable_size(self) -> int:
+        """Capacity recoverable via eviction.
+
+        Under the unified mixed KV pool the radix tree only stores quant
+        slots (HP slots are per-request and never enter the tree), so this
+        is identical to ``evictable_size`` -- the standard SGLang shape, and
+        the same answer ``RadixCache`` gives.
+        """
         return self.tree_core.evictable_size()
 
     def protected_size(self) -> int:

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import mixed_kv_pool_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
@@ -52,6 +53,15 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
+    if mixed_kv_pool_of(params.token_to_kv_pool_allocator) is not None:
+        # The mixed-KV tiering lives at the cache level, but it inserts FULL
+        # KV without a mamba checkpoint (a mamba tombstone on the leaf) when
+        # the checkpoint falls inside the request's HP-recent window; the Rust
+        # core has not been taught that insert shape.
+        return (
+            "the OSCAR mixed-KV tiering (FULL-only inserts beside mamba "
+            "tombstones) is implemented on the Python TreeCore"
+        )
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (

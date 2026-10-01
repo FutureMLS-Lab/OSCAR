@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.mixed_kv_prefix_mixin import mixed_kv_pool_of
 from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
 
 if TYPE_CHECKING:
@@ -78,11 +79,7 @@ def registered_radix_cache_backends() -> list[str]:
 
 
 def _is_oscar_mixed_kv(params: CacheInitParams) -> bool:
-    allocator = params.token_to_kv_pool_allocator
-    if allocator is None:
-        return False
-    kvcache = allocator.get_kvcache()
-    return kvcache is not None and kvcache.mixed_kv_enabled()
+    return mixed_kv_pool_of(params.token_to_kv_pool_allocator) is not None
 
 
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
@@ -112,15 +109,35 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # OSCAR mixed-KV pool (2-bit codes + BF16 prefix / recent windows):
         # the two-tier tree semantics -- tier cap on matches, HP-recent tail
         # trim before insert, request-owned partial quant pages -- live in
-        # RadixCache through MixedKVPrefixMixin. UnifiedRadixCache has no
-        # equivalent yet, so a hybrid SSM model (whose mamba states the unified
-        # cache tracks) cannot combine prefix caching with mixed KV on this tree.
+        # MixedKVPrefixMixin and are honoured by RadixCache and
+        # UnifiedRadixCache alike. Non-hybrid models stay on RadixCache; a
+        # hybrid SSM model needs UnifiedRadixCache (FULL + MAMBA components),
+        # which restores the recurrent state on a prefix hit.
         if ctx.is_hybrid_ssm:
-            raise NotImplementedError(
-                "OSCAR mixed KV with the prefix cache is not available for hybrid "
-                "SSM models on this tree (UnifiedRadixCache tracks the mamba states "
-                "but has no mixed-KV tiering). Serve with --disable-radix-cache."
-            )
+            if not params.enable_mamba_extra_buffer:
+                # Mixed KV pages the full-attention pool by N_Q (page_size > 1);
+                # the mamba component only supports that with the ping-pong
+                # extra buffer (--mamba-radix-cache-strategy auto resolves to
+                # extra_buffer when page_size > 1, so only an explicit
+                # no_buffer gets here).
+                raise ValueError(
+                    "OSCAR mixed KV with the prefix cache on a hybrid SSM model "
+                    f"requires the mamba extra buffer (page_size={params.page_size} "
+                    "> 1): use --mamba-radix-cache-strategy extra_buffer (or auto), "
+                    "or serve with --disable-radix-cache."
+                )
+            if (
+                ctx.enable_hierarchical_cache
+                or get_memory().enable_unified_cache_external_linker
+            ):
+                # Neither tier of the mixed pool has a host counterpart, and
+                # RadixCache (the non-hybrid mixed-KV path) never attaches one
+                # either.
+                raise ValueError(
+                    "OSCAR mixed KV does not support --enable-hierarchical-cache "
+                    "or --enable-unified-cache-external-linker."
+                )
+            return create_unified_radix_cache(ctx)
         from sglang.srt.mem_cache.radix_cache import RadixCache
 
         return RadixCache(params)
