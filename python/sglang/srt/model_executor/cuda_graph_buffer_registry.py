@@ -513,6 +513,14 @@ class CudaGraphBufferRegistry:
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
 
 
+def _make_out_cache_loc_pad_fill(pad_value: int):
+    def _fill(buf: torch.Tensor, _fb: ForwardBatch, ctx: FillContext) -> None:
+        if ctx.raw_num_tokens < ctx.padded_num_tokens:
+            buf[ctx.raw_num_tokens : ctx.padded_num_tokens].fill_(pad_value)
+
+    return _fill
+
+
 def build_decode_registry(
     *,
     device: torch.device,
@@ -542,10 +550,10 @@ def build_decode_registry(
 
       - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
       - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
-        (``out_cache_loc`` -> FILL_SENTINEL(out_cache_loc_pad_value) when a
-        pool reserves a specific dummy slot for padded writes; the OSCAR
-        mixed-KV pool does, because slot 0 is a quant slot and a decode write
-        must land in the HP tier)
+        (``out_cache_loc`` additionally gets its padded tail rewritten to
+        ``out_cache_loc_pad_value`` when a pool reserves a specific dummy slot
+        for padded writes; the OSCAR mixed-KV pool does, because slot 0 is a
+        quant slot and a decode write must land in the HP tier)
       - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
         plan reads the padded tail, so leaving stale out-of-range values there
         triggers an illegal memory access (issue #24361).
@@ -588,12 +596,16 @@ def build_decode_registry(
             _tokens,
             cache_loc_dtype,
             axis="tokens",
-            padding_policy=(
-                PaddingPolicy.ZERO
+            padding_policy=PaddingPolicy.ZERO,
+            # The slot stays ZERO so it agrees with INDEX_SEMANTIC_BUFFERS (a
+            # mid-serving recapture zeroes it through reset_index_buffers); a
+            # pool that reserves a different dummy slot rewrites the padded
+            # tail after the copy instead.
+            post_fill=(
+                None
                 if out_cache_loc_pad_value is None
-                else PaddingPolicy.FILL_SENTINEL
+                else _make_out_cache_loc_pad_fill(int(out_cache_loc_pad_value))
             ),
-            pad_value=out_cache_loc_pad_value,
         ),
         GraphSlot(
             "req_pool_indices",
