@@ -2537,6 +2537,18 @@ class TritonAttnBackend(AttentionBackend):
             and (not layer_is_sliding or mixed_pool_active)
             and self.forward_metadata.custom_mask is None
         )
+        kv_from_pool = False
+        if k is None and v is None and _is_int2_pool(kv_pool):
+            # A KV-shared layer (Gemma-4's last layers) attends with the K/V its
+            # source layer wrote for this forward's tokens. In an int2 pool those
+            # rows exist only as stored, so dequantize them -- they come back in
+            # the pool's rotated frame -- and hand them to the int2 prefill as
+            # already-rotated K/V. The source layer owns the cache write.
+            k, v = dequantize_prefix_kv(
+                kv_pool, layer.layer_id, forward_batch.out_cache_loc, q.dtype
+            )
+            kv_from_pool = True
+            save_kv_cache = False
         pre_rotated_q = None
         pre_rotated_k = None
         pre_rotated_v = None
@@ -2557,6 +2569,7 @@ class TritonAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k.contiguous(),
                     v.contiguous(),
+                    kv_already_hadamard_transformed=kv_from_pool,
                 )
             )
 

@@ -304,6 +304,10 @@ def audit_latent_windows(batch, kv_pool) -> None:
         return
     if not getattr(kv_pool, "latent_windows_enabled", lambda: False)():
         return
+    if hasattr(kv_pool, "materialize_rows"):
+        # The packed pool keeps no BF16 latent to grade against the grid; it
+        # audits its own window arena (``audit_window_arena``).
+        return
     if getattr(kv_pool, "hp_subspaces", None):
         # The HP-subspace variant adds a full-precision component back after
         # the round trip, so a quantized row is no longer on the grid.
