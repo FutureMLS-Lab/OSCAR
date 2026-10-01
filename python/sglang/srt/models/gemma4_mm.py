@@ -135,6 +135,12 @@ class Gemma4MultimodalEmbedder(nn.Module):
         return embs_proj
 
 
+def _kv_pool_is_int2() -> bool:
+    """True when the active attention backend serves the OSCAR int2 KV pool."""
+    pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
+    return getattr(pool, "dtype", None) == "int2"
+
+
 class Gemma4ForConditionalGeneration(PreTrainedModel):
     config_class = Gemma4Config
     """Gemma4 multimodal model for conditional generation."""
@@ -649,11 +655,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             forward_batch.forward_mode == ForwardMode.EXTEND
             and forward_batch.contains_image_inputs()
         ):
-            self.prepare_attn_masks(
-                forward_batch,
-                input_ids,
-                mask_dtype=torch.bool,
-            )
+            if _kv_pool_is_int2():
+                # The bidirectional image mask routes prefill through the
+                # generic extend kernel, which cannot read the int2-packed KV
+                # buffers; image tokens attend causally under the OSCAR int2
+                # cache (the documented Gemma fallback).
+                logger.warning_once(
+                    "Image tokens attend causally under the int2 KV cache: the "
+                    "bidirectional image mask is not supported on that path."
+                )
+            else:
+                self.prepare_attn_masks(
+                    forward_batch,
+                    input_ids,
+                    mask_dtype=torch.bool,
+                )
 
         # general_mm_embed_routine already handles PP: it skips the embedding
         # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.
