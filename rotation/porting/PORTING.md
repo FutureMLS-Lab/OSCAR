@@ -71,3 +71,17 @@ to be re-measured on this stack; the numbers in PR #26 are the old tree's.
 * Not ported: K3-only files and env knobs (upstream has Kimi-K3 natively), the
   graph-vs-eager verify diagnostic, the old `minimax_sparse_backend.py`
   (MiniMax-M3 INT2 goes into upstream's native MSA backend in phase 3).
+* Dropped as duplicates of what upstream now ships natively: the copied
+  `configs/gemma4_unified.py` + `multimodal/processors/gemma4_unified_*`
+  (upstream registers `gemma4_unified` through `_Gemma4UnifiedConfigAlias` and
+  `processors/gemma4_unified.py`) and `layers/attention/minimax_sparse_kernels/`
+  (upstream's MSA kernels live in `layers/attention/minimax_sparse_ops/`).
+  `layers/attention/minimax_sparse_staging.py` stays for phase 3, where the
+  INT2 staging is attached to upstream's `minimax_sparse_backend.py`.
+* Phase 2 still owes the gemma4 model-side INT2 guards (the old
+  `models/gemma4_unified.py` skipped its fused KV write when the pool dtype is
+  int2) on upstream's `gemma4_causal.py` / `gemma4_unified.py`, and a
+  prefix-cache answer for hybrid SSM models: the mixed-KV tree semantics are on
+  `RadixCache`, while upstream serves Qwen3.5 / Kimi-K3 through
+  `UnifiedRadixCache` (which tracks the mamba states); the factory raises for
+  that combination today.
