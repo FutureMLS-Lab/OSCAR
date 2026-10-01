@@ -31,8 +31,8 @@ to be re-measured on this stack; the numbers in PR #26 are the old tree's.
 |---|---|---|---|
 | 0 | repository layout, porting reference, image base | image boots upstream models | done (`docker/Dockerfile.oscar` on `lmsysorg/sglang:v0.5.21-cu130`) |
 | 1 | KV-quant core: `--kv-cache-dtype int2`, `UnifiedInt2HPKVPool` + allocator, mixed HP windows, radix-cache tiers, scheduler flush, triton INT2 prefill/decode, QuantKernel, pool pricing, env knobs | Qwen3-8B INT2 at 8K ctx, radix + graph on | **PASS** (image v55: prefix-cache hit, 62 captured graph shapes, 2048-token probe clean) |
-| 2 | MHA/GQA models: qwen3, qwen3_5 (hybrid GDN), qwen3_moe, gemma4_unified (two-group), minimax_m2.7 | each model's smoke | qwen3-4b-think / qwen3-32b / qwen3-30b-a3b PASS; gemma4 (KV-shared layers), minimax-m2.7 and the Qwen3.5 pair (mixed KV on UnifiedRadixCache) in progress |
-| 3 | MLA packed latent (`MLAPackedInt2KVPool`, `NSAPackedInt2KVPool`, packed decode kernels) on upstream's DSA backend for GLM-5.2/5.3, trtllm_mla for Kimi-K3; MSA for MiniMax-M3 on upstream's native backend | GLM-5.2 recall probe past 2K tokens, then smoke | DSA staging + MLA rotation hooks ported (not yet run on a GPU); M3 pending |
+| 2 | MHA/GQA models: qwen3, qwen3_5 (hybrid GDN), qwen3_moe, gemma4_unified (two-group), minimax_m2.7 | each model's smoke | qwen3-4b-think / qwen3-32b / qwen3-30b-a3b / minimax-m2.7 PASS; gemma4 (KV-shared layers) and the Qwen3.5 pair (mixed KV on UnifiedRadixCache) in progress |
+| 3 | MLA packed latent (`MLAPackedInt2KVPool`, `NSAPackedInt2KVPool`, packed decode kernels) on upstream's DSA backend for GLM-5.2/5.3, trtllm_mla for Kimi-K3; MSA for MiniMax-M3 on upstream's native backend | GLM-5.2 recall probe past 2K tokens, then smoke | **GLM-5.2 PASS** on upstream's DSA backend (flashmla_sparse prefill / trtllm decode, packed pool 4.00x, graph + prefix cache on); GLM-5.3 and the long-prompt recall probe next; M3 in progress |
 | 4 | harness: `rotation/` paths (`sglang-research/python` -> `python`), run scripts, verify sweep, bench | 12-model sweep | not started |
 | 5 | GPQA @64K + 64K decode speed for all 12, table and README | | not started |
 
