@@ -3,7 +3,7 @@
 ## GPQA under INT2 OSCAR KV
 
 ```bash
-examples/gpqa_int2_oscar.sh qwen3-8b
+rotation/examples/gpqa_int2_oscar.sh qwen3-8b
 ```
 
 Runs GPQA-Diamond (198 questions, scored by the vendored `simple_evals`) against

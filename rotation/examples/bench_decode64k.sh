@@ -18,7 +18,7 @@
 set -uo pipefail
 MODEL_KEY=${1:?usage: bench_decode64k.sh <model-key>   (see rotation/run/)}
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${OSCAR_SRC:-$(cd -- "$HERE/.." && pwd)}"
+ROOT="${OSCAR_SRC:-$(cd -- "$HERE/../.." && pwd)}"
 RUN="$ROOT/rotation/run/${MODEL_KEY}.sh"
 [ -x "$RUN" ] || { echo "no run script for '$MODEL_KEY'"; exit 1; }
 
