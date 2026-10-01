@@ -527,7 +527,7 @@ use, and it is where 2-bit currently costs the most — see the MLA section for
 the decomposition against stock upstream (95.83) that shows the 10.4 pp is the
 quantiser and not the serving path.
 
-> MiniMax-M2.7 / Qwen3.5 calibration scripts live on `zhongzhu/hybrid-model`; pre-fit rotations for several models are available on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
+> Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
 ## How the rotation is fit (spectral covariance)
 
@@ -602,7 +602,7 @@ Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
 
 - **Garbled / mixed-language output in long-context agent sessions.** Update to the latest `main`. Older checkouts (before the mixed-KV slot-accounting fix) could free KV slots still referenced by other in-flight requests under concurrency, corrupting reads.
 - **`--kv-cache-dtype int2` only supports full-attention models.** MLA models (GLM-5.1 / DeepSeek-style) and hybrid linear-attention models (Qwen3.5 GatedDeltaNet) are not supported on `main` yet — see [Model support](#model-support).
-- **Hybrid / preview models (Qwen3.5, MiniMax-M2.7).** Use the `zhongzhu/hybrid-model` branch with `SGLANG_LLOYD_MAX=1`.
+- **Hybrid models (Qwen3.5, Kimi-K3).** Their prefix cache needs `--mamba-radix-cache-strategy extra_buffer` (the recipes set it); without it the Mamba radix cache asserts `page_size == 1`, which surfaces asynchronously as an illegal memory access.
 - **Running locally on a Mac.** Use the `zhongzhu/llamacpp` branch or the pre-built `*-rot-kv.gguf` files on Hugging Face.
 
 ## Citation
