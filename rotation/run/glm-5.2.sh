@@ -16,7 +16,7 @@ export MLA_GROUP_SIZE="${MLA_GROUP_SIZE:-128}"
 export MLA_PACKED=1 MLA_PACKED_SELFCHECK=0
 export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-64}"
 export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
-# DSA sparse attention (`nsa`: flashmla_sparse prefill, trtllm sparse decode) is
+# DSA sparse attention (`--attention-backend dsa`: flashmla_sparse prefill, trtllm sparse decode) is
 # the model's deployed form; the packed pool is staged into BF16 for those
 # kernels per layer. ATTN_BACKEND=triton gives the dense fallback.
 export ATTN_BACKEND="${ATTN_BACKEND:-dsa}" PREFILL_BACKEND="${PREFILL_BACKEND:-dsa}" DECODE_BACKEND="${DECODE_BACKEND:-dsa}"

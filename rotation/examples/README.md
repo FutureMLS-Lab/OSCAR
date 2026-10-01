@@ -20,7 +20,7 @@ these are separate files:
 | group size 256 | Qwen3.5-4B, Qwen3.5-35B-A3B (128 elsewhere) |
 | published-Hadamard rotation file | MiniMax-M3 |
 | packed 2-bit MLA latent | GLM-5.2, GLM-5.3, Kimi-K3 |
-| `--mamba-scheduler-strategy extra_buffer` | Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid) |
+| `--mamba-radix-cache-strategy extra_buffer` | Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid) |
 | two nodes | Kimi-K3 (1.5 TB bf16 does not fit 8 x 183 GB) |
 
 Qwen3-30B-A3B is the sharpest case: its 4 KV heads are near orthogonal, so a

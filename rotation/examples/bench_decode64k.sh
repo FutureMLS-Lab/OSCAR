@@ -53,7 +53,7 @@ export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --context-length $((TOK + 2048)
 #   GLM-5.x   DSA sparse attention. Its MLA is qk 256 / v 256 (qk_nope 192 +
 #             rope 64, v 256), which plain trtllm_mla rejects outright ("only
 #             support deepseek r1 192/128 or 128/128"); upstream serves GLM-5
-#             with --attention-backend dsa (named `nsa` in this fork) whose
+#             with --attention-backend dsa whose
 #             prefill/decode kernels are flashmla_sparse / trtllm.
 #   Kimi-K3   trtllm_mla, as in upstream's day-0 K3 support. Its MLA is the
 #             DeepSeek-R1 192/128 shape that kernel is built for; what broke
