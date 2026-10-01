@@ -216,7 +216,7 @@ verify_probe_and_verdict() {
       echo "  saved : $OUT/$name.probe.json ($(printf '%s' "$r2" | wc -c) bytes)"
   fi
   tb=$(grep -ac Traceback "$log")          # BEFORE teardown
-  cg=$(grep -acE "Capture cuda graph|Capturing cuda graph|cuda graph" "$log")
+  cg=$(grep -aciE "capture .*graph|cuda[ _]graph" "$log")
   rx=$(grep -aoE "#cached-token: [0-9]+" "$log" | awk '{s+=$2} END{print s+0}')
   pool=$(grep -aoE "\[MLAPacked\][^\"]{0,70}" "$log" | sort -u | head -1)
 
