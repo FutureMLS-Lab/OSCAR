@@ -63,6 +63,9 @@ export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --context-length $((TOK + 2048)
 case "$MODEL_KEY" in
   glm-5*)  FI_BACKEND="${FI_BACKEND:-dsa}" ;;
   kimi-k3) FI_BACKEND="${FI_BACKEND:-trtllm_mla}" ;;
+  # Gemma-4 rejects plain flashinfer outright (its model file asserts
+  # trtllm_mha/triton/...); trtllm_mha is the FlashInfer-family kernel it allows.
+  gemma-4*) FI_BACKEND="${FI_BACKEND:-trtllm_mha}" ;;
   *)       if grep -qE 'MLA_ROT_PATH|MLA_PACKED' "$RUN" 2>/dev/null; then FI_BACKEND="${FI_BACKEND:-trtllm_mla}"; else FI_BACKEND="${FI_BACKEND:-flashinfer}"; fi ;;
 esac
 echo "baseline decode backend for $MODEL_KEY: $FI_BACKEND"
