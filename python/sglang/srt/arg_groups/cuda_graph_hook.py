@@ -220,12 +220,16 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         # rebinds break guards); breakable/full support LoRA.
         ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
         (
-            # The INT2 extend path of the MiniMax sparse backend stages
-            # dequantized rows through Python-built tables; dynamo stops at
-            # its first lazy import ("Unsupported: Import failure").
-            "OSCAR int2 KV under MiniMax sparse attention",
-            lambda: cfg.kv_cache_dtype == "int2"
-            and _is_minimax_sparse_model(server_args),
+            # Dynamo cannot trace the MiniMax sparse backend's extend path on
+            # the triton attention backend -- upstream's BF16 path included --
+            # and dies at capture with "Unsupported: Import failure"; the OSCAR
+            # int2 staging path needs triton, so it is covered either way.
+            "MiniMax sparse attention on the triton backend or the OSCAR int2 KV",
+            lambda: _is_minimax_sparse_model(server_args)
+            and (
+                cfg.kv_cache_dtype == "int2"
+                or attention_backends_of(resolved_view(server_args))[0] == "triton"
+            ),
         ),
         (
             "multimodal model",
