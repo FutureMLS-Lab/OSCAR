@@ -581,7 +581,7 @@ server answers `/v1/models`, so no foreign kernel runs during a measurement.
 | GLM-4.7-FP8 | 26.68 | 74.49 | 9.73 | 2.74× slower |
 | GLM-5.2-FP8 | 14.32 | 10.52 (DSA, same backend both arms) | 10.52 (DSA) | 1.36× slower |
 | GLM-5.3 | 14.33 | 10.52 (DSA, same backend both arms) | 10.52 (DSA) | 1.36× slower |
-| MiniMax-M3 | pending | pending | pending | |
+| MiniMax-M3 | 13.75 | 12.04 (MSA sparse, same backend both arms) | 9.01 | 1.53× slower |
 | Kimi-K3 | pending | pending | pending (trtllm_mla) | |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
