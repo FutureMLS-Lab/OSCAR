@@ -67,7 +67,11 @@ case "$MODEL_KEY" in
 esac
 echo "baseline decode backend for $MODEL_KEY: $FI_BACKEND"
 
-for MODE in int2 bf16 bf16_flashinfer; do
+# BENCH_MODES narrows the run to some arms. A two-node model (Kimi-K3) cannot
+# restart its server between arms, because rank 1 only knows how to serve one
+# launch and wait for it; each arm then runs as its own allocation and the last
+# one computes the ratio from the files the earlier ones left behind.
+for MODE in ${BENCH_MODES:-int2 bf16 bf16_flashinfer}; do
   # Idempotent per arm: an arm whose measurement already exists is not re-run.
   # Re-measuring the K3 baseline after a one-line backend fix should cost the
   # one arm that failed, not two more hours of 16-GPU weight loading for the
@@ -108,7 +112,8 @@ def load(mode, kv=None):
 i, b, f = load("int2"), load("bf16"), load("bf16_flashinfer", kv="bf16")
 if not i or not b:
     print(f"BENCH {key}: incomplete (int2={'ok' if i else 'MISSING'} bf16={'ok' if b else 'MISSING'})")
-    sys.exit(1)
+    # A partial run (BENCH_MODES set) is expected to be incomplete; a full run is not.
+    sys.exit(0 if os.environ.get("BENCH_MODES") else 1)
 # Slower-is-bigger, so the ratio reads directly as "how much slower".
 r_ttft = i["ttft_s_median"] / b["ttft_s_median"]
 r_dec  = i["decode_s_per_token_median"] / b["decode_s_per_token_median"]
