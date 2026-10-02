@@ -581,21 +581,21 @@ server answers `/v1/models`, so no foreign kernel runs during a measurement.
 Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 ~19% in both arms (ratio unchanged), so TP 8 rows come from 96-core pods.
 
-| Model | INT2 ms/tok | BF16 triton ms/tok | BF16 FlashInfer ms/tok | INT2 vs FlashInfer |
-|---|---:|---:|---:|---:|
-| Qwen3-4B-Thinking-2507 | 12.19 | 33.74 | 4.40 | 2.77× slower |
-| Qwen3-8B | 13.76 | 35.01 | 5.41 | 2.54× slower |
-| Qwen3-32B | 22.04 | 61.52 | 9.30 | 2.37× slower |
-| Qwen3-30B-A3B | 14.04 | 42.67 | 3.64 | 3.86× slower |
-| Qwen3.5-4B | 5.78 | 11.17 | 2.90 | 1.99× slower |
-| Qwen3.5-35B-A3B | 6.63 | 13.89 | 2.61 | 2.54× slower |
-| Gemma-4-12B-it | 19.98 | 18.45 | 6.66 (trtllm_mha) | 3.00× slower |
-| MiniMax-M2.7 | 25.80 | 69.01 | 8.20 | 3.15× slower |
-| GLM-4.7-FP8 | 26.68 | 74.49 | 9.73 | 2.74× slower |
-| GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
-| GLM-5.3 | 11.99 | 8.82 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
-| MiniMax-M3 | 14.79 | 11.19 (MSA sparse, same backend both arms) | 8.67 | 1.71× slower |
-| Kimi-K3 | pending | pending | pending (trtllm_mla) | |
+| Model | INT2 ms/tok | BF16 triton ms/tok | INT2 vs BF16 triton | BF16 FlashInfer-family ms/tok | INT2 vs FlashInfer |
+|---|---:|---:|---:|---:|---:|
+| Qwen3-4B-Thinking-2507 | 12.19 | 33.74 | 2.77× faster | 4.40 | 2.77× slower |
+| Qwen3-8B | 13.76 | 35.01 | 2.54× faster | 5.41 | 2.54× slower |
+| Qwen3-32B | 22.04 | 61.52 | 2.79× faster | 9.30 | 2.37× slower |
+| Qwen3-30B-A3B | 14.04 | 42.67 | 3.04× faster | 3.64 | 3.86× slower |
+| Qwen3.5-4B | 5.78 | 11.17 | 1.93× faster | 2.90 | 1.99× slower |
+| Qwen3.5-35B-A3B | 6.63 | 13.89 | 2.09× faster | 2.61 | 2.54× slower |
+| Gemma-4-12B-it | 19.98 | 18.45 | 1.08× slower | 6.66 (trtllm_mha) | 3.00× slower |
+| MiniMax-M2.7 | 25.80 | 69.01 | 2.67× faster | 8.20 | 3.15× slower |
+| GLM-4.7-FP8 | 26.68 | 74.49 | 2.79× faster | 9.73 | 2.74× slower |
+| GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 1.36× slower | same DSA path (8.81) | 1.36× slower |
+| GLM-5.3 | 11.99 | 8.82 (DSA, same backend both arms) | 1.36× slower | same DSA path (8.81) | 1.36× slower |
+| MiniMax-M3 | 14.79 | 11.19 (MSA sparse, same backend both arms) | 1.32× slower | 8.67 | 1.71× slower |
+| Kimi-K3 | pending | pending | | pending (trtllm_mla) | |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
