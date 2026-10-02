@@ -533,7 +533,7 @@ dense GQA. The BF16 control uses the same backend in every row.
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
 |---|---|---|---:|---:|---:|
 | `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
-| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 60.6, 56.6 [^two] | 50.0, 52.5 [^two] | −7.3 (means; INT2 answers run longer, median 60K vs 45K chars) |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | 64.1 | 59.6 | −4.5 |
 | `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.6 | −5.6 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
 | `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
@@ -556,6 +556,9 @@ dense GQA. The BF16 control uses the same backend in every row.
     62.1 (p = 0.02); the second draws are 64.1 and 63.1, and every second-draw
     pairing is inside noise (p ≥ 0.6). Its answers are short (median ~2.7K
     characters), so the spread is temperature sampling, not the budget.
+    Qwen3-8B: the first pair read INT2 50.0 vs BF16 60.6 (p < 0.001) against a
+    5-point gap on the previous base; the second draws are 52.5 and 56.6, so
+    the gap is real but about 7 points, not 11.
 
 ### 64K decode on B200 (this tree)
 
@@ -582,7 +585,7 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 | MiniMax-M2.7 | 25.80 | 69.01 | 8.20 | 3.15× slower |
 | GLM-4.7-FP8 | 26.68 | 74.49 | 9.73 | 2.74× slower |
 | GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
-| GLM-5.3 | pending (re-measure) | pending | pending (DSA) | |
+| GLM-5.3 | 11.99 | 8.82 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
 | MiniMax-M3 | pending (re-measure) | pending | pending | |
 | Kimi-K3 | pending | pending | pending (trtllm_mla) | |
 
