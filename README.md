@@ -501,7 +501,7 @@ flush, and nothing in the earlier probes re-read the prompt.
 | MiniMax-M2.7 | PASS |
 | GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | PASS (92 / 90 graph shapes captured, prefix hits logged) |
 | MiniMax-M3 (MSA + INT2 staging) | PASS (91 graph shapes, prefix hits logged) |
-| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | pending (two-node job; the probe runs inside its GPQA job, waiting for two whole nodes) |
+| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | PASS (probed inside its two-node GPQA job: 173 graph shapes, 1,856 prefix tokens hit, packed latent 288 B/token/layer) |
 
 **Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
 two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
