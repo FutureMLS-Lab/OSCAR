@@ -537,8 +537,8 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | pending | pending | |
 | `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | pending | pending | |
 | `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
-| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 86.9, 81.8 [^q35] | 79.3, 83.8 [^q35] | −2.8 (means) |
-| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 86.9, 81.8 [^two] | 79.3, 83.8 [^two] | −2.8 (means) |
+| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 62.1, 63.1 [^two] | 69.7, 64.1 [^two] | +4.3 (means) |
 | `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | pending | pending | |
 | `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | pending | pending | |
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | pending | pending | |
@@ -546,13 +546,16 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | pending | pending | |
 | `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | pending | pending | |
 
-[^q35]: Two independent draws per arm. The first pair (INT2 79.3 vs BF16 86.9)
-    looked like a 7.6-point loss, so both arms were sampled again on the same
-    tree: the second BF16 draw is 81.8 and the second INT2 draw 83.8, and an
-    INT2 run with the prefix cache disabled scores 84.8. Per-question pairing
-    (McNemar) puts the two BF16 draws 5.1 points apart (p = 0.03) and every
-    second-draw INT2-vs-BF16 pairing inside noise, so the row reports both
-    draws rather than the first one.
+[^two]: Two independent draws per arm, listed first draw then second. A
+    single-seed pair whose gap was out of line with the other rows was sampled
+    again on the same tree rather than reported as is. Qwen3.5-35B-A3B: the
+    first pair read INT2 79.3 vs BF16 86.9; the second draws are 83.8 and 81.8,
+    the two BF16 draws are 5.1 points apart by per-question pairing (McNemar
+    p = 0.03), and an INT2 run with the prefix cache disabled scores 84.8.
+    Gemma-4-12B-it is the mirror image: the first pair read INT2 69.7 vs BF16
+    62.1 (p = 0.02); the second draws are 64.1 and 63.1, and every second-draw
+    pairing is inside noise (p ≥ 0.6). Its answers are short (median ~2.7K
+    characters), so the spread is temperature sampling, not the budget.
 
 ### 64K decode on B200 (this tree)
 
