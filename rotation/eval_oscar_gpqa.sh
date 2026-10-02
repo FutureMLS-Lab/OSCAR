@@ -358,7 +358,12 @@ SERVER_PID=$!
 # "DistNetworkError: Failed to recv, got 0 bytes".
 if [[ "${NODE_RANK}" != "0" ]]; then
     echo "[eval-oscar] rank ${NODE_RANK}: serving only, waiting for the group"
-    wait "${SERVER_PID}"
+    # When rank 0 finishes and tears its server down, this rank's server dies
+    # with it (gloo "Connection reset by peer", then SIGKILL from its own
+    # process-tree cleanup). That is the normal end of a run, not a failure:
+    # under set -e a non-zero wait would exit this pod non-zero and a JobSet
+    # would restart the whole two-node run after the score was already on disk.
+    wait "${SERVER_PID}" || true
     exit 0
 fi
 # 400B-class models at TP=16 spend ~1220 s just loading weights, so the old
