@@ -535,7 +535,7 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
 | `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | pending | pending | |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | pending | pending | |
-| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.6 | −5.6 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
 | `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
 | `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 86.9, 81.8 [^two] | 79.3, 83.8 [^two] | −2.8 (means) |
 | `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 62.1, 63.1 [^two] | 69.7, 64.1 [^two] | +4.3 (means) |
