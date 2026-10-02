@@ -127,7 +127,8 @@ try:
     choice = d['choices'][0]
     m = choice['message']
     text = (m.get('reasoning_content') or '') + (m.get('content') or '')
-    print(json.dumps({'text': text, 'finish_reason': choice.get('finish_reason')}))
+    print(json.dumps({'text': text, 'content': m.get('content') or '',
+                      'finish_reason': choice.get('finish_reason')}))
 except Exception:
     print(json.dumps({'text': '', 'error': {'message': 'unexpected chat response: ' + raw[:200]}}))"
 }
@@ -228,18 +229,35 @@ verify_probe_and_verdict() {
   r2=$(verify_gen "$port" "Explain in detail, step by step, how a four-stroke internal combustion engine works, covering each stroke, valve timing, and the thermodynamic cycle." 2048)
   echo "  probe2: $(echo "$r2" | head -c 130) ... [$(echo "$r2" | wc -c) bytes]"
 
-  # Prompt retention across a long generation. The BF16 prefix covers the first
-  # 64 tokens only; a code word placed after ~130 tokens of filler sits in the
-  # recent window at prefill and is demoted to int2 slots by the decode flush
-  # within the first few hundred generated tokens. MiniMax-M3 scored 56.6 vs
-  # 90.9 on GPQA because its indexer keys were left behind by that flush, while
-  # the engine probe above stayed fluent: nothing in it re-reads the prompt.
-  local code_word="orchid-granite-$(( RANDOM % 9000 + 1000 ))"
+  # Prompt retention across a long generation, judged on what the model says
+  # AFTER its reasoning. A code word is useless here: a thinking model restates
+  # it in the first lines of its reasoning and later "recalls" its own text (on
+  # the unfixed MiniMax-M3 pool four such variants passed; see the lab in the
+  # porting notes). What a model does not restate verbatim is a 35-word option,
+  # so the probe is a four-option question with long options, at least 700
+  # words of reasoning demanded, and the chosen option copied verbatim on the
+  # last line. The copy must come from the prompt, through the KV cache, after
+  # the options' tokens have long been demoted to int2 slots; on the unfixed
+  # pool it came back wrong (MISS) while every code-word variant passed.
   local filler
   filler=$(python3 -c "print('The quick brown fox jumps over the lazy dog near the old river bank. ' * 10)")
-  r3=$(verify_gen "$port" "$filler Remember this code word: $code_word. Now write a detailed essay of about 800 words on the history of the printing press. After the essay, on its own last line, write the code word exactly." 1600)
-  local recall=MISS
-  printf '%s' "$r3" | grep -q "$code_word" && recall=OK
+  local optA="a slow-moving nocturnal reptile of the Sonoran desert that stores water in its tail, basks on warm basalt at dusk, and lays leathery eggs in sand burrows every second spring"
+  local optB="a migratory marine mammal of the North Atlantic that nurses its calf for eleven months, feeds on krill through baleen plates, and sings long structured songs during the breeding season"
+  local optC="a flightless island bird with bright blue feet that nests on bare volcanic rock, dives for sardines from twenty meters, and performs a slow stamping courtship dance each morning"
+  local optD="a cold-water cephalopod of the Pacific shelf that changes skin texture in under a second, hunts crabs at night with eight sucker-lined arms, and dies shortly after guarding its eggs"
+  r3=$(verify_gen "$port" "$filler Question: which option describes a mammal? A) $optA B) $optB C) $optC D) $optD. Reason about every option in detail, in at least 700 words, before deciding. Then end your answer with two lines: the letter on one line, and the complete text of that option copied verbatim on the last line." 3000)
+  local recall
+  recall=$(python3 - "$r3" "$optB" <<'PY2'
+import json, re, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print("MISS"); raise SystemExit
+norm = lambda t: re.sub(r"\s+", " ", t).strip().lower()
+final = d.get("content") or d.get("text") or ""
+print("OK" if norm(sys.argv[2]) in norm(final[-1500:]) else "MISS")
+PY2
+)
   echo "  probe3: recall=$recall ($(echo "$r3" | wc -c) bytes)"
 
   garb=$(verify_judge "$r2")

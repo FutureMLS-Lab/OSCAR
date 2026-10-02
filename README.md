@@ -485,13 +485,18 @@ transformers exactly as in sglang, because its tokenizer under transformers 5.12
 prepends no `<bos>` to raw text; the template carries the token and the model
 answers. A probe that bypasses the model's real input path measures the probe.
 
-A third probe checks that the prompt survives a long generation: a code word
-placed after ~130 tokens of filler (so it sits in the BF16 recent window at
-prefill and is demoted to int2 slots by the decode flush), an 800-word essay,
-then the code word on the last line; a missing code word is `FAIL(no-recall)`.
-It exists because MiniMax-M3 passed the fluency probes while scoring 56.6
-against a 90.9 BF16 control on GPQA: its indexer keys were left behind by the
-flush, and nothing in the earlier probes re-read the prompt.
+A third probe checks that the prompt is still readable after a long
+generation, judged on what the model says *after* its reasoning: a four-option
+question whose options are ~35 words each, placed after ~130 tokens of filler
+so they sit in the BF16 recent window at prefill and are demoted to int2 slots
+by the decode flush; at least 700 words of reasoning are demanded, then the
+letter and the chosen option copied verbatim on the last line. A copy that does
+not match is `FAIL(no-recall)`. The shape matters: on the MiniMax-M3 pool
+before its indexer-key fix (56.6 on GPQA against a 90.9 BF16 control) four
+code-word variants of this probe all passed, because a thinking model restates
+a short code word in the first lines of its reasoning and later recalls its
+own text; the verbatim-quote variant missed on that pool and recalls on the
+fixed one.
 
 | model | smoke on this tree (base `67eab57057`) |
 |---|---|
@@ -564,8 +569,8 @@ a few hundred generated tokens the indexer scored every flushed token --
 including the question beyond the 64-token BF16 prefix -- against zeros. The
 pool now moves those rows in the same step (`on_flush_applied`); the re-run on
 the fixed tree scores 88.9 (8/12 discordant against BF16, p = 0.5) with 6
-unanswered questions against BF16's 5. The smoke suite gained the retention
-probe described above because the fluency probes had passed on the broken pool.
+unanswered questions against BF16's 5. The smoke suite gained the verbatim-quote
+retention probe described above because every fluency probe had passed on the broken pool.
 
 [^two]: Two independent draws per arm, listed first draw then second. A
     single-seed pair whose gap was out of line with the other rows was sampled
