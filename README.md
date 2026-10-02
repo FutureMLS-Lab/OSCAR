@@ -569,15 +569,15 @@ server answers `/v1/models`, so no foreign kernel runs during a measurement.
 |---|---:|---:|---:|---:|
 | Qwen3-4B-Thinking-2507 | 12.19 | 33.74 | 4.40 | 2.77× slower |
 | Qwen3-8B | 13.76 | 35.01 | 5.41 | 2.54× slower |
-| Qwen3-32B | pending | pending | pending | |
+| Qwen3-32B | 22.04 | 61.52 | 9.30 | 2.37× slower |
 | Qwen3-30B-A3B | 14.04 | 42.67 | 3.64 | 3.86× slower |
 | Qwen3.5-4B | 5.78 | 11.17 | 2.90 | 1.99× slower |
-| Qwen3.5-35B-A3B | pending | pending | pending | |
+| Qwen3.5-35B-A3B | 6.63 | 13.89 | 2.61 | 2.54× slower |
 | Gemma-4-12B-it | 19.98 | 18.45 | 6.66 (trtllm_mha) | 3.00× slower |
-| MiniMax-M2.7 | pending | pending | pending | |
-| GLM-4.7-FP8 | pending | pending | pending | |
-| GLM-5.2-FP8 | pending | pending | pending (DSA) | |
-| GLM-5.3 | pending | pending | pending (DSA) | |
+| MiniMax-M2.7 | 25.80 | 69.01 | 8.20 | 3.15× slower |
+| GLM-4.7-FP8 | 26.68 | 74.49 | 9.73 | 2.74× slower |
+| GLM-5.2-FP8 | 14.32 | 10.52 (DSA, same backend both arms) | 10.52 (DSA) | 1.36× slower |
+| GLM-5.3 | 14.33 | 10.52 (DSA, same backend both arms) | 10.52 (DSA) | 1.36× slower |
 | MiniMax-M3 | pending | pending | pending | |
 | Kimi-K3 | pending | pending | pending (trtllm_mla) | |
 
