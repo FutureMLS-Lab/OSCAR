@@ -490,7 +490,7 @@ answers. A probe that bypasses the model's real input path measures the probe.
 | MiniMax-M2.7 | PASS |
 | GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | PASS |
 | MiniMax-M3 (MSA + INT2 staging) | PASS |
-| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | serves (two-node job); GPQA in progress |
+| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | serves (two-node job); GPQA n=48 @64K BF16 93.75 / INT2 93.75 |
 
 **Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
 two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
