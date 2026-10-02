@@ -487,13 +487,13 @@ answers. A probe that bypasses the model's real input path measures the probe.
 
 | model | smoke on this tree (base `67eab57057`) |
 |---|---|
-| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | pending |
-| Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid GatedDeltaNet) | pending |
-| Gemma-4-12B-it (hybrid SWA, dual head_dim) | pending |
-| MiniMax-M2.7 | pending |
-| GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | pending |
-| MiniMax-M3 (MSA + INT2 staging) | pending |
-| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | pending (two-node job) |
+| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | PASS |
+| Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid GatedDeltaNet) | PASS |
+| Gemma-4-12B-it (hybrid SWA, dual head_dim) | PASS |
+| MiniMax-M2.7 | PASS |
+| GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | PASS (92 / 90 graph shapes captured, prefix hits logged) |
+| MiniMax-M3 (MSA + INT2 staging) | PASS (91 graph shapes, prefix hits logged) |
+| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | pending (two-node job; the probe runs inside its GPQA job, waiting for two whole nodes) |
 
 **Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
 two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
@@ -532,12 +532,12 @@ dense GQA. The BF16 control uses the same backend in every row.
 
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
 |---|---|---|---:|---:|---:|
-| `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
 | `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | pending | pending | |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | pending | pending | |
 | `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | pending | pending | |
-| `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | pending | pending | |
-| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
+| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 86.9, 81.8 [^q35] | 79.3, 83.8 [^q35] | −2.8 (means) |
 | `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | pending | pending | |
 | `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | pending | pending | |
 | `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | pending | pending | |
@@ -546,17 +546,40 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | pending | pending | |
 | `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | pending | pending | |
 
+[^q35]: Two independent draws per arm. The first pair (INT2 79.3 vs BF16 86.9)
+    looked like a 7.6-point loss, so both arms were sampled again on the same
+    tree: the second BF16 draw is 81.8 and the second INT2 draw 83.8, and an
+    INT2 run with the prefix cache disabled scores 84.8. Per-question pairing
+    (McNemar) puts the two BF16 draws 5.1 points apart (p = 0.03) and every
+    second-draw INT2-vs-BF16 pairing inside noise, so the row reports both
+    draws rather than the first one.
+
 ### 64K decode on B200 (this tree)
 
 Batch size 1, a 65,536-token prompt followed by 512 generated tokens, median
 of three repeats; measured after the GPQA sweep on the same base. The BF16
 column is the same model on the triton backend (what OSCAR's INT2 kernels
 replace); the FlashInfer column is the fastest BF16 baseline that serves the
-model (for GLM that is upstream's DSA path).
+model (for GLM that is upstream's DSA path, for Gemma-4 `trtllm_mha`, the only
+FlashInfer-family backend its model file accepts). A GPU keep-alive that the
+cluster's idle-pod reaper requires during weight loads is paused while the
+server answers `/v1/models`, so no foreign kernel runs during a measurement.
 
 | Model | INT2 ms/tok | BF16 triton ms/tok | BF16 FlashInfer ms/tok | INT2 vs FlashInfer |
 |---|---:|---:|---:|---:|
-| (pending the sweep on this base) | | | | |
+| Qwen3-4B-Thinking-2507 | 12.19 | 33.74 | 4.40 | 2.77× slower |
+| Qwen3-8B | 13.76 | 35.01 | 5.41 | 2.54× slower |
+| Qwen3-32B | pending | pending | pending | |
+| Qwen3-30B-A3B | 14.04 | 42.67 | 3.64 | 3.86× slower |
+| Qwen3.5-4B | 5.78 | 11.17 | 2.90 | 1.99× slower |
+| Qwen3.5-35B-A3B | pending | pending | pending | |
+| Gemma-4-12B-it | 19.98 | 18.45 | 6.66 (trtllm_mha) | 3.00× slower |
+| MiniMax-M2.7 | pending | pending | pending | |
+| GLM-4.7-FP8 | pending | pending | pending | |
+| GLM-5.2-FP8 | pending | pending | pending (DSA) | |
+| GLM-5.3 | pending | pending | pending (DSA) | |
+| MiniMax-M3 | pending | pending | pending | |
+| Kimi-K3 | pending | pending | pending (trtllm_mla) | |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
