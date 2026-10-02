@@ -174,6 +174,12 @@ def apply_cuda_graph_compatibility(server_args: Any):
         disable_full_prefill_cudagraph_if_incompatible(server_args)
 
 
+def _is_minimax_sparse_model(server_args: Any) -> bool:
+    from sglang.srt.configs.model_config import is_minimax_sparse
+
+    return is_minimax_sparse(model_config_of(server_args).hf_config)
+
+
 def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
     """TcPiecewise (torch.compile + piecewise) is incompatible with
     these configurations. Most are torch.compile / dynamo limitations.
@@ -213,6 +219,14 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
         # rebinds break guards); breakable/full support LoRA.
         ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
+        (
+            # The INT2 extend path of the MiniMax sparse backend stages
+            # dequantized rows through Python-built tables; dynamo stops at
+            # its first lazy import ("Unsupported: Import failure").
+            "OSCAR int2 KV under MiniMax sparse attention",
+            lambda: cfg.kv_cache_dtype == "int2"
+            and _is_minimax_sparse_model(server_args),
+        ),
         (
             "multimodal model",
             lambda: (
