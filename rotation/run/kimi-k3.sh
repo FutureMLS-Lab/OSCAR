@@ -23,10 +23,13 @@
 # The two ranks reach the rendezvous minutes apart, so --dist-timeout must
 # exceed torch's 600 s default or the leader gives up with "8/16 clients joined".
 #
-# --moe-runner-backend triton_kernel keeps those weights PACKED. Without it
-# mxfp4.py's process_weights_after_loading calls upcast_from_mxfp(bfloat16) on
-# w13/w2 and 1.4 TB will not fit: rank 0 OOMs at 175.7 GiB/GPU with 90% of the
-# shards loaded. The loader threads are raised for load time only.
+# Leave --moe-runner-backend UNSET. Upstream swaps the compressed-tensors config
+# for Mxfp4Config on K3's experts and resolves FlashInfer MXFP4 (trtllm-gen SiTU)
+# on Blackwell, which keeps the 1.4 TB packed; that is the deployment the
+# cookbook (docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx) recommends.
+# Forcing triton_kernel here dies in the fused MoE loader ("size of tensor a
+# (768) must match ... (1792)") before a single layer is up. The loader threads
+# are raised for load time only.
 #
 # KEEP mmap ON. The 1.4 TB checkpoint is mmapped by default and its page cache
 # is charged to the container, so loading creeps toward the memory ceiling and
@@ -69,15 +72,9 @@ export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND
 # K3 is a linear-attention hybrid, so it selects MambaRadixCache, which asserts
 # page_size == 1 unless the extra buffer is enabled.
 export MAMBA_SCHEDULER_STRATEGY="${MAMBA_SCHEDULER_STRATEGY:-extra_buffer}"
-# --disable-prefill-cuda-graph, NOT --disable-cuda-graph. Ordinary CUDA graph
-# capture stays ON; only the torch.compile-based PIECEWISE variant is off, and it
-# has to be: piecewise graphs trace the model with dynamo, and the
-# triton_kernel MoE routing kernel takes a custom object argument that dynamo
-# rejects with
-#     torch._dynamo.exc.Unsupported: Unexpected argument type for a Triton
-#     kernel: UserDefinedObjectVariable(Tensor)
-# That backend is not optional here -- without it mxfp4.py upcasts w13/w2 to
-# bfloat16 and 1.4 TB does not fit on 16 GPUs -- so the compile layer is what
-# gives way, not the graphs and not the packing.
-export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --pipeline-parallel-size ${PP_SIZE} --moe-runner-backend triton_kernel --disable-prefill-cuda-graph --model-loader-extra-config {\"num_threads\":6}"
+# --disable-prefill-cuda-graph, NOT --disable-cuda-graph. Decode CUDA graph
+# capture stays ON; only the piecewise prefill graphs are off for the two-node
+# PP run (they were never exercised on this shape; K3's KDA + MLA + PP stage
+# boundary is the one place a capture failure would cost a 30-minute load).
+export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --pipeline-parallel-size ${PP_SIZE} --disable-prefill-cuda-graph --model-loader-extra-config {\"num_threads\":6}"
 launch
