@@ -43,7 +43,10 @@ python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
   ${NO_AUTOTUNE:+--disable-flashinfer-autotune} \
   $EXTRA > "$LOG" 2>&1 &
 SRV=$!
-if ! verify_wait_serve $SRV $PORT 150; then
+# 10 s per try. A tp=8 model reads 60-90 shards off a shared volume; under
+# contention that alone passed 25 minutes and a healthy MiniMax-M3 was
+# reported as FAIL(no-serve) with the server still loading.
+if ! verify_wait_serve $SRV $PORT "${WAIT_TRIES:-$(( TP >= 8 ? 360 : 150 ))}"; then
   grep -aE "Error|assert|OutOfMemory|Page size|not divisible|no attribute" "$LOG" \
     | grep -avE "Ignore import" | tail -3
   kill -9 $SRV 2>/dev/null; wait $SRV 2>/dev/null
