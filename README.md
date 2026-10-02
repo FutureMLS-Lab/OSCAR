@@ -567,6 +567,8 @@ model (for GLM that is upstream's DSA path, for Gemma-4 `trtllm_mha`, the only
 FlashInfer-family backend its model file accepts). A GPU keep-alive that the
 cluster's idle-pod reaper requires during weight loads is paused while the
 server answers `/v1/models`, so no foreign kernel runs during a measurement.
+Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
+~19% in both arms (ratio unchanged), so TP 8 rows come from 96-core pods.
 
 | Model | INT2 ms/tok | BF16 triton ms/tok | BF16 FlashInfer ms/tok | INT2 vs FlashInfer |
 |---|---:|---:|---:|---:|
@@ -579,9 +581,9 @@ server answers `/v1/models`, so no foreign kernel runs during a measurement.
 | Gemma-4-12B-it | 19.98 | 18.45 | 6.66 (trtllm_mha) | 3.00× slower |
 | MiniMax-M2.7 | 25.80 | 69.01 | 8.20 | 3.15× slower |
 | GLM-4.7-FP8 | 26.68 | 74.49 | 9.73 | 2.74× slower |
-| GLM-5.2-FP8 | 14.32 | 10.52 (DSA, same backend both arms) | 10.52 (DSA) | 1.36× slower |
-| GLM-5.3 | 14.33 | 10.52 (DSA, same backend both arms) | 10.52 (DSA) | 1.36× slower |
-| MiniMax-M3 | 13.75 | 12.04 (MSA sparse, same backend both arms) | 9.01 | 1.53× slower |
+| GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
+| GLM-5.3 | pending (re-measure) | pending | pending (DSA) | |
+| MiniMax-M3 | pending (re-measure) | pending | pending | |
 | Kimi-K3 | pending | pending | pending (trtllm_mla) | |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
