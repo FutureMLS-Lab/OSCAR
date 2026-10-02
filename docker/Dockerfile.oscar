@@ -10,7 +10,7 @@
 #
 # where <context> holds this repository under ./oscar-src and the rotations
 # under ./rotations.
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.21-cu130
+ARG BASE_IMAGE=lmsysorg/sglang:nightly-dev-20261002-67eab570
 FROM ${BASE_IMAGE}
 
 ARG IMAGE_TAG=dev

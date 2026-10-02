@@ -383,6 +383,15 @@ if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     exit 1
 fi
 
+# SMOKE_ONLY=1 runs the verify harness's chat-template probe against this very
+# server and exits with its PASS/FAIL line, so a model the single-pod sweep
+# cannot host (Kimi-K3 spans two nodes) is judged by the same probe and judge.
+if [[ "${SMOKE_ONLY:-0}" == "1" ]]; then
+    OUT="${RUN_DIR}" source "${REPO_ROOT}/rotation/verify/_common.sh"
+    verify_probe_and_verdict "${NAME}" "${PORT}" "${LOG_SERVER}" | tee -a "${LOG_RUNNER}"
+    exit 0
+fi
+
 # BENCH_PREFILL swaps the client, not the server. Reusing the launch path above
 # is the entire point: the 64K number and the GPQA number then come from one
 # configuration, so a speed claim cannot quietly describe a setup that was never

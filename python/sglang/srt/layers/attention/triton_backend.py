@@ -2470,10 +2470,14 @@ class TritonAttnBackend(AttentionBackend):
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
-            loc = forward_batch.out_cache_loc // self.dcp_size
+            # The rank-local slot of a physical loc is physical.
+            loc = KVWriteLoc(
+                forward_batch.out_cache_loc // self.dcp_size,
+                physical=forward_batch.out_cache_loc_is_physical,
+            )
             if (
                 forward_batch.positions is not None
-                and forward_batch.positions.numel() == loc.numel()
+                and forward_batch.positions.numel() == loc.loc.numel()
             ):
                 dcp_kv_mask = forward_batch.positions % self.dcp_size == self.dcp_rank
             else:
@@ -2603,9 +2607,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                loc_info = KVWriteLoc(
-                    forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
+                loc_info = KVWriteLoc.for_batch(
+                    forward_batch,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
                     full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
                 # The OSCAR pools take a bare loc tensor, not a KVWriteLoc: they
@@ -3634,9 +3638,9 @@ class TritonAttnBackend(AttentionBackend):
                     # pool, refreshed into a capture-stable buffer before replay —
                     # translating inside set_kv_buffer would be captured and replay
                     # a stale v2p. None (-> raw loc) for static pools.
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,
@@ -3646,9 +3650,9 @@ class TritonAttnBackend(AttentionBackend):
                 self._set_kv_buffer(
                     forward_batch,
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,

@@ -89,7 +89,7 @@ MiniMax2.7
 | AIME 2025 | 0.7667 | **0.7667** | 0.0 pp |
 | MATH500 | 0.9379 | **0.9279** | −1.0 pp |
 
-</details>
+👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
 
 <details>
 <summary><b>MLA models — packed 2-bit latent (GLM-5.2, GLM-5.3, Kimi-K3)</b> </summary>
@@ -316,9 +316,11 @@ third_party/simple_evals/   git submodule — eval harness (needs git clone --re
 
 ## Setup
 
-The repository root is upstream SGLang `main` with the OSCAR low-bit KV cache
-added under `python/sglang/`. It is served from the official `lmsysorg/sglang`
-image with this tree laid over the image's editable `sglang` install, so there
+The repository root is upstream SGLang `main` (currently commit `67eab57057`)
+with the OSCAR low-bit KV cache added under `python/sglang/`. It is served from
+the official `lmsysorg/sglang` nightly image built from that same commit
+(`nightly-dev-20261002-67eab570`), with this tree laid over the image's editable
+`sglang` install, so there
 is no OSCAR-specific environment to assemble: `docker/Dockerfile.oscar` is the
 whole recipe. The QKV-dump fork `sglang-dump-qkv/` ships in the repo for
 calibration.
@@ -329,8 +331,9 @@ calibration.
   4 for Qwen3-32B / MiniMax-M2.7 / Gemma-4-12B, 8 for GLM-5.2 / GLM-5.3 /
   MiniMax-M3, 16 across two nodes for Kimi-K3. The verification sweep below
   runs on B200.
-- Docker with the NVIDIA container runtime. The base image carries CUDA 13.0,
-  torch 2.13, transformers 5.12, flashinfer and sgl-kernel; nothing is
+- Docker with the NVIDIA container runtime. The base image is the official
+  `lmsysorg/sglang` nightly the tree is merged to (CUDA 13.0, torch 2.13,
+  transformers 5.17, flashinfer 0.7, sglang-kernel 0.4.8); nothing is
   installed on the host.
 - HuggingFace access for the model weights, and the pre-fit rotations from the
   [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
@@ -482,15 +485,15 @@ transformers exactly as in sglang, because its tokenizer under transformers 5.12
 prepends no `<bos>` to raw text; the template carries the token and the model
 answers. A probe that bypasses the model's real input path measures the probe.
 
-| model | smoke on this tree |
+| model | smoke on this tree (base `67eab57057`) |
 |---|---|
-| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | PASS |
-| Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid GatedDeltaNet) | PASS |
-| Gemma-4-12B-it (hybrid SWA, dual head_dim) | PASS |
-| MiniMax-M2.7 | PASS |
-| GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | PASS |
-| MiniMax-M3 (MSA + INT2 staging) | PASS |
-| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | serves (two-node job); full GPQA in progress |
+| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | pending |
+| Qwen3.5-4B, Qwen3.5-35B-A3B (hybrid GatedDeltaNet) | pending |
+| Gemma-4-12B-it (hybrid SWA, dual head_dim) | pending |
+| MiniMax-M2.7 | pending |
+| GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | pending |
+| MiniMax-M3 (MSA + INT2 staging) | pending |
+| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | pending (two-node job) |
 
 **Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
 two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
@@ -512,11 +515,13 @@ Calibration-pipeline folders included on this branch (`rotation/<model>/`):
 
 ### Per-model GPQA: BF16 vs OSCAR INT2 (this tree)
 
-Every number below was produced on **this tree** (upstream SGLang `main` plus
-OSCAR, served from the image `docker/Dockerfile.oscar` builds); nothing is
-carried over from the earlier fork. Both arms of a row share one launch path
-(`rotation/run/<model>.sh`) and differ only in `KV_MODE`; GPQA-Diamond is
-single-seed at a 64K generation budget with radix cache and CUDA graphs on.
+The table is populated only from runs on **this tree at its current upstream
+base** (`67eab57057`, nightly image `nightly-dev-20261002-67eab570`); numbers
+from earlier bases are not carried over. Both arms of a row share one launch
+path (`rotation/run/<model>.sh`) and differ only in `KV_MODE`; GPQA-Diamond is
+single-seed, all 198 questions, at a 64K generation budget with radix cache
+and CUDA graphs on. The sweep starts once every model's smoke passes on this
+base.
 
 **The INT2 arm runs the model's own attention.** GLM-5.2/5.3 run upstream's
 DSA sparse attention (flashmla_sparse prefill, trtllm sparse decode) with the
@@ -527,49 +532,31 @@ dense GQA. The BF16 control uses the same backend in every row.
 
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
 |---|---|---|---:|---:|---:|
-| `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 65.15 | 62.12 | −3.03 |
-| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 57.58 | 52.53 | −5.05 |
-| `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | running | 61.11 | |
-| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.62 | 56.06 | −5.56 |
-| `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 76.77 | 72.22 | −4.55 |
-| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 83.33 | 82.32 | −1.01 |
-| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 64.14 | 65.15 | +1.01 |
-| `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | queued | running | |
-| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | queued | queued | |
-| `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | running | 83.84 | |
-| `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | queued | queued | |
-| `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | queued | queued | |
-| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | queued | running | |
-
-Single-seed GPQA at n=198 has a standard error of about 3.4 points, so a Δ
-inside that band is noise; the one row that is not noise-shaped is Qwen3-8B,
-whose INT2 answers are also longer (60.0k vs 47.1k characters on average).
+| `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | pending | pending | |
+| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | pending | pending | |
+| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | pending | pending | |
+| `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | pending | pending | |
+| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | pending | pending | |
+| `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | pending | pending | |
+| `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | pending | pending | |
+| `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | pending | pending | |
+| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | pending | pending | |
 
 ### 64K decode on B200 (this tree)
 
 Batch size 1, a 65,536-token prompt followed by 512 generated tokens, median
-of three repeats. The BF16 column is the same model on the triton backend
-(what OSCAR's INT2 kernels replace); the FlashInfer column is the fastest
-BF16 baseline that serves the model (for GLM that is upstream's DSA path).
+of three repeats; measured after the GPQA sweep on the same base. The BF16
+column is the same model on the triton backend (what OSCAR's INT2 kernels
+replace); the FlashInfer column is the fastest BF16 baseline that serves the
+model (for GLM that is upstream's DSA path).
 
 | Model | INT2 ms/tok | BF16 triton ms/tok | BF16 FlashInfer ms/tok | INT2 vs FlashInfer |
 |---|---:|---:|---:|---:|
-| Qwen3-4B-Thinking | 12.02 | 33.36 | 4.47 | 2.69× slower |
-| Qwen3-8B | 13.65 | 34.99 | 5.55 | 2.46× slower |
-| Qwen3-32B | 22.13 | 60.80 | 9.79 | 2.26× slower |
-| Qwen3-30B-A3B | 14.01 | 42.39 | 3.69 | 3.80× slower |
-| Qwen3.5-4B | 5.61 | 11.07 | 2.95 | 1.90× slower |
-| Qwen3.5-35B-A3B | 6.74 | 13.72 | 2.60 | 2.59× slower |
-| Gemma-4-12B-it | 19.93 | 18.41 | — (head_dim 512) | — |
-| MiniMax-M2.7 | 21.64 | 57.98 | 7.22 | 3.00× slower |
-| MiniMax-M3 | 14.48 | running | running | |
-| GLM-5.2-FP8 (DSA) | 12.52 | 8.85 | 8.94 | 1.40× slower |
-| GLM-5.3 (DSA) | 12.46 | 9.43 | 9.24 | 1.35× slower |
-
-INT2 trades decode speed for KV memory: 2–3× faster than the triton BF16
-path it replaces, 1.4–3.8× slower than the FlashInfer-family BF16 kernels.
-The memory side is the point — 4.00× on the MLA latent, and the per-head INT2
-pool keeps only the sink and recent windows in BF16.
+| (pending the sweep on this base) | | | | |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 

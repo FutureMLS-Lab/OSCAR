@@ -20,10 +20,13 @@ smoke test before the next.
 ## Environment
 
 Upstream pins torch 2.13 / CUDA 13.0 / flashinfer 0.7.0.post1 /
-sglang-kernel 0.4.8 / transformers 5.17. The OSCAR image is built FROM the
-official `lmsysorg/sglang:v0.5.21-cu130` (main is 166 commits past v0.5.21)
-with this repository laid over it. Every number in the verification table has
-to be re-measured on this stack; the numbers in PR #26 are the old tree's.
+sglang-kernel 0.4.8 / transformers 5.17. The tree is merged to upstream main
+`67eab57057` (2026-10-01) and the OSCAR image is built FROM the official
+nightly built from that exact commit, `lmsysorg/sglang:nightly-dev-20261002-67eab570`
+(digest `sha256:352f1373...`), with this repository laid over it. The first
+port landed on the v0.5.21 merge-base `bd78095030` (image
+`lmsysorg/sglang:v0.5.21-cu130`); every number measured there is void and the
+verification restarts on this base: all 12 smokes first, then the 64K sweep.
 
 ## Phases
 
