@@ -552,7 +552,7 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 83.8 | −3.5 (INT2 answers run longer: median 63K vs 32K chars, 24 vs 9 without a final answer) |
 | `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 84.3 | −3.0 (INT2 answers run longer: median 51K vs 31K chars, 21 vs 8 without a final answer) |
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | pending | pending | |
-| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | pending | pending | |
+| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | 90.9 | 93.4 | +2.5 |
 
 [^two]: Two independent draws per arm, listed first draw then second. A
     single-seed pair whose gap was out of line with the other rows was sampled
