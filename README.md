@@ -586,7 +586,7 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 | GLM-4.7-FP8 | 26.68 | 74.49 | 9.73 | 2.74× slower |
 | GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
 | GLM-5.3 | 11.99 | 8.82 (DSA, same backend both arms) | 8.81 (DSA) | 1.36× slower |
-| MiniMax-M3 | pending (re-measure) | pending | pending | |
+| MiniMax-M3 | 14.79 | 11.19 (MSA sparse, same backend both arms) | 8.67 | 1.71× slower |
 | Kimi-K3 | pending | pending | pending (trtllm_mla) | |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
