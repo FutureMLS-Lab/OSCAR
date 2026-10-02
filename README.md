@@ -548,11 +548,24 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 86.9, 81.8 [^two] | 79.3, 83.8 [^two] | −2.8 (means) |
 | `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 62.1, 63.1 [^two] | 69.7, 64.1 [^two] | +4.3 (means) |
 | `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | 86.9 | 87.9 | +1.0 |
-| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | pending | pending | |
+| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | 90.9 | 88.9 | −2.0 (after the indexer-key fix below; 56.6 before it) |
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 83.8 | −3.5 (INT2 answers run longer: median 63K vs 32K chars, 24 vs 9 without a final answer) |
 | `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 84.3 | −3.0 (INT2 answers run longer: median 51K vs 31K chars, 21 vs 8 without a final answer) |
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | pending | pending | |
 | `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | 90.9 | 93.4 | +2.5 |
+
+**MiniMax-M3 scored 56.6 on the first INT2 run of this base.** The BF16 control
+(90.9, same MSA backend) ruled out noise: 47 of 198 INT2 answers had no final
+letter and 12 ended by asking for the question after pages of correct reasoning.
+The cause was in the INT2 pool, not the kernels: the decode flush demotes
+recent-window rows into int2 slots and remaps `req_to_token`, but the lightning
+indexer's key rows written at the window slots did not move with them, so after
+a few hundred generated tokens the indexer scored every flushed token --
+including the question beyond the 64-token BF16 prefix -- against zeros. The
+pool now moves those rows in the same step (`on_flush_applied`); the re-run on
+the fixed tree scores 88.9 (8/12 discordant against BF16, p = 0.5) with 6
+unanswered questions against BF16's 5. The smoke suite gained the retention
+probe described above because the fluency probes had passed on the broken pool.
 
 [^two]: Two independent draws per arm, listed first draw then second. A
     single-seed pair whose gap was out of line with the other rows was sampled
