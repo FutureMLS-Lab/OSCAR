@@ -485,6 +485,14 @@ transformers exactly as in sglang, because its tokenizer under transformers 5.12
 prepends no `<bos>` to raw text; the template carries the token and the model
 answers. A probe that bypasses the model's real input path measures the probe.
 
+A third probe checks that the prompt survives a long generation: a code word
+placed after ~130 tokens of filler (so it sits in the BF16 recent window at
+prefill and is demoted to int2 slots by the decode flush), an 800-word essay,
+then the code word on the last line; a missing code word is `FAIL(no-recall)`.
+It exists because MiniMax-M3 passed the fluency probes while scoring 56.6
+against a 90.9 BF16 control on GPQA: its indexer keys were left behind by the
+flush, and nothing in the earlier probes re-read the prompt.
+
 | model | smoke on this tree (base `67eab57057`) |
 |---|---|
 | Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | PASS |
