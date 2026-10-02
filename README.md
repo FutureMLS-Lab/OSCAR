@@ -490,7 +490,7 @@ answers. A probe that bypasses the model's real input path measures the probe.
 | MiniMax-M2.7 | PASS |
 | GLM-5.2-FP8, GLM-5.3 (DSA + packed 2-bit latent) | PASS |
 | MiniMax-M3 (MSA + INT2 staging) | PASS |
-| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | serves (two-node job); GPQA n=48 @64K BF16 93.75 / INT2 93.75 |
+| Kimi-K3 (TP 8 × PP 2, packed 2-bit latent) | serves (two-node job); full GPQA in progress |
 
 **Kimi-K3 is verified separately, not by this sweep.** It needs 16 GPUs across
 two nodes (tp 8 × pp 2, 1.4 TB of MXFP4 weights) and the sweep is one pod with
@@ -539,7 +539,7 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | running | 83.84 | |
 | `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | queued | queued | |
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | queued | queued | |
-| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 48 / 64K | 93.75 | 93.75 | 0.00 |
+| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | queued | running | |
 
 Single-seed GPQA at n=198 has a standard error of about 3.4 points, so a Δ
 inside that band is noise; the one row that is not noise-shaped is Qwen3-8B,
