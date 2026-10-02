@@ -221,15 +221,12 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
         (
             # Dynamo cannot trace the MiniMax sparse backend's extend path on
-            # the triton attention backend -- upstream's BF16 path included --
-            # and dies at capture with "Unsupported: Import failure"; the OSCAR
-            # int2 staging path needs triton, so it is covered either way.
-            "MiniMax sparse attention on the triton backend or the OSCAR int2 KV",
+            # the triton and flashinfer attention backends -- upstream's BF16
+            # path included -- and dies at capture with "Unsupported: Import
+            # failure". Only the cookbook's fa4 (MSA) recipe is left alone.
+            "MiniMax sparse attention off the fa4 recipe",
             lambda: _is_minimax_sparse_model(server_args)
-            and (
-                cfg.kv_cache_dtype == "int2"
-                or attention_backends_of(resolved_view(server_args))[0] == "triton"
-            ),
+            and attention_backends_of(resolved_view(server_args))[0] != "fa4",
         ),
         (
             "multimodal model",
