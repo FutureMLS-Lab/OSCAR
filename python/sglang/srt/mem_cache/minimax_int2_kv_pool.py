@@ -7,7 +7,11 @@ layers and the sparse layers alike -- live in ``UnifiedInt2HPKVPool`` (packed
 INT2 codes plus the BF16 prefix / recent windows, one flat slot id space), and
 the index-key cache is carried beside it with one row per slot of that space,
 window slots included. Slot ids come straight out of ``req_to_token``, so a
-prefix-cache hit, a window promotion or a flush needs no bookkeeping here.
+prefix-cache hit or a window promotion needs no bookkeeping here. The decode
+flush does: it demotes HP-recent rows into quant slots and remaps
+``req_to_token``, and the index rows written at the old window slots must move
+with them (``on_flush_applied``), or the indexer scores every flushed token --
+the question itself, beyond the 64-token prefix -- against zeros.
 
 The index cache is NOT quantized: the indexer reads it through the ordinary
 sparse kernels over the real page table, and it is not what attention reads.
@@ -42,6 +46,21 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
+
+
+def follow_flush(side_cache: torch.Tensor, plan, hp_global_offset: int) -> None:
+    """Carry a slot-indexed side cache ``[num_layers, num_slots, ...]`` along
+    with one decode flush. For each demoted token the plan names the window
+    slot it left (``src_hp_slot``, local to the window arena) and the quant
+    slot it now occupies (``dst_quant_slots``); entries with ``valid_mask == 0``
+    copy a slot onto itself, so the update stays one device-side index op
+    with no host sync."""
+    if plan is None or side_cache.numel() == 0:
+        return
+    valid = plan.valid_mask.to(torch.bool)
+    dst = plan.dst_quant_slots.to(torch.int64)
+    src = torch.where(valid, plan.src_hp_slot.to(torch.int64) + hp_global_offset, dst)
+    side_cache[:, dst] = side_cache[:, src]
 
 
 def index_cache_slots(pool: UnifiedInt2HPKVPool) -> int:
@@ -109,18 +128,22 @@ class MiniMaxInt2SparseKVPool(UnifiedInt2HPKVPool):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                for lid in local_sparse:
-                    self.index_k_buffer[lid] = torch.zeros(
-                        (n_slots, 1, self.idx_head_dim),
-                        dtype=self.index_store_dtype,
-                        device=self.device,
-                    )
-                for lid in local_kv_sparse:
-                    self.index_v_buffer[lid] = torch.zeros(
-                        (n_slots, 1, self.idx_head_dim),
-                        dtype=self.index_store_dtype,
-                        device=self.device,
-                    )
+                # One tensor per side so a flush or a move updates every
+                # layer in a single index op; the per-layer dict holds views.
+                self._index_k_all = torch.zeros(
+                    (len(local_sparse), n_slots, 1, self.idx_head_dim),
+                    dtype=self.index_store_dtype,
+                    device=self.device,
+                )
+                for i, lid in enumerate(local_sparse):
+                    self.index_k_buffer[lid] = self._index_k_all[i]
+                self._index_v_all = torch.zeros(
+                    (len(local_kv_sparse), n_slots, 1, self.idx_head_dim),
+                    dtype=self.index_store_dtype,
+                    device=self.device,
+                )
+                for i, lid in enumerate(local_kv_sparse):
+                    self.index_v_buffer[lid] = self._index_v_all[i]
 
         index_bytes = self.get_index_cache_size_bytes()
         self.mem_usage += index_bytes / GB
@@ -264,7 +287,10 @@ class MiniMaxInt2SparseKVPool(UnifiedInt2HPKVPool):
         # The index caches span the whole slot space, so a move is tier-agnostic.
         tgt = tgt_loc.to(torch.int64)
         src = src_loc.to(torch.int64)
-        for buf in self.index_k_buffer.values():
-            buf[tgt] = buf[src]
-        for buf in self.index_v_buffer.values():
-            buf[tgt] = buf[src]
+        for side in (self._index_k_all, self._index_v_all):
+            if side.numel():
+                side[:, tgt] = side[:, src]
+
+    def on_flush_applied(self, plan) -> None:
+        for side in (self._index_k_all, self._index_v_all):
+            follow_flush(side, plan, int(self.hp_global_offset))

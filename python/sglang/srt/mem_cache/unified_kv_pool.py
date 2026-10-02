@@ -1038,6 +1038,14 @@ class UnifiedInt2HPKVPool(KVCache):
                 self.hp_k_buffer[l][tgt_hp] = self.hp_k_buffer[l][src_hp]
                 self.hp_v_buffer[l][tgt_hp] = self.hp_v_buffer[l][src_hp]
 
+    def on_flush_applied(self, plan) -> None:
+        """Runs once per decode step after the HP -> int2 flush has demoted rows
+        and remapped ``req_to_token``. K/V need nothing here: the flush kernel
+        wrote the quant slots itself. A pool that keeps a side cache keyed by
+        slot id (the MiniMax indexer keys) moves those rows along in its
+        override; ``plan`` is the ``FlushPlan`` the kernels consumed."""
+        return None
+
     def get_cpu_copy(self, indices):
         raise NotImplementedError("CPU offload is not supported by UnifiedInt2HPKVPool")
 

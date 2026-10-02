@@ -870,6 +870,9 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
                 k_sz_layers=g["k_sz_layers"],
                 v_sz_layers=g["v_sz_layers"],
             )
+        # Side caches keyed by slot id (MiniMax indexer keys) must follow the
+        # demoted rows, or the indexer reads zeros for every flushed token.
+        kv_pool.on_flush_applied(plan)
 
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens

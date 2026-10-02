@@ -213,7 +213,7 @@ PY
 # Probes a live server and prints the verdict. $1 name, $2 port, $3 logfile.
 verify_probe_and_verdict() {
   local name=$1 port=$2 log=$3
-  local pre r r2 garb tb cg rx pool
+  local pre r r2 r3 garb tb cg rx pool
 
   # 24 repeats: long enough to exceed the cache's block granularity.
   pre=$(python3 -c "print('The following is a reference passage about European geography. ' * 24)")
@@ -228,6 +228,20 @@ verify_probe_and_verdict() {
   r2=$(verify_gen "$port" "Explain in detail, step by step, how a four-stroke internal combustion engine works, covering each stroke, valve timing, and the thermodynamic cycle." 2048)
   echo "  probe2: $(echo "$r2" | head -c 130) ... [$(echo "$r2" | wc -c) bytes]"
 
+  # Prompt retention across a long generation. The BF16 prefix covers the first
+  # 64 tokens only; a code word placed after ~130 tokens of filler sits in the
+  # recent window at prefill and is demoted to int2 slots by the decode flush
+  # within the first few hundred generated tokens. MiniMax-M3 scored 56.6 vs
+  # 90.9 on GPQA because its indexer keys were left behind by that flush, while
+  # the engine probe above stayed fluent: nothing in it re-reads the prompt.
+  local code_word="orchid-granite-$(( RANDOM % 9000 + 1000 ))"
+  local filler
+  filler=$(python3 -c "print('The quick brown fox jumps over the lazy dog near the old river bank. ' * 10)")
+  r3=$(verify_gen "$port" "$filler Remember this code word: $code_word. Now write a detailed essay of about 800 words on the history of the printing press. After the essay, on its own last line, write the code word exactly." 1600)
+  local recall=MISS
+  printf '%s' "$r3" | grep -q "$code_word" && recall=OK
+  echo "  probe3: recall=$recall ($(echo "$r3" | wc -c) bytes)"
+
   garb=$(verify_judge "$r2")
   # Keep the judged response. A verdict with no artifact cannot be argued with:
   # when qwen3-4b-think came back "token-run 374; tail-collapse 0.00" there was
@@ -236,6 +250,10 @@ verify_probe_and_verdict() {
   if [ -n "${OUT:-}" ] && [ "$garb" != "CLEAN" ]; then
     printf '%s' "$r2" > "$OUT/$name.probe.json" 2>/dev/null &&
       echo "  saved : $OUT/$name.probe.json ($(printf '%s' "$r2" | wc -c) bytes)"
+  fi
+  if [ -n "${OUT:-}" ] && [ "$recall" = "MISS" ]; then
+    printf '%s' "$r3" > "$OUT/$name.probe3.json" 2>/dev/null &&
+      echo "  saved : $OUT/$name.probe3.json ($(printf '%s' "$r3" | wc -c) bytes)"
   fi
   tb=$(grep -ac Traceback "$log")          # BEFORE teardown
   cg=$(grep -aciE "capture .*graph|cuda[ _]graph" "$log")
@@ -247,6 +265,7 @@ verify_probe_and_verdict() {
 
   local v=PASS
   [ "$tb"   != "0"     ] && v=FAIL
+  [ "$recall" = "MISS" ] && v="FAIL(no-recall)"
   [ "$cg"   = "0"      ] && v="FAIL(no-cuda-graph)"
   [ "$rx"   = "0"      ] && v="FAIL(no-prefix-cache)"
   case "$garb" in
