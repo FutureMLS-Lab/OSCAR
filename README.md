@@ -644,19 +644,21 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 
 #### Decode-speed knobs (dense INT2 path)
 
-Three settings decide how the mixed HP+INT2 decode kernel is launched. All
+These settings decide how the mixed HP+INT2 decode kernel is launched. All
 are on by default; each can be switched off on its own for an A/B.
 
 | Env | Default | What it changes |
 |:---|:---:|:---|
-| `SGLANG_INT2_MAX_SPLITS` | `32` | Split ceiling for the INT2 tier. The stage-1 grid is `batch × head-tiles × splits` programs, so the shared cap of 8 leaves most of a B200 idle at batch 1; INT2 reads 8× fewer bytes per token than BF16, so more splits stay bandwidth-feasible. The per-request count is still adaptive (~128·√batch-token chunks); only the ceiling moves. The HP window keeps `SGLANG_MIXED_KV_HP_MAX_SPLITS`. |
+| `SGLANG_INT2_MAX_SPLITS` | `64` | Split ceiling for the INT2 tier. The stage-1 grid is `batch × head-tiles × splits` programs, so the shared cap of 8 leaves most of a B200 idle at batch 1 (the kernel moves ~150 GB/s there: it is short of resident programs, not bandwidth). Measured at 64K / bs=1 on Qwen3-8B (B200): 206 µs per layer at 8 splits, 74 at 32, 59 at 64 with the 64-token tile below; FlashInfer BF16 on the same shape is ~56 µs. The per-request count is still adaptive; only the ceiling moves. The HP window keeps `SGLANG_MIXED_KV_HP_MAX_SPLITS`. |
 | `SGLANG_OSCAR_FUSED_STAGE1` | `1` | One grid for the HP window and the INT2 tier (`program_id(2)` below the HP split count selects the tier) instead of two launches. Each tier body is the standalone kernel's; `rotation/tests/test_int2_fused_stage1_gpu.py` asserts the partial states are bit-identical to the two-launch path and that the kernel replays inside a CUDA graph. |
 | `SGLANG_OSCAR_FAST_ROT` | `1` | Decode `q @ R_k` and `o @ R_vᵀ` through one Triton launch each (`sglang/QuantKernel/oscar_rotate_rows.py`) instead of a cuBLAS GEMM plus its copy kernels; per-KV-head rotations are read in place, with no `repeat_interleave`. bf16 in, fp32 accumulate, bf16 out, held to one bf16 ulp by `rotation/tests/test_rotate_rows_gpu.py`. |
+| `SGLANG_INT2_FAST_STAGE2` | `1` | Reduce the split partials with one program per (request, head, 16-wide slice of head_dim) instead of one serial loop per (request, head). The serial kernel's time grows with the split count (6.5 µs at 40 splits, ~21 µs at 72); the parallel one stays under 3 µs. Only when no LSE is requested; held to one bf16 ulp of the serial result. |
+| `SGL_INT2_BLOCK_N` / `SGL_INT2_BLOCK_H` / `SGL_INT2_NUM_WARPS` / `SGL_INT2_NUM_STAGES` | shape-dependent | Stage-1 tile. The bs<4 row is `64/8/2/3` (B200-measured; the previous `128/8/4/3` plateaus at 72–75 µs past 32 splits); batch ≥4 rows keep the H100-era settings. |
 
-The table above was measured before these three came back onto this tree
-(they existed on the pre-rebase branch and were dropped by the rebase); the
-dense rows are being re-measured in one pod per model, with a same-pod
-ablation of each knob, and will be replaced as they land.
+The table above was measured before these came back onto this tree (the
+first three existed on the pre-rebase branch and were dropped by the rebase;
+the B200 tuning is new); the dense rows are being re-measured in one pod per
+model, with a same-pod ablation ladder, and will be replaced as they land.
 
 ## How the rotation is fit (spectral covariance)
 
