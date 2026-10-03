@@ -642,6 +642,22 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
+#### Decode-speed knobs (dense INT2 path)
+
+Three settings decide how the mixed HP+INT2 decode kernel is launched. All
+are on by default; each can be switched off on its own for an A/B.
+
+| Env | Default | What it changes |
+|:---|:---:|:---|
+| `SGLANG_INT2_MAX_SPLITS` | `32` | Split ceiling for the INT2 tier. The stage-1 grid is `batch × head-tiles × splits` programs, so the shared cap of 8 leaves most of a B200 idle at batch 1; INT2 reads 8× fewer bytes per token than BF16, so more splits stay bandwidth-feasible. The per-request count is still adaptive (~128·√batch-token chunks); only the ceiling moves. The HP window keeps `SGLANG_MIXED_KV_HP_MAX_SPLITS`. |
+| `SGLANG_OSCAR_FUSED_STAGE1` | `1` | One grid for the HP window and the INT2 tier (`program_id(2)` below the HP split count selects the tier) instead of two launches. Each tier body is the standalone kernel's; `rotation/tests/test_int2_fused_stage1_gpu.py` asserts the partial states are bit-identical to the two-launch path and that the kernel replays inside a CUDA graph. |
+| `SGLANG_OSCAR_FAST_ROT` | `1` | Decode `q @ R_k` and `o @ R_vᵀ` through one Triton launch each (`sglang/QuantKernel/oscar_rotate_rows.py`) instead of a cuBLAS GEMM plus its copy kernels; per-KV-head rotations are read in place, with no `repeat_interleave`. bf16 in, fp32 accumulate, bf16 out, held to one bf16 ulp by `rotation/tests/test_rotate_rows_gpu.py`. |
+
+The table above was measured before these three came back onto this tree
+(they existed on the pre-rebase branch and were dropped by the rebase); the
+dense rows are being re-measured in one pod per model, with a same-pod
+ablation of each knob, and will be replaced as they land.
+
 ## How the rotation is fit (spectral covariance)
 
 For each transformer layer, given calibration `(Q, K, V)` activations, OSCAR estimates two attention-aware **covariance** matrices and uses their eigenspectra to derive rotations:
