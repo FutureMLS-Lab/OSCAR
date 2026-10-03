@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
     load_oscar_rotation_config,
+    load_oscar_rotation_field,
     load_oscar_rotations,
 )
 from sglang.srt.mem_cache.oscar_calibration import (
@@ -132,6 +133,32 @@ def compute_recent_ring_size(hp_recent_tokens: int, n_q: int) -> int:
     return int(hp_recent_tokens) + int(n_q) - 1
 
 
+
+
+def _shard_head_vectors(mean, local_head_num: int, tp_rank: int):
+    """``_shard_rotation_heads`` for per-head vectors: a stacked
+    ``[L, H, hd]`` tensor or a per-layer list of ``[H, hd]`` keeps only this
+    rank's KV heads; shared ``[hd]`` vectors pass through."""
+
+    def _slice(m):
+        if m.dim() != 2:
+            return m
+        total = m.shape[0]
+        if total == local_head_num:
+            return m
+        if total % local_head_num != 0:
+            raise ValueError(
+                f"per-head key mean has {total} KV heads, which is not a "
+                f"multiple of this rank's {local_head_num}"
+            )
+        beg = tp_rank * local_head_num
+        return m[beg : beg + local_head_num].contiguous()
+
+    if isinstance(mean, (list, tuple)):
+        return [_slice(m) for m in mean]
+    if mean.dim() == 3:
+        return torch.stack([_slice(m) for m in mean], dim=0)
+    return mean
 
 
 def _rotate_heads(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
@@ -420,6 +447,59 @@ class UnifiedInt2HPKVPool(KVCache):
         _bk, _bv = _rot_shape(self._R_k), _rot_shape(self._R_v)
         self._R_k = _shard_rotation_heads(self._R_k, self.head_num, _tp_rank)
         self._R_v = _shard_rotation_heads(self._R_v, self.head_num, _tp_rank)
+        # OSCAR-2 transform family: a non-orthogonal key transform ships the
+        # query-side matrix R_k^{-T} as ``q_rotation``, a non-orthogonal value
+        # transform ships R_v^{-T} as ``o_rotation`` (applied as o @ O^T), and
+        # key centering ships ``k_mean``. Each defaults to the orthogonal
+        # behaviour (alias of the rotation, no mean) when absent, so V1
+        # checkpoints and calibrating launches are unchanged.
+        self._Q_k = load_oscar_rotation_field(
+            self._oscar_cfg.k_rotation_path,
+            "q_rotation",
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=k_head_dim_arg,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+            layer_ids=self._rotation_layer_ids,
+        )
+        self._O_v = load_oscar_rotation_field(
+            self._oscar_cfg.v_rotation_path,
+            "o_rotation",
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=v_head_dim_arg,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+            layer_ids=self._rotation_layer_ids,
+        )
+        self._k_mean = load_oscar_rotation_field(
+            self._oscar_cfg.k_rotation_path,
+            "k_mean",
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=k_head_dim_arg,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+            layer_ids=self._rotation_layer_ids,
+            vector=True,
+        )
+        if self._Q_k is not None:
+            self._Q_k = _shard_rotation_heads(self._Q_k, self.head_num, _tp_rank)
+        else:
+            self._Q_k = self._R_k
+        if self._O_v is not None:
+            self._O_v = _shard_rotation_heads(self._O_v, self.head_num, _tp_rank)
+        else:
+            self._O_v = self._R_v
+        if self._k_mean is not None:
+            self._k_mean = _shard_head_vectors(self._k_mean, self.head_num, _tp_rank)
+        logger.info(
+            "UnifiedInt2HPKVPool: OSCAR-2 transforms: key %s, value %s, centering %s",
+            "non-orthogonal (q_rotation)" if self._Q_k is not self._R_k else "orthogonal",
+            "non-orthogonal (o_rotation)" if self._O_v is not self._R_v else "orthogonal",
+            "on (k_mean)" if self._k_mean is not None else "off",
+        )
         logger.info(
             "UnifiedInt2HPKVPool: rotation shard rank=%d local_kv_heads=%d "
             "K %s -> %s | V %s -> %s",
@@ -1118,6 +1198,17 @@ class UnifiedInt2HPKVPool(KVCache):
         hp_loc_global = loc64[hp_mask] - self._hp_offset
         return quant_loc, hp_loc_global, hp_mask
 
+    def _centered_keys(self, idx: int, cache_k: torch.Tensor) -> torch.Tensor:
+        """Subtract the per-head key mean (OSCAR-2 centering) before the key
+        rotation. Every stored key -- HP window and INT2 tier alike -- and the
+        extend-time keys are centered the same way, so all logits shift by
+        the same per-head constant and the softmax is unchanged; nothing on
+        the read side needs the mean. ``cache_k`` is
+        ``[tokens, local_kv_heads, head_dim]``."""
+        if self._k_mean is None:
+            return cache_k
+        return cache_k - self._k_mean[idx].to(cache_k.dtype)
+
     def _rotate_kv_inplace(
         self,
         layer_id: int,
@@ -1132,7 +1223,9 @@ class UnifiedInt2HPKVPool(KVCache):
         loaded in ``__init__``.
         """
         idx = self._layer_index(layer_id)
-        k_hp = _rotate_heads(cache_k.to(self.hp_dtype), self._R_k[idx])
+        k_hp = _rotate_heads(
+            self._centered_keys(idx, cache_k.to(self.hp_dtype)), self._R_k[idx]
+        )
         if v_rotation_absorbed:
             v_hp = cache_v.to(self.hp_dtype)
         else:
@@ -1215,6 +1308,7 @@ class UnifiedInt2HPKVPool(KVCache):
             and not already_hadamard_transformed
             and v_rotation_absorbed
             and clip_on
+            and self._k_mean is None  # the fused kernel does not center keys
             and self._pq_k is None
             and _get_num_scale_groups(self.k_scales_zeros[idx]) == 1
             and _get_num_scale_groups(self.v_scales_zeros[idx]) == 1

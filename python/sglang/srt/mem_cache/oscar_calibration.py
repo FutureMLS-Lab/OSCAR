@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -27,6 +28,8 @@ from sglang.srt.mem_cache.oscar_rotation_paths import (
     get_oscar_checkpoint_pair,
     get_oscar_pair_artifact_paths,
 )
+
+logger = logging.getLogger(__name__)
 
 _GRAM_CHUNK_TOKENS = 512
 _COVARIANCE_CHUNK_TOKENS = 2048
@@ -324,6 +327,77 @@ class OscarOnlineCalibrator:
             numerator.add_(torch.einsum("th,thd,the->hde", energy, v_chunk, v_chunk))
         return numerator / denominator.clamp_min(1e-12)[:, None, None]
 
+    def save_moments(self, directory: Path) -> str:
+        """Write this rank's per-(layer, local KV head) sufficient statistics
+        so the OSCAR-2 transform family (per-head, centered, NOVA / flat /
+        fixed-rate key metrics, output-aware values) can be fitted offline by
+        ``rotation/tools/fit_oscar2_variants.py`` without re-running the model:
+
+        * ``M_q``  ``[H, hd, hd]``   mean of ``q^T q`` over the tokens and the
+                                      query heads that read each KV head
+        * ``k_sum`` ``[H, hd]``       sum of ``k`` over tokens
+        * ``M_k``  ``[H, hd, hd]``   sum of ``k^T k`` over tokens
+        * ``S_v``  ``[H, vd, vd]``   attention-energy-weighted value covariance
+                                      (the V objective of ``sst``)
+        * ``count``                   tokens behind every sum
+
+        Each TP rank writes its own heads (``oscar_moments_rank<r>.pt``); the
+        fitter merges them. Float64 throughout, like the rotations.
+        """
+        if not self.complete:
+            raise RuntimeError("OSCAR calibration moments requested before the token budget was met")
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        layers: dict = {}
+        for layer_id in self.local_layers:
+            q_cov = self._q_grams[layer_id] / (self.token_budget * self._gqa_ratios[layer_id])
+            k_sum = torch.zeros((self.local_kv_heads, self.head_dim), dtype=torch.float64, device=self.device)
+            m_k = torch.zeros(
+                (self.local_kv_heads, self.head_dim, self.head_dim), dtype=torch.float64, device=self.device
+            )
+            for start in range(0, self.token_budget, _COVARIANCE_CHUNK_TOKENS):
+                stop = min(start + _COVARIANCE_CHUNK_TOKENS, self.token_budget)
+                k_chunk = self._k_values[layer_id][start:stop].to(
+                    device=self.device, dtype=torch.float64, non_blocking=True
+                )
+                k_sum.add_(k_chunk.sum(dim=0))
+                m_k.add_(torch.einsum("thd,the->hde", k_chunk, k_chunk))
+            s_v = self._energy_weighted_v_covariance(layer_id, q_cov)
+            layers[layer_id] = {
+                "M_q": q_cov.detach().cpu(),
+                "k_sum": k_sum.cpu(),
+                "M_k": m_k.cpu(),
+                "S_v": s_v.detach().cpu(),
+                "count": self.token_budget,
+            }
+        payload = {
+            "format_version": 1,
+            "model_path": self.model_path,
+            "model_revision": self.model_revision,
+            "prompt_sha256": self.prompt_sha256,
+            "tokens": self.token_budget,
+            "tp_rank": self.tp_rank,
+            "tp_size": self.tp_size,
+            "local_kv_heads": self.local_kv_heads,
+            "global_kv_heads": self.total_kv_heads,
+            "global_q_heads": self.total_q_heads,
+            "head_dim": self.head_dim,
+            "v_head_dim": self.v_head_dim,
+            "layers": layers,
+        }
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"oscar_moments_rank{self.tp_rank}.pt"
+        tmp = str(path) + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        logger.info(
+            "OSCAR calibration moments for %d layers x %d KV heads written to %s",
+            len(layers),
+            self.local_kv_heads,
+            path,
+        )
+        return str(path)
+
     def allocate_result_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         num_layers = len(self.local_layers)
         k_rotations = torch.empty(
@@ -343,6 +417,9 @@ class OscarOnlineCalibrator:
         rotation buffers there; other ranks receive them in ``broadcast``."""
         if self.state != "collecting":
             raise RuntimeError(f"Cannot finalize OSCAR calibrator from state={self.state}")
+        if envs.SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS.get():
+            k_path, _ = get_oscar_checkpoint_pair()
+            self.save_moments(Path(os.path.dirname(k_path)))
         if self.tp_group is not None and self.tp_group.world_size > 1:
             torch.distributed.all_reduce(covariance_sums, group=self.tp_group.device_group)
         covariances = covariance_sums / self.total_kv_heads

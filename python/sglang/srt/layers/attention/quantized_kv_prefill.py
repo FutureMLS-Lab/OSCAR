@@ -98,6 +98,28 @@ def _pool_uses_oscar_rotation(kv_pool) -> bool:
     return getattr(kv_pool, "_R_k", None) is not None
 
 
+def oscar_q_rotation(kv_pool, layer_idx: int) -> torch.Tensor:
+    """Matrix the query is rotated with for layer ``layer_idx``: the key
+    rotation itself for an orthogonal key transform, ``R_k^{-T}`` (shipped as
+    ``q_rotation``) for a non-orthogonal one."""
+    Q = getattr(kv_pool, "_Q_k", None)
+    return (Q if Q is not None else kv_pool._R_k)[layer_idx]
+
+
+def oscar_o_rotation(kv_pool, layer_idx: int) -> torch.Tensor:
+    """Matrix ``O`` the attention output is un-rotated with (``o @ O.T``):
+    the value rotation for an orthogonal value transform, ``R_v^{-T}``
+    (shipped as ``o_rotation``) for a non-orthogonal one."""
+    O = getattr(kv_pool, "_O_v", None)
+    return (O if O is not None else kv_pool._R_v)[layer_idx]
+
+
+def oscar_k_mean(kv_pool, layer_idx: int) -> Optional[torch.Tensor]:
+    """Per-head key mean subtracted before the key rotation, or ``None``."""
+    mean = getattr(kv_pool, "_k_mean", None)
+    return None if mean is None else mean[layer_idx]
+
+
 def _apply_oscar_rotation(
     tensor: torch.Tensor, R: torch.Tensor, kv_group_num: int = 1
 ) -> torch.Tensor:
@@ -139,6 +161,8 @@ def prepare_quantized_extend_qkv(
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_k = kv_pool._R_k[layer_idx]
         R_v = kv_pool._R_v[layer_idx]
+        Q_k = oscar_q_rotation(kv_pool, layer_idx)
+        k_mean = oscar_k_mean(kv_pool, layer_idx)
         v_rotation_absorbed = bool(
             getattr(layer, "oscar_v_rotation_absorbed", False)
         )
@@ -146,8 +170,13 @@ def prepare_quantized_extend_qkv(
             q.shape[-2] // k.shape[-2] if R_k.dim() == 3 and k.dim() >= 2 else 1
         )
         if not q_already_hadamard_transformed:
-            q = _apply_oscar_rotation(q, R_k, kv_group_num)
+            q = _apply_oscar_rotation(q, Q_k, kv_group_num)
         if not kv_already_hadamard_transformed:
+            if k_mean is not None:
+                # Centering: the same mean the pool subtracts from every stored
+                # key, so every logit of the request shifts by one per-head
+                # constant and the softmax is unchanged.
+                k = k - k_mean.to(k.dtype)
             k = _apply_oscar_rotation(k, R_k)
             if v_rotation_absorbed:
                 v = v.to(R_v.dtype).contiguous()
@@ -488,7 +517,7 @@ def apply_inverse_v_rotation(
         return result
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
-        R_v = kv_pool._R_v[layer_idx]
+        R_v = oscar_o_rotation(kv_pool, layer_idx)
         if R_v.dim() == 2:
             return (result.to(R_v.dtype) @ R_v.T).contiguous()
         q_heads = result.shape[-2]

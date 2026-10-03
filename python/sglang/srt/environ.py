@@ -950,6 +950,12 @@ class Envs:
     # Decision snapshot written by the server-arg hook before the scheduler
     # processes spawn; every process reads it instead of the filesystem.
     SGLANG_OSCAR_CALIBRATION_ACTIVE = EnvBool(False)
+    # Also write the per-(layer, KV head) sufficient statistics the startup
+    # calibration collected (query second moment, key sum and second moment,
+    # energy-weighted value covariance) next to the published pair, as
+    # oscar_moments_rank<r>.pt, so rotation/tools/fit_oscar2_variants.py can
+    # fit the OSCAR-2 transform family offline without re-running the model.
+    SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS = EnvBool(False)
     # Quant-tier encoders of the unified pool. "int2": 2-bit per value with
     # per-row (or grouped) scale/zero. "pq": product quantization against a
     # per-layer codebook file (one uint8 per sub-vector, no scale); a file

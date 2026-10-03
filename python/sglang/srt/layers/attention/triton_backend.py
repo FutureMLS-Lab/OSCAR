@@ -34,6 +34,8 @@ from sglang.srt.layers.attention.quantized_kv_prefill import (
     apply_segmented_hadamard_transform,
     dequantize_prefix_kv,
     prepare_quantized_extend_qkv,
+    oscar_o_rotation,
+    oscar_q_rotation,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
@@ -3644,7 +3646,7 @@ class TritonAttnBackend(AttentionBackend):
             # q is [bs, q_heads, hd]; a per-head rotation is indexed by KV
             # head, so under GQA each KV head's matrix serves
             # ``kv_group_num`` consecutive query heads.
-            R_k_dec = kv_pool._R_k[oscar_layer_idx]
+            R_k_dec = oscar_q_rotation(kv_pool, oscar_layer_idx)
             q_kv_group = (
                 q_for_decode.shape[1] // R_k_dec.shape[0] if R_k_dec.dim() == 3 else 1
             )
@@ -3777,7 +3779,7 @@ class TritonAttnBackend(AttentionBackend):
         # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
         # the segmented FWHT (self-inverse with 1/sqrt(N)).
         if uses_oscar:
-            R_v = kv_pool._R_v[oscar_layer_idx]
+            R_v = oscar_o_rotation(kv_pool, oscar_layer_idx)
             o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             if self.fast_rotation and rotate_rows_supported(o3.shape[-1]):
                 fast_rotate_rows(

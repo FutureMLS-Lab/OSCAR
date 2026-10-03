@@ -374,6 +374,85 @@ def load_oscar_rotations(
     return out.to(device)
 
 
+
+def load_oscar_rotation_field(
+    path: str,
+    field: str,
+    layer_num: int,
+    start_layer: int,
+    head_dim,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+    layer_ids: Optional[List[int]] = None,
+    *,
+    vector: bool = False,
+):
+    """Optional per-layer companion of ``rotation`` in an OSCAR checkpoint.
+
+    The OSCAR-2 transform family stores, next to the write-side ``rotation``:
+
+    * ``q_rotation`` (K file): the query-side matrix of a non-orthogonal key
+      transform, ``R_k^{-T}``, so that ``(q @ q_rotation) . (k @ rotation) ==
+      q . k``. Absent for orthogonal keys (the query then uses ``rotation``).
+    * ``o_rotation`` (V file): the output-side matrix of a non-orthogonal
+      value transform, ``R_v^{-T}``; the attention output is un-rotated as
+      ``o @ o_rotation.T``. Absent for orthogonal values.
+    * ``k_mean`` (K file, ``vector=True``): the per-head key mean subtracted
+      before the key rotation (centering). ``[head_dim]`` or
+      ``[num_kv_heads, head_dim]`` per layer.
+
+    Returns the layout ``load_oscar_rotations`` returns (a stacked tensor, or a
+    per-layer list for heterogeneous head dims), or ``None`` when no layer
+    carries the field. A field on some layers but not others is an error; a
+    calibrating launch (identity rotations) has none of them.
+    """
+    if oscar_calibration_required():
+        return None
+    state = torch.load(path, map_location="cpu")
+    layers = state["layers"]
+    if layer_ids is not None:
+        global_layer_ids = list(layer_ids)
+    else:
+        global_layer_ids = [start_layer + local for local in range(layer_num)]
+    per_layer = not isinstance(head_dim, int)
+    head_dims = list(head_dim) if per_layer else [head_dim] * layer_num
+    mats = []
+    present = 0
+    for local, global_lid in enumerate(global_layer_ids):
+        ldata = layers.get(global_lid, layers.get(str(global_lid)))
+        if ldata is None:
+            raise ValueError(f"Oscar rotation checkpoint at {path} missing layer {global_lid}")
+        t = ldata.get(field)
+        if t is None:
+            mats.append(None)
+            continue
+        present += 1
+        hd = head_dims[local]
+        tail = (hd,) if vector else (hd, hd)
+        if tuple(t.shape[-len(tail):]) != tail or t.dim() not in (len(tail), len(tail) + 1):
+            raise ValueError(
+                f"Oscar checkpoint {path} layer {global_lid}: {field} has shape "
+                f"{tuple(t.shape)}, expected {tail} or (num_kv_heads, *{tail})"
+            )
+        mats.append(t.to(dtype))
+    if present == 0:
+        return None
+    if present != len(mats):
+        raise ValueError(
+            f"Oscar checkpoint {path}: {field} is present on {present} of "
+            f"{len(mats)} layers; it must be on all or none"
+        )
+    logger.info(
+        "Loaded Oscar %s from %s for %d layers%s",
+        field,
+        path,
+        len(mats),
+        (" [per-head: %d kv heads]" % mats[0].shape[0]) if mats[0].dim() == len(tail) + 1 else "",
+    )
+    if per_layer:
+        return [m.to(device) for m in mats]
+    return torch.stack(mats, dim=0).to(device)
+
 class _OscarRotationProxy:
     """Index-translating view onto an inner OSCAR pool's per-layer rotation
     tensor. The triton OSCAR decode path indexes the outer pool's ``_R_k`` /
@@ -4467,6 +4546,35 @@ class HybridLinearKVPool(KVCache):
     def _R_v(self):
         return _OscarRotationProxy(
             self.full_kv_pool._R_v,
+            self.full_attention_layer_id_mapping,
+            self.start_layer,
+        )
+
+    # OSCAR-2 companions of the rotations (query-side / output-side matrices
+    # of non-orthogonal transforms, per-head key mean). Same index translation.
+    @property
+    def _Q_k(self):
+        return _OscarRotationProxy(
+            self.full_kv_pool._Q_k,
+            self.full_attention_layer_id_mapping,
+            self.start_layer,
+        )
+
+    @property
+    def _O_v(self):
+        return _OscarRotationProxy(
+            self.full_kv_pool._O_v,
+            self.full_attention_layer_id_mapping,
+            self.start_layer,
+        )
+
+    @property
+    def _k_mean(self):
+        inner = self.full_kv_pool._k_mean
+        if inner is None:
+            return None
+        return _OscarRotationProxy(
+            inner,
             self.full_attention_layer_id_mapping,
             self.start_layer,
         )
