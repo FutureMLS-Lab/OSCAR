@@ -431,6 +431,9 @@ def _decode_grouped_att_m_fwd_pq(
         assert v_buffer.shape[-1] == v_n_sub
         v_codebook_arg = v_codebook
         v_group_size = Lv
+        # A PQ V tier has a zero-width scale arena; its data pointer may be
+        # null, so hand the disabled branch a real tensor instead.
+        v_scales_zeros = v_codebook
     else:
         assert v_buffer.shape[-1] * 4 == Lv
         v_n_centroids, v_sub_dim = 1, 1

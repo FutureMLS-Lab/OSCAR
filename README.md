@@ -697,6 +697,78 @@ export SGLANG_OSCAR_K_ROTATION_PATH=$ROT/k_rotation_qqt_r_h_pbr.pt
 export SGLANG_OSCAR_V_ROTATION_PATH=$ROT/v_rotation_sst_r_h_pbr.pt
 ```
 
+### Fit the rotation at server startup (no offline calibration)
+
+When the unified mixed pool is active and the rotation pair is unset, or the
+configured files are missing, the server fits the pair itself before it
+accepts traffic: the pool starts on identity rotations, a prefill-only pass
+over calibration prompts (GPQA-Diamond by default, downloaded once) collects
+the `qqt` / `sst` moments through the attention layers, the scheduler reduces
+them over TP and decomposes them exactly as the offline pipeline does, and the
+rotations are installed in place (captured decode CUDA graphs stay valid).
+The pair is written atomically under a lock and later launches load it.
+
+```bash
+# nothing to download: the pair lands in $HF_HOME/oscar-rotations/<model>-<digest>/
+SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
+python -m sglang.launch_server --model-path Qwen/Qwen3-8B --kv-cache-dtype int2 \
+  --kv-cache-quant-group-size 128 --attention-backend triton
+```
+
+| Env | Default | Effect |
+|---|---|---|
+| `SGLANG_OSCAR_CALIBRATION_PROMPTS_PATH` | `` | JSONL of `{"messages": [...]}` prompts (or an original GPQA CSV); empty = GPQA-Diamond |
+| `SGLANG_OSCAR_CALIBRATION_TOKENS` | 30000 | Prompt tokens observed per layer |
+| `SGLANG_OSCAR_CALIBRATION_BATCH_SIZE` | 32 | Prompts per calibration request |
+| `SGLANG_OSCAR_CALIBRATION_TIMEOUT` | 1800 | Seconds before the launch fails |
+| `SGLANG_OSCAR_CALIBRATION_LOCK_DIR` | `/tmp/sglang-oscar-locks` | Lock files that serialize pair publication |
+
+Single node, DP=PP=1, no HiCache, no torch.compile, no explicit prefill CUDA
+graph backend; the first launch also keeps the V rotation at runtime (no
+`SGLANG_OSCAR_ABSORB_V_ROTATION`). The smoke harness exercises it with
+`CALIBRATE_DIR=<dir> bash rotation/verify/all.sh qwen3-8b`.
+
+## 1-bit and 1.5-bit K with product quantization
+
+The quant tier's encoder is selectable per tensor. `pq` stores each row as
+`n_sub` uint8 codes against a per-layer codebook trained on the rotated
+activations (no per-row scale; 16 codes for head_dim 128 = 1.0 bit/value); a
+codebook file with a second stage adds a residual code (RVQ, 1.5 bit/value).
+Prefill encode, the decode-time flush, prefix dequant and a graph-safe split-KV
+decode (centroids reconstructed inline, or scored through a per-query lookup
+table at small batch) all run as Triton kernels; the BF16 sink/recent windows
+are unchanged.
+
+```bash
+SGLANG_OSCAR_K_QUANTIZER=pq SGLANG_OSCAR_PQ_K_CODEBOOK=$ROT/codebooks/k_pq_n16_c256_d8.pt   # K 1.0 bit, V INT2
+SGLANG_OSCAR_K_QUANTIZER=pq SGLANG_OSCAR_PQ_K_CODEBOOK=$ROT/codebooks/k_rvq_n16_c256x16_d8.pt   # K 1.5 bit (RVQ)
+SGLANG_OSCAR_V_QUANTIZER=pq SGLANG_OSCAR_PQ_V_CODEBOOK=$ROT/codebooks/v_pq_n16_c256_d8.pt   # with K pq: V 1.0 bit too
+```
+
+| Env | Default | Effect |
+|---|---|---|
+| `SGLANG_OSCAR_K_QUANTIZER` / `SGLANG_OSCAR_V_QUANTIZER` | `int2` | `int2` or `pq`; V may be `pq` only when K is |
+| `SGLANG_OSCAR_PQ_K_CODEBOOK` / `SGLANG_OSCAR_PQ_V_CODEBOOK` | `` | Codebook file for the tier (`codebooks_per_layer`, or `codebooks_stage1/2` for RVQ) |
+| `SGLANG_OSCAR_PQ_USE_ADC` | -1 | Decode scoring: -1 = lookup table when batch < 4, 0 = reconstruct K, 1 = always lookup table |
+
+Codebooks are bound to the rotation they were trained against. Train them from
+the same dumps the rotation came from:
+
+```bash
+python rotation/tools/train_pq_codebooks.py --dumps $CALIB/qkv_dumps/gpqa \
+  --rotation $CALIB/rotations/k_rotation_qqt_r_h_pbr.pt --tensor k --out codebooks/k_pq_n16_c256_d8.pt
+python rotation/tools/train_pq_codebooks.py --dumps $CALIB/qkv_dumps/gpqa \
+  --rotation $CALIB/rotations/k_rotation_qqt_r_h_pbr.pt --tensor k --stage2-centroids 16 \
+  --out codebooks/k_rvq_n16_c256x16_d8.pt
+```
+
+Measured on Qwen3-8B before the port (GPQA-Diamond, BF16 windows 512/2048):
+BF16 59.0, INT2 57.8, PQ K 1.0 bit + INT2 V 57.2. PQ decode is slower than
+INT2 at long context; it is a memory lever, not a speed lever. PQ is not
+available on the two-group (Gemma 4), MiniMax-sparse or packed-MLA pools.
+The smoke rows `qwen3-8b-kpq`, `qwen3-8b-krvq` and `qwen3-8b-kpq-vpq` cover
+the three configurations.
+
 ## Calibration knobs
 
 Override per `bash rotation/<model>/save_qkv_<model>.sh ENV=val`:
