@@ -388,6 +388,14 @@ if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     exit 1
 fi
 
+# POST_HEALTH_CMD runs an arbitrary command against the live server (profiling,
+# diagnostics) and exits with its status; the trap tears the server down.
+if [[ -n "${POST_HEALTH_CMD:-}" ]]; then
+    echo "[eval-oscar] POST_HEALTH_CMD: ${POST_HEALTH_CMD}"
+    bash -c "${POST_HEALTH_CMD}" 2>&1 | tee -a "${LOG_RUNNER}"
+    exit "${PIPESTATUS[0]}"
+fi
+
 # SMOKE_ONLY=1 runs the verify harness's chat-template probe against this very
 # server and exits with its PASS/FAIL line, so a model the single-pod sweep
 # cannot host (Kimi-K3 spans two nodes) is judged by the same probe and judge.
