@@ -23,6 +23,54 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+try:  # CPU-only test hosts import this module without triton
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _remap_prefill_table_kernel(
+        table_ptr, slot_to_ragged_ptr, out_ptr, n, BLOCK: tl.constexpr
+    ):
+        """``out[i] = slot_to_ragged[table[i]]`` where ``table[i] >= 0``, else
+        ``table[i]`` -- stage_prefill's ``where(valid, slot_to_ragged[safe],
+        table)`` in one pass over the (num_q x topk) table, without the int64
+        cast and the two where() passes."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        t = tl.load(table_ptr + offs, mask=m, other=-1).to(tl.int32)
+        valid = t >= 0
+        safe = tl.where(valid, t, 0).to(tl.int64)
+        r = tl.load(slot_to_ragged_ptr + safe, mask=m & valid, other=0).to(tl.int32)
+        tl.store(out_ptr + offs, tl.where(valid, r, t), mask=m)
+
+
+def remap_prefill_table(page_table_1: torch.Tensor, slot_to_ragged: torch.Tensor) -> torch.Tensor:
+    """The staged top-k table for a ragged prefill: every live slot replaced by
+    its position in the staging buffer, holes (negative) kept. One launch on
+    GPU; the tensor expression it replaces on CPU."""
+    pt = page_table_1.to(torch.int32)
+    if triton is None or not pt.is_cuda:
+        valid = pt >= 0
+        safe = torch.where(valid, pt, torch.zeros_like(pt))
+        return torch.where(valid, slot_to_ragged[safe.to(torch.int64)].to(torch.int32), pt)
+    pt = pt.contiguous()
+    out = torch.empty_like(pt)
+    n = pt.numel()
+    if n == 0:
+        return out
+    BLOCK = 1024
+    _remap_prefill_table_kernel[(triton.cdiv(n, BLOCK),)](
+        pt.view(-1), slot_to_ragged, out.view(-1), n, BLOCK=BLOCK, num_warps=4
+    )
+    return out
+
 Materialize = Callable[[torch.Tensor, torch.Tensor], None]
 
 
@@ -119,8 +167,5 @@ def stage_prefill(
     if fresh_rows is not None:
         pos = slot_to_ragged[fresh_slots.to(torch.int64)].to(torch.int64)
         buf[pos, 0, :] = fresh_rows.reshape(pos.numel(), -1).to(buf.dtype)
-    page_table_1 = page_table_1.to(torch.int32)
-    valid = page_table_1 >= 0
-    safe = torch.where(valid, page_table_1, torch.zeros_like(page_table_1))
-    table = torch.where(valid, slot_to_ragged[safe.to(torch.int64)], page_table_1)
+    table = remap_prefill_table(page_table_1, slot_to_ragged)
     return buf, table
