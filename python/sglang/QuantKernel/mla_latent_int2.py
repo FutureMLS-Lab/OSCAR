@@ -631,6 +631,56 @@ def _gather_dequant_assemble_kernel(
         tl.store(table_ptr + pid, tl.where(valid, pid, slot).to(tl.int32))
 
 
+@triton.jit
+def _store_extend_kernel(
+    c_ptr, pe_ptr, loc_ptr, pos_ptr, seq_ptr, req_ptr,
+    codes_ptr, params_ptr, rope_ptr, hp_ptr, hp_row_ptr, hp_owner_ptr,
+    n_rows, P, W, PER_REQ, MAX_REQS,
+    D: tl.constexpr, GS: tl.constexpr, NG: tl.constexpr, LLOYD: tl.constexpr,
+    BITS: tl.constexpr, PF: tl.constexpr,
+    MASK: tl.constexpr, MAXQ: tl.constexpr,
+    T0: tl.constexpr, T1: tl.constexpr, T2: tl.constexpr,
+    LM_SPAN3: tl.constexpr, LM_RATIO: tl.constexpr, LM_C0: tl.constexpr,
+    ROPE: tl.constexpr,
+):
+    """The prefill (extend) write of one latent row in one launch. Row ``i``
+    is token ``pos[i]`` of a request whose length after this extend is
+    ``seq[i]`` and whose request row is ``req[i]`` (both already expanded per
+    token). Same placement as ``ring_rows_from_positions`` and the same
+    quantization as ``_scatter_pack_kernel``; unlike the Python path it
+    writes the arena only for rows that are kept, so a 16k-token chunk no
+    longer scatters 16k rows onto the dummy arena row.
+    """
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
+    loc = tl.load(loc_ptr + pid).to(tl.int64)
+    s = tl.where(loc >= 0, loc, 0)
+    _quant_pack_row(
+        c_ptr + pid * D, s, codes_ptr, params_ptr,
+        D, GS, NG, LLOYD, BITS, PF, MASK, MAXQ, T0, T1, T2, LM_SPAN3, LM_RATIO, LM_C0,
+    )
+    ro = tl.arange(0, ROPE)
+    pe = tl.load(pe_ptr + pid * ROPE + ro)
+    tl.store(rope_ptr + s * ROPE + ro, pe.to(rope_ptr.dtype.element_ty))
+
+    pos = tl.load(pos_ptr + pid).to(tl.int64)
+    seq = tl.load(seq_ptr + pid).to(tl.int64)
+    req = tl.load(req_ptr + pid).to(tl.int64)
+    keep = ((pos < P) | (pos >= seq - W)) & (req < MAX_REQS) & (loc > 0)
+    in_sink = pos < P
+    off = tl.where(in_sink, pos, P + tl.maximum(pos - P, 0) % W)
+    ring = 1 + req * PER_REQ + off
+    if keep:
+        offs = tl.arange(0, D)
+        c = tl.load(c_ptr + pid * D + offs)
+        tl.store(hp_ptr + ring * D + offs, c.to(hp_ptr.dtype.element_ty))
+        tl.store(hp_owner_ptr + ring, loc.to(tl.int32))
+        tl.store(hp_row_ptr + s, ring.to(tl.int32))
+    else:
+        tl.store(hp_row_ptr + s, -1)
+
+
 def scatter_pack_rows(x, slots, codes_buf, params_buf, group_size, lloyd_max, bits=2):
     """Quantize ``x`` (``[n, D]``, rotated frame) into ``codes/params`` at ``slots``."""
     # Lloyd-Max here is a THREE-THRESHOLD codebook, i.e. 2-bit by construction.
@@ -749,3 +799,36 @@ def assemble_rows(c, slots, rope_buf, hp_buf, hp_row_of_slot, hp_owner_of_row, o
         D=d, ROPE=rope_d, OUT_D=out.shape[-1], HAS_HP=has_hp,
     )
     return out
+
+
+def store_extend_rows(c_rot, k_pe, loc, positions, seq_lens_per_token, req_per_token,
+                      codes_buf, params_buf, rope_buf, hp_buf, hp_row_of_slot, hp_owner_of_row,
+                      *, sink, recent, per_req_hp, max_reqs, group_size, lloyd_max, bits=2):
+    """One launch for the extend write of ``n`` latent rows: codes/params at
+    ``loc``, ``k_pe`` into ``rope_buf``, and the window placement from each
+    row's position (``positions``), its request's length after the extend and
+    its request row, both expanded per token. Agrees with the Python write
+    path except that rows not kept do not touch arena row 0 (the dummy)."""
+    assert bits in (2, 4), f"unsupported bits={bits}"
+    assert not (lloyd_max and bits != 2)
+    n, d = c_rot.shape
+    assert d % group_size == 0 and group_size % 4 == 0
+    assert recent >= 1, "the fused store needs a recent window (the modulo)"
+    if n == 0:
+        return
+    for t in (positions, seq_lens_per_token, req_per_token, loc):
+        assert t.numel() == n, (t.shape, n)
+    rope_d = rope_buf.shape[-1]
+    assert k_pe.shape == (n, rope_d), (k_pe.shape, n, rope_d)
+    c_rot = c_rot.contiguous().to(torch.float32)
+    k_pe = k_pe.contiguous()
+    _store_extend_kernel[(n,)](
+        c_rot, k_pe, loc, positions, seq_lens_per_token, req_per_token,
+        codes_buf, params_buf, rope_buf, hp_buf, hp_row_of_slot, hp_owner_of_row,
+        n, int(sink), int(recent), int(per_req_hp), int(max_reqs),
+        D=d, GS=group_size, NG=d // group_size, LLOYD=lloyd_max, BITS=bits, PF=8 // bits,
+        MASK=(1 << bits) - 1, MAXQ=float((1 << bits) - 1),
+        T0=_LM_THRESHOLDS[0], T1=_LM_THRESHOLDS[1], T2=_LM_THRESHOLDS[2],
+        LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=_LM_RATIO, LM_C0=_LM_CENTROIDS[0],
+        ROPE=rope_d,
+    )

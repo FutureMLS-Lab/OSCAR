@@ -613,6 +613,28 @@ class _PackedLatentMixin(_Int2HPMixin):
             pos, seq, req, self._write_loc, P, W, self._per_req_hp, self._max_reqs
         )
 
+    def _extend_window_args(self, n_tokens: int):
+        """``(positions, seq_lens_per_token, req_per_token)`` for an extend
+        whose windows the fused store can place in-kernel, else None (the
+        Python path then runs and does its own fallback logging). The two
+        expansions are the same repeat_interleave the Python path uses."""
+        if not self._latent_windows or self._win_r < 1:
+            return None
+        meta = self._fb_window_meta
+        if meta is None or meta.get("fallback") or meta["is_decode"]:
+            return None
+        positions, ext, seq_lens, req = (
+            meta["positions"], meta["extend_seq_lens"], meta["seq_lens"], meta["req_pool_indices"]
+        )
+        if positions is None or ext is None or seq_lens is None or req is None:
+            return None
+        if positions.numel() != n_tokens or ext.numel() != seq_lens.numel() or req.numel() != seq_lens.numel():
+            return None
+        ext64 = ext.to(torch.int64)
+        seq_e = torch.repeat_interleave(seq_lens.to(torch.int64), ext64, output_size=n_tokens)
+        req_e = torch.repeat_interleave(req.to(torch.int64), ext64, output_size=n_tokens)
+        return positions.to(torch.int64), seq_e, req_e
+
     def _decode_window_args(self, n_tokens: int):
         """``(seq_lens, req_pool_indices)`` when this forward is a plain decode
         whose windows the fused store can place in-kernel, else None (the
@@ -645,6 +667,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         from sglang.QuantKernel.mla_latent_int2 import (
             scatter_pack_rows,
             store_decode_rows,
+            store_extend_rows,
         )
 
         # LOCAL already: HybridLinearKVPool.set_kv_buffer remaps through
@@ -678,6 +701,20 @@ class _PackedLatentMixin(_Int2HPMixin):
                 seq_lens, req_idx = win
                 store_decode_rows(
                     c, pe, loc64, seq_lens, req_idx,
+                    self.c_codes[li], self.c_params[li], self.rope_buf[li],
+                    self.hp_c[li], self.hp_row_of_slot, self.hp_owner_of_row,
+                    sink=self._win_p, recent=self._win_r,
+                    per_req_hp=self._per_req_hp, max_reqs=self._max_reqs,
+                    group_size=self._group_size, lloyd_max=self._lloyd_max,
+                    bits=self._bits,
+                )
+                self._maybe_audit(layer_id)
+                return
+            ext = self._extend_window_args(c.shape[0])
+            if ext is not None:
+                positions, seq_e, req_e = ext
+                store_extend_rows(
+                    c, pe, loc64, positions, seq_e, req_e,
                     self.c_codes[li], self.c_params[li], self.rope_buf[li],
                     self.hp_c[li], self.hp_row_of_slot, self.hp_owner_of_row,
                     sink=self._win_p, recent=self._win_r,

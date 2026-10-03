@@ -214,27 +214,12 @@ PY
 }
 
 # Probes a live server and prints the verdict. $1 name, $2 port, $3 logfile.
-verify_recall3() {  # response-json needle -> OK | MISS | CAP | ERR
-  python3 - "$1" "$2" <<'PY2'
-import json, re, sys
-try:
-    d = json.loads(sys.argv[1])
-except Exception:
-    print("MISS"); raise SystemExit
-norm = lambda t: re.sub(r"\s+", " ", t).strip().lower()
-final = d.get("content") or d.get("text") or ""
-if d.get("error"):
-    # the server refused or failed the request: a harness/serving error, named as such
-    print("ERR")
-elif norm(sys.argv[2]) in norm(final[-1500:]):
-    print("OK")
-elif d.get("finish_reason") == "length":
-    # the answer never reached its last line: the budget ran out while the
-    # model was still writing -- a probe budget problem, not a recall failure
-    print("CAP")
-else:
-    print("MISS")
-PY2
+verify_recall3() {  # response-json correct-option other-options... -> OK | MISS | CAP | ERR
+  # recall_judge.py: an exact copy in the tail is OK; so is a paraphrase that
+  # keeps >= 85% of the option's words in order while scoring far above every
+  # other option (Qwen3-4B-Thinking writes "11 months" and "with baleen
+  # plates"); quoting a different option, garbling, or a budget cut are not.
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recall_judge.py" "$@"
 }
 
 verify_probe_and_verdict() {
@@ -278,7 +263,7 @@ verify_probe_and_verdict() {
   local q3="$filler Question: which option describes a mammal? A) $optA B) $optB C) $optC D) $optD. Reason about every option in detail, in at least 700 words, before deciding. Then end your answer with two lines: the letter on one line, and the complete text of that option copied verbatim on the last line."
   r3=$(verify_gen "$port" "$q3" "$n3")
   local recall
-  recall=$(verify_recall3 "$r3" "$optB")
+  recall=$(verify_recall3 "$r3" "$optB" "$optA" "$optC" "$optD")
   local recall_note=""
   if [ "$recall" = "CAP" ]; then
     # The model is still thinking when the budget runs out (GLM-5.3 writes
@@ -290,7 +275,7 @@ verify_probe_and_verdict() {
     echo "  probe3: recall=CAP ($(echo "$r3" | wc -c) bytes) -> retry with thinking disabled"
     [ -n "${OUT:-}" ] && printf '%s' "$r3" > "$OUT/$name.probe3.think.json" 2>/dev/null
     r3=$(verify_gen "$port" "${q3/at least 700 words/at least 1200 words}" "$n3" '{"chat_template_kwargs":{"enable_thinking":false}}')
-    recall=$(verify_recall3 "$r3" "$optB")
+    recall=$(verify_recall3 "$r3" "$optB" "$optA" "$optC" "$optD")
     recall_note=" (no-think retry)"
   fi
   echo "  probe3: recall=$recall$recall_note ($(echo "$r3" | wc -c) bytes)"
