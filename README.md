@@ -783,12 +783,31 @@ python rotation/tools/train_pq_codebooks.py --dumps $CALIB/qkv_dumps/gpqa \
   --out codebooks/k_rvq_n16_c256x16_d8.pt
 ```
 
-Measured on Qwen3-8B before the port (GPQA-Diamond, BF16 windows 512/2048):
-BF16 59.0, INT2 57.8, PQ K 1.0 bit + INT2 V 57.2. PQ decode is slower than
-INT2 at long context; it is a memory lever, not a speed lever. PQ is not
-available on the two-group (Gemma 4), MiniMax-sparse or packed-MLA pools.
-The smoke rows `qwen3-8b-kpq`, `qwen3-8b-krvq` and `qwen3-8b-kpq-vpq` cover
-the three configurations.
+Measured on this tree (Qwen3-8B, GPQA-Diamond at 64K, the model's recipe
+windows of 128 BF16 prefix / 2048 BF16 recent, one seed, n=198):
+
+| K / V | bits (K) | GPQA |
+|:---|:---:|:---:|
+| BF16 | 16 | 60.6 / 57.1 (two runs) |
+| INT2 / INT2 | 2.0 | 52.5 (v87), 50.0 / 53.5 (earlier runs) |
+| PQ K / INT2 V | 1.0 | 36.4 |
+| RVQ K / INT2 V | 1.5 | 36.9 |
+| PQ K / PQ V | 1.0 | 36.4 |
+
+The three PQ rows serve cleanly (graphs, prefix cache, no exceptions; the
+prefix read is checked row by row against the codebook in
+`rotation/tests/test_pq_kv_gpu.py`), but the codes themselves carry little:
+at 1–1.5 bit the accuracy lives in the BF16 window. An earlier measurement
+with a 512-token BF16 prefix, which kept the whole GPQA question in BF16,
+scored 57.2 for PQ K; with the 128-token prefix the question is read back
+through the codes and the score drops to the mid thirties, and the residual
+stage of RVQ buys nothing on top. The smoke's long-context recall probe fails
+for all three for the same reason (INT2 passes it). Treat PQ as a memory
+lever for contexts long enough to amortize the BF16 window, not as an
+accuracy-neutral tier; PQ decode is also slower than INT2 at long context.
+PQ is not available on the two-group (Gemma 4), MiniMax-sparse or packed-MLA
+pools. The smoke rows `qwen3-8b-kpq`, `qwen3-8b-krvq` and `qwen3-8b-kpq-vpq`
+cover the three configurations and report `FAIL(no-recall)` on the probe.
 
 ## Calibration knobs
 
