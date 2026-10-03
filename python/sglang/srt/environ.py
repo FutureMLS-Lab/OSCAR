@@ -950,6 +950,23 @@ class Envs:
     # Decision snapshot written by the server-arg hook before the scheduler
     # processes spawn; every process reads it instead of the filesystem.
     SGLANG_OSCAR_CALIBRATION_ACTIVE = EnvBool(False)
+    # Quant-tier encoders of the unified pool. "int2": 2-bit per value with
+    # per-row (or grouped) scale/zero. "pq": product quantization against a
+    # per-layer codebook file (one uint8 per sub-vector, no scale); a file
+    # with a stage-2 codebook adds a residual stage (RVQ). V may be pq only
+    # when K is.
+    SGLANG_OSCAR_K_QUANTIZER = EnvStr("int2")
+    SGLANG_OSCAR_V_QUANTIZER = EnvStr("int2")
+    SGLANG_OSCAR_PQ_K_CODEBOOK = EnvStr("")
+    SGLANG_OSCAR_PQ_V_CODEBOOK = EnvStr("")
+    # PQ decode kernel: -1 = lookup-table scoring (ADC) when the batch is
+    # below 4, 0 = always reconstruct K, 1 = always ADC. Tile knobs; 0 picks
+    # the shape-dependent default.
+    SGLANG_OSCAR_PQ_USE_ADC = EnvInt(-1)
+    SGLANG_OSCAR_PQ_BLOCK_N = EnvInt(0)
+    SGLANG_OSCAR_PQ_BLOCK_H = EnvInt(0)
+    SGLANG_OSCAR_PQ_NUM_WARPS = EnvInt(0)
+    SGLANG_OSCAR_PQ_NUM_STAGES = EnvInt(0)
     # Fuse oscar K-rotation (rows @ R_k) into the prefill clip+quantize+pack
     # kernel. Eliminates the separate bf16 GEMM staging and the intermediate
     # rotated-K tensor for the quant pack. Requires oscar mode, V-rotation

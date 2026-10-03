@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -305,6 +306,39 @@ def _validate_oscar_calibration_topology(cfg: Any) -> None:
         raise ValueError(
             "Startup OSCAR calibration requires --enable-torch-compile to be off"
         )
+
+
+def handle_oscar_quantizer_compatibility(server_args: Any) -> None:
+    """Fail at resolution when the OSCAR quant-tier encoders are misconfigured:
+    a PQ tier needs the unified mixed pool, a codebook file, and a PQ K tier
+    under a PQ V tier."""
+    k_name = envs.SGLANG_OSCAR_K_QUANTIZER.get().strip().lower()
+    v_name = envs.SGLANG_OSCAR_V_QUANTIZER.get().strip().lower()
+    for label, name in (("K", k_name), ("V", v_name)):
+        if name not in ("int2", "pq"):
+            raise ValueError(f"SGLANG_OSCAR_{label}_QUANTIZER must be int2 or pq, got {name!r}")
+    if k_name == "int2" and v_name == "int2":
+        return
+    if not _unified_mixed_kv_active(server_args):
+        raise ValueError(
+            "PQ quantizers need the unified mixed INT2 pool: --kv-cache-dtype int2 "
+            "with SGLANG_ENABLE_MIXED_KV_WINDOWS=1 on the Triton (or FA3-prefill + "
+            "Triton-decode) attention path"
+        )
+    if v_name == "pq" and k_name != "pq":
+        raise ValueError("SGLANG_OSCAR_V_QUANTIZER=pq requires SGLANG_OSCAR_K_QUANTIZER=pq")
+    for label, env in (
+        ("K", envs.SGLANG_OSCAR_PQ_K_CODEBOOK),
+        ("V", envs.SGLANG_OSCAR_PQ_V_CODEBOOK),
+    ):
+        name = k_name if label == "K" else v_name
+        if name != "pq":
+            continue
+        path = env.get()
+        if not path:
+            raise ValueError(f"SGLANG_OSCAR_{label}_QUANTIZER=pq needs SGLANG_OSCAR_PQ_{label}_CODEBOOK")
+        if not os.path.isfile(path):
+            raise ValueError(f"SGLANG_OSCAR_PQ_{label}_CODEBOOK does not exist: {path}")
 
 
 def handle_kv4_compatibility(server_args: Any) -> None:

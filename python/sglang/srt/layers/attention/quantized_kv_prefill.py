@@ -43,6 +43,7 @@ try:
 except ImportError:
     from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
+from sglang.srt.layers.attention.pq_prefill import mixed_prefix_dequantize_pq
 from sglang.srt.mem_cache.kv_quant_kernels import (
     _get_num_scale_groups,
     dequantize_kv_int2_triton,
@@ -311,6 +312,55 @@ def _mixed_prefix_dequantize_tensor(
     return out
 
 
+def _dequantize_mixed_prefix_pq(
+    kv_pool,
+    layer_id: int,
+    prefix_indices: torch.Tensor,
+    model_dtype: torch.dtype,
+    *,
+    v_head_dim: int,
+    out_k: Optional[torch.Tensor],
+    out_v: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mixed prefix of a pool whose K tier is product-quantized (V is PQ or
+    INT2)."""
+    hp_off = kv_pool.hp_global_offset
+    k = mixed_prefix_dequantize_pq(
+        prefix_indices,
+        kv_pool.get_raw_key_buffer(layer_id),
+        kv_pool.pq_k_codebook(layer_id),
+        kv_pool.get_hp_key_buffer(layer_id),
+        hp_off,
+        model_dtype,
+        codes2=kv_pool.get_raw_key_buffer2(layer_id),
+        codebook2=kv_pool.pq_k_codebook2(layer_id),
+        out=out_k,
+    )
+    v_codebook = kv_pool.pq_v_codebook(layer_id)
+    if v_codebook is not None:
+        v = mixed_prefix_dequantize_pq(
+            prefix_indices,
+            kv_pool.get_raw_value_buffer(layer_id),
+            v_codebook,
+            kv_pool.get_hp_value_buffer(layer_id),
+            hp_off,
+            model_dtype,
+            out=out_v,
+        )
+    else:
+        v = _mixed_prefix_dequantize_tensor(
+            prefix_indices,
+            kv_pool.get_raw_value_buffer(layer_id),
+            kv_pool.get_value_scales_zeros(layer_id),
+            kv_pool.get_hp_value_buffer(layer_id),
+            hp_off,
+            v_head_dim,
+            model_dtype,
+            out=out_v,
+        )
+    return k, v
+
+
 def dequantize_prefix_kv(
     kv_pool,
     layer_id: int,
@@ -372,6 +422,16 @@ def dequantize_prefix_kv(
         assert kv_pool.dtype == "int2", (
             f"Unsupported quantized KV dtype: {kv_pool.dtype}"
         )
+        if kv_pool.pq_k_set is not None:
+            return _dequantize_mixed_prefix_pq(
+                kv_pool,
+                layer_id,
+                prefix_indices,
+                model_dtype,
+                v_head_dim=l_v_head_dim,
+                out_k=out_k,
+                out_v=out_v,
+            )
         return (
             _mixed_prefix_dequantize_tensor(
                 prefix_indices,

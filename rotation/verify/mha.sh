@@ -26,6 +26,21 @@ else
   [ -n "$KROT" ] && [ -n "$VROT" ] || { echo "RESULT=$NAME SKIP(no rotation in $R)"; exit 0; }
   echo "  rotations: $(basename "$KROT") / $(basename "$VROT")"
 fi
+# KV_QUANT selects the quant-tier encoders; codebooks live beside the rotation
+# they were trained against. kpq: PQ K + INT2 V; krvq: residual PQ K + INT2 V;
+# kpq-vpq: PQ K + PQ V.
+K_QUANTIZER=int2; V_QUANTIZER=int2; PQ_K_CB=""; PQ_V_CB=""
+case "${KV_QUANT:-int2}" in
+  int2) ;;
+  kpq)     K_QUANTIZER=pq; PQ_K_CB=$R/codebooks/k_pq_n16_c256_d8.pt ;;
+  krvq)    K_QUANTIZER=pq; PQ_K_CB=$R/codebooks/k_rvq_n16_c256x16_d8.pt ;;
+  kpq-vpq) K_QUANTIZER=pq; V_QUANTIZER=pq; PQ_K_CB=$R/codebooks/k_pq_n16_c256_d8.pt; PQ_V_CB=$R/codebooks/v_pq_n16_c256_d8.pt ;;
+  *) echo "RESULT=$NAME FAIL(unknown KV_QUANT=$KV_QUANT)"; exit 1 ;;
+esac
+for cb in $PQ_K_CB $PQ_V_CB; do
+  [ -f "$cb" ] || { echo "RESULT=$NAME SKIP(no codebook $cb)"; exit 0; }
+done
+[ "$K_QUANTIZER" = int2 ] || echo "  quantizers: K=$K_QUANTIZER V=$V_QUANTIZER ($(basename "$PQ_K_CB")${PQ_V_CB:+ / $(basename "$PQ_V_CB")})"
 
 verify_prune_weights "$REPO"
 MD=$(verify_download "$REPO")
@@ -41,6 +56,8 @@ export VERIFY_CTX="${CTX:-16384}"
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=$SINK SGLANG_MIXED_KV_RECENT_TOKENS=$RECENT \
 SGLANG_OSCAR_K_ROTATION_PATH=$KROT SGLANG_OSCAR_V_ROTATION_PATH=$VROT \
+SGLANG_OSCAR_K_QUANTIZER=$K_QUANTIZER SGLANG_OSCAR_V_QUANTIZER=$V_QUANTIZER \
+SGLANG_OSCAR_PQ_K_CODEBOOK=$PQ_K_CB SGLANG_OSCAR_PQ_V_CODEBOOK=$PQ_V_CB \
 CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP-1))) \
 python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
   --tp-size "$TP" --port $PORT --host 127.0.0.1 \

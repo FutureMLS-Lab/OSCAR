@@ -138,6 +138,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_cache_compatibility,
         handle_int2_kv_cache_compatibility,
         handle_kv4_compatibility,
+        handle_oscar_quantizer_compatibility,
         handle_oscar_startup_calibration,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
@@ -248,6 +249,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # page_size == N_Q, and the default pass would otherwise claim page_size=1.
     run_hook(handle_int2_kv_cache_compatibility, server_args)
     run_hook(handle_oscar_startup_calibration, server_args)
+    run_hook(handle_oscar_quantizer_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
     run_hook(handle_amd_specifics, server_args)
     run_hook(handle_nccl_pre_warm, server_args)

@@ -47,6 +47,7 @@ def test_fused_staging_matches_reference(bs, topk, block_size, heads, head_dim, 
     pool = types.SimpleNamespace(
         dtype="int2", head_num=heads, head_dim=head_dim, v_head_dim=v_head_dim,
         hp_global_offset=hp_off, mixed_kv_enabled=lambda: True,
+        pq_k_set=None, pq_v_set=None,
         get_raw_key_buffer=lambda l: quant_k, get_raw_value_buffer=lambda l: quant_v,
         get_key_scales_zeros=lambda l: sz_k, get_value_scales_zeros=lambda l: sz_v,
         get_hp_key_buffer=lambda l: hp_k, get_hp_value_buffer=lambda l: hp_v,

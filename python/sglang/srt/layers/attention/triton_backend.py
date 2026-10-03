@@ -387,6 +387,9 @@ class TritonAttnBackend(AttentionBackend):
             decode_attention_fwd_int2_unified,
             decode_attention_fwd_quantized,
         )
+        from sglang.srt.layers.attention.triton_ops.decode_attention_pq import (
+            decode_attention_fwd_pq_unified,
+        )
 
         super().__init__()
 
@@ -396,6 +399,9 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.decode_attention_fwd_int2_unified = torch.compiler.disable(
             decode_attention_fwd_int2_unified
+        )
+        self.decode_attention_fwd_pq_unified = torch.compiler.disable(
+            decode_attention_fwd_pq_unified
         )
         # Work-Centric (Lean) Attention activation. None => auto-gate from host-side
         # seqlen metadata in forward_decode; True/False => explicit override.
@@ -3413,30 +3419,59 @@ class TritonAttnBackend(AttentionBackend):
                 decode_hp_kv_indices = self.forward_metadata.mixed_hp_kv_indices
                 decode_quant_kv_indptr = self.forward_metadata.mixed_quant_kv_indptr
                 decode_quant_kv_indices = self.forward_metadata.mixed_quant_kv_indices
-            self.decode_attention_fwd_int2_unified(
-                q_for_decode,
-                kv_pool.get_hp_key_buffer(layer.layer_id),
-                kv_pool.get_hp_value_buffer(layer.layer_id),
-                kv_pool.get_raw_key_buffer(layer.layer_id),
-                kv_pool.get_raw_value_buffer(layer.layer_id),
-                kv_pool.get_key_scales_zeros(layer.layer_id),
-                kv_pool.get_value_scales_zeros(layer.layer_id),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                decode_hp_kv_indptr,
-                decode_hp_kv_indices,
-                decode_quant_kv_indptr,
-                decode_quant_kv_indices,
-                mixed_logits,
-                mixed_lse,
-                self.forward_metadata.mixed_hp_num_kv_splits[:bs],
-                self.forward_metadata.mixed_quant_num_kv_splits[:bs],
-                self.max_hp_kv_splits,
-                self.max_kv_splits,
-                layer.scaling,
-                logit_cap=logits_soft_cap,
-                sinks=sinks,
-                xai_temperature_len=layer.xai_temperature_len,
-            )
+            if kv_pool.pq_k_set is not None:
+                self.decode_attention_fwd_pq_unified(
+                    q_for_decode,
+                    kv_pool.get_hp_key_buffer(layer.layer_id),
+                    kv_pool.get_hp_value_buffer(layer.layer_id),
+                    kv_pool.get_raw_key_buffer(layer.layer_id),
+                    kv_pool.get_raw_value_buffer(layer.layer_id),
+                    kv_pool.get_value_scales_zeros(layer.layer_id),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    decode_hp_kv_indptr,
+                    decode_hp_kv_indices,
+                    decode_quant_kv_indptr,
+                    decode_quant_kv_indices,
+                    mixed_logits,
+                    mixed_lse,
+                    self.forward_metadata.mixed_hp_num_kv_splits[:bs],
+                    self.forward_metadata.mixed_quant_num_kv_splits[:bs],
+                    self.max_hp_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    k_codebook=kv_pool.pq_k_codebook(layer.layer_id),
+                    k_codes2=kv_pool.get_raw_key_buffer2(layer.layer_id),
+                    k_codebook2=kv_pool.pq_k_codebook2(layer.layer_id),
+                    v_codebook=kv_pool.pq_v_codebook(layer.layer_id),
+                    logit_cap=logits_soft_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                )
+            else:
+                self.decode_attention_fwd_int2_unified(
+                    q_for_decode,
+                    kv_pool.get_hp_key_buffer(layer.layer_id),
+                    kv_pool.get_hp_value_buffer(layer.layer_id),
+                    kv_pool.get_raw_key_buffer(layer.layer_id),
+                    kv_pool.get_raw_value_buffer(layer.layer_id),
+                    kv_pool.get_key_scales_zeros(layer.layer_id),
+                    kv_pool.get_value_scales_zeros(layer.layer_id),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    decode_hp_kv_indptr,
+                    decode_hp_kv_indices,
+                    decode_quant_kv_indptr,
+                    decode_quant_kv_indices,
+                    mixed_logits,
+                    mixed_lse,
+                    self.forward_metadata.mixed_hp_num_kv_splits[:bs],
+                    self.forward_metadata.mixed_quant_num_kv_splits[:bs],
+                    self.max_hp_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    logit_cap=logits_soft_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                )
         else:
             # Use optimized quantized attention kernel
             self.decode_attention_fwd_quantized(

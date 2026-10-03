@@ -815,7 +815,18 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         # per geometry. The plan (slot ids / req_to_token positions) is
         # geometry-agnostic and shared across groups. The remap kernel only
         # needs to run once, so it is issued by the LAST group's apply.
-        groups = kv_pool._flush_groups
+        if kv_pool.pq_k_set is not None or kv_pool.pq_v_set is not None:
+            # PQ tiers encode row by row against their codebooks; the fused
+            # INT2 kernel below cannot express them.
+            gpu_flush_pq_apply(
+                plan,
+                req_pool_indices=req_idx_f,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                kv_pool=kv_pool,
+            )
+            groups = []
+        else:
+            groups = kv_pool._flush_groups
         n_groups = len(groups)
         for gi, g in enumerate(groups):
             gpu_flush_int2_apply(

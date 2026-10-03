@@ -149,6 +149,11 @@ class MiniMaxInt2SparseKVPool(UnifiedInt2HPKVPool):
         self.index_k_buffer: Dict[int, torch.Tensor] = {}
         self.index_v_buffer: Dict[int, torch.Tensor] = {}
         super().__init__(**unified_kwargs)
+        if self.pq_k_set is not None or self.pq_v_set is not None:
+            raise ValueError(
+                "MiniMax sparse attention stages INT2 rows for its kernels; "
+                "PQ quantizers are not supported on this pool"
+            )
 
         self.idx_head_dim = int(idx_head_dim)
         self.index_dtype = (

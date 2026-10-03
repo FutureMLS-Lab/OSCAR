@@ -22,10 +22,14 @@ mkdir -p "$OUT" "$HF_HOME"
 # so the row could only ever report FAIL(no-serve) -- which reads as "the model
 # is broken" when it means "the harness cannot host it". Verify K3 with its own
 # two-node job (rotation/run/kimi-k3.sh) and record that verdict separately.
-# name | kind | repo | tp | group-or-rotdir | rot | sink | recent | memfrac
+# name | kind | repo | tp | group-or-rotdir | rot | sink | recent | memfrac | quant
+# quant (mha only, optional): int2 (default) | kpq | krvq | kpq-vpq, see mha.sh.
 MODELS="
 qwen3-4b-think|mha|Qwen/Qwen3-4B-Thinking-2507|1|128|Qwen3-4B-Thinking-2507/seq20000_prompt83_group128|64|256|0.55
 qwen3-8b|mha|Qwen/Qwen3-8B|1|128|Qwen3-8B/seq20000_prompt83_group128|64|512|0.55
+qwen3-8b-kpq|mha|Qwen/Qwen3-8B|1|128|Qwen3-8B/seq20000_prompt83_group128|64|512|0.55|kpq
+qwen3-8b-krvq|mha|Qwen/Qwen3-8B|1|128|Qwen3-8B/seq20000_prompt83_group128|64|512|0.55|krvq
+qwen3-8b-kpq-vpq|mha|Qwen/Qwen3-8B|1|128|Qwen3-8B/seq20000_prompt83_group128|64|512|0.55|kpq-vpq
 qwen3-32b|mha|Qwen/Qwen3-32B|2|128|Qwen3-32B/seq16000_prompt69_group128|64|256|0.55
 qwen3-30b-a3b|mha|Qwen/Qwen3-30B-A3B|2|128|Qwen3-30B-A3B|64|256|0.60
 qwen35-4b|mha|Qwen/Qwen3.5-4B|1|256|Qwen3.5-4B|64|256|0.55
@@ -45,7 +49,7 @@ echo "### sweep $(date -u +%FT%TZ)  image=$(cat /oscar/IMAGE_TAG 2>/dev/null)  $
 # was skipped outright that way, and qwen35-35b's verdict landed under
 # minimax-m27's header. A here-string keeps stdin free, and `< /dev/null` on
 # each launch makes sure nothing downstream can eat the list either.
-while IFS='|' read -r name kind repo tp a rot sink recent mf; do
+while IFS='|' read -r name kind repo tp a rot sink recent mf quant; do
   [ -n "$name" ] || continue
   if [ -n "${ONLY}" ] && [ "$name" != "$ONLY" ]; then
     continue
@@ -61,6 +65,7 @@ while IFS='|' read -r name kind repo tp a rot sink recent mf; do
       *)                    unset MAMBA_STRATEGY ;;
     esac
     export NO_AUTOTUNE=1
+    export KV_QUANT="${quant:-int2}"
     bash "$D/mha.sh" "$name" "$repo" "$tp" "$a" "$rot" "$sink" "$recent" "$mf" \
       < /dev/null 2>&1 | tee "$OUT/$name.out" | tail -22
   else

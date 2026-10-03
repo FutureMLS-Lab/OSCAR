@@ -220,6 +220,8 @@ def _get_unified_mixed_kv_bytes_per_quant_token(
     k_groups: int,
     v_groups: int,
     n_q: int,
+    k_code_bytes: Optional[int] = None,
+    v_code_bytes: Optional[int] = None,
 ) -> int:
     """Shared-arena bytes per *quant token* in the unified pool.
 
@@ -229,10 +231,12 @@ def _get_unified_mixed_kv_bytes_per_quant_token(
     live in a parallel arena (one entry per quant slot) and are included
     here so the scheduler's cell-size matches the actual allocator size.
     """
-    arena_bytes_per_page = (k_head_dim + v_head_dim) * hp_dtype_bytes
-    arena_bytes_per_quant_token = arena_bytes_per_page // n_q
+    # A PQ tier stores one uint8 code per sub-vector and no scales; the INT2
+    # tier's row is ``head_dim * hp_dtype_bytes / n_q`` (= head_dim // 4).
+    k_bytes = (k_head_dim * hp_dtype_bytes) // n_q if k_code_bytes is None else k_code_bytes
+    v_bytes = (v_head_dim * hp_dtype_bytes) // n_q if v_code_bytes is None else v_code_bytes
     scales_zeros_bytes_per_quant_token = 2 * scale_dtype_bytes * (k_groups + v_groups)
-    return arena_bytes_per_quant_token + scales_zeros_bytes_per_quant_token
+    return k_bytes + v_bytes + scales_zeros_bytes_per_quant_token
 
 
 def _int2_scale_dtype_bytes() -> int:
@@ -360,6 +364,9 @@ class _Int2Pricing(msgspec.Struct, frozen=True):
     scale_bytes: int
     hp_dtype_bytes: Optional[int] = None
     n_q: Optional[int] = None
+    # Bytes per row of a product-quantized tier (None = INT2 packing).
+    k_code_bytes: Optional[int] = None
+    v_code_bytes: Optional[int] = None
 
     def bytes_per_head(self, *, head_dim: int, v_head_dim: int) -> int:
         """Bytes per quant token for one K/V head pair of this geometry."""
@@ -369,9 +376,19 @@ class _Int2Pricing(msgspec.Struct, frozen=True):
                 v_head_dim=v_head_dim,
                 hp_dtype_bytes=self.hp_dtype_bytes,
                 scale_dtype_bytes=self.scale_bytes,
-                k_groups=_resolve_quant_group_count(head_dim, self.group_size),
-                v_groups=_resolve_quant_group_count(v_head_dim, self.group_size),
+                k_groups=(
+                    0
+                    if self.k_code_bytes is not None
+                    else _resolve_quant_group_count(head_dim, self.group_size)
+                ),
+                v_groups=(
+                    0
+                    if self.v_code_bytes is not None
+                    else _resolve_quant_group_count(v_head_dim, self.group_size)
+                ),
                 n_q=self.n_q,
+                k_code_bytes=self.k_code_bytes,
+                v_code_bytes=self.v_code_bytes,
             )
         return _get_int_kv_bytes_per_head_pair(
             k_head_dim=head_dim,
@@ -411,13 +428,37 @@ def _resolve_int2_pricing(kvc: KVCacheConfigurator) -> Optional[_Int2Pricing]:
     hp_dtype = resolve_hp_dtype(envs.SGLANG_MIXED_KV_HP_DTYPE.get())
     hp_dtype_bytes = torch.empty(0, dtype=hp_dtype).element_size()
     _, n_q = compute_page_geometry(hp_dtype)
+    k_code_bytes, v_code_bytes = _pq_code_bytes(kvc)
     return _Int2Pricing(
         mixed=True,
         group_size=group_size,
         scale_bytes=scale_bytes,
         hp_dtype_bytes=hp_dtype_bytes,
         n_q=int(n_q),
+        k_code_bytes=k_code_bytes,
+        v_code_bytes=v_code_bytes,
     )
+
+
+def _pq_code_bytes(kvc: KVCacheConfigurator) -> tuple[Optional[int], Optional[int]]:
+    """Row bytes of the K / V tiers when they are product-quantized; the
+    codebook header is read so the price matches the pool the env selects."""
+    from sglang.srt.mem_cache.oscar_pq_codebooks import pq_code_bytes_per_row
+
+    k_code_bytes = v_code_bytes = None
+    if envs.SGLANG_OSCAR_K_QUANTIZER.get().strip().lower() == "pq":
+        k_code_bytes = pq_code_bytes_per_row(
+            envs.SGLANG_OSCAR_PQ_K_CODEBOOK.get(),
+            head_dim=kvc.model_config.head_dim,
+            label="PQ K",
+        )
+    if envs.SGLANG_OSCAR_V_QUANTIZER.get().strip().lower() == "pq":
+        v_code_bytes = pq_code_bytes_per_row(
+            envs.SGLANG_OSCAR_PQ_V_CODEBOOK.get(),
+            head_dim=kvc.model_config.v_head_dim,
+            label="PQ V",
+        )
+    return k_code_bytes, v_code_bytes
 
 
 def check_dsv4_unified_fp8_pd_supported(

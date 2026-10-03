@@ -20,7 +20,10 @@ import triton.language as tl
 from sglang.QuantKernel.fused_hadamard_int2_kv import (
     quantized_set_kv_int2_pretransformed_triton,
 )
+from sglang.QuantKernel.oscar_pq_kv import pq_decode_at_locs, pq_encode
 from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
+    _launch_grouped_clip_int2,
+    _launch_single_clip_int2,
     quantized_set_kv_int2_oscar_rotate_k_clip_triton,
     quantized_set_kv_int2_pretransformed_clip_triton,
 )
@@ -44,6 +47,7 @@ from sglang.srt.mem_cache.oscar_calibration import (
     get_active_oscar_calibrator,
     set_active_oscar_calibrator,
 )
+from sglang.srt.mem_cache.oscar_pq_codebooks import PQCodebookSet, load_pq_codebook_set
 from sglang.srt.mem_cache.oscar_rotation_paths import oscar_calibration_required
 
 logger = logging.getLogger(__name__)
@@ -338,6 +342,17 @@ class UnifiedInt2HPKVPool(KVCache):
                 f"v_head_dim={vhd} (layer {li}) must be divisible by 4 for int2 packing"
             )
 
+        if rotation_layer_ids is not None and len(rotation_layer_ids) != self.layer_num:
+            raise ValueError(
+                f"UnifiedInt2HPKVPool: rotation_layer_ids has "
+                f"{len(rotation_layer_ids)} entries but layer_num={self.layer_num}"
+            )
+        self._rotation_layer_ids = (
+            list(rotation_layer_ids) if rotation_layer_ids is not None else None
+        )
+        # The quant-tier encoders decide the code widths, so they resolve
+        # before the arenas exist.
+        self._init_quantizers()
         self._create_arenas()
 
         # Cached attributes used by the rest of the stack.
@@ -367,14 +382,6 @@ class UnifiedInt2HPKVPool(KVCache):
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
-        if rotation_layer_ids is not None and len(rotation_layer_ids) != self.layer_num:
-            raise ValueError(
-                f"UnifiedInt2HPKVPool: rotation_layer_ids has "
-                f"{len(rotation_layer_ids)} entries but layer_num={self.layer_num}"
-            )
-        self._rotation_layer_ids = (
-            list(rotation_layer_ids) if rotation_layer_ids is not None else None
-        )
         # Scalar head_dim for uniform models (stacked [L,hd,hd], indexable as
         # ``self._R_k[idx]``); per-layer list for the two-geometry-group case
         # (list of per-layer matrices, indexed the same way).
@@ -474,6 +481,179 @@ class UnifiedInt2HPKVPool(KVCache):
 
     def mixed_kv_enabled(self) -> bool:
         return True
+
+    # -- Quant-tier encoders -----------------------------------------------
+
+    def _init_quantizers(self) -> None:
+        """Resolve the K/V quant-tier encoders from the environment and load
+        their codebooks for this pool's layers."""
+        k_name = envs.SGLANG_OSCAR_K_QUANTIZER.get().strip().lower()
+        v_name = envs.SGLANG_OSCAR_V_QUANTIZER.get().strip().lower()
+        for label, name in (("K", k_name), ("V", v_name)):
+            if name not in ("int2", "pq"):
+                raise ValueError(
+                    f"SGLANG_OSCAR_{label}_QUANTIZER must be int2 or pq, got {name!r}"
+                )
+        if v_name == "pq" and k_name != "pq":
+            raise ValueError("SGLANG_OSCAR_V_QUANTIZER=pq requires SGLANG_OSCAR_K_QUANTIZER=pq")
+        self._k_quantizer = k_name
+        self._v_quantizer = v_name
+        self._pq_k: Optional[PQCodebookSet] = None
+        self._pq_v: Optional[PQCodebookSet] = None
+        if k_name == "int2":
+            return
+        if self._layer_groups is not None:
+            raise ValueError(
+                "PQ quantizers need one head geometry across layers; "
+                "two-group pools stay on INT2"
+            )
+        if oscar_calibration_required():
+            raise ValueError(
+                "PQ codebooks are trained against a fixed rotation pair; startup "
+                "calibration cannot run with a PQ quantizer"
+            )
+        layer_ids = self.oscar_layer_ids()
+        k_path = envs.SGLANG_OSCAR_PQ_K_CODEBOOK.get()
+        if not k_path:
+            raise ValueError("SGLANG_OSCAR_K_QUANTIZER=pq needs SGLANG_OSCAR_PQ_K_CODEBOOK")
+        self._pq_k = load_pq_codebook_set(
+            k_path, head_dim=self.head_dim, layer_ids=layer_ids, device=self.device, label="PQ K"
+        )
+        if v_name == "pq":
+            v_path = envs.SGLANG_OSCAR_PQ_V_CODEBOOK.get()
+            if not v_path:
+                raise ValueError("SGLANG_OSCAR_V_QUANTIZER=pq needs SGLANG_OSCAR_PQ_V_CODEBOOK")
+            self._pq_v = load_pq_codebook_set(
+                v_path,
+                head_dim=self.v_head_dim,
+                layer_ids=layer_ids,
+                device=self.device,
+                label="PQ V",
+            )
+        logger.info(
+            "UnifiedInt2HPKVPool: K quantizer pq [%s] from %s | V quantizer %s%s",
+            self._pq_k.describe(self.head_dim),
+            k_path,
+            v_name,
+            (
+                f" [{self._pq_v.describe(self.v_head_dim)}] from {self._pq_v.source}"
+                if self._pq_v is not None
+                else ""
+            ),
+        )
+
+    def _k_code_width(self, li: int) -> int:
+        return self._pq_k.n_sub if self._pq_k is not None else self._layer_head_dim[li] // 4
+
+    def _v_code_width(self, li: int) -> int:
+        return self._pq_v.n_sub if self._pq_v is not None else self._layer_v_head_dim[li] // 4
+
+    def _k_scale_groups(self, li: int) -> int:
+        return 0 if self._pq_k is not None else self._layer_k_num_scale_groups[li]
+
+    def _v_scale_groups(self, li: int) -> int:
+        return 0 if self._pq_v is not None else self._layer_v_num_scale_groups[li]
+
+    @property
+    def k_quantizer(self) -> str:
+        return self._k_quantizer
+
+    @property
+    def v_quantizer(self) -> str:
+        return self._v_quantizer
+
+    @property
+    def pq_k_set(self) -> Optional[PQCodebookSet]:
+        return self._pq_k
+
+    @property
+    def pq_v_set(self) -> Optional[PQCodebookSet]:
+        return self._pq_v
+
+    def pq_k_codebook(self, layer_id: int) -> Optional[torch.Tensor]:
+        if self._pq_k is None:
+            return None
+        return self._pq_k.codebooks[self._layer_index(layer_id)]
+
+    def pq_k_codebook2(self, layer_id: int) -> Optional[torch.Tensor]:
+        if self._pq_k is None or not self._pq_k.residual:
+            return None
+        return self._pq_k.stage2_codebooks[self._layer_index(layer_id)]
+
+    def pq_v_codebook(self, layer_id: int) -> Optional[torch.Tensor]:
+        if self._pq_v is None:
+            return None
+        return self._pq_v.codebooks[self._layer_index(layer_id)]
+
+    def get_raw_key_buffer2(self, layer_id: int) -> Optional[torch.Tensor]:
+        if self.k_buffer2 is None:
+            return None
+        return self.k_buffer2[self._layer_index(layer_id)]
+
+    def _store_quant_pq(
+        self,
+        idx: int,
+        quant_loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        mixed_hp_offset: Optional[int],
+    ) -> None:
+        """Prefill write of the quant slots when K is product-quantized;
+        the rows are already in the rotated frame. HP locs are skipped by the
+        kernels themselves."""
+        book = self._pq_k
+        pq_encode(
+            cache_k,
+            quant_loc,
+            self.k_buffer[idx],
+            book.codebooks[idx],
+            book.norms[idx],
+            hp_global_offset=mixed_hp_offset,
+        )
+        if book.residual:
+            recon = pq_decode_at_locs(
+                self.k_buffer[idx],
+                quant_loc,
+                book.codebooks[idx],
+                head_dim=self.head_dim,
+                hp_global_offset=mixed_hp_offset,
+            ).to(cache_k.dtype)
+            pq_encode(
+                (cache_k - recon).contiguous(),
+                quant_loc,
+                self.k_buffer2[idx],
+                book.stage2_codebooks[idx],
+                book.stage2_norms[idx],
+                hp_global_offset=mixed_hp_offset,
+            )
+        if self._pq_v is not None:
+            pq_encode(
+                cache_v,
+                quant_loc,
+                self.v_buffer[idx],
+                self._pq_v.codebooks[idx],
+                self._pq_v.norms[idx],
+                hp_global_offset=mixed_hp_offset,
+            )
+        elif _get_num_scale_groups(self.v_scales_zeros[idx]) == 1:
+            _launch_single_clip_int2(
+                cache_v,
+                quant_loc,
+                self.v_buffer[idx],
+                self.v_scales_zeros[idx],
+                self._v_clip_ratio,
+                hp_global_offset=mixed_hp_offset,
+                lloyd_max=self._lloyd_max,
+            )
+        else:
+            _launch_grouped_clip_int2(
+                cache_v,
+                quant_loc,
+                self.v_buffer[idx],
+                self.v_scales_zeros[idx],
+                self._v_clip_ratio,
+                hp_global_offset=mixed_hp_offset,
+            )
 
     # -- Startup calibration -----------------------------------------------
 
@@ -707,23 +887,30 @@ class UnifiedInt2HPKVPool(KVCache):
             ):
                 self.k_buffer = [
                     torch.zeros(
-                        (nq, self._layer_head_num[li], self._layer_head_dim[li] // 4),
+                        (nq, self._layer_head_num[li], self._k_code_width(li)),
                         dtype=torch.uint8,
                         device=self.device,
                     )
                     for li in range(self.layer_num)
                 ]
+                # Residual-stage codes mirror the stage-1 code buffer.
+                self.k_buffer2 = (
+                    [torch.zeros_like(self.k_buffer[li]) for li in range(self.layer_num)]
+                    if self._pq_k is not None and self._pq_k.residual
+                    else None
+                )
                 self.v_buffer = [
                     torch.zeros(
-                        (nq, self._layer_head_num[li], self._layer_v_head_dim[li] // 4),
+                        (nq, self._layer_head_num[li], self._v_code_width(li)),
                         dtype=torch.uint8,
                         device=self.device,
                     )
                     for li in range(self.layer_num)
                 ]
+                # A PQ tier carries no scale/zero; its arena is zero-width.
                 self.k_scales_zeros = [
                     torch.zeros(
-                        (nq, self._layer_head_num[li], 2 * self._layer_k_num_scale_groups[li]),
+                        (nq, self._layer_head_num[li], 2 * self._k_scale_groups(li)),
                         dtype=self.scale_dtype,
                         device=self.device,
                     )
@@ -731,7 +918,7 @@ class UnifiedInt2HPKVPool(KVCache):
                 ]
                 self.v_scales_zeros = [
                     torch.zeros(
-                        (nq, self._layer_head_num[li], 2 * self._layer_v_num_scale_groups[li]),
+                        (nq, self._layer_head_num[li], 2 * self._v_scale_groups(li)),
                         dtype=self.scale_dtype,
                         device=self.device,
                     )
@@ -845,6 +1032,8 @@ class UnifiedInt2HPKVPool(KVCache):
 
     def get_kv_size_bytes(self):
         k = sum(get_tensor_size_bytes(t) for t in self.k_buffer)
+        if self.k_buffer2 is not None:
+            k += sum(get_tensor_size_bytes(t) for t in self.k_buffer2)
         k += sum(get_tensor_size_bytes(s) for s in self.k_scales_zeros)
         k += sum(get_tensor_size_bytes(t) for t in self.hp_k_buffer)
         v = sum(get_tensor_size_bytes(t) for t in self.v_buffer)
@@ -899,13 +1088,16 @@ class UnifiedInt2HPKVPool(KVCache):
 
     def get_raw_kv_buffer(self, layer_id: int):
         idx = self._layer_index(layer_id)
-        return {
+        buffers = {
             "k_buffer": self.k_buffer[idx],
             "v_buffer": self.v_buffer[idx],
             "k_scales_zeros": self.k_scales_zeros[idx],
             "v_scales_zeros": self.v_scales_zeros[idx],
             "dtype": "int2",
         }
+        if self.k_buffer2 is not None:
+            buffers["k_buffer2"] = self.k_buffer2[idx]
+        return buffers
 
     def _split_global_locs(self, loc: torch.Tensor):
         loc64 = loc.to(torch.int64)
@@ -1011,6 +1203,7 @@ class UnifiedInt2HPKVPool(KVCache):
             and not already_hadamard_transformed
             and v_rotation_absorbed
             and clip_on
+            and self._pq_k is None
             and _get_num_scale_groups(self.k_scales_zeros[idx]) == 1
             and _get_num_scale_groups(self.v_scales_zeros[idx]) == 1
         )
@@ -1037,6 +1230,10 @@ class UnifiedInt2HPKVPool(KVCache):
         else:
             cache_k = cache_k.to(self.hp_dtype)
             cache_v = cache_v.to(self.hp_dtype)
+
+        if self._pq_k is not None:
+            self._store_quant_pq(idx, quant_loc, cache_k, cache_v, mixed_hp_offset)
+            return
 
         if not clip_on:
             quantized_set_kv_int2_pretransformed_triton(
@@ -1198,6 +1395,8 @@ class UnifiedInt2HPKVPool(KVCache):
         for l in range(self.layer_num):
             if tgt_q.numel() > 0:
                 self.k_buffer[l][tgt_q] = self.k_buffer[l][src_q]
+                if self.k_buffer2 is not None:
+                    self.k_buffer2[l][tgt_q] = self.k_buffer2[l][src_q]
                 self.v_buffer[l][tgt_q] = self.v_buffer[l][src_q]
                 self.k_scales_zeros[l][tgt_q] = self.k_scales_zeros[l][src_q]
                 self.v_scales_zeros[l][tgt_q] = self.v_scales_zeros[l][src_q]
