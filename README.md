@@ -62,19 +62,19 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 
 ### Results on the upstream-aligned tree
 
-Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; GPQA-Diamond @64K budget, n=198, single seed; decode at 64K context, batch 1. Details and ms/tok in the [per-model](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) and [speed](#64k-decode-on-b200-this-tree) tables.
+Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; GPQA-Diamond @64K budget, n=198, single seed unless a cell says otherwise (then the mean over the seeds run on this tree); decode at 64K context, batch 1. Details and ms/tok in the [per-model](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) and [speed](#64k-decode-on-b200-this-tree) tables.
 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family |
 |:---:|:---:|:---:|:---:|:---:|
 | Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower |
-| Qwen3-8B | 56.6 | 52.5 | 5.71× faster | 1.22× slower |
+| Qwen3-8B | 58.6 (2 seeds) | 52.8 (4 seeds) | 5.71× faster | 1.22× slower |
 | Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower |
-| Qwen3-30B-A3B | 61.1 | 55.6 | 8.39× faster | 1.40× slower |
+| Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower |
 | Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower |
 | Qwen3.5-35B-A3B | 81.8 | 83.8 | 3.97× faster | 1.32× slower |
 | Gemma-4-12B-it | 63.1 | 64.1 | 2.03× faster | 1.51× slower (trtllm_mha) |
 | MiniMax-M2.7 | 86.9 | 87.9 | 6.66× faster | 1.27× slower |
-| MiniMax-M3 (MSA sparse) | 90.9 | 88.9 | 1.34× slower | 1.73× slower |
+| MiniMax-M3 (MSA sparse) | 90.9 | 88.1 (2 seeds) | 1.34× slower | 1.73× slower |
 | GLM-4.7-FP8 | 80.8 | 78.8 | 6.54× faster | 1.18× slower |
 | GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path |
 | GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path |
@@ -572,7 +572,7 @@ The table is populated only from runs on **this tree at its current upstream
 base** (`67eab57057`, nightly image `nightly-dev-20261002-67eab570`); numbers
 from earlier bases are not carried over. Both arms of a row share one launch
 path (`rotation/run/<model>.sh`) and differ only in `KV_MODE`; GPQA-Diamond is
-single-seed, all 198 questions, at a 64K generation budget with radix cache
+single-seed unless the cell lists its seeds, all 198 questions, at a 64K generation budget with radix cache
 and CUDA graphs on. All thirteen rows below are complete on this base.
 
 **The INT2 arm runs the model's own attention.** GLM-5.2/5.3 run upstream's
@@ -585,14 +585,14 @@ dense GQA. The BF16 control uses the same backend in every row.
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
-| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 56.6 | 52.5 | −4.0 |
+| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 58.6 (2 seeds: 60.6, 56.6) | 52.8 (4 seeds: 50.0, 52.5, 56.1, 52.5) | −5.8 |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | 64.1 | 59.6 | −4.5 |
-| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.6 | −5.6 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
+| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.3 (2 seeds: 55.6, 55.1) | −5.8 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
 | `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
 | `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 81.8 | 83.8 | +2.0 |
 | `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 63.1 | 64.1 | +1.0 |
 | `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | 86.9 | 87.9 | +1.0 |
-| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | 90.9 | 88.9 | −2.0 (after the indexer-key fix below; 56.6 before it) |
+| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | 90.9 | 88.1 (2 seeds: 88.9, 87.4) | −2.8 (after the indexer-key fix below; 56.6 before it) |
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 83.8 | −3.5 (INT2 answers run longer: median 63K vs 32K chars, 24 vs 9 without a final answer) |
 | `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 84.3 | −3.0 (INT2 answers run longer: median 51K vs 31K chars, 21 vs 8 without a final answer) |
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | 80.8 | 78.8 | −2.0 |
