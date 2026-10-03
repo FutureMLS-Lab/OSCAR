@@ -48,6 +48,64 @@ GB = 1024 * 1024 * 1024
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
 
 
+try:  # CPU-only test hosts import this module without triton
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _follow_flush_kernel(
+        side_ptr, src_ptr, dst_ptr, valid_ptr,
+        hp_off, layer_stride, slot_stride, n_rows,
+        ROW_BYTES: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """``side[l, dst[r]] = side[l, src[r] + hp_off]`` for every valid row
+        and every layer, bytewise; one launch for the whole flush."""
+        r = tl.program_id(0)
+        layer = tl.program_id(1)
+        if r >= n_rows:
+            return
+        valid = tl.load(valid_ptr + r).to(tl.int32)
+        if valid == 0:
+            return
+        src = tl.load(src_ptr + r).to(tl.int64) + hp_off
+        dst = tl.load(dst_ptr + r).to(tl.int64)
+        base = side_ptr + layer.to(tl.int64) * layer_stride
+        offs = tl.arange(0, BLOCK)
+        m = offs < ROW_BYTES
+        x = tl.load(base + src * slot_stride + offs, mask=m)
+        tl.store(base + dst * slot_stride + offs, x, mask=m)
+
+
+def follow_flush_fused(side_cache: torch.Tensor, plan, hp_global_offset: int) -> None:
+    """``follow_flush`` as one launch (grid rows x layers), rows copied as
+    bytes so any index dtype works. Falls back to ``follow_flush`` where
+    triton or a GPU is missing."""
+    if plan is None or side_cache.numel() == 0:
+        return
+    if triton is None or not side_cache.is_cuda:
+        return follow_flush(side_cache, plan, hp_global_offset)
+    layers, slots = side_cache.shape[0], side_cache.shape[1]
+    flat = side_cache.view(layers, slots, -1)
+    assert flat.is_contiguous(), "index side cache must be contiguous"
+    row_bytes = flat.shape[-1] * flat.element_size()
+    raw = flat.view(torch.uint8).view(layers, slots, row_bytes)
+    n = int(plan.valid_mask.numel())
+    if n == 0:
+        return
+    _follow_flush_kernel[(n, layers)](
+        raw, plan.src_hp_slot, plan.dst_quant_slots, plan.valid_mask,
+        int(hp_global_offset), slots * row_bytes, row_bytes, n,
+        ROW_BYTES=row_bytes, BLOCK=triton.next_power_of_2(row_bytes),
+        num_warps=1 if row_bytes <= 512 else 4,
+    )
+
+
 def follow_flush(side_cache: torch.Tensor, plan, hp_global_offset: int) -> None:
     """Carry a slot-indexed side cache ``[num_layers, num_slots, ...]`` along
     with one decode flush. For each demoted token the plan names the window
@@ -293,4 +351,4 @@ class MiniMaxInt2SparseKVPool(UnifiedInt2HPKVPool):
 
     def on_flush_applied(self, plan) -> None:
         for side in (self._index_k_all, self._index_v_all):
-            follow_flush(side, plan, int(self.hp_global_offset))
+            follow_flush_fused(side, plan, int(self.hp_global_offset))

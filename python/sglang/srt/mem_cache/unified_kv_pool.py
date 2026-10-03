@@ -283,9 +283,23 @@ class UnifiedInt2HPKVPool(KVCache):
         # to (hp_recent+N_Q-1)-H_0) keeps every flush whole-page.
         self.flush_interval = self.N_Q
         self.max_req_slots = int(max_req_slots)
-        self._flush_counter = torch.zeros(
-            (self.max_req_slots,), dtype=torch.int32, device=self.device
-        )
+        # Per-request flush countdown, kept on the HOST. The decode step reads
+        # it to learn which requests demote a page this step, so the plan and
+        # the apply run only for those rows and only on the steps that have
+        # any -- (N_Q - 1) of every N_Q steps have none and skip the whole
+        # sequence. Seeded by _alloc_for_extend_mixed, reset by
+        # release_req_slab, advanced by advance_flush_counters.
+        self._flush_counter_host: List[int] = [0] * self.max_req_slots
+        # Pinned staging for the flush rows' (req idx, seq_len, protected
+        # prefix) triples: one async H2D per flush step, no pageable copy. A
+        # ring, so a step never rewrites a buffer whose copy may still be in
+        # flight (the GPU is never more than a couple of steps behind).
+        _pin = torch.cuda.is_available() and str(self.device).startswith("cuda")
+        self._flush_stage = [
+            torch.empty((max(self.max_req_slots, 1), 3), dtype=torch.int64, pin_memory=_pin)
+            for _ in range(16)
+        ]
+        self._flush_stage_i = 0
         self._next_slab_offset = torch.zeros(
             (self.max_req_slots,), dtype=torch.int32, device=self.device
         )
@@ -494,15 +508,62 @@ class UnifiedInt2HPKVPool(KVCache):
         # Reset the per-req HP-recent cursor and flush counter so the next
         # request taking over ``req_pool_idx`` starts clean.
         if isinstance(req_pool_idx, torch.Tensor):
-            idx = req_pool_idx.to(self._next_slab_offset.device).to(torch.int64)
-            if idx.numel() == 0:
+            if req_pool_idx.numel() == 0:
                 return
+            idx_list = req_pool_idx.detach().cpu().to(torch.int64).tolist()
+            idx = req_pool_idx.to(self._next_slab_offset.device).to(torch.int64)
             self._next_slab_offset[idx] = 0
-            self._flush_counter[idx] = 0
+            for i in idx_list:
+                self._flush_counter_host[int(i)] = 0
         else:
             i = int(req_pool_idx)
             self._next_slab_offset[i] = 0
-            self._flush_counter[i] = 0
+            self._flush_counter_host[i] = 0
+
+    def seed_flush_counters(self, req_pool_indices: List[int], inits: List[int]) -> None:
+        """Admission (every chunk of a chunked extend re-seeds; the latest wins)."""
+        for rpi, c in zip(req_pool_indices, inits):
+            self._flush_counter_host[int(rpi)] = int(c)
+
+    def advance_flush_counters(self, req_pool_indices: List[int]) -> List[int]:
+        """One decode step for the given batch rows. Returns the rows whose
+        countdown hit zero: they demote ``flush_interval`` HP-recent slots
+        into one quant page this step and restart at ``flush_interval - 1``;
+        every other row counts down by one. Same arithmetic the device
+        tensor used to run, now a few Python ints with no launch and no sync."""
+        fi = int(self.flush_interval)
+        host = self._flush_counter_host
+        rows: List[int] = []
+        for i, rpi in enumerate(req_pool_indices):
+            c = host[rpi]
+            if c == 0:
+                host[rpi] = fi - 1
+                rows.append(i)
+            else:
+                host[rpi] = c - 1
+        return rows
+
+    def stage_flush_rows(
+        self,
+        req_pool_indices: List[int],
+        seq_lens: List[int],
+        prefix_lens: List[int],
+        device,
+    ):
+        """``(req_pool_indices int64, seq_lens int32, prefix_lens int32)`` on
+        ``device`` for the flushing rows, through one pinned async copy."""
+        n = len(req_pool_indices)
+        buf = self._flush_stage[self._flush_stage_i]
+        self._flush_stage_i = (self._flush_stage_i + 1) % len(self._flush_stage)
+        buf[:n, 0] = torch.as_tensor(req_pool_indices, dtype=torch.int64)
+        buf[:n, 1] = torch.as_tensor(seq_lens, dtype=torch.int64)
+        buf[:n, 2] = torch.as_tensor(prefix_lens, dtype=torch.int64)
+        dev = buf[:n].to(device, non_blocking=True)
+        return (
+            dev[:, 0].contiguous(),
+            dev[:, 1].to(torch.int32),
+            dev[:, 2].to(torch.int32),
+        )
 
     def _resolve_quant_grouping(self, head_dim: int, tensor_name: str) -> tuple[int, int]:
         group_size = (

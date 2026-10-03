@@ -7,15 +7,13 @@ logs the first violation of each kind (rate-limited).
 
 The invariants, and why each one matters:
 
-1. **Flush windows are all-or-nothing.** ``gpu_flush_int2_plan`` allocates one
-   whole quant page per flushing request and hands back the *unused* slots of
-   that page via ``returned_slot_ids``. ``UnifiedInt2HPKVAllocator.free``
-   aggregates quant slot ids to whole pages, so a partially-used page is
-   returned to ``free_pages`` while some of its slots are live in
-   ``req_to_token``. That page is then handed to another request → two writers
-   on the same physical slots → silently corrupted KV. A flushing request must
-   therefore have ``valid_mask`` all-ones (page fully consumed) or all-zeros
-   (page fully returned).
+1. **Flush windows are all-or-nothing.** The decode step allocates one whole
+   quant page per request whose countdown hit zero and keeps the page with the
+   request (nothing is handed back to the allocator any more, so a partial page
+   can no longer be double-allocated). A flushing request should still consume
+   the page in full: ``valid_mask`` all-ones. Fewer means the HP-recent ring did
+   not drain by a full page this cycle (invariant 2) and the page carries
+   unused slots until the request's slots are freed.
 
 2. **The HP-recent ring must drain.** Live HP-recent slots are a contiguous
    position suffix of length <= ``hp_recent_ring_size``. Ring slots are only
@@ -101,8 +99,8 @@ def audit_flush_plan(plan, flush_mask: torch.Tensor, seq_lens: torch.Tensor,
             f"seq_lens={seq_lens[straddle].tolist()} "
             f"prefix_lens={prefix_lens[straddle].tolist()} "
             f"req_pool_idx={req_pool_indices[straddle].tolist()} "
-            "-> partially-used quant page returned to the free list "
-            "(double allocation, corrupts KV)",
+            "-> page kept with the request with unused slots; the HP-recent "
+            "ring drained by less than a page this cycle",
         )
     if bool(skipped.any().item()):
         idx = torch.nonzero(skipped).flatten().tolist()

@@ -29,6 +29,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+try:  # CPU-only hosts import the allocator without triton
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+
+if triton is not None:
+
+    @triton.jit
+    def _hp_recent_alloc_kernel(
+        req_idx_ptr, cursor_ptr, out_ptr, n, RING, OFFSET,
+    ):
+        """Decode HP-recent allocation, one program per request: hand out the
+        request's ring slot at its cursor and advance the cursor. Same values
+        as the tensor sequence it replaces (``bases + old_cursors``,
+        ``(old + 1) % ring``)."""
+        i = tl.program_id(0)
+        if i >= n:
+            return
+        r = tl.load(req_idx_ptr + i).to(tl.int64)
+        c = tl.load(cursor_ptr + r).to(tl.int64)
+        tl.store(out_ptr + i, OFFSET + r * RING + c)
+        tl.store(cursor_ptr + r, ((c + 1) % RING).to(tl.int32))
+
+else:  # pragma: no cover
+    _hp_recent_alloc_kernel = None
+
+
 class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
     """Paged quant + HP-prefix free-lists, plus per-req HP-recent indexer."""
 
@@ -283,11 +312,22 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         ring = self.hp_recent_ring_size
 
         idx_dev = req_pool_indices.to(self.device).to(torch.int64)
+        uniform_decode = total == bs and all(c == 1 for c in counts_list)
+        if uniform_decode and _hp_recent_alloc_kernel is not None and idx_dev.is_cuda:
+            # Decode hot path in one launch: slot = base + cursor, then
+            # cursor = (cursor + 1) % ring. The tensor sequence below is the
+            # reference (rotation/tests/test_mixed_flush_kernels_gpu.py).
+            out = torch.empty((bs,), dtype=torch.int64, device=self.device)
+            _hp_recent_alloc_kernel[(bs,)](
+                idx_dev, cursor_buf, out, bs, int(ring), int(self._hp_recent_offset),
+                num_warps=1,
+            )
+            return out
         bases = idx_dev * ring + self._hp_recent_offset  # [bs]
         old_cursors = cursor_buf[idx_dev].to(torch.int64)  # [bs]
 
         # Decode hot path: every request asks for one HP-recent slot.
-        if total == bs and all(c == 1 for c in counts_list):
+        if uniform_decode:
             slots = bases + old_cursors
             new_cursors = ((old_cursors + 1) % ring).to(torch.int32)
             cursor_buf[idx_dev] = new_cursors

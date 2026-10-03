@@ -668,9 +668,7 @@ def _alloc_for_extend_mixed(
     # on the first chunk for a fresh admission. We do a single async H2D
     # copy + scatter so the decode hot path sees the counter without a
     # later sync.
-    counter_inits_cpu = torch.tensor(flush_counter_inits, dtype=torch.int32)
-    counter_inits_device = counter_inits_cpu.to(batch.device, non_blocking=True)
-    kv_pool._flush_counter[req_pool_indices_device] = counter_inits_device
+    kv_pool.seed_flush_counters(req_pool_indices, flush_counter_inits)
 
     try:
         batch.req_to_token_pool.alloc_aux_to_lengths(
@@ -691,9 +689,9 @@ def _alloc_for_extend_mixed(
 
 
 def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
-    # One HP-recent slot per req per step; over-provision bs*N_Q quant slots
-    # per step and let the per-req flush counter decide which use them as
-    # demote targets vs return them via ``returned_slot_ids``.
+    # One HP-recent slot per req per step; one quant page per request whose
+    # host-side flush countdown hits zero this step (see
+    # UnifiedInt2HPKVPool.advance_flush_counters), nothing for the others.
     if token_per_req != 1:
         raise NotImplementedError(
             "Mixed KV decode currently supports token_per_req=1 only."
@@ -708,118 +706,107 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
 
     req_pool_indices_int64 = batch.req_pool_indices.to(torch.int64)
 
-    # Per-request flush gating: shape-static RMW, no host sync.
-    counters = kv_pool._flush_counter[req_pool_indices_int64]
-    flush_mask = counters == 0
-    new_counters = torch.where(
-        flush_mask,
-        torch.full_like(counters, flush_interval - 1),
-        counters - 1,
-    )
-    kv_pool._flush_counter[req_pool_indices_int64] = new_counters
+    # Per-request flush gating on the host: the countdowns are Python ints
+    # (seeded at admission, advanced here), so this step knows which rows
+    # demote a page without a launch or a sync, and the (N_Q - 1) of every
+    # N_Q steps on which no request does skip plan, apply and remap
+    # altogether.
+    rpi_cpu = batch.req_pool_indices_cpu.tolist()
+    flush_rows = kv_pool.advance_flush_counters(rpi_cpu)
+    n_flush = len(flush_rows)
 
-    # Worst case: every req flushes -> bs*N_Q quant slots needed.
-    quant_need = bs * flush_interval
-    # ``evict_from_tree_cache`` gates on ``allocator.available_size()`` which
-    # for the unified pool sums quant + HP-prefix free slots. When quant is
-    # drained but HP-prefix has slack, the combined check skips eviction and
-    # ``alloc_quant`` below crashes. Force quant-tier-specific eviction here.
-    quant_pages_have = allocator.free_pages.numel() + allocator.release_pages.numel()
-    if (
-        quant_pages_have < bs
-        and batch.tree_cache is not None
-        and not batch.tree_cache.is_chunk_cache()
-    ):
-        # Tree leaves may be quant or HP-prefix; some leaves are big. Loop a
-        # few times in case the first leaves popped are HP-prefix, but cap
-        # work so we don't spin if everything left is pinned.
-        for attempt in range(8):
-            prev_quant = quant_pages_have
-            prev_hp = (
-                allocator.hp_prefix_free_pages.numel()
-                + allocator.hp_prefix_release_pages.numel()
-            )
-            # Ramp up the budget each attempt: 1x, 2x, 4x ... up to 16x.
-            mult = 1 << min(attempt, 4)
-            evict_slots = max(bs - quant_pages_have, 1) * flush_interval * mult
-            batch.tree_cache.evict(EvictParams(num_tokens=evict_slots))
-            quant_pages_have = (
-                allocator.free_pages.numel() + allocator.release_pages.numel()
-            )
-            if quant_pages_have >= bs:
-                break
-            cur_hp = (
-                allocator.hp_prefix_free_pages.numel()
-                + allocator.hp_prefix_release_pages.numel()
-            )
-            if quant_pages_have == prev_quant and cur_hp == prev_hp:
-                # Tree had nothing to evict -- leaves all pinned. Stop.
-                break
+    if n_flush > 0:
+        # ``evict_from_tree_cache`` gates on ``allocator.available_size()``
+        # which for the unified pool sums quant + HP-prefix free slots. When
+        # quant is drained but HP-prefix has slack, the combined check skips
+        # eviction and ``alloc_quant`` below crashes. Force quant-tier-specific
+        # eviction here.
+        quant_pages_have = allocator.free_pages.numel() + allocator.release_pages.numel()
+        if (
+            quant_pages_have < n_flush
+            and batch.tree_cache is not None
+            and not batch.tree_cache.is_chunk_cache()
+        ):
+            # Tree leaves may be quant or HP-prefix; some leaves are big. Loop
+            # a few times in case the first leaves popped are HP-prefix, but
+            # cap work so we don't spin if everything left is pinned.
+            for attempt in range(8):
+                prev_quant = quant_pages_have
+                prev_hp = (
+                    allocator.hp_prefix_free_pages.numel()
+                    + allocator.hp_prefix_release_pages.numel()
+                )
+                # Ramp up the budget each attempt: 1x, 2x, 4x ... up to 16x.
+                mult = 1 << min(attempt, 4)
+                evict_slots = max(n_flush - quant_pages_have, 1) * flush_interval * mult
+                batch.tree_cache.evict(EvictParams(num_tokens=evict_slots))
+                quant_pages_have = (
+                    allocator.free_pages.numel() + allocator.release_pages.numel()
+                )
+                if quant_pages_have >= n_flush:
+                    break
+                cur_hp = (
+                    allocator.hp_prefix_free_pages.numel()
+                    + allocator.hp_prefix_release_pages.numel()
+                )
+                if quant_pages_have == prev_quant and cur_hp == prev_hp:
+                    # Tree had nothing to evict -- leaves all pinned. Stop.
+                    break
 
     out_cache_loc = allocator.alloc_hp_recent(
         req_pool_indices_int64, [token_per_req] * bs
     )
 
-    dst_quant_slots = allocator.alloc_quant(quant_need)
-    if dst_quant_slots is None:
-        raise RuntimeError(
-            "Mixed KV windows failed to allocate quant flush slots. "
-            f"{allocator.debug_print()}"
+    if n_flush > 0:
+        # One quant page per flushing request, nothing for the others.
+        dst_quant_slots = allocator.alloc_quant(n_flush * flush_interval)
+        if dst_quant_slots is None:
+            raise RuntimeError(
+                "Mixed KV windows failed to allocate quant flush slots. "
+                f"{allocator.debug_print()}"
+            )
+        seq_lens_cpu = batch.seq_lens_cpu.tolist()
+        req_idx_f, seq_lens_f, prefix_lens_f = kv_pool.stage_flush_rows(
+            [rpi_cpu[i] for i in flush_rows],
+            [int(seq_lens_cpu[i]) for i in flush_rows],
+            [int(batch.reqs[i].kv.cache_protected_len) for i in flush_rows],
+            batch.device,
         )
+        flush_mask = torch.ones(n_flush, dtype=torch.bool, device=batch.device)
 
-    # Build the protected boundary on device in one go.  This is the
-    # tree-owned prefix that flush must not overwrite; ``prefix_indices`` may
-    # additionally contain request-owned tail slots for chunk continuation.
-    prefix_lens_cpu = torch.tensor(
-        [int(r.kv.cache_protected_len) for r in batch.reqs], dtype=torch.int32
-    )
-    prefix_lens_gpu = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    seq_lens_int32 = batch.seq_lens.to(torch.int32)
-
-    # Phase 1 (no-race with previous forward): plan kernel reads
-    # ``req_to_token`` and produces ``returned_slot_ids`` etc. Followed by
-    # ``allocator.free``, whose ``torch.unique`` host-syncs only against this
-    # short pre-wait prefix instead of the previous forward. See
-    # plan-for-a-fix-starry-russell.md.
-    plan = gpu_flush_int2_plan(
-        seq_lens=seq_lens_int32,
-        prefix_lens=prefix_lens_gpu,
-        req_pool_indices=req_pool_indices_int64,
-        dst_quant_slots=dst_quant_slots,
-        req_to_token=batch.req_to_token_pool.req_to_token,
-        flush_mask=flush_mask,
-        hp_prefix_tokens=kv_pool.hp_prefix_tokens,
-        hp_recent_tokens=kv_pool.hp_recent_tokens,
-        hp_global_offset=kv_pool.hp_global_offset,
-        flush_interval=flush_interval,
-    )
-
-    if plan is not None:
+        # Phase 1 (no race with the previous forward): the plan kernel only
+        # reads ``req_to_token``. The flushed HP-recent slots need no free
+        # (per-request ring, reclaimed by its cursor) and the quant page now
+        # belongs to the request -- a row the plan could not demote leaves an
+        # unused slot in it that goes back with the page when the request's
+        # slots are freed. Nothing is handed back, so the masked-select and
+        # unique() syncs the old bulk free paid every step are gone.
+        plan = gpu_flush_int2_plan(
+            seq_lens=seq_lens_f,
+            prefix_lens=prefix_lens_f,
+            req_pool_indices=req_idx_f,
+            dst_quant_slots=dst_quant_slots,
+            req_to_token=batch.req_to_token_pool.req_to_token,
+            flush_mask=flush_mask,
+            hp_prefix_tokens=kv_pool.hp_prefix_tokens,
+            hp_recent_tokens=kv_pool.hp_recent_tokens,
+            hp_global_offset=kv_pool.hp_global_offset,
+            flush_interval=flush_interval,
+        )
+        assert plan is not None
         if mixed_kv_audit.audit_enabled():
             mixed_kv_audit.audit_flush_plan(
                 plan,
                 flush_mask=flush_mask,
-                seq_lens=seq_lens_int32,
-                prefix_lens=prefix_lens_gpu,
-                req_pool_indices=req_pool_indices_int64,
+                seq_lens=seq_lens_f,
+                prefix_lens=prefix_lens_f,
+                req_pool_indices=req_idx_f,
             )
-            mixed_kv_audit.audit_req_to_token(batch, kv_pool)
-            mixed_kv_audit.audit_kv_content(batch, kv_pool)
-        # Free everything returned by the kernel in one call: flushed HP
-        # slots (freed from HP tier) and unused quant slots from
-        # non-flushing requests (whole pages, since per-request
-        # all-or-nothing). The allocator decodes tier from each global slot
-        # id.
-        allocator.free(plan.returned_slot_ids)
 
-    # Phase 2 (must wait): the apply kernels write ``req_to_token`` at
-    # positions inside the previous forward's read range. Order
-    # schedule_stream after ``forward_done`` here, not at the top of the
-    # event loop, so the host syncs above and any retract/eviction frees
-    # don't stall behind the previous forward.
-    kv_pool.wait_pending_forward()
+        # Phase 2 (must wait): the apply kernels write ``req_to_token`` at
+        # positions inside the previous forward's read range.
+        kv_pool.wait_pending_forward()
 
-    if plan is not None:
         # The fused flush kernel requires identical strides across the layers
         # it spans, so it runs once per uniform-geometry group. For uniform
         # models ``_flush_groups`` has a single entry covering all layers
@@ -833,7 +820,7 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         for gi, g in enumerate(groups):
             gpu_flush_int2_apply(
                 plan,
-                req_pool_indices=req_pool_indices_int64,
+                req_pool_indices=req_idx_f,
                 req_to_token=batch.req_to_token_pool.req_to_token,
                 hp_k_ptrs=g["hp_k_ptrs"],
                 hp_v_ptrs=g["hp_v_ptrs"],
@@ -873,6 +860,11 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         # Side caches keyed by slot id (MiniMax indexer keys) must follow the
         # demoted rows, or the indexer reads zeros for every flushed token.
         kv_pool.on_flush_applied(plan)
+
+    if mixed_kv_audit.audit_enabled():
+        # after the remap, as before: the table the audit reads is this step's
+        mixed_kv_audit.audit_req_to_token(batch, kv_pool)
+        mixed_kv_audit.audit_kv_content(batch, kv_pool)
 
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
