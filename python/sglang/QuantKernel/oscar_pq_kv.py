@@ -40,6 +40,7 @@ def _pq_encode_kernel(
     N_CENTROIDS: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
     HP_OFFSET: tl.constexpr,
+    NIBBLE: tl.constexpr,
 ):
     pid_tok = tl.program_id(0)
     pid_head = tl.program_id(1)
@@ -49,6 +50,8 @@ def _pq_encode_kernel(
     if HP_OFFSET >= 0:
         active &= cache_loc < HP_OFFSET
     cent_range = tl.arange(0, N_CENTROIDS)
+    # NIBBLE: codes of sub-vectors (2j, 2j+1) share byte j, low nibble first.
+    pending = tl.zeros([BLOCK_TOK], dtype=tl.int32)
 
     for s in tl.static_range(N_SUB):
         # ||x - c||^2 = ||x||^2 + ||c||^2 - 2 x.c, accumulated one channel at a
@@ -71,15 +74,28 @@ def _pq_encode_kernel(
             dot += x_d[:, None] * cb_d[None, :]
         cb_n2 = tl.load(cb_norm2_ptr + s * N_CENTROIDS + cent_range).to(tl.float32)
         d2 = x_norm2[:, None] + cb_n2[None, :] - 2.0 * dot
-        code = tl.argmin(d2, axis=1).to(tl.uint8)
-        tl.store(
-            codes_ptr
-            + cache_loc * codes_stride_loc
-            + pid_head * codes_stride_head
-            + s * codes_stride_sub,
-            code,
-            mask=active,
-        )
+        code = tl.argmin(d2, axis=1).to(tl.int32)
+        if NIBBLE:
+            if s % 2 == 0:
+                pending = code
+            else:
+                tl.store(
+                    codes_ptr
+                    + cache_loc * codes_stride_loc
+                    + pid_head * codes_stride_head
+                    + (s // 2) * codes_stride_sub,
+                    (pending | (code << 4)).to(tl.uint8),
+                    mask=active,
+                )
+        else:
+            tl.store(
+                codes_ptr
+                + cache_loc * codes_stride_loc
+                + pid_head * codes_stride_head
+                + s * codes_stride_sub,
+                code.to(tl.uint8),
+                mask=active,
+            )
 
 
 @triton.jit
@@ -98,6 +114,7 @@ def _pq_decode_rows_kernel(
     SUB_DIM: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
+    NIBBLE: tl.constexpr,
 ):
     pid_tok = tl.program_id(0)
     pid_head = tl.program_id(1)
@@ -105,14 +122,22 @@ def _pq_decode_rows_kernel(
     active = tok_range < num_tokens
     sub_range = tl.arange(0, SUB_DIM)
     for s in tl.static_range(N_SUB):
+        if NIBBLE:
+            byte_idx: tl.constexpr = s // 2
+            shift: tl.constexpr = (s % 2) * 4
+        else:
+            byte_idx: tl.constexpr = s
+            shift: tl.constexpr = 0
         code = tl.load(
             codes_ptr
             + tok_range * codes_stride_loc
             + pid_head * codes_stride_head
-            + s * codes_stride_sub,
+            + byte_idx * codes_stride_sub,
             mask=active,
             other=0,
         ).to(tl.int32)
+        if NIBBLE:
+            code = (code >> shift) & 0xF
         cb_idx = (s * N_CENTROIDS + code[:, None]) * SUB_DIM + sub_range[None, :]
         recon = tl.load(cb_ptr + cb_idx, mask=active[:, None], other=0.0)
         out_off = (
@@ -141,6 +166,7 @@ def _pq_decode_at_locs_kernel(
     N_CENTROIDS: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
     HP_OFFSET: tl.constexpr,
+    NIBBLE: tl.constexpr,
 ):
     """Decode the cache rows at ``loc`` without data-dependent indexing on the
     host; HP locs produce zero rows."""
@@ -155,14 +181,22 @@ def _pq_decode_at_locs_kernel(
     safe_loc = tl.where(active, cache_loc, 0)
     sub_range = tl.arange(0, SUB_DIM)
     for s in tl.static_range(N_SUB):
+        if NIBBLE:
+            byte_idx: tl.constexpr = s // 2
+            shift: tl.constexpr = (s % 2) * 4
+        else:
+            byte_idx: tl.constexpr = s
+            shift: tl.constexpr = 0
         code = tl.load(
             codes_ptr
             + safe_loc * codes_stride_loc
             + pid_head * codes_stride_head
-            + s * codes_stride_sub,
+            + byte_idx * codes_stride_sub,
             mask=active,
             other=0,
         ).to(tl.int32)
+        if NIBBLE:
+            code = (code >> shift) & 0xF
         cb_idx = (s * N_CENTROIDS + code[:, None]) * SUB_DIM + sub_range[None, :]
         recon = tl.load(cb_ptr + cb_idx, mask=active[:, None], other=0.0)
         out_off = (
@@ -184,6 +218,25 @@ def _check_codebook(codebook: torch.Tensor, head_dim: int) -> tuple[int, int, in
     return n_sub, n_centroids, sub_dim
 
 
+def pq_code_width(n_sub: int, n_centroids: int) -> int:
+    """Bytes one row of codes takes: a byte per sub-vector, or a nibble when
+    the codebook has at most 16 centroids and the sub-vectors pair up."""
+    if n_centroids <= 16 and n_sub % 2 == 0:
+        return n_sub // 2
+    return n_sub
+
+
+def _nibble_layout(code_width: int, n_sub: int, n_centroids: int) -> bool:
+    if code_width == n_sub:
+        return False
+    if code_width * 2 == n_sub and n_centroids <= 16:
+        return True
+    raise ValueError(
+        f"code buffer holds {code_width} bytes per row; the codebook needs "
+        f"{pq_code_width(n_sub, n_centroids)} ({n_sub} sub-vectors, {n_centroids} centroids)"
+    )
+
+
 def pq_encode(
     rows: torch.Tensor,
     loc: torch.Tensor,
@@ -201,10 +254,7 @@ def pq_encode(
     if num_tokens == 0:
         return
     n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
-    if codes_buffer.shape[-1] != n_sub:
-        raise ValueError(
-            f"code buffer holds {codes_buffer.shape[-1]} bytes per row, codebook needs {n_sub}"
-        )
+    nibble = _nibble_layout(int(codes_buffer.shape[-1]), n_sub, n_centroids)
     rows_fp16 = rows.to(torch.float16).contiguous()
     cb = codebook.to(torch.float16).contiguous()
     grid = (triton.cdiv(num_tokens, block_tok), num_heads)
@@ -225,6 +275,7 @@ def pq_encode(
         N_CENTROIDS=n_centroids,
         BLOCK_TOK=block_tok,
         HP_OFFSET=-1 if hp_global_offset is None else int(hp_global_offset),
+        NIBBLE=nibble,
         num_warps=4,
         num_stages=2,
     )
@@ -234,8 +285,9 @@ def pq_decode_rows(
     codes: torch.Tensor, codebook: torch.Tensor, *, head_dim: int, block_tok: int = 16
 ) -> torch.Tensor:
     """Reconstruct ``codes`` ``[n, heads, n_sub]`` to fp16 ``[n, heads, head_dim]``."""
-    num_tokens, num_heads, n_sub = codes.shape
-    _, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    num_tokens, num_heads, code_width = codes.shape
+    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    nibble = _nibble_layout(int(code_width), n_sub, n_centroids)
     out = torch.empty(
         (num_tokens, num_heads, head_dim), dtype=torch.float16, device=codes.device
     )
@@ -258,6 +310,7 @@ def pq_decode_rows(
         SUB_DIM=sub_dim,
         N_CENTROIDS=n_centroids,
         BLOCK_TOK=block_tok,
+        NIBBLE=nibble,
         num_warps=4,
         num_stages=2,
     )
@@ -275,8 +328,9 @@ def pq_decode_at_locs(
 ) -> torch.Tensor:
     """Reconstruct the cache rows at ``loc`` to fp16 ``[len(loc), heads, head_dim]``."""
     num_tokens = int(loc.shape[0])
-    _, num_heads, n_sub = codes_buffer.shape
-    _, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    _, num_heads, code_width = codes_buffer.shape
+    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    nibble = _nibble_layout(int(code_width), n_sub, n_centroids)
     out = torch.empty(
         (num_tokens, num_heads, head_dim), dtype=torch.float16, device=codes_buffer.device
     )
@@ -301,6 +355,7 @@ def pq_decode_at_locs(
         N_CENTROIDS=n_centroids,
         BLOCK_TOK=block_tok,
         HP_OFFSET=-1 if hp_global_offset is None else int(hp_global_offset),
+        NIBBLE=nibble,
         num_warps=4,
         num_stages=1,
     )

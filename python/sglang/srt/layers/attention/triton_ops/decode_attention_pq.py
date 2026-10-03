@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.QuantKernel.oscar_pq_kv import _nibble_layout
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _MIN_BLOCK_KV,
@@ -123,6 +124,7 @@ def _fwd_grouped_kernel_stage1_pq(
     V_N_CENTROIDS: tl.constexpr,
     V_GROUP_SIZE: tl.constexpr,
     HAS_K_STAGE2: tl.constexpr,
+    K2_NIBBLE: tl.constexpr,
     V_IS_PQ: tl.constexpr,
     USE_ADC: tl.constexpr,
 ):
@@ -202,14 +204,22 @@ def _fwd_grouped_kernel_stage1_pq(
                         other=0.0,
                     )
                     if HAS_K_STAGE2:
+                        if K2_NIBBLE:
+                            k2_byte: tl.constexpr = sub // 2
+                            k2_shift: tl.constexpr = (sub % 2) * 4
+                        else:
+                            k2_byte: tl.constexpr = sub
+                            k2_shift: tl.constexpr = 0
                         code2 = tl.load(
                             K_Codes2
                             + kv_loc * stride_k2bs
                             + cur_kv_head * stride_k2h
-                            + sub * stride_k2s,
+                            + k2_byte * stride_k2s,
                             mask=valid_n,
                             other=0,
                         ).to(tl.int32)
+                        if K2_NIBBLE:
+                            code2 = (code2 >> k2_shift) & 0xF
                         qk += tl.load(
                             K_Lut2
                             + cur_batch * stride_lut2_b
@@ -235,14 +245,23 @@ def _fwd_grouped_kernel_stage1_pq(
                     other=0.0,
                 ).to(q.dtype)
                 if HAS_K_STAGE2:
+                    if K2_NIBBLE:
+                        k2_byte_idx = k_sub // 2
+                        k2_shift_t = (k_sub % 2) * 4
+                    else:
+                        k2_byte_idx = k_sub
+                        k2_shift_t = k_sub * 0
                     k_code2 = tl.load(
                         K_Codes2
                         + kv_loc[None, :] * stride_k2bs
                         + cur_kv_head * stride_k2h
-                        + k_sub[:, None] * stride_k2s,
+                        + k2_byte_idx[:, None] * stride_k2s,
                         mask=mask_dk[:, None] & valid_n[None, :],
                         other=0,
-                    ).to(tl.int64)
+                    ).to(tl.int32)
+                    if K2_NIBBLE:
+                        k_code2 = (k_code2 >> k2_shift_t[:, None]) & 0xF
+                    k_code2 = k_code2.to(tl.int64)
                     k += tl.load(
                         K_Codebook2
                         + (k_sub[:, None] * K2_N_CENTROIDS + k_code2) * K_SUB_DIM
@@ -401,11 +420,13 @@ def _decode_grouped_att_m_fwd_pq(
     assert k_codes.shape[-1] == k_n_sub
 
     has_k_stage2 = k_codes2 is not None
+    k2_nibble = False
     if has_k_stage2:
         assert k_codebook2 is not None
         assert k_codebook2.shape[0] == k_n_sub and k_codebook2.shape[2] == k_sub_dim
         k_codes2_arg, k_codebook2_arg = k_codes2, k_codebook2
         k2_n_centroids = int(k_codebook2.shape[1])
+        k2_nibble = _nibble_layout(int(k_codes2.shape[-1]), int(k_n_sub), k2_n_centroids)
     else:
         k_codes2_arg, k_codebook2_arg = k_codes, k_codebook
         k2_n_centroids = int(k_n_centroids)
@@ -500,6 +521,7 @@ def _decode_grouped_att_m_fwd_pq(
         V_N_CENTROIDS=int(v_n_centroids),
         V_GROUP_SIZE=v_group_size,
         HAS_K_STAGE2=has_k_stage2,
+        K2_NIBBLE=k2_nibble,
         V_IS_PQ=v_is_pq,
         USE_ADC=use_adc,
         num_warps=num_warps,

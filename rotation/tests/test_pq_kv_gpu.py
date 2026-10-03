@@ -132,9 +132,10 @@ def test_pq_pool_geometry_on_cpu():
     pool = _make_pool(k_codebook=k_path, v_codebook=v_path, layer_num=2, device="cpu")
     assert pool.k_quantizer == "pq" and pool.v_quantizer == "pq"
     assert pool.k_buffer[0].shape[-1] == 8 and pool.v_buffer[0].shape[-1] == 8
-    assert pool.k_buffer2 is not None and pool.k_buffer2[1].shape == pool.k_buffer[1].shape
+    # 16-centroid residual codes pack two per byte: 8 sub-vectors -> 4 bytes
+    assert pool.k_buffer2 is not None and pool.k_buffer2[1].shape[-1] == 4
     assert pool.k_scales_zeros[0].shape[-1] == 0 and pool.v_scales_zeros[0].shape[-1] == 0
-    assert pool.pq_k_set.code_bytes == 16 and pool.pq_v_set.code_bytes == 8
+    assert pool.pq_k_set.code_bytes == 12 and pool.pq_v_set.code_bytes == 8
     assert pool.pq_k_codebook2(1) is not None and pool.pq_v_codebook(1) is not None
     assert "k_buffer2" in pool.get_raw_kv_buffer(1)
 

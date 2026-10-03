@@ -543,10 +543,14 @@ class UnifiedInt2HPKVPool(KVCache):
         )
 
     def _k_code_width(self, li: int) -> int:
-        return self._pq_k.n_sub if self._pq_k is not None else self._layer_head_dim[li] // 4
+        if self._pq_k is not None:
+            return self._pq_k.stage1_code_width
+        return self._layer_head_dim[li] // 4
 
     def _v_code_width(self, li: int) -> int:
-        return self._pq_v.n_sub if self._pq_v is not None else self._layer_v_head_dim[li] // 4
+        if self._pq_v is not None:
+            return self._pq_v.stage1_code_width
+        return self._layer_v_head_dim[li] // 4
 
     def _k_scale_groups(self, li: int) -> int:
         return 0 if self._pq_k is not None else self._layer_k_num_scale_groups[li]
@@ -893,9 +897,17 @@ class UnifiedInt2HPKVPool(KVCache):
                     )
                     for li in range(self.layer_num)
                 ]
-                # Residual-stage codes mirror the stage-1 code buffer.
+                # Residual-stage codes: two 4-bit codes per byte for a
+                # 16-centroid stage, so a 1.5-bit RVQ row really is 24 bytes.
                 self.k_buffer2 = (
-                    [torch.zeros_like(self.k_buffer[li]) for li in range(self.layer_num)]
+                    [
+                        torch.zeros(
+                            (nq, self._layer_head_num[li], self._pq_k.stage2_code_width),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for li in range(self.layer_num)
+                    ]
                     if self._pq_k is not None and self._pq_k.residual
                     else None
                 )

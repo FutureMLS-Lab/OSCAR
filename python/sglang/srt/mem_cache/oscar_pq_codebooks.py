@@ -18,7 +18,7 @@ from typing import Optional, Sequence
 import msgspec
 import torch
 
-from sglang.QuantKernel.oscar_pq_kv import pq_codebook_norms
+from sglang.QuantKernel.oscar_pq_kv import pq_code_width, pq_codebook_norms
 
 
 class PQCodebookHeader(msgspec.Struct, frozen=True, kw_only=True):
@@ -30,8 +30,22 @@ class PQCodebookHeader(msgspec.Struct, frozen=True, kw_only=True):
     stage2_centroids: int = 0
 
     @property
+    def stage1_code_width(self) -> int:
+        # Stage-1 codes are always one byte per sub-vector: the attention and
+        # prefix kernels read them as bytes (lookup tables index by byte).
+        return self.n_sub
+
+    @property
+    def stage2_code_width(self) -> int:
+        """Bytes per row of the residual codes; a 16-centroid stage packs two
+        codes per byte."""
+        if self.kind != "residual":
+            return 0
+        return pq_code_width(self.n_sub, self.stage2_centroids)
+
+    @property
     def code_bytes(self) -> int:
-        return self.n_sub * (2 if self.kind == "residual" else 1)
+        return self.stage1_code_width + self.stage2_code_width
 
 
 class PQCodebookSet(msgspec.Struct, frozen=True, kw_only=True):
@@ -52,6 +66,14 @@ class PQCodebookSet(msgspec.Struct, frozen=True, kw_only=True):
     @property
     def n_sub(self) -> int:
         return self.header.n_sub
+
+    @property
+    def stage1_code_width(self) -> int:
+        return self.header.stage1_code_width
+
+    @property
+    def stage2_code_width(self) -> int:
+        return self.header.stage2_code_width
 
     @property
     def code_bytes(self) -> int:

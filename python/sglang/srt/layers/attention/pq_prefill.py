@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.QuantKernel.oscar_pq_kv import _nibble_layout
+
 
 @triton.jit
 def _mixed_prefix_pq_dequant_kernel(
@@ -41,6 +43,7 @@ def _mixed_prefix_pq_dequant_kernel(
     N_CENTROIDS2: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     HAS_STAGE2: tl.constexpr,
+    STAGE2_NIBBLE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -68,14 +71,22 @@ def _mixed_prefix_pq_dequant_kernel(
         other=0.0,
     ).to(tl.float32)
     if HAS_STAGE2:
+        if STAGE2_NIBBLE:
+            code2_byte = sub_idx // 2
+            code2_shift = (sub_idx % 2) * 4
+        else:
+            code2_byte = sub_idx
+            code2_shift = sub_idx * 0
         code2 = tl.load(
             codes2_ptr
             + quant_slot * codes2_stride_token
             + head_idx * codes2_stride_head
-            + sub_idx * codes2_stride_sub,
+            + code2_byte * codes2_stride_sub,
             mask=(~is_hp) & dim_mask,
             other=0,
         ).to(tl.int64)
+        if STAGE2_NIBBLE:
+            code2 = (code2 >> code2_shift) & 0xF
         quant_val += tl.load(
             codebook2_ptr + (sub_idx * N_CENTROIDS2 + code2) * SUB_DIM + sub_off,
             mask=(~is_hp) & dim_mask,
@@ -125,11 +136,13 @@ def mixed_prefix_dequantize_pq(
     if num_tokens == 0:
         return out
     has_stage2 = codes2 is not None
+    stage2_nibble = False
     if has_stage2:
         assert codebook2 is not None
         assert codebook2.shape[0] == n_sub and codebook2.shape[2] == sub_dim
         codes2_arg, codebook2_arg = codes2, codebook2
         n_centroids2 = int(codebook2.shape[1])
+        stage2_nibble = _nibble_layout(int(codes2.shape[-1]), int(n_sub), n_centroids2)
     else:
         # Triton still needs pointer arguments for the disabled constexpr branch.
         codes2_arg, codebook2_arg = codes, codebook
@@ -164,6 +177,7 @@ def mixed_prefix_dequantize_pq(
         N_CENTROIDS2=n_centroids2,
         BLOCK_DIM=triton.next_power_of_2(head_dim),
         HAS_STAGE2=has_stage2,
+        STAGE2_NIBBLE=stage2_nibble,
         num_warps=4,
         num_stages=1,
     )

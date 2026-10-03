@@ -734,9 +734,8 @@ The quant tier's encoder is selectable per tensor. `pq` stores each row as
 `n_sub` uint8 codes against a per-layer codebook trained on the rotated
 activations (no per-row scale; 16 codes for head_dim 128 = 1.0 bit/value,
 physically 16 bytes per row). A codebook file with a second stage adds a
-residual code (RVQ): its 16-centroid codes carry 4 bits of information but are
-stored one per byte, so an RVQ row is physically 2.0 bit/value (32 bytes,
-still without the INT2 scale/zero) until the stage-2 codes are nibble-packed.
+residual code (RVQ): its 16-centroid codes are packed two per byte, so an RVQ
+row is 24 bytes = 1.5 bit/value, still without the INT2 scale/zero.
 Prefill encode, the decode-time flush, prefix dequant and a graph-safe split-KV
 decode (centroids reconstructed inline, or scored through a per-query lookup
 table at small batch) all run as Triton kernels; the BF16 sink/recent windows
@@ -744,7 +743,7 @@ are unchanged.
 
 ```bash
 SGLANG_OSCAR_K_QUANTIZER=pq SGLANG_OSCAR_PQ_K_CODEBOOK=$ROT/codebooks/k_pq_n16_c256_d8.pt   # K 1.0 bit, V INT2
-SGLANG_OSCAR_K_QUANTIZER=pq SGLANG_OSCAR_PQ_K_CODEBOOK=$ROT/codebooks/k_rvq_n16_c256x16_d8.pt   # K RVQ: 1.5 bit of information, 2.0 bit stored
+SGLANG_OSCAR_K_QUANTIZER=pq SGLANG_OSCAR_PQ_K_CODEBOOK=$ROT/codebooks/k_rvq_n16_c256x16_d8.pt   # K 1.5 bit (RVQ, residual codes nibble-packed)
 SGLANG_OSCAR_V_QUANTIZER=pq SGLANG_OSCAR_PQ_V_CODEBOOK=$ROT/codebooks/v_pq_n16_c256_d8.pt   # with K pq: V 1.0 bit too
 ```
 
