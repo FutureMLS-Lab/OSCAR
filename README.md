@@ -610,21 +610,17 @@ the fixed tree scores 88.9 (8/12 discordant against BF16, p = 0.5) with 6
 unanswered questions against BF16's 5. The smoke suite gained the verbatim-quote
 retention probe described above because every fluency probe had passed on the broken pool.
 
-[^two]: Mean of two independent draws per arm. A single-seed pair whose gap
+[^two]: Mean of two independent draws per arm; a single-seed pair whose gap
     was out of line with the other rows was sampled again on the same tree
-    rather than reported as is; the draws were Qwen3-8B BF16 60.6 / 56.6 and
-    INT2 50.0 / 52.5, Qwen3.5-35B-A3B BF16 86.9 / 81.8 and INT2 79.3 / 83.8,
-    Gemma-4-12B-it BF16 62.1 / 63.1 and INT2 69.7 / 64.1. Qwen3.5-35B-A3B: the
-    first pair read INT2 79.3 vs BF16 86.9; the second draws are 83.8 and 81.8,
-    the two BF16 draws are 5.1 points apart by per-question pairing (McNemar
-    p = 0.03), and an INT2 run with the prefix cache disabled scores 84.8.
-    Gemma-4-12B-it is the mirror image: the first pair read INT2 69.7 vs BF16
-    62.1 (p = 0.02); the second draws are 64.1 and 63.1, and every second-draw
-    pairing is inside noise (p ≥ 0.6). Its answers are short (median ~2.7K
-    characters), so the spread is temperature sampling, not the budget.
-    Qwen3-8B: the first pair read INT2 50.0 vs BF16 60.6 (p < 0.001) against a
-    5-point gap on the previous base; the second draws are 52.5 and 56.6, so
-    the gap is real but about 7 points, not 11.
+    rather than reported as is. Draws: Qwen3-8B BF16 60.6 / 56.6, INT2
+    50.0 / 52.5; Qwen3.5-35B-A3B BF16 86.9 / 81.8, INT2 79.3 / 83.8 (an INT2
+    run with the prefix cache disabled scores 84.8); Gemma-4-12B-it BF16
+    62.1 / 63.1, INT2 69.7 / 64.1. Per-question pairing (McNemar) puts the two
+    BF16 draws of Qwen3.5-35B-A3B 5.1 points apart (p = 0.03) and every
+    second-draw INT2-vs-BF16 pairing of these three models inside noise
+    (p ≥ 0.3); Gemma-4's answers are short (median ~2.7K characters), so its
+    spread is temperature sampling, not the budget. For Qwen3-8B the gap is
+    real but about 7 points, not the 11 of the first pair.
 
 ### 64K decode on B200 (this tree)
 
