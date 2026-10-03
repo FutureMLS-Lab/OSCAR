@@ -253,6 +253,142 @@ def _scatter_mixed_kv_indices_kernel(
         quant_running += tl.sum(quant_inc, axis=0)
 
 
+@triton.jit
+def _count_mixed_hp_blocks_kernel(
+    req_to_token_ptr,        # int32 [num_req_slots, max_ctx]
+    req_pool_indices_ptr,    # int64 [bs]
+    seq_lens_ptr,            # int32 [bs]
+    start_pos_ptr,           # int32 [bs] or None -- per-req scan start position
+    block_hp_counts_ptr,     # int32 [bs, N_BLOCKS] out
+    block_quant_counts_ptr,  # int32 [bs, N_BLOCKS] out
+    rtt_stride_row,
+    bc_stride_row,
+    HP_OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Pass 1 of the parallel mixed-KV metadata build: one program per
+    (request, 512-token block) counts that block's HP and quant slots. Blocks
+    past the request's scanned range store 0, so the grid can be sized from
+    ``max_context_len`` without a device-to-host read of ``seq_lens``."""
+    req = tl.program_id(0)
+    blk = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
+    start = tl.zeros((), dtype=tl.int32)
+    if start_pos_ptr:
+        start = tl.load(start_pos_ptr + req).to(tl.int32)
+    offs = start + blk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offs < seq_len
+    req_pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
+    slot = tl.load(
+        req_to_token_ptr + req_pool_idx * rtt_stride_row + offs.to(tl.int64),
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    out_off = req * bc_stride_row + blk
+    tl.store(block_hp_counts_ptr + out_off, tl.sum((valid & (slot >= HP_OFFSET)).to(tl.int32), axis=0))
+    tl.store(block_quant_counts_ptr + out_off, tl.sum((valid & (slot < HP_OFFSET)).to(tl.int32), axis=0))
+
+
+@triton.jit
+def _prefix_indptr_all_kernel(
+    block_hp_counts_ptr,     # int32 [bs, N_BLOCKS]
+    block_quant_counts_ptr,  # int32 [bs, N_BLOCKS]
+    block_hp_offsets_ptr,    # int32 [bs, N_BLOCKS] out: exclusive cross-block prefix
+    block_quant_offsets_ptr, # int32 [bs, N_BLOCKS] out
+    hp_kv_indptr_ptr,        # int32 [bs + 1] out (indptr[0] pre-zeroed)
+    quant_kv_indptr_ptr,     # int32 [bs + 1] out
+    bc_stride_row,
+    BS,
+    N_BLOCKS,
+    BS_POW2: tl.constexpr,
+    N_POW2: tl.constexpr,
+):
+    """Pass 2: one program folds the per-request exclusive block prefix, the
+    per-request totals and the cross-request indptr into a single launch
+    (replacing a prefix kernel plus two torch cumsums). Out-of-range lanes are
+    masked to 0 so the prefix sums stay exact."""
+    rows = tl.arange(0, BS_POW2)
+    cols = tl.arange(0, N_POW2)
+    rmask = rows < BS
+    cmask = cols < N_BLOCKS
+    mask2 = rmask[:, None] & cmask[None, :]
+    off2 = rows[:, None] * bc_stride_row + cols[None, :]
+    hp_c = tl.load(block_hp_counts_ptr + off2, mask=mask2, other=0)
+    q_c = tl.load(block_quant_counts_ptr + off2, mask=mask2, other=0)
+    hp_incl = tl.cumsum(hp_c, axis=1)
+    q_incl = tl.cumsum(q_c, axis=1)
+    tl.store(block_hp_offsets_ptr + off2, hp_incl - hp_c, mask=mask2)
+    tl.store(block_quant_offsets_ptr + off2, q_incl - q_c, mask=mask2)
+    hp_tot = tl.sum(hp_c, axis=1)
+    q_tot = tl.sum(q_c, axis=1)
+    tl.store(hp_kv_indptr_ptr + 1 + rows, tl.cumsum(hp_tot, axis=0), mask=rmask)
+    tl.store(quant_kv_indptr_ptr + 1 + rows, tl.cumsum(q_tot, axis=0), mask=rmask)
+
+
+@triton.jit
+def _scatter_mixed_blocks_kernel(
+    req_to_token_ptr,        # int32 [num_req_slots, max_ctx]
+    req_pool_indices_ptr,    # int64 [bs]
+    seq_lens_ptr,            # int32 [bs]
+    hp_kv_indptr_ptr,        # int32 [bs + 1]   already cumsum'd
+    quant_kv_indptr_ptr,     # int32 [bs + 1]   already cumsum'd
+    block_hp_offsets_ptr,    # int32 [bs, N_BLOCKS]  exclusive cross-block prefix
+    block_quant_offsets_ptr, # int32 [bs, N_BLOCKS]
+    hp_kv_indices_ptr,       # int64 [*] destination, pre-sized
+    quant_kv_indices_ptr,    # int64 [*] destination, pre-sized
+    start_pos_ptr,           # int32 [bs] or None
+    rtt_stride_row,
+    bo_stride_row,
+    HP_OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Pass 3: every (request, block) program scatters its own chunk from the
+    precomputed base offset, with no cross-block dependency. Block-major order
+    plus the within-block ``tl.cumsum`` rank reproduce the serial kernel's
+    layout exactly (hp indices are HP-local, quant indices are raw slots)."""
+    req = tl.program_id(0)
+    blk = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
+    start = tl.zeros((), dtype=tl.int32)
+    if start_pos_ptr:
+        start = tl.load(start_pos_ptr + req).to(tl.int32)
+    blk_start = start + blk * BLOCK_SIZE
+    if blk_start >= seq_len:
+        return
+    req_pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
+    hp_base = tl.load(hp_kv_indptr_ptr + req).to(tl.int64)
+    quant_base = tl.load(quant_kv_indptr_ptr + req).to(tl.int64)
+    bo_off = req * bo_stride_row + blk
+    hp_block_off = tl.load(block_hp_offsets_ptr + bo_off).to(tl.int64)
+    quant_block_off = tl.load(block_quant_offsets_ptr + bo_off).to(tl.int64)
+    offs = blk_start + tl.arange(0, BLOCK_SIZE)
+    valid = offs < seq_len
+    slot = tl.load(
+        req_to_token_ptr + req_pool_idx * rtt_stride_row + offs.to(tl.int64),
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    is_hp = valid & (slot >= HP_OFFSET)
+    is_quant = valid & (slot < HP_OFFSET)
+    hp_inc = is_hp.to(tl.int32)
+    quant_inc = is_quant.to(tl.int32)
+    hp_rank = tl.cumsum(hp_inc, axis=0) - hp_inc
+    quant_rank = tl.cumsum(quant_inc, axis=0) - quant_inc
+    tl.store(
+        hp_kv_indices_ptr + hp_base + hp_block_off + hp_rank.to(tl.int64),
+        slot - HP_OFFSET,
+        mask=is_hp,
+    )
+    tl.store(
+        quant_kv_indices_ptr + quant_base + quant_block_off + quant_rank.to(tl.int64),
+        slot,
+        mask=is_quant,
+    )
+
+
+# Tokens per program in the parallel mixed-KV metadata build.
+_FAST_META_BLOCK = 512
+
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
@@ -818,7 +954,7 @@ class TritonAttnBackend(AttentionBackend):
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
 
-    def _build_mixed_kv_indices(
+    def _build_mixed_kv_indices_serial(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -917,6 +1053,124 @@ class TritonAttnBackend(AttentionBackend):
             HP_OFFSET=int(self.mixed_hp_global_offset),
             BLOCK_SIZE=512,
             num_warps=2,
+            num_stages=1,
+        )
+
+    def _build_mixed_kv_indices(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        hp_kv_indptr: torch.Tensor,
+        hp_kv_indices: torch.Tensor,
+        quant_kv_indptr: torch.Tensor,
+        quant_kv_indices: torch.Tensor,
+        bs: int,
+        start_pos: Optional[torch.Tensor] = None,
+    ):
+        """Classify each token's slot id as HP vs quant and scatter into the
+        caller-provided per-tier index buffers (see the serial variant for the
+        contract). The parallel build runs one program per 512-token block
+        instead of one per request -- at bs=1 and 64K the serial count+scatter
+        pair is ~0.3 ms per step on the decode critical path, outside the CUDA
+        graph; the parallel one is ~0.1 ms with a bit-identical layout
+        (``SGLANG_OSCAR_FAST_METADATA``). The one-program prefix stage holds a
+        [bs, blocks] tile, so very long contexts at large eager batches fall
+        back to the serial build."""
+        n_blocks = triton.cdiv(self.req_to_token.shape[1], _FAST_META_BLOCK)
+        if (
+            envs.SGLANG_OSCAR_FAST_METADATA.get()
+            and triton.next_power_of_2(bs) * triton.next_power_of_2(n_blocks) <= 65536
+        ):
+            return self._build_mixed_kv_indices_fast(
+                req_pool_indices,
+                seq_lens,
+                hp_kv_indptr,
+                hp_kv_indices,
+                quant_kv_indptr,
+                quant_kv_indices,
+                bs,
+                start_pos=start_pos,
+            )
+        return self._build_mixed_kv_indices_serial(
+            req_pool_indices,
+            seq_lens,
+            hp_kv_indptr,
+            hp_kv_indices,
+            quant_kv_indptr,
+            quant_kv_indices,
+            bs,
+            start_pos=start_pos,
+        )
+
+    def _build_mixed_kv_indices_fast(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        hp_kv_indptr: torch.Tensor,
+        hp_kv_indices: torch.Tensor,
+        quant_kv_indptr: torch.Tensor,
+        quant_kv_indices: torch.Tensor,
+        bs: int,
+        start_pos: Optional[torch.Tensor] = None,
+    ):
+        """Three launches: per-block counts, one-program prefix/indptr, per-block
+        scatter. Same output layout as ``_build_mixed_kv_indices_serial``."""
+        BLOCK = _FAST_META_BLOCK
+        seq_lens_i32 = seq_lens[:bs].to(torch.int32)
+        req_pool_indices = req_pool_indices[:bs].to(torch.int64)
+        if start_pos is not None:
+            start_pos = start_pos[:bs].to(torch.int32)
+        n_blocks = triton.cdiv(self.req_to_token.shape[1], BLOCK)
+        dev = self.device
+        block_hp_counts = torch.empty((bs, n_blocks), dtype=torch.int32, device=dev)
+        block_quant_counts = torch.empty((bs, n_blocks), dtype=torch.int32, device=dev)
+        _count_mixed_hp_blocks_kernel[(bs, n_blocks)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens_i32,
+            start_pos,
+            block_hp_counts,
+            block_quant_counts,
+            self.req_to_token.stride(0),
+            block_hp_counts.stride(0),
+            HP_OFFSET=int(self.mixed_hp_global_offset),
+            BLOCK_SIZE=BLOCK,
+            num_warps=4,
+            num_stages=1,
+        )
+        block_hp_offsets = torch.empty((bs, n_blocks), dtype=torch.int32, device=dev)
+        block_quant_offsets = torch.empty((bs, n_blocks), dtype=torch.int32, device=dev)
+        _prefix_indptr_all_kernel[(1,)](
+            block_hp_counts,
+            block_quant_counts,
+            block_hp_offsets,
+            block_quant_offsets,
+            hp_kv_indptr,
+            quant_kv_indptr,
+            block_hp_counts.stride(0),
+            bs,
+            n_blocks,
+            BS_POW2=triton.next_power_of_2(bs),
+            N_POW2=triton.next_power_of_2(n_blocks),
+            num_warps=8,
+            num_stages=1,
+        )
+        _scatter_mixed_blocks_kernel[(bs, n_blocks)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens_i32,
+            hp_kv_indptr,
+            quant_kv_indptr,
+            block_hp_offsets,
+            block_quant_offsets,
+            hp_kv_indices,
+            quant_kv_indices,
+            start_pos,
+            self.req_to_token.stride(0),
+            block_hp_offsets.stride(0),
+            HP_OFFSET=int(self.mixed_hp_global_offset),
+            BLOCK_SIZE=BLOCK,
+            num_warps=4,
             num_stages=1,
         )
 

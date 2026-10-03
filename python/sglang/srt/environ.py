@@ -999,6 +999,10 @@ class Envs:
     # (request, head, 16-wide slice of head_dim) instead of one serial program
     # per (request, head). Only when no LSE is requested.
     SGLANG_INT2_FAST_STAGE2 = EnvBool(True)
+    # Build the per-step mixed-KV index metadata with one program per 512-token
+    # block (three launches) instead of one serial program per request. Same
+    # layout; it runs outside the CUDA graph on the decode critical path.
+    SGLANG_OSCAR_FAST_METADATA = EnvBool(True)
     HADAMARD_ORDER = EnvInt(16)
 
     # ===================================================================
