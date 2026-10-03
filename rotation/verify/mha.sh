@@ -28,11 +28,12 @@ verify_release_page_cache
 PORT=$((34000 + RANDOM % 1500))
 # radix cache ON (no --disable-radix-cache) and cuda graph ON (no
 # --disable-cuda-graph) -- that is the whole point of this run.
+# the recall probe sizes its budget from the server context
+export VERIFY_CTX="${CTX:-16384}"
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=$SINK SGLANG_MIXED_KV_RECENT_TOKENS=$RECENT \
 SGLANG_OSCAR_K_ROTATION_PATH=$KROT SGLANG_OSCAR_V_ROTATION_PATH=$VROT \
 CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP-1))) \
-export VERIFY_CTX="${CTX:-16384}"
 python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
   --tp-size "$TP" --port $PORT --host 127.0.0.1 \
   --attention-backend triton --prefill-attention-backend triton \
