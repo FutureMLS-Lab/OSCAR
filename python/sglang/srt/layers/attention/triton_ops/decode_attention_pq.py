@@ -205,21 +205,24 @@ def _fwd_grouped_kernel_stage1_pq(
                     )
                     if HAS_K_STAGE2:
                         if K2_NIBBLE:
-                            k2_byte: tl.constexpr = sub // 2
-                            k2_shift: tl.constexpr = (sub % 2) * 4
+                            packed2 = tl.load(
+                                K_Codes2
+                                + kv_loc * stride_k2bs
+                                + cur_kv_head * stride_k2h
+                                + (sub // 2) * stride_k2s,
+                                mask=valid_n,
+                                other=0,
+                            ).to(tl.int32)
+                            code2 = (packed2 >> ((sub % 2) * 4)) & 0xF
                         else:
-                            k2_byte: tl.constexpr = sub
-                            k2_shift: tl.constexpr = 0
-                        code2 = tl.load(
-                            K_Codes2
-                            + kv_loc * stride_k2bs
-                            + cur_kv_head * stride_k2h
-                            + k2_byte * stride_k2s,
-                            mask=valid_n,
-                            other=0,
-                        ).to(tl.int32)
-                        if K2_NIBBLE:
-                            code2 = (code2 >> k2_shift) & 0xF
+                            code2 = tl.load(
+                                K_Codes2
+                                + kv_loc * stride_k2bs
+                                + cur_kv_head * stride_k2h
+                                + sub * stride_k2s,
+                                mask=valid_n,
+                                other=0,
+                            ).to(tl.int32)
                         qk += tl.load(
                             K_Lut2
                             + cur_batch * stride_lut2_b

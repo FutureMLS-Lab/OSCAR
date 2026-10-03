@@ -123,21 +123,24 @@ def _pq_decode_rows_kernel(
     sub_range = tl.arange(0, SUB_DIM)
     for s in tl.static_range(N_SUB):
         if NIBBLE:
-            byte_idx: tl.constexpr = s // 2
-            shift: tl.constexpr = (s % 2) * 4
+            packed = tl.load(
+                codes_ptr
+                + tok_range * codes_stride_loc
+                + pid_head * codes_stride_head
+                + (s // 2) * codes_stride_sub,
+                mask=active,
+                other=0,
+            ).to(tl.int32)
+            code = (packed >> ((s % 2) * 4)) & 0xF
         else:
-            byte_idx: tl.constexpr = s
-            shift: tl.constexpr = 0
-        code = tl.load(
-            codes_ptr
-            + tok_range * codes_stride_loc
-            + pid_head * codes_stride_head
-            + byte_idx * codes_stride_sub,
-            mask=active,
-            other=0,
-        ).to(tl.int32)
-        if NIBBLE:
-            code = (code >> shift) & 0xF
+            code = tl.load(
+                codes_ptr
+                + tok_range * codes_stride_loc
+                + pid_head * codes_stride_head
+                + s * codes_stride_sub,
+                mask=active,
+                other=0,
+            ).to(tl.int32)
         cb_idx = (s * N_CENTROIDS + code[:, None]) * SUB_DIM + sub_range[None, :]
         recon = tl.load(cb_ptr + cb_idx, mask=active[:, None], other=0.0)
         out_off = (
@@ -182,21 +185,24 @@ def _pq_decode_at_locs_kernel(
     sub_range = tl.arange(0, SUB_DIM)
     for s in tl.static_range(N_SUB):
         if NIBBLE:
-            byte_idx: tl.constexpr = s // 2
-            shift: tl.constexpr = (s % 2) * 4
+            packed = tl.load(
+                codes_ptr
+                + safe_loc * codes_stride_loc
+                + pid_head * codes_stride_head
+                + (s // 2) * codes_stride_sub,
+                mask=active,
+                other=0,
+            ).to(tl.int32)
+            code = (packed >> ((s % 2) * 4)) & 0xF
         else:
-            byte_idx: tl.constexpr = s
-            shift: tl.constexpr = 0
-        code = tl.load(
-            codes_ptr
-            + safe_loc * codes_stride_loc
-            + pid_head * codes_stride_head
-            + byte_idx * codes_stride_sub,
-            mask=active,
-            other=0,
-        ).to(tl.int32)
-        if NIBBLE:
-            code = (code >> shift) & 0xF
+            code = tl.load(
+                codes_ptr
+                + safe_loc * codes_stride_loc
+                + pid_head * codes_stride_head
+                + s * codes_stride_sub,
+                mask=active,
+                other=0,
+            ).to(tl.int32)
         cb_idx = (s * N_CENTROIDS + code[:, None]) * SUB_DIM + sub_range[None, :]
         recon = tl.load(cb_ptr + cb_idx, mask=active[:, None], other=0.0)
         out_off = (
