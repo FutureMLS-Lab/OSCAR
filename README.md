@@ -27,7 +27,6 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 
 ## 🔥 Latest News
 - **[2026-10-03]** OSCAR now lives on top of **upstream SGLang main** (base `67eab57057`, the official nightly of 2026-10-02): the repository root is upstream, OSCAR is the diff. Twelve model families pass the garbling sweep with radix cache and CUDA graphs on, and the [upstream-aligned results](#results-on-the-upstream-aligned-tree) cover GPQA-Diamond at a 64K budget and 64K-context decode speed for thirteen models, with every INT2 arm running the model's own attention (DSA for GLM-5.x, MSA for MiniMax-M3, MLA + KDA across two nodes for Kimi-K3).
-- **[Upcoming]** OSCAR is testing MiniMax 3, GLM 5.2 and more models in long horizon agentic tasks (1M+ token context). Happy to see OSCAR used in the wild!
 - **[2026-06-26]** OSCAR is PRing into **vLLM** too, bringing INT2 KV cache support to another high-throughput serving stack.
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
   <details>
