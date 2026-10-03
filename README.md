@@ -96,11 +96,10 @@ heads), INT2 is 1.1–1.4× slower than BF16 on the same backend; the gain there
 is the 4× smaller cache, not speed.
 
 <details>
-<summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
+<summary><b>Qwen3.5-4B preview</b></summary>
 
 Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std over 3 seeds (35B-A3B AIME: 8 seeds, N=30 is high-variance). OSCAR quantizer per model best: 4B uniform, 35B-A3B Lloyd-Max.
 
-**Qwen3.5-4B**
 | Benchmark | BF16 | OSCAR | Δ vs BF16 |
 |---|:---:|:---:|:---:|
 | GPQA-Diamond | 76.9 ± 1.3 | **75.8 ± 1.6** | −1.2 |
@@ -108,7 +107,13 @@ Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std ove
 | AIME 2025 | 47.8 ± 3.1 | **46.7 ± 0.0** | −1.1 |
 | MATH500 | 89.5 ± 0.6 | **88.0 ± 0.6** | −1.5 |
 
-**Qwen3.5-35B-A3B**
+</details>
+
+<details>
+<summary><b>Qwen3.5-35B-A3B preview</b></summary>
+
+Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std over 3 seeds (35B-A3B AIME: 8 seeds, N=30 is high-variance). OSCAR quantizer per model best: 4B uniform, 35B-A3B Lloyd-Max.
+
 | Benchmark | BF16 | OSCAR | Δ vs BF16 |
 |---|:---:|:---:|:---:|
 | GPQA-Diamond | 83.3 ± 1.8 | **84.0 ± 1.3** | +0.7 |
@@ -118,7 +123,13 @@ Qwen3.5 — BF16 vs OSCAR INT2 KV (2-bit, sink 64 / recent 256), mean ± std ove
 
 <sub>† AIME N=30 is high-variance; measured over 8 seeds. The −4.6 gap is not statistically significant (Welch t=1.72). At 3 seeds it read −6.7, inflated by a favorable BF16 draw.</sub>
 
-MiniMax2.7
+</details>
+
+<details>
+<summary><b>MiniMax-M2.7 preview</b></summary>
+
+MiniMax-M2.7 — BF16 vs OSCAR INT2 KV (LM_RATIO=1.16), single run per benchmark.
+
 | Benchmark | BF16 | OSCAR (LM_RATIO=1.16) | Δ |
 |---|---|---|---|
 | GPQA-Diamond | 0.7828 | **0.7929** | +1.0 pp |
@@ -126,7 +137,7 @@ MiniMax2.7
 | AIME 2025 | 0.7667 | **0.7667** | 0.0 pp |
 | MATH500 | 0.9379 | **0.9279** | −1.0 pp |
 
-👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
+</details>
 
 <details>
 <summary><b>MLA models — packed 2-bit latent (GLM-5.2, GLM-5.3, Kimi-K3)</b> </summary>
