@@ -978,6 +978,22 @@ class Envs:
     # clip kernels (num_groups == 1). Requires oscar rotation + clip enabled.
     SGLANG_LLOYD_MAX = EnvBool(False)
     SGLANG_MIXED_KV_HP_MAX_SPLITS = EnvInt(8)
+    # Split ceiling for the INT2 tier of the mixed decode kernel. The stage-1
+    # grid is bs * head_tiles * splits programs, so the upstream default of 8
+    # leaves most of a B200 idle at low batch, and INT2 reads 8x fewer bytes
+    # per token than BF16 so more splits stay bandwidth-feasible. The
+    # per-request count is still adaptive (~128*sqrt(bs)-token chunks); this
+    # is only its cap. The HP window keeps SGLANG_MIXED_KV_HP_MAX_SPLITS.
+    SGLANG_INT2_MAX_SPLITS = EnvInt(32)
+    # Run the HP-window and INT2 stage-1 of the mixed decode kernel as one
+    # grid (program_id(2) below the HP split count selects the tier) instead
+    # of two launches. Per-tier numerics are unchanged; 0 restores the
+    # two-launch path for A/B comparison.
+    SGLANG_OSCAR_FUSED_STAGE1 = EnvBool(True)
+    # Rotate decode Q into the KV frame (q @ R_k) and the attention output
+    # back (o @ R_v^T) with one Triton launch each instead of a cuBLAS GEMM
+    # plus its copy kernels. bf16 in, fp32 accumulate, bf16 out like the GEMM.
+    SGLANG_OSCAR_FAST_ROT = EnvBool(True)
     HADAMARD_ORDER = EnvInt(16)
 
     # ===================================================================

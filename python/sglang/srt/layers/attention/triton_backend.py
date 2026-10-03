@@ -24,6 +24,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.QuantKernel.oscar_rotate_rows import fast_rotate_rows, rotate_rows_supported
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.quantized_kv_prefill import (
@@ -631,6 +632,15 @@ class TritonAttnBackend(AttentionBackend):
             if self.enable_mixed_kv
             else 0
         )
+        # The INT2 tier gets its own split ceiling (SGLANG_INT2_MAX_SPLITS):
+        # at bs=1 the stage-1 grid is head_tiles * splits programs, and with
+        # the upstream cap of 8 that is a few dozen programs on a 148-SM part.
+        # Final value is set once ``max_kv_splits`` is final (``split_tile_size``
+        # may still raise it below).
+        self.max_int2_kv_splits = 0
+        # Decode Q / output rotations through one Triton launch each instead
+        # of a cuBLAS GEMM plus copy kernels (SGLANG_OSCAR_FAST_ROT).
+        self.fast_rotation = envs.SGLANG_OSCAR_FAST_ROT.get()
         # Output dtype for per-tier intermediate buffers in the mixed-KV path.
         self.model_dtype = model_runner.dtype
         self.device = model_runner.device
@@ -692,6 +702,11 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
+        self.max_int2_kv_splits = (
+            max(self.max_kv_splits, envs.SGLANG_INT2_MAX_SPLITS.get())
+            if self.enable_mixed_kv
+            else self.max_kv_splits
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -944,7 +959,7 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens_sum, dtype=torch.int64, device=dev
             ),
         }
-        total_splits = self.max_kv_splits + self.max_hp_kv_splits
+        total_splits = self.max_int2_kv_splits + self.max_hp_kv_splits
         # Single combined stage-1 scratch. LSE is pre-filled with -inf so the
         # tier-agnostic stage-2 can skip unused splits.
         fields["mixed_attn_logits"] = torch.empty(
@@ -978,7 +993,11 @@ class TritonAttnBackend(AttentionBackend):
         # it uses the full sequence length as a cheap planning proxy instead of
         # per-tier mixed-KV counts.
         quant_num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=dev)
-        self.get_num_kv_splits(quant_num_kv_splits, forward_batch.seq_lens)
+        self.get_num_kv_splits(
+            quant_num_kv_splits,
+            forward_batch.seq_lens,
+            max_kv_splits=self.max_int2_kv_splits,
+        )
         fields["mixed_quant_num_kv_splits"] = quant_num_kv_splits
         self._build_mixed_kv_indices(
             forward_batch.req_pool_indices,
@@ -1070,7 +1089,7 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_mixed_swa_quant_kv_indptr = None
             self.cuda_graph_mixed_swa_hp_kv_indices = None
             self.cuda_graph_mixed_swa_quant_kv_indices = None
-        total_splits = self.max_kv_splits + self.max_hp_kv_splits
+        total_splits = self.max_int2_kv_splits + self.max_hp_kv_splits
         # Sliding layers have their own head geometry (gemma4: 256 vs 512 on
         # full layers), so they need their own stage-1 scratch. Sharing the
         # full-geometry buffer writes at the wrong stride.
@@ -1162,7 +1181,9 @@ class TritonAttnBackend(AttentionBackend):
             )
         self.cuda_graph_mixed_hp_num_kv_splits[:bs] = self.max_hp_kv_splits
         self.get_num_kv_splits(
-            self.cuda_graph_mixed_quant_num_kv_splits[:bs], seq_lens[:bs]
+            self.cuda_graph_mixed_quant_num_kv_splits[:bs],
+            seq_lens[:bs],
+            max_kv_splits=self.max_int2_kv_splits,
         )
         # The unified attention wrapper fills LSE with -inf every call, so the
         # shared scratch is always in a known state entering stage-2. No extra
@@ -3373,7 +3394,12 @@ class TritonAttnBackend(AttentionBackend):
             q_kv_group = (
                 q_for_decode.shape[1] // R_k_dec.shape[0] if R_k_dec.dim() == 3 else 1
             )
-            q_for_decode = _apply_oscar_rotation(q_for_decode, R_k_dec, q_kv_group)
+            if self.fast_rotation and rotate_rows_supported(q_for_decode.shape[-1]):
+                q_for_decode = fast_rotate_rows(
+                    q_for_decode, R_k_dec, kv_group_num=q_kv_group
+                )
+            else:
+                q_for_decode = _apply_oscar_rotation(q_for_decode, R_k_dec, q_kv_group)
         else:
             q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
         if mixed_decode_enabled:
@@ -3437,7 +3463,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.forward_metadata.mixed_hp_num_kv_splits[:bs],
                     self.forward_metadata.mixed_quant_num_kv_splits[:bs],
                     self.max_hp_kv_splits,
-                    self.max_kv_splits,
+                    self.max_int2_kv_splits,
                     layer.scaling,
                     k_codebook=kv_pool.pq_k_codebook(layer.layer_id),
                     k_codes2=kv_pool.get_raw_key_buffer2(layer.layer_id),
@@ -3466,7 +3492,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.forward_metadata.mixed_hp_num_kv_splits[:bs],
                     self.forward_metadata.mixed_quant_num_kv_splits[:bs],
                     self.max_hp_kv_splits,
-                    self.max_kv_splits,
+                    self.max_int2_kv_splits,
                     layer.scaling,
                     logit_cap=logits_soft_cap,
                     sinks=sinks,
@@ -3499,7 +3525,15 @@ class TritonAttnBackend(AttentionBackend):
         if uses_oscar:
             R_v = kv_pool._R_v[oscar_layer_idx]
             o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            if R_v.dim() == 2:
+            if self.fast_rotation and rotate_rows_supported(o3.shape[-1]):
+                fast_rotate_rows(
+                    o3,
+                    R_v,
+                    trans=True,
+                    out=o3,
+                    kv_group_num=max(1, o3.shape[1] // R_v.shape[0]),
+                )
+            elif R_v.dim() == 2:
                 o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
             else:
                 Rv_h = R_v.repeat_interleave(max(1, o3.shape[1] // R_v.shape[0]), dim=0)
