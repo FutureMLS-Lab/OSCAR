@@ -26,6 +26,7 @@ OSCAR captures Q/K/V activations on a small calibration set, estimates **attenti
 OSCAR is built directly into the open-source SGLang framework (main branch), llama.cpp (zhongzhu/llamacpp branch). We also provide a rotation zoo so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
+- **[2026-10-03]** Dense INT2 decode on B200 is now within **1.2–1.5× of FlashInfer BF16** at 64K / batch 1 (it was 2–3.9×): a separate INT2 split cap, a fused HP+INT2 stage-1, batched decode rotations, a parallel stage-2 and a parallel metadata build, all default-on and checked bit-for-bit against the two-launch path. The rotation can also be **fit at server start** (no offline calibration), and 1-bit / 1.5-bit K via product quantization ships as an opt-in tier.
 - **[2026-10-03]** OSCAR now lives on top of **upstream SGLang main** (base `67eab57057`, the official nightly of 2026-10-02): the repository root is upstream, OSCAR is the diff. Twelve model families pass the garbling sweep with radix cache and CUDA graphs on, and the [upstream-aligned results](#results-on-the-upstream-aligned-tree) cover GPQA-Diamond at a 64K budget and 64K-context decode speed for thirteen models, with every INT2 arm running the model's own attention (DSA for GLM-5.x, MSA for MiniMax-M3, MLA + KDA across two nodes for Kimi-K3).
 - **[2026-06-26]** OSCAR is PRing into **vLLM** too, bringing INT2 KV cache support to another high-throughput serving stack.
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
@@ -65,16 +66,16 @@ Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; 
 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family |
 |:---:|:---:|:---:|:---:|:---:|
-| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 2.77× faster | 2.77× slower |
-| Qwen3-8B | 56.6 | 52.5 | 2.54× faster | 2.54× slower |
-| Qwen3-32B | 64.1 | 59.6 | 2.79× faster | 2.37× slower |
-| Qwen3-30B-A3B | 61.1 | 55.6 | 3.04× faster | 3.86× slower |
-| Qwen3.5-4B | 79.3 | 75.3 | 1.93× faster | 1.99× slower |
-| Qwen3.5-35B-A3B | 81.8 | 83.8 | 2.09× faster | 2.54× slower |
-| Gemma-4-12B-it | 63.1 | 64.1 | 1.08× slower | 3.00× slower (trtllm_mha) |
-| MiniMax-M2.7 | 86.9 | 87.9 | 2.67× faster | 3.15× slower |
+| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower |
+| Qwen3-8B | 56.6 | 52.5 | 5.71× faster | 1.22× slower |
+| Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower |
+| Qwen3-30B-A3B | 61.1 | 55.6 | 8.39× faster | 1.40× slower |
+| Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower |
+| Qwen3.5-35B-A3B | 81.8 | 83.8 | 3.97× faster | 1.32× slower |
+| Gemma-4-12B-it | 63.1 | 64.1 | 2.03× faster | 1.51× slower (trtllm_mha) |
+| MiniMax-M2.7 | 86.9 | 87.9 | 6.66× faster | 1.27× slower |
 | MiniMax-M3 (MSA sparse) | 90.9 | 88.9 | 1.34× slower | 1.73× slower |
-| GLM-4.7-FP8 | 80.8 | 78.8 | 2.79× faster | 2.74× slower |
+| GLM-4.7-FP8 | 80.8 | 78.8 | 6.54× faster | 1.18× slower |
 | GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path |
 | GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path |
 | Kimi-K3 (TP 8 × PP 2) | 90.9 | 93.4 | 1.33× slower | 1.40× slower (trtllm_mla) |
@@ -614,7 +615,10 @@ retention probe described above because every fluency probe had passed on the br
 
 Batch size 1, a 65,536-token prompt followed by 512 generated tokens, median
 of three repeats; measured on the same base as the GPQA sweep, all thirteen
-rows complete. The BF16
+rows complete. The nine dense rows were then re-measured on the current image
+(v88) with the decode-speed knobs below on, one pod per model with all three
+arms in that pod; GLM-5.x, MiniMax-M3 and Kimi-K3 run sparse or MLA paths the
+knobs do not touch and keep their earlier same-pod numbers. The BF16
 column is the same model on the triton backend (what OSCAR's INT2 kernels
 replace); the FlashInfer column is the fastest BF16 baseline that serves the
 model (for GLM that is upstream's DSA path, for Gemma-4 `trtllm_mha`, the only
@@ -626,15 +630,15 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 
 | Model | INT2 ms/tok | BF16 triton ms/tok | INT2 vs BF16 triton | BF16 FlashInfer-family ms/tok | INT2 vs FlashInfer |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| Qwen3-4B-Thinking-2507 | 12.19 | 33.74 | 2.77× faster | 4.40 | 2.77× slower |
-| Qwen3-8B | 13.76 | 35.01 | 2.54× faster | 5.41 | 2.54× slower |
-| Qwen3-32B | 22.04 | 61.52 | 2.79× faster | 9.30 | 2.37× slower |
-| Qwen3-30B-A3B | 14.04 | 42.67 | 3.04× faster | 3.64 | 3.86× slower |
-| Qwen3.5-4B | 5.78 | 11.17 | 1.93× faster | 2.90 | 1.99× slower |
-| Qwen3.5-35B-A3B | 6.63 | 13.89 | 2.09× faster | 2.61 | 2.54× slower |
-| Gemma-4-12B-it | 19.98 | 18.45 | 1.08× slower | 6.66 (trtllm_mha) | 3.00× slower |
-| MiniMax-M2.7 | 25.80 | 69.01 | 2.67× faster | 8.20 | 3.15× slower |
-| GLM-4.7-FP8 | 26.68 | 74.49 | 2.79× faster | 9.73 | 2.74× slower |
+| Qwen3-4B-Thinking-2507 | 6.10 | 40.09 | 6.57× faster | 4.81 | 1.27× slower |
+| Qwen3-8B | 7.23 | 41.23 | 5.71× faster | 5.91 | 1.22× slower |
+| Qwen3-32B | 11.23 | 61.17 | 5.45× faster | 9.38 | 1.20× slower |
+| Qwen3-30B-A3B | 5.08 | 42.60 | 8.39× faster | 3.62 | 1.40× slower |
+| Qwen3.5-4B | 4.09 | 13.21 | 3.23× faster | 3.26 | 1.26× slower |
+| Qwen3.5-35B-A3B | 4.08 | 16.18 | 3.97× faster | 3.08 | 1.32× slower |
+| Gemma-4-12B-it | 9.08 | 18.43 | 2.03× faster | 6.01 (trtllm_mha) | 1.51× slower |
+| MiniMax-M2.7 | 8.85 | 58.98 | 6.66× faster | 6.95 | 1.27× slower |
+| GLM-4.7-FP8 | 11.41 | 74.58 | 6.54× faster | 9.71 | 1.18× slower |
 | GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 1.36× slower | same DSA path (8.81) | 1.36× slower |
 | GLM-5.3 | 11.99 | 8.82 (DSA, same backend both arms) | 1.36× slower | same DSA path (8.81) | 1.36× slower |
 | MiniMax-M3 | 14.98 | 11.19 (MSA sparse, same backend both arms) | 1.34× slower | 8.67 | 1.73× slower |
@@ -656,10 +660,11 @@ are on by default; each can be switched off on its own for an A/B.
 | `SGLANG_OSCAR_FAST_METADATA` | `1` | Build the per-step HP/INT2 index lists with one program per 512-token block (three launches) instead of one serial program per request. Runs outside the CUDA graph on the decode critical path: 279 → 94 µs per step at 64K / bs=1. Bit-identical layout, sliding windows included; falls back to the serial build when the one-program prefix tile would not fit. |
 | `SGL_INT2_BLOCK_N` / `SGL_INT2_BLOCK_H` / `SGL_INT2_NUM_WARPS` / `SGL_INT2_NUM_STAGES` | shape-dependent | Stage-1 tile. The bs<4 row is `64/8/2/3` (B200-measured; the previous `128/8/4/3` plateaus at 72–75 µs past 32 splits); batch ≥4 rows keep the H100-era settings. |
 
-The table above was measured before these came back onto this tree (the
-first three existed on the pre-rebase branch and were dropped by the rebase;
-the B200 tuning is new); the dense rows are being re-measured in one pod per
-model, with a same-pod ablation ladder, and will be replaced as they land.
+The dense rows of the table above are measured with all of these on. The
+same-pod ablation on Qwen3-8B (64K, bs=1) reads 16.25 → 10.15 (split cap 32)
+→ 8.86 (+ fused stage-1, batched rotation) → 8.36 (cap 64 + tile) → 7.50 ms/tok
+(+ parallel stage-2), against FlashInfer BF16 at 5.94 in that pod; the parallel
+metadata build then took the table row to 7.23 against 5.91.
 
 ## How the rotation is fit (spectral covariance)
 
