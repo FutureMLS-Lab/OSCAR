@@ -61,19 +61,10 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 
 ### Results on the upstream-aligned tree
 
-Base `67eab57057` (upstream SGLang main, nightly image `nightly-dev-20261002-67eab570`),
-B200, radix cache and CUDA graphs on. GPQA-Diamond is single-seed, all 198
-questions, 64K generation budget; both arms share one launch path and differ
-only in the KV mode. Decode speed is batch 1 after a 65,536-token prompt, 512
-generated tokens, median of three; "triton BF16" is the same model on the
-backend OSCAR's kernels replace, "FlashInfer family" the fastest BF16 baseline
-that serves the model. Rows with two numbers are two independent draws (see
-the [per-model table](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) for the
-pairing and notes; the [speed table](#64k-decode-on-b200-this-tree) has the
-ms/tok). Every INT2 arm runs the model's own attention form.
+Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; GPQA-Diamond @64K budget, n=198, single seed (two numbers = two draws); decode at 64K context, batch 1. Details and ms/tok in the [per-model](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) and [speed](#64k-decode-on-b200-this-tree) tables.
 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family |
-|---|---:|---:|---:|---:|
+|:---:|:---:|:---:|:---:|:---:|
 | Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 2.77× faster | 2.77× slower |
 | Qwen3-8B | 60.6, 56.6 | 50.0, 52.5 | 2.54× faster | 2.54× slower |
 | Qwen3-32B | 64.1 | 59.6 | 2.79× faster | 2.37× slower |
@@ -591,7 +582,7 @@ same sparse kernels); Kimi-K3 runs MLA + KDA across two nodes; the rest are
 dense GQA. The BF16 control uses the same backend in every row.
 
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
-|---|---|---|---:|---:|---:|
+|:---:|:---:|:---:|:---:|:---:|:---:|
 | `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
 | `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 60.6, 56.6 [^two] | 50.0, 52.5 [^two] | −7.3 (means; INT2 answers run longer, median 60K vs 45K chars) |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | 64.1 | 59.6 | −4.5 |
@@ -648,7 +639,7 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 ~19% in both arms (ratio unchanged), so TP 8 rows come from 96-core pods.
 
 | Model | INT2 ms/tok | BF16 triton ms/tok | INT2 vs BF16 triton | BF16 FlashInfer-family ms/tok | INT2 vs FlashInfer |
-|---|---:|---:|---:|---:|---:|
+|:---:|:---:|:---:|:---:|:---:|:---:|
 | Qwen3-4B-Thinking-2507 | 12.19 | 33.74 | 2.77× faster | 4.40 | 2.77× slower |
 | Qwen3-8B | 13.76 | 35.01 | 2.54× faster | 5.41 | 2.54× slower |
 | Qwen3-32B | 22.04 | 61.52 | 2.79× faster | 9.30 | 2.37× slower |
