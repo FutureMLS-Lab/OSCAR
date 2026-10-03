@@ -401,3 +401,63 @@ def test_pq_flush_demotes_hp_rows_and_remaps():
         _launch_single_clip_int2(pool.hp_v_buffer[l][hp_rows], dst, ref_v, ref_sz, 0.0, hp_global_offset=None, lloyd_max=False)
         assert torch.equal(pool.v_buffer[l][dst], ref_v[dst])
         assert torch.equal(pool.v_scales_zeros[l][dst], ref_sz[dst])
+
+
+@gpu
+@pytest.mark.parametrize("variant", ["kpq", "krvq", "kpq-vpq"])
+def test_pq_prefix_dequant_matches_reconstruction(variant):
+    """Chunked prefill reads the PQ prefix through ``dequantize_prefix_kv``; a
+    long-context recall probe depends on exactly this path, so it is checked
+    row by row against the codebook reconstruction (and the HP rows against
+    the HP buffer) on a mixed HP/PQ prefix in interleaved order."""
+    from sglang.QuantKernel.oscar_pq_kv import pq_decode_rows
+    from sglang.srt.layers.attention.quantized_kv_prefill import dequantize_prefix_kv
+    from sglang.srt.mem_cache.kv_quant_kernels import dequantize_kv_int2_triton
+
+    rvq = variant == "krvq"
+    pool = _make_pool(
+        k_codebook=_codebook_path(f"prefix_{variant}_k", head_dim=128, layer_num=1, n_sub=16, rvq=rvq),
+        v_codebook=_codebook_path(f"prefix_{variant}_v", head_dim=128, layer_num=1, n_sub=16)
+        if variant == "kpq-vpq"
+        else "",
+        head_dim=128,
+        v_head_dim=128,
+    )
+    torch.manual_seed(41)
+    n_quant, n_hp = 6, 3
+    loc = torch.arange(4, 4 + n_quant, dtype=torch.int64, device="cuda")
+    _write_quant(
+        pool,
+        loc,
+        torch.randn(n_quant, pool.head_num, pool.head_dim, dtype=pool.hp_dtype, device="cuda"),
+        torch.randn(n_quant, pool.head_num, pool.v_head_dim, dtype=pool.hp_dtype, device="cuda"),
+    )
+    pool.hp_k_buffer[0][0:n_hp] = torch.randn(n_hp, pool.head_num, pool.head_dim, dtype=pool.hp_dtype, device="cuda")
+    pool.hp_v_buffer[0][0:n_hp] = torch.randn(n_hp, pool.head_num, pool.v_head_dim, dtype=pool.hp_dtype, device="cuda")
+    hp_off = pool.hp_global_offset
+    # interleaved: hp0 q4 q5 hp1 q6 q7 hp2 q8 q9
+    prefix = torch.tensor([hp_off, 4, 5, hp_off + 1, 6, 7, hp_off + 2, 8, 9], dtype=torch.int64, device="cuda")
+    is_hp = prefix >= hp_off
+
+    k, v = dequantize_prefix_kv(pool, 0, prefix, torch.bfloat16)
+    torch.cuda.synchronize()
+    assert k.shape == (9, pool.head_num, 128) and v.shape == (9, pool.head_num, 128)
+
+    rk = pq_decode_rows(pool.k_buffer[0][loc], pool.pq_k_codebook(0), head_dim=128).float()
+    if rvq:
+        rk = rk + pq_decode_rows(pool.k_buffer2[0][loc], pool.pq_k_codebook2(0), head_dim=128).float()
+    if variant == "kpq-vpq":
+        rv = pq_decode_rows(pool.v_buffer[0][loc], pool.pq_v_codebook(0), head_dim=128).float()
+    else:
+        rv = dequantize_kv_int2_triton(pool.v_buffer[0][loc], pool.v_scales_zeros[0][loc], 128, pool.hp_dtype).float()
+    exp_k = torch.empty_like(k, dtype=torch.float32)
+    exp_v = torch.empty_like(v, dtype=torch.float32)
+    exp_k[is_hp] = pool.hp_k_buffer[0][prefix[is_hp] - hp_off].float()
+    exp_v[is_hp] = pool.hp_v_buffer[0][prefix[is_hp] - hp_off].float()
+    exp_k[~is_hp] = rk[prefix[~is_hp] - 4]
+    exp_v[~is_hp] = rv[prefix[~is_hp] - 4]
+    torch.testing.assert_close(k.float(), exp_k, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(v.float(), exp_v, atol=2e-2, rtol=2e-2)
+    # the quant rows must be real reconstructions, not zeros or the HP rows
+    assert exp_k[~is_hp].abs().mean() > 0.05
+    assert not torch.allclose(k[~is_hp].float(), exp_k[is_hp][:1].expand_as(k[~is_hp]).float())
