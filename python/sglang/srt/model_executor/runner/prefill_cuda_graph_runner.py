@@ -82,6 +82,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
+    notify_kv_pool_of_forward_batch,
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
@@ -1530,6 +1531,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
                 max_seq_len_override=self.max_context_size,
             )
+            notify_kv_pool_of_forward_batch(forward_batch, self.model_runner.token_to_kv_pool)
             ngram_manager = self.model_runner.ngram_embedding_manager
             if ngram_manager.enabled:
                 forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
@@ -1894,6 +1896,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             max_seq_len_override=self.max_context_size,
         )
+        notify_kv_pool_of_forward_batch(static_forward_batch, self.model_runner.token_to_kv_pool)
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history

@@ -1033,7 +1033,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # A position-dependent KV pool has to see the *graph's* static
         # seq_lens / req_pool_indices tensors, because the ops it builds on
         # them are what gets captured and replayed.
-        notify_kv_pool_of_forward_batch(forward_batch)
+        notify_kv_pool_of_forward_batch(
+            forward_batch, self.model_runner.token_to_kv_pool
+        )
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.

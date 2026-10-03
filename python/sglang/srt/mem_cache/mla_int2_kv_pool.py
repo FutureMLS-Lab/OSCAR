@@ -530,6 +530,17 @@ class _Int2HPMixin:
             self._fb_window_meta = None
             return
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+        if not getattr(self, "_window_meta_logged", False):
+            # The windows depend on this hook firing; say so once, so a log
+            # that shows "windows: sink=.. recent=.." and not this line reads
+            # as the failure it is.
+            self._window_meta_logged = True
+            logger.info(
+                "[Int2HPKVPool] forward metadata hook live (first forward: "
+                "decode=%s, %d request rows)",
+                is_decode,
+                0 if forward_batch.seq_lens is None else int(forward_batch.seq_lens.numel()),
+            )
         self._fb_window_meta = {
             "is_decode": is_decode,
             "positions": forward_batch.positions,

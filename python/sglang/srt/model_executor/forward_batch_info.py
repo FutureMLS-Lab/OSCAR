@@ -1215,7 +1215,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
             )
 
-        notify_kv_pool_of_forward_batch(ret)
+        notify_kv_pool_of_forward_batch(ret, model_runner.token_to_kv_pool)
         return ret
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
@@ -2221,8 +2221,16 @@ def _stable_hash_str_to_i64(rid: str) -> int:
     return int.from_bytes(digest, "little", signed=True)
 
 
-def notify_kv_pool_of_forward_batch(forward_batch: "ForwardBatch") -> None:
+def notify_kv_pool_of_forward_batch(
+    forward_batch: "ForwardBatch", pool: Optional[object] = None
+) -> None:
     """Hand a finished ``ForwardBatch`` to a KV pool that needs per-forward state.
+
+    ``pool`` is the model runner's ``token_to_kv_pool``. It has to be passed:
+    ``ForwardBatch`` carries no reference to the pool, and the old
+    ``getattr(forward_batch, "token_to_kv_pool")`` lookup therefore never
+    found one -- the hook silently never fired and the packed-latent pools ran
+    with their BF16 windows off while logging that they were on.
 
     A KV pool whose tiering depends on a token's *position in its sequence*
     cannot get that from ``set_kv_buffer(layer, loc, ...)``; only the batch
@@ -2237,7 +2245,8 @@ def notify_kv_pool_of_forward_batch(forward_batch: "ForwardBatch") -> None:
     it. A pool that is handed stale metadata detects the shape mismatch and
     falls back to quantizing every token.
     """
-    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None:
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
     hook = getattr(pool, "note_forward_batch", None)
     if hook is not None:
         hook(forward_batch)

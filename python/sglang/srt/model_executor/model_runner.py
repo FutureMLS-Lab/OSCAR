@@ -95,6 +95,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    notify_kv_pool_of_forward_batch,
     ForwardBatch,
     PPProxyTensors,
 )
@@ -1715,6 +1716,13 @@ class ModelRunner:
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
+        # A position-dependent KV pool (the OSCAR packed latent pools) needs
+        # this forward's seq_lens / positions before its set_kv_buffer calls.
+        # Every batch that runs the model passes here, so this is the one hook
+        # point that cannot be missed; the graph runners also call it on their
+        # capture batches so the captured ops read the static tensors.
+        notify_kv_pool_of_forward_batch(forward_batch, self.token_to_kv_pool)
 
         self.forward_pass_id += 1
 
