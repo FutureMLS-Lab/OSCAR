@@ -752,6 +752,56 @@ graph backend; the first launch also keeps the V rotation at runtime (no
 `SGLANG_OSCAR_ABSORB_V_ROTATION`). The smoke harness exercises it with
 `CALIBRATE_DIR=<dir> bash rotation/verify/all.sh qwen3-8b`.
 
+## The OSCAR-2 transform family (per-head, centering, non-orthogonal keys, output-aware values)
+
+The rotation checkpoints can carry three optional companions of `rotation`;
+each defaults to the plain orthogonal behaviour when absent, so V1 files and
+calibrating launches are unchanged:
+
+| Field (file) | Meaning | Where it acts |
+|:---|:---|:---|
+| `q_rotation` (K) | query-side matrix `R_k⁻ᵀ` of a **non-orthogonal** key transform, so `(q·q_rotation)·(k·rotation) = q·k` exactly | prefill q, decode q |
+| `o_rotation` (V) | `R_v⁻ᵀ` of a non-orthogonal value transform; the attention output is un-rotated as `o·o_rotationᵀ` | prefill and decode output |
+| `k_mean` (K) | per-head key mean subtracted before the key rotation (**centering**) | every stored key (HP window and INT2 tier) and the extend-time keys, so all logits of a request shift by one constant and the softmax is unchanged; nothing on the read side |
+
+Shapes follow `rotation`: `[hd, hd]` (shared) or `[kv_heads, hd, hd]` (per
+head); `k_mean` is `[hd]` or `[kv_heads, hd]`. Per-head fields are sharded per
+TP rank like the rotations. The fused rotate-clip-quant write kernel does not
+center, so it stays off under `k_mean`.
+
+`rotation/tools/fit_oscar2_variants.py` fits every row of the component
+ablation from one startup calibration run: launch once with
+`SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS=1` and the calibrator leaves
+`oscar_moments_rank<r>.pt` next to the published pair (per layer and KV head:
+the query second moment `M_q`, the key sum and second moment, the
+energy-weighted value covariance), then
+
+```bash
+python rotation/tools/fit_oscar2_variants.py --moments-dir $CAL --out $OUT \
+    --variants perhead,center,nova,flat,stretch,outaware --model Qwen/Qwen3-8B
+```
+
+| Variant | Key transform | Values |
+|:---|:---|:---|
+| `perhead` | orthogonal per KV head, `E_q H P_br` | orthogonal, `E_v H P_br` |
+| `center` | `perhead` + `k_mean` | same |
+| `nova` | centered, NOVA compact basis `M_q^{1/2} E`, query side `M_q^{-1/2} E` | same |
+| `flat` | centered, `M_q^{1/2} E H P_br` (flattened spectrum) | same |
+| `stretch` | centered, fixed-rate stretch `X*^{1/2} E* H P_br` | same |
+| `outaware` | `--k-base` (default `flat`) | post-`W_O` metric `G^{1/2} E_v H P_br`, `G = Σ W_{O,j}ᵀ W_{O,j}` pooled over the query heads reading the KV head; ships `o_rotation` |
+
+Each variant lands in its own directory as `k_rotation_oscar2_<v>.pt` /
+`v_rotation_oscar2_<v>.pt`, which the run recipes discover
+(`ROT_DIR=<dir> rotation/run/qwen3-8b.sh`). `--shared` averages the per-head
+moments into one basis per layer. The fitter checks on every file that
+`q'·k' = q·k` and that `o_rotation` inverts the value transform;
+`rotation/tests/test_oscar2_transforms.py` runs quantized decode under a fully
+non-orthogonal centered pair against dense attention.
+`rotation/_eval_runner/ppl_longctx.py` scores teacher-forced NLL over 32K
+WikiText-2 windows past the BF16 recent window, the low-noise metric used to
+rank the variants before GPQA. Results on Qwen3-8B are being measured and will
+be reported here with the ablation table.
+
 ## 1-bit and 1.5-bit K with product quantization
 
 The quant tier's encoder is selectable per tensor. `pq` stores each row as
