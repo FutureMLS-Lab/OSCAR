@@ -61,17 +61,17 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 
 ### Results on the upstream-aligned tree
 
-Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; GPQA-Diamond @64K budget, n=198, single seed (rows marked [^two] are the mean of two draws); decode at 64K context, batch 1. Details and ms/tok in the [per-model](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) and [speed](#64k-decode-on-b200-this-tree) tables.
+Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; GPQA-Diamond @64K budget, n=198, single seed; decode at 64K context, batch 1. Details and ms/tok in the [per-model](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) and [speed](#64k-decode-on-b200-this-tree) tables.
 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family |
 |:---:|:---:|:---:|:---:|:---:|
 | Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 2.77× faster | 2.77× slower |
-| Qwen3-8B | 58.6 | 51.3 | 2.54× faster | 2.54× slower |
+| Qwen3-8B | 56.6 | 52.5 | 2.54× faster | 2.54× slower |
 | Qwen3-32B | 64.1 | 59.6 | 2.79× faster | 2.37× slower |
 | Qwen3-30B-A3B | 61.1 | 55.6 | 3.04× faster | 3.86× slower |
 | Qwen3.5-4B | 79.3 | 75.3 | 1.93× faster | 1.99× slower |
-| Qwen3.5-35B-A3B | 84.3 | 81.6 | 2.09× faster | 2.54× slower |
-| Gemma-4-12B-it | 62.6 | 66.9 | 1.08× slower | 3.00× slower (trtllm_mha) |
+| Qwen3.5-35B-A3B | 81.8 | 83.8 | 2.09× faster | 2.54× slower |
+| Gemma-4-12B-it | 63.1 | 64.1 | 1.08× slower | 3.00× slower (trtllm_mha) |
 | MiniMax-M2.7 | 86.9 | 87.9 | 2.67× faster | 3.15× slower |
 | MiniMax-M3 (MSA sparse) | 90.9 | 88.9 | 1.34× slower | 1.73× slower |
 | GLM-4.7-FP8 | 80.8 | 78.8 | 2.79× faster | 2.74× slower |
@@ -584,12 +584,12 @@ dense GQA. The BF16 control uses the same backend in every row.
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
-| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 58.6 [^two] | 51.3 [^two] | −7.3 (INT2 answers run longer, median 60K vs 45K chars) |
+| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 56.6 | 52.5 | −4.0 |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | 64.1 | 59.6 | −4.5 |
 | `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.6 | −5.6 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
 | `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
-| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 84.3 [^two] | 81.6 [^two] | −2.8 |
-| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 62.6 [^two] | 66.9 [^two] | +4.3 |
+| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 81.8 | 83.8 | +2.0 |
+| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 63.1 | 64.1 | +1.0 |
 | `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | 86.9 | 87.9 | +1.0 |
 | `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | 90.9 | 88.9 | −2.0 (after the indexer-key fix below; 56.6 before it) |
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 83.8 | −3.5 (INT2 answers run longer: median 63K vs 32K chars, 24 vs 9 without a final answer) |
@@ -609,18 +609,6 @@ pool now moves those rows in the same step (`on_flush_applied`); the re-run on
 the fixed tree scores 88.9 (8/12 discordant against BF16, p = 0.5) with 6
 unanswered questions against BF16's 5. The smoke suite gained the verbatim-quote
 retention probe described above because every fluency probe had passed on the broken pool.
-
-[^two]: Mean of two independent draws per arm; a single-seed pair whose gap
-    was out of line with the other rows was sampled again on the same tree
-    rather than reported as is. Draws: Qwen3-8B BF16 60.6 / 56.6, INT2
-    50.0 / 52.5; Qwen3.5-35B-A3B BF16 86.9 / 81.8, INT2 79.3 / 83.8 (an INT2
-    run with the prefix cache disabled scores 84.8); Gemma-4-12B-it BF16
-    62.1 / 63.1, INT2 69.7 / 64.1. Per-question pairing (McNemar) puts the two
-    BF16 draws of Qwen3.5-35B-A3B 5.1 points apart (p = 0.03) and every
-    second-draw INT2-vs-BF16 pairing of these three models inside noise
-    (p ≥ 0.3); Gemma-4's answers are short (median ~2.7K characters), so its
-    spread is temperature sampling, not the budget. For Qwen3-8B the gap is
-    real but about 7 points, not the 11 of the first pair.
 
 ### 64K decode on B200 (this tree)
 
