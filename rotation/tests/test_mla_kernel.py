@@ -7,7 +7,7 @@ so the bar here is exact agreement, not "close".
 
   python test_mla_kernel.py [--ckv <layer_N.pt>] [--rot <rotations_dir>]
 """
-import argparse, os, sys, time
+import argparse, os, pathlib, sys, time
 import torch
 
 sys.path.insert(

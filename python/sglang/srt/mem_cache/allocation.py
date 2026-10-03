@@ -42,6 +42,7 @@ from sglang.QuantKernel.gpu_flush_int2 import (
     gpu_flush_int2_apply,
     gpu_flush_int2_plan,
 )
+from sglang.QuantKernel.gpu_flush_pq import gpu_flush_pq_apply
 
 _is_hip = is_hip()
 _is_npu = is_npu()
