@@ -40,6 +40,11 @@ from sglang.srt.mem_cache.memory_pool import (
     load_oscar_rotation_config,
     load_oscar_rotations,
 )
+from sglang.srt.mem_cache.oscar_calibration import (
+    get_active_oscar_calibrator,
+    set_active_oscar_calibrator,
+)
+from sglang.srt.mem_cache.oscar_rotation_paths import oscar_calibration_required
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +425,20 @@ class UnifiedInt2HPKVPool(KVCache):
             self._v_clip_ratio,
             self._lloyd_max,
         )
+        # Startup calibration: the identity stacks above are overwritten in
+        # place once the collector attached below has seen its prompts.
+        self._oscar_calibration_pending = oscar_calibration_required()
+        self._oscar_calibrator = None
+        self._oscar_rotation_version = 0
+        if (
+            self._oscar_calibration_pending
+            and envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get()
+        ):
+            raise ValueError(
+                "Startup OSCAR calibration is incompatible with "
+                "SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT; the first launch must "
+                "keep the V rotation at runtime"
+            )
 
         hp_total_slots = (
             self.num_hp_prefix_slots
@@ -455,6 +474,93 @@ class UnifiedInt2HPKVPool(KVCache):
 
     def mixed_kv_enabled(self) -> bool:
         return True
+
+    # -- Startup calibration -----------------------------------------------
+
+    @property
+    def oscar_calibration_pending(self) -> bool:
+        return self._oscar_calibration_pending
+
+    @property
+    def oscar_calibrator(self):
+        return self._oscar_calibrator
+
+    def oscar_layer_ids(self) -> List[int]:
+        """Global ids of the layers whose rotations this pool holds, in
+        local (stack) order."""
+        if self._rotation_layer_ids is not None:
+            return list(self._rotation_layer_ids)
+        return list(range(self.start_layer, self.start_layer + self.layer_num))
+
+    def attach_oscar_calibrator(self, calibrator) -> None:
+        if not self._oscar_calibration_pending:
+            raise RuntimeError(
+                "Cannot attach an OSCAR calibrator when no checkpoint "
+                "calibration is pending"
+            )
+        if self._layer_groups is not None:
+            raise ValueError(
+                "Startup OSCAR calibration does not support two-geometry-group "
+                "pools; ship calibrated checkpoints for this model"
+            )
+        self._oscar_calibrator = calibrator
+        set_active_oscar_calibrator(calibrator)
+
+    def detach_oscar_calibrator(self) -> None:
+        if self._oscar_calibrator is None:
+            return
+        if get_active_oscar_calibrator() is self._oscar_calibrator:
+            set_active_oscar_calibrator(None)
+        self._oscar_calibrator = None
+
+    def update_oscar_rotations_(
+        self, k_rotations: torch.Tensor, v_rotations: torch.Tensor
+    ) -> None:
+        """Validate and install both rotation stacks without changing their
+        addresses: both are checked before either destination is written."""
+
+        def _stage(value: torch.Tensor, destination, name: str) -> torch.Tensor:
+            if not isinstance(destination, torch.Tensor):
+                raise ValueError(
+                    f"{name} rotation stack is per-layer ragged; calibration "
+                    "needs one stacked tensor"
+                )
+            if tuple(value.shape) != tuple(destination.shape):
+                raise ValueError(
+                    f"{name} rotation shape {tuple(value.shape)} does not match "
+                    f"pool shape {tuple(destination.shape)}"
+                )
+            check = value.detach().to(device=destination.device, dtype=torch.float32)
+            if not bool(torch.isfinite(check).all()):
+                raise ValueError(f"{name} rotation contains non-finite values")
+            eye = torch.eye(check.shape[-1], device=check.device, dtype=check.dtype)
+            orth_err = (
+                torch.matmul(check, check.transpose(-1, -2)) - eye
+            ).abs().amax()
+            if float(orth_err) > 5e-3:
+                raise ValueError(
+                    f"{name} rotation is not orthogonal (max error={float(orth_err):.3e})"
+                )
+            return value.detach().to(
+                device=destination.device, dtype=destination.dtype
+            ).contiguous()
+
+        staged_k = _stage(k_rotations, self._R_k, "K")
+        staged_v = _stage(v_rotations, self._R_v, "V")
+        self._R_k.copy_(staged_k)
+        self._R_v.copy_(staged_v)
+        self._oscar_rotation_version += 1
+        self._oscar_calibration_pending = False
+
+    def reset_runtime_state_(self) -> None:
+        """Forget per-request ring cursors and flush countdowns; part of a
+        whole-cache flush, after which no request owns a slab."""
+        pending = self._pending_forward_done
+        if pending is not None:
+            pending.synchronize()
+        self._pending_forward_done = None
+        self._next_slab_offset.zero_()
+        self._flush_counter_host = [0] * self.max_req_slots
 
     def stash_pending_forward(self, event) -> None:
         """Record the most recent forward-stream completion event.

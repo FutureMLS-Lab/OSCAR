@@ -17,7 +17,11 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.mem_cache.oscar_rotation_paths import (
+    determine_oscar_calibration_required,
+    ensure_oscar_rotation_paths,
+)
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
@@ -235,6 +239,71 @@ def handle_int2_kv_cache_compatibility(server_args: Any) -> None:
             f"Unified mixed KV requires --page-size={n_q} (= N_Q for "
             f"hp_dtype={_unified_mixed_kv_hp_dtype()}); got "
             f"--page-size={cfg.page_size}."
+        )
+
+
+def handle_oscar_startup_calibration(server_args: Any) -> None:
+    """Decide whether this launch calibrates the OSCAR rotation pair and
+    snapshot that into SGLANG_OSCAR_CALIBRATION_ACTIVE for every process.
+
+    Must run after handle_int2_kv_cache_compatibility (the unified pool gate
+    is final) and after the CUDA graph config is parsed: the collector is a
+    Python hook on prefill, so prefill must stay eager on a calibrating launch.
+    """
+    if not _unified_mixed_kv_active(server_args):
+        envs.SGLANG_OSCAR_CALIBRATION_ACTIVE.set(False)
+        return
+    cfg = resolving_view(server_args)
+    ensure_oscar_rotation_paths(model_path=cfg.model_path, revision=cfg.revision)
+    active = determine_oscar_calibration_required()
+    envs.SGLANG_OSCAR_CALIBRATION_ACTIVE.set(active)
+    if not active:
+        return
+    _validate_oscar_calibration_topology(cfg)
+    if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked and (
+        cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "An explicit prefill CUDA graph backend conflicts with startup OSCAR "
+            "calibration (the collector must run every prefill eagerly). Drop "
+            "the prefill graph flag or ship calibrated rotation checkpoints."
+        )
+    logger.warning(
+        "OSCAR rotation pair is missing or incomplete (K=%s V=%s); this launch "
+        "calibrates it from %d prompt tokens before serving and keeps prefill "
+        "CUDA graphs disabled meanwhile.",
+        envs.SGLANG_OSCAR_K_ROTATION_PATH.get(),
+        envs.SGLANG_OSCAR_V_ROTATION_PATH.get(),
+        envs.SGLANG_OSCAR_CALIBRATION_TOKENS.get(),
+    )
+    declare_resolution(
+        server_args,
+        "_handle_oscar_startup_calibration",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+        ),
+    )
+
+
+def _validate_oscar_calibration_topology(cfg: Any) -> None:
+    if cfg.dp_size != 1 or cfg.pp_size != 1 or cfg.nnodes != 1:
+        raise ValueError("Startup OSCAR calibration requires single-node DP=PP=1")
+    if cfg.attn_cp_size != 1:
+        raise ValueError("Startup OSCAR calibration requires attention CP=1")
+    if cfg.enable_hierarchical_cache:
+        raise ValueError("Startup OSCAR calibration is incompatible with HiCache")
+    if cfg.grpc_mode or cfg.use_ray or cfg.encoder_only or cfg.enable_http2:
+        raise ValueError(
+            "Startup OSCAR calibration supports only the standard HTTP launcher "
+            "or the direct Engine API"
+        )
+    if cfg.tokenizer_worker_num != 1:
+        raise ValueError(
+            "Startup OSCAR calibration requires exactly one tokenizer/HTTP worker"
+        )
+    if cfg.enable_torch_compile:
+        raise ValueError(
+            "Startup OSCAR calibration requires --enable-torch-compile to be off"
         )
 
 

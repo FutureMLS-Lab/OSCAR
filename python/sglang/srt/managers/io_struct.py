@@ -1760,6 +1760,18 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class OscarCalibrationReqInput(BaseReq, kw_only=True):
+    action: Literal["start", "finalize"]
+    prompt_sha256: str = ""
+    token_budget: int = 0
+
+
+class OscarCalibrationReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    captured_tokens: int = 0
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

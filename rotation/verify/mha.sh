@@ -16,8 +16,16 @@ echo "=== $NAME  tp=$TP g$GS mf=$MF sink/recent=$SINK/$RECENT mamba='${MAMBA_STR
 # supported" when the files were there all along.
 KROT=$(ls "$R"/k_rotation_*.pt 2>/dev/null | head -1)
 VROT=$(ls "$R"/v_rotation_*.pt 2>/dev/null | head -1)
-[ -n "$KROT" ] && [ -n "$VROT" ] || { echo "RESULT=$NAME SKIP(no rotation in $R)"; exit 0; }
-echo "  rotations: $(basename "$KROT") / $(basename "$VROT")"
+# CALIBRATE_DIR=<dir>: ignore the zoo and point the pair at <dir>; a missing
+# pair makes the server calibrate it at startup, an existing one is loaded.
+if [ -n "${CALIBRATE_DIR:-}" ]; then
+  mkdir -p "$CALIBRATE_DIR"
+  KROT=$CALIBRATE_DIR/k_rotation_qqt_r_h_pbr.pt; VROT=$CALIBRATE_DIR/v_rotation_qqt_r_h_pbr.pt
+  echo "  rotations: startup calibration into $CALIBRATE_DIR ($([ -f "$KROT" ] && echo present || echo missing))"
+else
+  [ -n "$KROT" ] && [ -n "$VROT" ] || { echo "RESULT=$NAME SKIP(no rotation in $R)"; exit 0; }
+  echo "  rotations: $(basename "$KROT") / $(basename "$VROT")"
+fi
 
 verify_prune_weights "$REPO"
 MD=$(verify_download "$REPO")

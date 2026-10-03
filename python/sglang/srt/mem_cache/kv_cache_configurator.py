@@ -28,6 +28,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -78,6 +79,8 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
 from sglang.srt.mem_cache.minimax_int2_kv_pool import MiniMaxInt2SparseKVPool
+from sglang.srt.mem_cache.oscar_calibration import OscarOnlineCalibrator
+from sglang.srt.mem_cache.oscar_rotation_paths import oscar_calibration_required
 from sglang.srt.mem_cache.unified_kv_pool import (
     UnifiedInt2HPKVPool,
     compute_page_geometry,
@@ -387,6 +390,8 @@ class KVCacheConfigurator:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
+        if oscar_calibration_required() and not self.is_draft_worker:
+            self._require_oscar_calibrator(pools.token_to_kv_pool)
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
         alloc = pools.token_to_kv_pool_allocator
@@ -2194,7 +2199,7 @@ class KVCacheConfigurator:
                 self.model_config.get_swa_num_kv_heads(tp),
                 self.model_config.swa_head_dim,
             )
-        return UnifiedInt2HPKVPool(
+        pool = UnifiedInt2HPKVPool(
             head_num=self.model_config.get_num_kv_heads(tp, dcp),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
@@ -2204,6 +2209,7 @@ class KVCacheConfigurator:
             layer_groups=layer_groups,
             **geometry,
         )
+        return self._attach_oscar_calibrator(pool)
 
     def _build_minimax_int2_sparse_kv_pool(
         self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
@@ -2524,7 +2530,7 @@ class KVCacheConfigurator:
             geometry["num_quant_pages"],
             geometry["num_hp_prefix_slots"],
         )
-        return UnifiedInt2HPKVPool(
+        pool = UnifiedInt2HPKVPool(
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
@@ -2537,6 +2543,7 @@ class KVCacheConfigurator:
             rotation_layer_ids=full_attention_layer_ids,
             **geometry,
         )
+        return self._attach_oscar_calibrator(pool)
 
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
@@ -2785,6 +2792,81 @@ class KVCacheConfigurator:
                     )
         return token_to_kv_pool_allocator
 
+    def _oscar_calibration_reserve_gb(self) -> float:
+        """GPU memory the startup calibrator keeps resident beside the pool:
+        the fp64 per-KV-head Gram tensors. The K/V rows it retains live in
+        pinned host memory and are only reported."""
+        if not oscar_calibration_required():
+            return 0.0
+        token_budget = envs.SGLANG_OSCAR_CALIBRATION_TOKENS.get()
+        if token_budget <= 0:
+            raise ValueError("SGLANG_OSCAR_CALIBRATION_TOKENS must be positive")
+        local_kv_heads = self.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        num_layers = self.layer_info.num_effective_layers
+        head_dim = self.model_config.head_dim
+        gram_bytes = num_layers * local_kv_heads * head_dim * head_dim * 8
+        retained_bytes = (
+            token_budget
+            * num_layers
+            * local_kv_heads
+            * (head_dim + self.model_config.v_head_dim)
+            * torch.empty((), dtype=self.model_dtype).element_size()
+        )
+        logger.info(
+            "Startup OSCAR calibration reserves %.3f GiB of GPU Gram storage and "
+            "%.2f GiB of pinned host K/V rows (token_budget=%d)",
+            gram_bytes / (1 << 30),
+            retained_bytes / (1 << 30),
+            token_budget,
+        )
+        return gram_bytes / (1 << 30)
+
+    def _attach_oscar_calibrator(self, pool: UnifiedInt2HPKVPool) -> UnifiedInt2HPKVPool:
+        """Arm the startup collector on a freshly built unified pool when
+        this launch is calibrating; the pool starts on identity rotations."""
+        if not oscar_calibration_required():
+            return pool
+        if get_parallel().attn_dcp_size != 1:
+            raise ValueError("Startup OSCAR calibration requires attention DCP=1")
+        calibrator = OscarOnlineCalibrator(
+            layer_ids=pool.oscar_layer_ids(),
+            local_kv_heads=pool.head_num,
+            head_dim=pool.head_dim,
+            v_head_dim=pool.v_head_dim,
+            device=pool.device,
+            total_q_heads=self.model_config.num_attention_heads,
+            total_kv_heads=self.model_config.get_total_num_kv_heads(),
+            tp_size=get_parallel().attn_tp_size,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_group=get_attn_tp_group(),
+            model_path=get_model().model_path,
+            model_revision=get_model().revision,
+        )
+        pool.attach_oscar_calibrator(calibrator)
+        logger.info(
+            "Startup OSCAR calibration armed: layers=%d local_kv_heads=%d "
+            "head_dim=%d tp=%d token_budget=%d",
+            len(calibrator.local_layers),
+            calibrator.local_kv_heads,
+            calibrator.head_dim,
+            calibrator.tp_size,
+            calibrator.max_token_budget,
+        )
+        return pool
+
+    @staticmethod
+    def _require_oscar_calibrator(pool) -> None:
+        if isinstance(pool, UnifiedInt2HPKVPool) and pool.oscar_calibrator is not None:
+            return
+        raise ValueError(
+            "Startup OSCAR calibration needs the unified mixed INT2 KV pool "
+            "(--kv-cache-dtype int2, SGLANG_ENABLE_MIXED_KV_WINDOWS=1, Triton or "
+            "FA3-prefill + Triton-decode attention); the sparse MiniMax, packed "
+            "MLA and two-geometry-group pools must ship calibrated checkpoints."
+        )
+
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -2819,6 +2901,7 @@ class KVCacheConfigurator:
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+        rest_memory -= self._oscar_calibration_reserve_gb()
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:

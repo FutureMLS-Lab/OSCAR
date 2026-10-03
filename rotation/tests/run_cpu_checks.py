@@ -23,6 +23,7 @@ MODULES = [
     "test_perhead_rotation.py",
     "test_mixed_kv_radix.py",
     "test_minimax_staging.py",
+    "test_oscar_online_calibration.py",
 ]
 
 failures = []

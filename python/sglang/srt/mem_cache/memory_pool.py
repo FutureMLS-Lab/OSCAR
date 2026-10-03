@@ -51,6 +51,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.oscar_rotation_paths import (
+    oscar_calibration_required,
+    oscar_pending_marker_for,
+)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -128,9 +132,9 @@ class OscarRotationConfig:
     """Config for the Oscar-style learned rotation + per-row clip applied to
     int2 KV cache. The rotation matrices in ``k_rotation_path`` /
     ``v_rotation_path`` (loaded via :func:`load_oscar_rotations`) are applied
-    to K/V rows; clip ratios drive per-row quantile clipping. Empty rotation
-    paths disable the Oscar path (the unified pool then has no rotations
-    loaded and rejects construction)."""
+    to K/V rows; clip ratios drive per-row quantile clipping. Both paths are
+    required; while a startup calibration is pending they load as identity
+    stacks that the calibrator overwrites in place."""
 
     k_rotation_path: str
     v_rotation_path: str
@@ -212,6 +216,36 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
     return R
 
 
+def _identity_oscar_rotations(
+    *,
+    path: str,
+    layer_num: int,
+    start_layer: int,
+    head_dim,
+    device: torch.device,
+    dtype: torch.dtype,
+    layer_ids: Optional[List[int]],
+):
+    """Fixed-address identity stack a calibrating launch starts with; the
+    calibrator copies the fitted rotations into it, so CUDA graphs captured
+    against it stay valid."""
+    if not isinstance(head_dim, int):
+        raise ValueError(
+            "Startup OSCAR calibration supports one head_dim across layers; "
+            "heterogeneous-geometry models must ship calibrated checkpoints"
+        )
+    out = torch.eye(head_dim, dtype=dtype).unsqueeze(0).repeat(layer_num, 1, 1)
+    logger.info(
+        "Identity OSCAR rotation for pending calibration: layers=%s head_dim=%d "
+        "dtype=%s destination=%s",
+        (list(layer_ids) if layer_ids is not None else f"[{start_layer}, {start_layer + layer_num})"),
+        head_dim,
+        dtype,
+        path,
+    )
+    return out.contiguous().to(device)
+
+
 def load_oscar_rotations(
     path: str,
     layer_num: int,
@@ -250,6 +284,22 @@ def load_oscar_rotations(
       tensors, the i-th of shape ``[head_dim[i], head_dim[i]]``. (A single
       stacked tensor can't hold ragged matrices.)
     """
+    if oscar_calibration_required():
+        return _identity_oscar_rotations(
+            path=path,
+            layer_num=layer_num,
+            start_layer=start_layer,
+            head_dim=head_dim,
+            device=device,
+            dtype=dtype,
+            layer_ids=layer_ids,
+        )
+    pending_marker = oscar_pending_marker_for(path)
+    if pending_marker is not None and os.path.isfile(pending_marker):
+        raise RuntimeError(
+            f"Refusing to load OSCAR checkpoint while {pending_marker} exists: a "
+            "publication of this pair was interrupted. Relaunch to recalibrate it."
+        )
     state = torch.load(path, map_location="cpu")
     if "layers" not in state:
         raise ValueError(f"Oscar rotation checkpoint at {path} missing 'layers' key")

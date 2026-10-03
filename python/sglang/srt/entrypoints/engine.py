@@ -63,6 +63,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.oscar_rotation_paths import OscarPairReadLock
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -372,6 +373,34 @@ class Engine(EngineScoreMixin, EngineBase):
             trace_set_thread_info(thread_label)
 
         self.loop = self._ensure_event_loop()
+        self.maybe_run_oscar_startup_calibration()
+
+    def maybe_run_oscar_startup_calibration(self):
+        """Fit the OSCAR rotation pair synchronously when this launch calibrates."""
+        from sglang.srt.mem_cache.oscar_rotation_paths import (
+            oscar_calibration_required,
+        )
+
+        if self.tokenizer_manager is None or not oscar_calibration_required():
+            return
+        if self.loop.is_running():
+            self.shutdown()
+            raise RuntimeError(
+                "Synchronous Engine startup OSCAR calibration cannot run inside "
+                "an already-running asyncio loop. Use the HTTP launcher or "
+                "construct Engine outside the loop."
+            )
+        from sglang.srt.entrypoints.oscar_startup_calibration import (
+            run_oscar_startup_calibration,
+        )
+
+        try:
+            self.loop.run_until_complete(
+                run_oscar_startup_calibration(self.tokenizer_manager)
+            )
+        except Exception:
+            self.shutdown()
+            raise
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
@@ -1106,6 +1135,11 @@ class Engine(EngineScoreMixin, EngineBase):
         if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
             resolve_auto_parsers(server_args)
 
+        # Held through model load: a concurrent calibrating launch must not
+        # replace the OSCAR pair between this launch's K and V loads.
+        oscar_pair_lock = OscarPairReadLock()
+        oscar_pair_lock.acquire()
+
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
         # caller that catches the launch error still has the context it had.
@@ -1172,6 +1206,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_parallel().node_rank >= 1:
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
+            oscar_pair_lock.release()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
@@ -1225,6 +1260,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # Do not use RayEngine with the Rust server, as it is not supported.
         if envs.SGLANG_RUST_SERVER.get():
             scheduler_init_result.wait_for_ready()
+            oscar_pair_lock.release()
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
@@ -1266,6 +1302,7 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
+            oscar_pair_lock.release()
 
             cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 

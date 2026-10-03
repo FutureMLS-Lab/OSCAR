@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.mem_cache import mixed_kv_audit
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -170,6 +171,10 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         # Upstream protocol: None means free immediately; a list collects
         # frees until ``free_group_end``.
         self.free_group = None
+        # The pool keeps per-request cursors the free lists do not cover;
+        # unit tests build this allocator over a None kvcache.
+        if isinstance(self._kvcache, UnifiedInt2HPKVPool):
+            self._kvcache.reset_runtime_state_()
 
     # -- Availability ------------------------------------------------------
 

@@ -955,8 +955,16 @@ def maybe_absorb_oscar_v_rotation_into_qkv(
         load_oscar_rotation_config,
         load_oscar_rotations,
     )
+    from sglang.srt.mem_cache.oscar_rotation_paths import oscar_calibration_required
 
     if not envs.SGLANG_OSCAR_ABSORB_V_ROTATION.get():
+        return False
+    if oscar_calibration_required():
+        logger.warning(
+            "Deferring OSCAR V-rotation absorption: the rotation pair is being "
+            "calibrated during this startup, so V stays a runtime rotation. "
+            "Relaunch to absorb the published checkpoint."
+        )
         return False
 
     oscar_cfg = load_oscar_rotation_config()

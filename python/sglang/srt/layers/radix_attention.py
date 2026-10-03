@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.mem_cache.oscar_calibration import get_active_oscar_calibrator
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -174,6 +175,21 @@ class RadixAttention(nn.Module):
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+
+        # Startup OSCAR calibration sees every prefill's Q/K/V here; the
+        # registry holds None except on a calibrating launch.
+        calibrator = get_active_oscar_calibrator()
+        if (
+            calibrator is not None
+            and k is not None
+            and forward_batch.forward_mode.is_extend()
+        ):
+            calibrator.observe(
+                layer_id=self.layer_id,
+                q=q.reshape(-1, self.tp_q_head_num, self.qk_head_dim),
+                k=k,
+                v=v,
+            )
 
         context = get_tc_piecewise_forward_context()
         if (

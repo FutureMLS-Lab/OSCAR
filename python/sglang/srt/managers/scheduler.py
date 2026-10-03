@@ -159,6 +159,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
     OpenSessionReqInput,
+    OscarCalibrationReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
@@ -227,6 +228,9 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.oscar_calibration_control import (
+    SchedulerOscarCalibrationControl,
+)
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -1300,6 +1304,15 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             ipc_channels=self.ipc_channels,
         )
+        self.oscar_calibration_control = SchedulerOscarCalibrationControl(
+            get_kv_pool=lambda: self.token_to_kv_pool_allocator.get_kvcache(),
+            flush_cache=self.flush_cache,
+            is_fully_idle=self.is_fully_idle,
+            tp_cpu_group=self.tp_cpu_group,
+            tp_size=get_parallel().tp_size,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            device=self.device,
+        )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -1725,6 +1738,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (OscarCalibrationReqInput, self.oscar_calibration_control.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),

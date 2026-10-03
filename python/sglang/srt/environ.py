@@ -936,6 +936,20 @@ class Envs:
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
+    # Startup calibration of the K/V rotation pair. When the unified mixed-KV
+    # pool is active and the pair is unset, incomplete, or mid-publication,
+    # the pool starts with identity rotations, prefill-only calibration
+    # prompts fit qqt/sst rotations, and the pair is installed in place
+    # before the server becomes ready. PROMPTS_PATH: JSONL of chat messages
+    # (or an original GPQA CSV); empty = GPQA-Diamond downloaded once.
+    SGLANG_OSCAR_CALIBRATION_PROMPTS_PATH = EnvStr("")
+    SGLANG_OSCAR_CALIBRATION_TOKENS = EnvInt(30000)
+    SGLANG_OSCAR_CALIBRATION_BATCH_SIZE = EnvInt(32)
+    SGLANG_OSCAR_CALIBRATION_TIMEOUT = EnvInt(1800)
+    SGLANG_OSCAR_CALIBRATION_LOCK_DIR = EnvStr("/tmp/sglang-oscar-locks")
+    # Decision snapshot written by the server-arg hook before the scheduler
+    # processes spawn; every process reads it instead of the filesystem.
+    SGLANG_OSCAR_CALIBRATION_ACTIVE = EnvBool(False)
     # Fuse oscar K-rotation (rows @ R_k) into the prefill clip+quantize+pack
     # kernel. Eliminates the separate bf16 GEMM staging and the intermediate
     # rotated-K tensor for the quant pack. Requires oscar mode, V-rotation

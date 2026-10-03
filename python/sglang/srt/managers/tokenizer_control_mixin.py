@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    OscarCalibrationReqInput,
+    OscarCalibrationReqOutput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
     ProfileReq,
@@ -125,6 +127,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("oscar_calibration", OscarCalibrationReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -328,6 +331,30 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def oscar_calibration_control(
+        self: TokenizerManager,
+        *,
+        action: str,
+        prompt_sha256: str = "",
+        token_budget: int = 0,
+    ) -> OscarCalibrationReqOutput:
+        self.auto_create_handle_loop()
+        responses = await self.oscar_calibration_communicator(
+            OscarCalibrationReqInput(
+                action=action,
+                prompt_sha256=prompt_sha256,
+                token_budget=token_budget,
+            )
+        )
+        success, message = FanOutCommunicator.merge_results(responses)
+        return OscarCalibrationReqOutput(
+            success=success,
+            message=message,
+            captured_tokens=min(
+                (response.captured_tokens for response in responses), default=0
+            ),
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

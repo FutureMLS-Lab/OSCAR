@@ -116,6 +116,9 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.entrypoints.oscar_startup_calibration import (
+    run_oscar_startup_calibration,
+)
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -395,6 +398,10 @@ async def lifespan(fast_api_app: FastAPI):
         logger.debug(
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
+
+    # Fit missing OSCAR rotations once the model is up and before any
+    # endpoint is observable.
+    await run_oscar_startup_calibration(_global_state.tokenizer_manager)
 
     # Execute custom warmups
     if get_serving().warmups is not None:
