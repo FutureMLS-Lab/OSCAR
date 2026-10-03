@@ -1186,6 +1186,41 @@ def _fwd_grouped_kernel_stage1_quant_int2(
         )
 
 
+
+def _int2_tile_defaults(batch: int, kv_group_num: int):
+    """(BLOCK_N, BLOCK_H, num_warps, num_stages) for the INT2 stage-1 kernels.
+
+    Measured on B200 (Qwen3-8B geometry: 32 q heads / 8 KV heads / head_dim
+    128, 64K context, bs=1, splits capped at 64), us per layer:
+
+      BLOCK_N=128 BLOCK_H=8 W=4 S=3 (old default) | 72-75   (plateaus past 32 splits)
+      BLOCK_N=64  BLOCK_H=8 W=2 S=3 (current)     | 58.6    (FlashInfer BF16: ~52 + 4 merge)
+
+    The smaller tile with two warps fits more programs per SM, which is what
+    the kernel is short of at batch 1 (it moves ~150 GB/s at the old default,
+    so it is occupancy-bound, not bandwidth-bound). The batch >= 4 rows keep
+    the H100-era settings; the split count is already adaptive there.
+    ``SGL_INT2_BLOCK_N`` / ``SGL_INT2_BLOCK_H`` / ``SGL_INT2_NUM_WARPS`` /
+    ``SGL_INT2_NUM_STAGES`` override every row.
+    """
+    if kv_group_num <= 8:
+        if batch >= 16:
+            bn, bh, nw = 32, 4, 1
+        elif batch >= 4:
+            bn, bh, nw = 64, 8, 2
+        else:
+            bn, bh, nw = 64, 8, 2
+    else:
+        bn = 128
+        bh = 16 if batch >= 16 else 8
+        nw = 4
+    return (
+        int(os.environ.get("SGL_INT2_BLOCK_N", bn)),
+        int(os.environ.get("SGL_INT2_BLOCK_H", bh)),
+        int(os.environ.get("SGL_INT2_NUM_WARPS", nw)),
+        int(os.environ.get("SGL_INT2_NUM_STAGES", 3)),
+    )
+
 def _decode_att_m_fwd_quant_int2(
     q,
     k_buffer,  # Quantized INT2 (packed)
@@ -1318,22 +1353,7 @@ def _decode_grouped_att_m_fwd_quant_int2(
 
     MAX_KV_SPLITS = max_kv_splits
 
-    # Tile heuristic 
-    if kv_group_num <= 8:
-        if batch >= 16:
-            _bn_default, _bh_default, _nw_default = 32, 4, 1
-        elif batch >= 4:
-            _bn_default, _bh_default, _nw_default = 64, 8, 2
-        else:
-            _bn_default, _bh_default, _nw_default = 128, 8, 4
-    else:
-        _bn_default = 128
-        _bh_default = 16 if batch >= 16 else 8
-        _nw_default = 4
-    BLOCK = int(os.environ.get("SGL_INT2_BLOCK_N", _bn_default))
-    BLOCK_H = int(os.environ.get("SGL_INT2_BLOCK_H", _bh_default))
-    num_warps = int(os.environ.get("SGL_INT2_NUM_WARPS", _nw_default))
-    num_stages = int(os.environ.get("SGL_INT2_NUM_STAGES", 3))
+    BLOCK, BLOCK_H, num_warps, num_stages = _int2_tile_defaults(batch, kv_group_num)
     # The tile heuristic above (and the env overrides) may pick a BLOCK_H that
     # does not divide kv_group_num; the kernel's head mapping cannot express
     # that. See _safe_block_h -- without this, MiniMax-M2.7 (kv_group_num=6)
@@ -1649,6 +1669,21 @@ def _fwd_grouped_kernel_stage1_unified(
             tl.store(
                 Att_Lse + offs_mid_o_1,
                 e_max + tl.log(e_sum),
+                mask=mask_h,
+            )
+        else:
+            # No tokens in this split (fewer active splits than the grid, or a
+            # request shorter than the split geometry): write the sentinel the
+            # tier-agnostic stage-2 skips, so the caller does not need a
+            # separate fill of Att_Lse before this launch.
+            offs_mid_o_1 = (
+                cur_batch * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_id * stride_mid_os
+            ) // Lv
+            tl.store(
+                Att_Lse + offs_mid_o_1,
+                tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf"),
                 mask=mask_h,
             )
     else:
@@ -2183,6 +2218,21 @@ def _fwd_grouped_kernel_stage1_unified(
                 e_max + tl.log(e_sum),
                 mask=mask_h,
             )
+        else:
+            # No tokens in this split (fewer active splits than the grid, or a
+            # request shorter than the split geometry): write the sentinel the
+            # tier-agnostic stage-2 skips, so the caller does not need a
+            # separate fill of Att_Lse before this launch.
+            offs_mid_o_1 = (
+                cur_batch * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_id * stride_mid_os
+            ) // L
+            tl.store(
+                Att_Lse + offs_mid_o_1,
+                tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf"),
+                mask=mask_h,
+            )
 
 
 def _decode_grouped_att_m_fwd_unified(
@@ -2246,22 +2296,7 @@ def _decode_grouped_att_m_fwd_unified(
         "HP and quant tiers must share kv_group_num"
     )
 
-    # Same tile heuristic and env overrides as _decode_grouped_att_m_fwd_quant_int2.
-    if kv_group_num <= 8:
-        if batch >= 16:
-            _bn_default, _bh_default, _nw_default = 32, 4, 1
-        elif batch >= 4:
-            _bn_default, _bh_default, _nw_default = 64, 8, 2
-        else:
-            _bn_default, _bh_default, _nw_default = 128, 8, 4
-    else:
-        _bn_default = 128
-        _bh_default = 16 if batch >= 16 else 8
-        _nw_default = 4
-    BLOCK_N = int(os.environ.get("SGL_INT2_BLOCK_N", _bn_default))
-    BLOCK_H = int(os.environ.get("SGL_INT2_BLOCK_H", _bh_default))
-    num_warps = int(os.environ.get("SGL_INT2_NUM_WARPS", _nw_default))
-    num_stages = int(os.environ.get("SGL_INT2_NUM_STAGES", 3))
+    BLOCK_N, BLOCK_H, num_warps, num_stages = _int2_tile_defaults(batch, kv_group_num)
     BLOCK_H = _safe_block_h(BLOCK_H, kv_group_num)
 
     total_splits = hp_max_kv_splits + quant_max_kv_splits
@@ -2548,6 +2583,55 @@ def _fwd_kernel_stage2_unified(
         )
 
 
+
+@triton.jit
+def _fwd_kernel_stage2_unified_parallel(
+    Mid_O,
+    Mid_O_1,
+    O,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    TOTAL_SPLITS: tl.constexpr,
+    SPLIT_POW2: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Parallel tier-agnostic stage-2 reduce (same -inf-sentinel layout as the
+    serial kernel). Grid is ``(batch, head_num, cdiv(Lv, BLOCK_D))`` and the
+    cross-split softmax is a vectorized reduce over the padded split axis, so
+    at batch 1 the reduce runs on ``head_num * Lv / BLOCK_D`` programs instead
+    of ``head_num`` serial loops over every split. Callers that need the LSE
+    use the serial kernel."""
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    d_block = tl.program_id(2)
+
+    splits = tl.arange(0, SPLIT_POW2)
+    split_valid = splits < TOTAL_SPLITS
+    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = d_offs < Lv
+
+    base = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+    offs_logic = base // Lv
+    lse_vals = tl.load(
+        Mid_O_1 + offs_logic + (splits * stride_mid_os) // Lv,
+        mask=split_valid,
+        other=float("-inf"),
+    )
+    is_active = split_valid & (lse_vals > float("-inf"))
+    e_max = tl.max(tl.where(is_active, lse_vals, float("-inf")), axis=0)
+    weights = tl.where(is_active, tl.exp(lse_vals - e_max), 0.0)
+    e_sum = tl.sum(weights, axis=0)
+    logit_ptrs = Mid_O + base + splits[:, None] * stride_mid_os + d_offs[None, :]
+    logit_vals = tl.load(logit_ptrs, mask=is_active[:, None] & mask_d[None, :], other=0.0)
+    acc = tl.sum(weights[:, None] * logit_vals, axis=0)
+    safe_e_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+    out = tl.where(e_sum > 0.0, acc / safe_e_sum, 0.0)
+    tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + d_offs, out, mask=mask_d)
+
 def _unified_stage2(
     attn_logits: torch.Tensor,
     attn_lse: torch.Tensor,
@@ -2558,6 +2642,33 @@ def _unified_stage2(
     batch, head_num = o.shape[0], o.shape[1]
     Lv = o.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
+    # Parallel reduce (SGLANG_INT2_FAST_STAGE2, default on) when no LSE is
+    # requested: the serial kernel runs batch*head_num programs, each walking
+    # every split -- 20 us per layer at bs=1 with 72 splits on B200.
+    if (
+        not _is_hip
+        and output_lse is None
+        and envs.SGLANG_INT2_FAST_STAGE2.get()
+    ):
+        BLOCK_D = 16
+        SPLIT_POW2 = triton.next_power_of_2(int(total_splits))
+        _fwd_kernel_stage2_unified_parallel[(batch, head_num, triton.cdiv(Lv, BLOCK_D))](
+            attn_logits,
+            attn_lse,
+            o,
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            o.stride(0),
+            o.stride(1),
+            TOTAL_SPLITS=int(total_splits),
+            SPLIT_POW2=SPLIT_POW2,
+            Lv=Lv,
+            BLOCK_D=BLOCK_D,
+            num_warps=max(1, min(8, (SPLIT_POW2 * BLOCK_D) // 128)),
+            num_stages=1,
+        )
+        return
     grid = (batch, head_num)
     extra_kargs = {}
     if _is_hip:
@@ -2631,11 +2742,6 @@ def decode_attention_fwd_int2_unified(
         f"({hp_max_kv_splits}) + quant_max_kv_splits ({quant_max_kv_splits})"
     )
 
-    # Unused splits (smaller sequences that don't use every split) retain a
-    # prior call's values because stage-1 early-exits without writing. Reset
-    # LSE to -inf so the unified stage-2 correctly skips them.
-    attn_lse.fill_(float("-inf"))
-
     # HP and quant each see their own slice of the shared scratch. Strides on
     # the sliced views are identical to the full tensor so per-split writes
     # continue to address the correct memory.
@@ -2696,6 +2802,12 @@ def decode_attention_fwd_int2_unified(
         )
         _unified_stage2(attn_logits, attn_lse, o, total_splits=total_splits)
         return o
+
+    # Two-launch path: the standalone stage-1 kernels early-exit on empty
+    # splits without writing, so a split a shorter sequence does not use would
+    # keep a prior call's LSE. Reset to -inf so stage-2 skips it. (The fused
+    # kernel writes the sentinel itself.)
+    attn_lse.fill_(float("-inf"))
 
     if hp_kv_indices.numel() > 0:
         if kv_group_num == 1:

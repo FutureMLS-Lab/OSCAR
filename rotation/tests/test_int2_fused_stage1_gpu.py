@@ -91,6 +91,11 @@ def _setup(*, head_dim, kv_heads, q_heads, hp_per_req, quant_per_req, bs, hp_max
 
 def _run(launch, q, attn_logits, attn_lse, fused):
     out = torch.empty_like(q)
+    # Poison the scratch: the fused kernel must write -inf for every split it
+    # leaves empty (the two-launch path fills before launching), so a stale
+    # finite value here would show up as an extra active split.
+    attn_lse.fill_(1e30)
+    attn_logits.fill_(7.0)
     with envs.SGLANG_OSCAR_FUSED_STAGE1.override(fused):
         launch(q, out)
     torch.cuda.synchronize()
@@ -123,13 +128,24 @@ def test_fused_stage1_matches_two_launch(kv_heads, q_heads, quant_per_req, quant
     assert torch.equal(active_ref, active_fused), "the fused grid wrote a different set of splits"
     assert active_ref[:, :, :2].all(), "both HP splits should be active with 70 HP tokens"
     assert active_ref[:, :, 2].all(), "the first INT2 split should be active"
-    assert torch.equal(lse_ref[active_ref], lse_fused[active_fused]), (
-        f"stage-1 LSE differs: max |d| = {(lse_ref[active_ref] - lse_fused[active_fused]).abs().max().item()}"
+    # INT2 tier: the fused body is the standalone kernel's, launched with the
+    # same tile, so its partial states must be bit-identical.
+    q_act = active_ref.clone()
+    q_act[:, :, :2] = False
+    assert torch.equal(lse_ref[q_act], lse_fused[q_act]), (
+        f"INT2 stage-1 LSE differs: max |d| = {(lse_ref[q_act] - lse_fused[q_act]).abs().max().item()}"
     )
-    assert torch.equal(logits_ref[active_ref], logits_fused[active_fused]), (
-        f"stage-1 partial outputs differ: max |d| = {(logits_ref[active_ref] - logits_fused[active_fused]).abs().max().item()}"
+    assert torch.equal(logits_ref[q_act], logits_fused[q_act]), (
+        f"INT2 stage-1 partial outputs differ: max |d| = {(logits_ref[q_act] - logits_fused[q_act]).abs().max().item()}"
     )
-    assert torch.equal(out_ref, out_fused)
+    # HP tier: same math as upstream's kernel, but it runs under the fused
+    # launch's warp count, so the fp32 reductions may differ by rounding.
+    hp_act = active_ref.clone()
+    hp_act[:, :, 2:] = False
+    torch.testing.assert_close(lse_fused[hp_act], lse_ref[hp_act], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(logits_fused[hp_act], logits_ref[hp_act], atol=1e-5, rtol=1e-5)
+    tol = 2.0**-7 * out_ref.float().abs().max().item()
+    assert (out_fused.float() - out_ref.float()).abs().max().item() <= tol, "output differs by more than one bf16 ulp"
     assert torch.isfinite(out_fused).all()
 
 
@@ -156,3 +172,20 @@ def test_fused_stage1_is_cuda_graph_safe():
         replayed = static_out.clone()
     ref2, *_ = _run(launch, q2, attn_logits, attn_lse, fused=False)
     assert torch.equal(replayed, ref2)
+
+
+@gpu
+def test_parallel_stage2_matches_serial():
+    """The parallel reduce changes the fp32 summation order only; its bf16
+    output may differ from the serial kernel by rounding, never more."""
+    pool, q, launch, attn_logits, attn_lse = _setup(
+        head_dim=128, kv_heads=2, q_heads=16, hp_per_req=70, quant_per_req=300, bs=3, hp_max=2, quant_max=64
+    )
+    outs = {}
+    for fast in (False, True):
+        with envs.SGLANG_INT2_FAST_STAGE2.override(fast):
+            outs[fast], *_ = _run(launch, q, attn_logits, attn_lse, fused=True)
+    ref, got = outs[False].float(), outs[True].float()
+    tol = 2.0**-7 * ref.abs().max().item()
+    assert (got - ref).abs().max().item() <= tol, f"max |d| {(got - ref).abs().max().item():.4g} > one bf16 ulp {tol:.4g}"
+    assert torch.isfinite(got).all()

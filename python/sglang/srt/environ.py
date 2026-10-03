@@ -983,8 +983,9 @@ class Envs:
     # leaves most of a B200 idle at low batch, and INT2 reads 8x fewer bytes
     # per token than BF16 so more splits stay bandwidth-feasible. The
     # per-request count is still adaptive (~128*sqrt(bs)-token chunks); this
-    # is only its cap. The HP window keeps SGLANG_MIXED_KV_HP_MAX_SPLITS.
-    SGLANG_INT2_MAX_SPLITS = EnvInt(32)
+    # is only its cap (64: measured 59 us/layer at 64K vs 74 at 32 and 206 at 8,
+    # Qwen3-8B on B200). The HP window keeps SGLANG_MIXED_KV_HP_MAX_SPLITS.
+    SGLANG_INT2_MAX_SPLITS = EnvInt(64)
     # Run the HP-window and INT2 stage-1 of the mixed decode kernel as one
     # grid (program_id(2) below the HP split count selects the tier) instead
     # of two launches. Per-tier numerics are unchanged; 0 restores the
@@ -994,6 +995,10 @@ class Envs:
     # back (o @ R_v^T) with one Triton launch each instead of a cuBLAS GEMM
     # plus its copy kernels. bf16 in, fp32 accumulate, bf16 out like the GEMM.
     SGLANG_OSCAR_FAST_ROT = EnvBool(True)
+    # Reduce the mixed decode kernel's split partials with one program per
+    # (request, head, 16-wide slice of head_dim) instead of one serial program
+    # per (request, head). Only when no LSE is requested.
+    SGLANG_INT2_FAST_STAGE2 = EnvBool(True)
     HADAMARD_ORDER = EnvInt(16)
 
     # ===================================================================
