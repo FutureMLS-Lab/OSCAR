@@ -26,6 +26,7 @@ OSCAR captures Q/K/V activations on a small calibration set, estimates **attenti
 OSCAR is built directly into the open-source SGLang framework (main branch), llama.cpp (zhongzhu/llamacpp branch). We also provide a rotation zoo so users can download calibrated rotations directly instead of recomputing them.
 
 ## 🔥 Latest News
+- **[2026-10-03]** OSCAR now lives on top of **upstream SGLang main** (base `67eab57057`, the official nightly of 2026-10-02): the repository root is upstream, OSCAR is the diff. Twelve model families pass the garbling sweep with radix cache and CUDA graphs on, and the [upstream-aligned results](#results-on-the-upstream-aligned-tree) cover GPQA-Diamond at a 64K budget and 64K-context decode speed for thirteen models, with every INT2 arm running the model's own attention (DSA for GLM-5.x, MSA for MiniMax-M3, MLA + KDA across two nodes for Kimi-K3).
 - **[Upcoming]** OSCAR is testing MiniMax 3, GLM 5.2 and more models in long horizon agentic tasks (1M+ token context). Happy to see OSCAR used in the wild!
 - **[2026-06-26]** OSCAR is PRing into **vLLM** too, bringing INT2 KV cache support to another high-throughput serving stack.
 - **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
@@ -58,6 +59,43 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 - [License & acknowledgements](#license--acknowledgements)
 
 ## Main results
+
+### Results on the upstream-aligned tree
+
+Base `67eab57057` (upstream SGLang main, nightly image `nightly-dev-20261002-67eab570`),
+B200, radix cache and CUDA graphs on. GPQA-Diamond is single-seed, all 198
+questions, 64K generation budget; both arms share one launch path and differ
+only in the KV mode. Decode speed is batch 1 after a 65,536-token prompt, 512
+generated tokens, median of three; "triton BF16" is the same model on the
+backend OSCAR's kernels replace, "FlashInfer family" the fastest BF16 baseline
+that serves the model. Rows with two numbers are two independent draws (see
+the [per-model table](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) for the
+pairing and notes; the [speed table](#64k-decode-on-b200-this-tree) has the
+ms/tok). Every INT2 arm runs the model's own attention form.
+
+| Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family |
+|---|---:|---:|---:|---:|
+| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 2.77× faster | 2.77× slower |
+| Qwen3-8B | 60.6, 56.6 | 50.0, 52.5 | 2.54× faster | 2.54× slower |
+| Qwen3-32B | 64.1 | 59.6 | 2.79× faster | 2.37× slower |
+| Qwen3-30B-A3B | 61.1 | 55.6 | 3.04× faster | 3.86× slower |
+| Qwen3.5-4B | 79.3 | 75.3 | 1.93× faster | 1.99× slower |
+| Qwen3.5-35B-A3B | 86.9, 81.8 | 79.3, 83.8 | 2.09× faster | 2.54× slower |
+| Gemma-4-12B-it | 62.1, 63.1 | 69.7, 64.1 | 1.08× slower | 3.00× slower (trtllm_mha) |
+| MiniMax-M2.7 | 86.9 | 87.9 | 2.67× faster | 3.15× slower |
+| MiniMax-M3 (MSA sparse) | 90.9 | 88.9 | 1.34× slower | 1.73× slower |
+| GLM-4.7-FP8 | 80.8 | 78.8 | 2.79× faster | 2.74× slower |
+| GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path |
+| GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path |
+| Kimi-K3 (TP 8 × PP 2) | 90.9 | 93.4 | 1.33× slower | 1.40× slower (trtllm_mla) |
+
+The dense-GQA rows read the same way: INT2 decodes 1.9–3.0× faster than the
+triton BF16 arm and 2.0–3.9× slower than the FlashInfer-family kernels. Where
+the BF16 arm is already a sparse or MLA-specific kernel (GLM's DSA, MiniMax-M3's
+MSA, Kimi-K3's MLA) or the head geometry has no fast path (Gemma-4's 512-wide
+heads), INT2 is 1.1–1.4× slower than BF16 on the same backend; the gain there
+is the 4× smaller cache, not speed.
+
 <details>
 <summary><b>Qwen3.5-4B, Qwen3.5-35B-A3B, MiniMax 2.7 Preview</b> </summary>
 
