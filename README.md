@@ -588,7 +588,8 @@ retention probe described above because every fluency probe had passed on the br
 ### 64K decode on B200 (this tree)
 
 Batch size 1, a 65,536-token prompt followed by 512 generated tokens, median
-of three repeats; measured after the GPQA sweep on the same base. The BF16
+of three repeats; measured on the same base as the GPQA sweep, all thirteen
+rows complete. The BF16
 column is the same model on the triton backend (what OSCAR's INT2 kernels
 replace); the FlashInfer column is the fastest BF16 baseline that serves the
 model (for GLM that is upstream's DSA path, for Gemma-4 `trtllm_mha`, the only
@@ -612,7 +613,7 @@ Bench pods get 12 CPU cores per GPU: a 16-core pod throttled a TP 8 model by
 | GLM-5.2-FP8 | 11.99 | 8.81 (DSA, same backend both arms) | 1.36× slower | same DSA path (8.81) | 1.36× slower |
 | GLM-5.3 | 11.99 | 8.82 (DSA, same backend both arms) | 1.36× slower | same DSA path (8.81) | 1.36× slower |
 | MiniMax-M3 | 14.98 | 11.19 (MSA sparse, same backend both arms) | 1.34× slower | 8.67 | 1.73× slower |
-| Kimi-K3 | pending | pending | | pending (trtllm_mla) | |
+| Kimi-K3 (TP 8 × PP 2) | 28.43 | 21.44 (triton MLA) | 1.33× slower | 20.27 (trtllm_mla) | 1.40× slower |
 
 > Every model's serving recipe (rotation set, windows, codebook, parallelism) is `rotation/run/<model>.sh` on this tree; pre-fit rotations for all of them are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
