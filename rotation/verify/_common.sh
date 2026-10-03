@@ -97,7 +97,7 @@ verify_wait_serve() {
 }
 
 verify_gen() {  # port prompt max_new -> JSON with a "text" field (the judge's shape)
-  local port=$1 prompt=$2 n=${3:-48}
+  local port=$1 prompt=$2 n=${3:-48} extra=${4:-"{}"}
   # Through the chat template, never raw /generate. An instruct checkpoint without
   # its template can collapse on its own: Gemma-4's tokenizer (transformers 5.12)
   # prepends no <bos> to raw text, and the model then echoes the prompt tail
@@ -107,9 +107,11 @@ verify_gen() {  # port prompt max_new -> JSON with a "text" field (the judge's s
   local body
   body=$(python3 -c "
 import json, sys
-print(json.dumps({'model': 'default',
-                  'messages': [{'role': 'user', 'content': sys.argv[1]}],
-                  'max_tokens': int(sys.argv[2]), 'temperature': 0.7, 'top_p': 0.95}))" "$prompt" "$n")
+d = {'model': 'default',
+     'messages': [{'role': 'user', 'content': sys.argv[1]}],
+     'max_tokens': int(sys.argv[2]), 'temperature': 0.7, 'top_p': 0.95}
+d.update(json.loads(sys.argv[3]))
+print(json.dumps(d))" "$prompt" "$n" "$extra")
   # 2048 tokens at a slow model's rate does not fit in 240s -- GLM-5.2 would
   # time out and the probe would read as a failure of the model.
   curl -sS -m 900 -X POST "http://127.0.0.1:$port/v1/chat/completions" \
@@ -212,6 +214,29 @@ PY
 }
 
 # Probes a live server and prints the verdict. $1 name, $2 port, $3 logfile.
+verify_recall3() {  # response-json needle -> OK | MISS | CAP | ERR
+  python3 - "$1" "$2" <<'PY2'
+import json, re, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print("MISS"); raise SystemExit
+norm = lambda t: re.sub(r"\s+", " ", t).strip().lower()
+final = d.get("content") or d.get("text") or ""
+if d.get("error"):
+    # the server refused or failed the request: a harness/serving error, named as such
+    print("ERR")
+elif norm(sys.argv[2]) in norm(final[-1500:]):
+    print("OK")
+elif d.get("finish_reason") == "length":
+    # the answer never reached its last line: the budget ran out while the
+    # model was still writing -- a probe budget problem, not a recall failure
+    print("CAP")
+else:
+    print("MISS")
+PY2
+}
+
 verify_probe_and_verdict() {
   local name=$1 port=$2 log=$3
   local pre r r2 r3 garb tb cg rx pool
@@ -250,32 +275,25 @@ verify_probe_and_verdict() {
   # recall failure (GLM-5.3 at the old 4096 did exactly that).
   local n3=${PROBE3_MAX_TOKENS:-10000}
   if [ -n "${VERIFY_CTX:-}" ] && [ $((VERIFY_CTX - 1024)) -lt "$n3" ]; then n3=$((VERIFY_CTX - 1024)); fi
-  r3=$(verify_gen "$port" "$filler Question: which option describes a mammal? A) $optA B) $optB C) $optC D) $optD. Reason about every option in detail, in at least 700 words, before deciding. Then end your answer with two lines: the letter on one line, and the complete text of that option copied verbatim on the last line." "$n3")
+  local q3="$filler Question: which option describes a mammal? A) $optA B) $optB C) $optC D) $optD. Reason about every option in detail, in at least 700 words, before deciding. Then end your answer with two lines: the letter on one line, and the complete text of that option copied verbatim on the last line."
+  r3=$(verify_gen "$port" "$q3" "$n3")
   local recall
-  recall=$(python3 - "$r3" "$optB" <<'PY2'
-import json, re, sys
-try:
-    d = json.loads(sys.argv[1])
-except Exception:
-    print("MISS"); raise SystemExit
-norm = lambda t: re.sub(r"\s+", " ", t).strip().lower()
-final = d.get("content") or d.get("text") or ""
-if d.get("error"):
-    # the server refused or failed the request: a harness/serving error, named as such
-    print("ERR")
-elif norm(sys.argv[2]) in norm(final[-1500:]):
-    print("OK")
-elif d.get("finish_reason") == "length":
-    # The answer never reached its last line: the budget ran out while the
-    # model was still writing (GLM-5.3 plans its essay in `content` and hit the
-    # old 3000-token cap mid-draft, coherent throughout). That is a probe
-    # budget problem, not a recall failure, and must not read as one.
-    print("CAP")
-else:
-    print("MISS")
-PY2
-)
-  echo "  probe3: recall=$recall ($(echo "$r3" | wc -c) bytes)"
+  recall=$(verify_recall3 "$r3" "$optB")
+  local recall_note=""
+  if [ "$recall" = "CAP" ]; then
+    # The model is still thinking when the budget runs out (GLM-5.3 writes
+    # 10k+ tokens of deliberation for this four-option question). Thinking
+    # is not what the probe tests; the verbatim copy through the int2 tier
+    # is. Retry once with thinking disabled through the chat template and a
+    # longer analysis demanded, so the option tokens are still far behind the
+    # BF16 recent window when the copy is made.
+    echo "  probe3: recall=CAP ($(echo "$r3" | wc -c) bytes) -> retry with thinking disabled"
+    [ -n "${OUT:-}" ] && printf '%s' "$r3" > "$OUT/$name.probe3.think.json" 2>/dev/null
+    r3=$(verify_gen "$port" "${q3/at least 700 words/at least 1200 words}" "$n3" '{"chat_template_kwargs":{"enable_thinking":false}}')
+    recall=$(verify_recall3 "$r3" "$optB")
+    recall_note=" (no-think retry)"
+  fi
+  echo "  probe3: recall=$recall$recall_note ($(echo "$r3" | wc -c) bytes)"
 
   garb=$(verify_judge "$r2")
   # Keep the judged response. A verdict with no artifact cannot be argued with:
