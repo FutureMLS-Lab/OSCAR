@@ -3,7 +3,8 @@
 # Usage: mla.sh <name> <repo> <rot-dir> <tp> [memfrac] [ctx]
 source "$(dirname "$0")/_common.sh"
 NAME=${1:?name}; REPO=${2:?repo}; ROT=${3:?rot}; TP=${4:?tp}
-MF=${5:-0.90}; CTX=${6:-4096}
+MF=${5:-0.90}; CTX=${6:-16384}
+export VERIFY_CTX=$CTX
 LOG=$OUT/$NAME.log
 LAT=$OSCAR_ROTATIONS/$ROT
 
