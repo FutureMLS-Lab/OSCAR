@@ -770,13 +770,25 @@ class Envs:
     # bs=1 seq=100 MATCHed at 6.5e-03 in one run and MISMATCHed at 9.3e-01 in
     # the next, on identical code, with several rel = 1.000e+00.
     #
-    # So the honest state is: the gate's verdicts are not trustworthy right now,
-    # which means neither "the tuning is safe" nor "the tuning breaks it" is
-    # established. Ship the constants that have been in production, keep the
-    # knobs for measurement, and fix the fixture before touching the defaults.
+    # So the honest state was: the gate's verdicts were not trustworthy, which
+    # means neither "the tuning is safe" nor "the tuning breaks it" was
+    # established.
+    #
+    # Re-measured 2026-10-03 with a clean fixture (torch reference of attention
+    # over exactly the window rows, B200, K3 geometry: 8 heads, 512+64, window
+    # 64+256 over 64K; /home/admin/imgctx/diag/winbench/winbench.py). Every
+    # config agrees with the reference to the same 1.0-1.5e-3 (bf16 tensor-core
+    # math), so the knobs change nothing but time. In the decode trace the pass
+    # costs ~120 us per layer -- a single CTA walking the window with a
+    # four-deep dependent load chain per block, L2-cold for each layer's
+    # arena. Cold-cache microbench (L2 flushed, 24 buffer sets), bs=2:
+    #   32/4/2 (old default) 54 us, 32/8/3 42 us, 64/4/2 48 us,
+    #   64/8/2 40 us, 128/4/1 52 us, 128/4/2 48 us, 128/8/2 40 us
+    # (128 x stages 3 exceeds shared memory). 64/8/2: fewer blocks per CTA, more
+    # warps to hide the gathers; -26% cold, equal numerics.
     SGLANG_OSCAR_MLA_WINDOW_BLOCK_H = EnvInt(16)
-    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(32)
-    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(4)
+    SGLANG_OSCAR_MLA_WINDOW_BLOCK_N = EnvInt(64)
+    SGLANG_OSCAR_MLA_WINDOW_WARPS = EnvInt(8)
     SGLANG_OSCAR_MLA_WINDOW_STAGES = EnvInt(2)
     # TRI-STATE, and the default value below is NOT the effective default.
     # Unset means AUTO: the backend turns gf on when the server's context length

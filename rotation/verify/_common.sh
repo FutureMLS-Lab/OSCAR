@@ -245,7 +245,7 @@ verify_probe_and_verdict() {
   local optB="a migratory marine mammal of the North Atlantic that nurses its calf for eleven months, feeds on krill through baleen plates, and sings long structured songs during the breeding season"
   local optC="a flightless island bird with bright blue feet that nests on bare volcanic rock, dives for sardines from twenty meters, and performs a slow stamping courtship dance each morning"
   local optD="a cold-water cephalopod of the Pacific shelf that changes skin texture in under a second, hunts crabs at night with eight sucker-lined arms, and dies shortly after guarding its eggs"
-  r3=$(verify_gen "$port" "$filler Question: which option describes a mammal? A) $optA B) $optB C) $optC D) $optD. Reason about every option in detail, in at least 700 words, before deciding. Then end your answer with two lines: the letter on one line, and the complete text of that option copied verbatim on the last line." 3000)
+  r3=$(verify_gen "$port" "$filler Question: which option describes a mammal? A) $optA B) $optB C) $optC D) $optD. Reason about every option in detail, in at least 700 words, before deciding. Then end your answer with two lines: the letter on one line, and the complete text of that option copied verbatim on the last line." 10000)
   local recall
   recall=$(python3 - "$r3" "$optB" <<'PY2'
 import json, re, sys
@@ -255,7 +255,16 @@ except Exception:
     print("MISS"); raise SystemExit
 norm = lambda t: re.sub(r"\s+", " ", t).strip().lower()
 final = d.get("content") or d.get("text") or ""
-print("OK" if norm(sys.argv[2]) in norm(final[-1500:]) else "MISS")
+if norm(sys.argv[2]) in norm(final[-1500:]):
+    print("OK")
+elif d.get("finish_reason") == "length":
+    # The answer never reached its last line: the budget ran out while the
+    # model was still writing (GLM-5.3 plans its essay in `content` and hit the
+    # old 3000-token cap mid-draft, coherent throughout). That is a probe
+    # budget problem, not a recall failure, and must not read as one.
+    print("CAP")
+else:
+    print("MISS")
 PY2
 )
   echo "  probe3: recall=$recall ($(echo "$r3" | wc -c) bytes)"
@@ -269,7 +278,7 @@ PY2
     printf '%s' "$r2" > "$OUT/$name.probe.json" 2>/dev/null &&
       echo "  saved : $OUT/$name.probe.json ($(printf '%s' "$r2" | wc -c) bytes)"
   fi
-  if [ -n "${OUT:-}" ] && [ "$recall" = "MISS" ]; then
+  if [ -n "${OUT:-}" ] && [ "$recall" != "OK" ]; then
     printf '%s' "$r3" > "$OUT/$name.probe3.json" 2>/dev/null &&
       echo "  saved : $OUT/$name.probe3.json ($(printf '%s' "$r3" | wc -c) bytes)"
   fi
@@ -284,6 +293,7 @@ PY2
   local v=PASS
   [ "$tb"   != "0"     ] && v=FAIL
   [ "$recall" = "MISS" ] && v="FAIL(no-recall)"
+  [ "$recall" = "CAP"  ] && v="FAIL(probe-cap)"
   [ "$cg"   = "0"      ] && v="FAIL(no-cuda-graph)"
   [ "$rx"   = "0"      ] && v="FAIL(no-prefix-cache)"
   case "$garb" in
