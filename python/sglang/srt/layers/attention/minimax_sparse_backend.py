@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.minimax_sparse_staging import (
     decode_block_rows,
     fill_decode_fake_table,
     prefill_fake_table,
+    stage_decode_blocks_fused,
 )
 from sglang.srt.layers.attention.quantized_kv_prefill import (
     apply_inverse_v_rotation,
@@ -2012,6 +2013,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._int2_dump_col = int(self.req_to_token.shape[1])
         self._int2_ext: Optional[_Int2PrefillStaging] = None
         self._int2_dec: Optional[_Int2DecodeBuffers] = None
+        # Fused decode staging (one launch per layer); the four-step path is
+        # kept as the reference and selectable for A/B.
+        self._int2_fused_staging = envs.SGLANG_MINIMAX_INT2_FUSED_STAGING.get()
         logger.info(
             "[MiniMaxSparse] int2 staging: block %d, %d blocks per request "
             "(group %d x topk %d), index cache slots %d, fake-table columns %d",
@@ -2241,6 +2245,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 f"reduced top-k width {n_blocks} != {self._int2_n_blocks} the "
                 "decode staging buffers were sized for"
             )
+        n_rows = bs * n_blocks * self.block_size_k
+        k_st, v_st = dec.k[:n_rows], dec.v[:n_rows]
+        fake = dec.fake[:bs]
+        if self._int2_fused_staging:
+            # One launch for slot lookup, K/V dequant of every head and the
+            # fake table; the four-step path below is the reference it is
+            # tested against (rotation/tests/test_minimax_fused_staging_gpu.py).
+            pool = self.kv_pool
+            stage_decode_blocks_fused(
+                topk_blk=topk_idx[0],
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                block_size=self.block_size_k,
+                quant_k=pool.get_raw_key_buffer(layer_id),
+                scales_zeros_k=pool.get_key_scales_zeros(layer_id),
+                hp_k=pool.get_hp_key_buffer(layer_id),
+                quant_v=pool.get_raw_value_buffer(layer_id),
+                scales_zeros_v=pool.get_value_scales_zeros(layer_id),
+                hp_v=pool.get_hp_value_buffer(layer_id),
+                hp_global_offset=pool.hp_global_offset,
+                out_k=k_st,
+                out_v=v_st,
+                fake=fake,
+                dump_col=self._int2_dump_col,
+            )
+            return k_st, v_st, fake, dec.slot_ids[:bs]
         slots, pos, valid = decode_block_rows(
             topk_blk=topk_idx[0],
             req_to_token=self.req_to_token,
@@ -2249,8 +2280,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             block_size=self.block_size_k,
             ar_block=self._int2_ar_block,
         )
-        n_rows = bs * n_blocks * self.block_size_k
-        k_st, v_st = dec.k[:n_rows], dec.v[:n_rows]
         dequantize_prefix_kv(
             kv_pool=self.kv_pool,
             layer_id=layer_id,
@@ -2259,7 +2288,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             out_k=k_st,
             out_v=v_st,
         )
-        fake = dec.fake[:bs]
         fill_decode_fake_table(
             fake=fake, pos=pos, valid=valid, rows=dec.rows[:bs], dump_col=self._int2_dump_col
         )

@@ -802,6 +802,10 @@ class Envs:
     # indexer selects plus the local block. OFF runs every layer as dense GQA,
     # which is the legacy fork behaviour and NOT the model's deployed form.
     SGLANG_MINIMAX_SPARSE_ATTENTION = EnvBool(True)
+    # MiniMax-M3 int2 decode staging as one Triton launch per layer (slot
+    # lookup, K/V dequant, fake table) instead of a dozen small ops. Off runs
+    # the reference path the fused kernel is tested against.
+    SGLANG_MINIMAX_INT2_FUSED_STAGING = EnvBool(True)
     # Runs the production kernel alongside the group-factored one on the same
     # call and logs the deviation. Expensive; a debugging instrument, not a
     # serving option.
