@@ -816,6 +816,14 @@ class Envs:
     # 0 = sink + recent (the two windows), which is the only correct value;
     # exposed so the arena can be sized down for probes.
     SGLANG_OSCAR_MLA_PACKED_HP_REQS = EnvInt(0)
+    # Packed-latent staging as one launch per layer (dequant, rope and window
+    # override together) instead of gather_dequant_rows + assemble_rows. Off
+    # runs the two-kernel reference path the fused kernel is tested against.
+    SGLANG_OSCAR_MLA_PACKED_FUSED_MATERIALIZE = EnvBool(True)
+    # Packed-latent decode write as one launch (pack, rope, window arena and
+    # bookkeeping). Off runs the Python sequence the fused kernel is tested
+    # against.
+    SGLANG_OSCAR_MLA_PACKED_FUSED_STORE = EnvBool(True)
     # Packed MLA decode kernel tiling. 16/8 rather than the BF16 kernel's 32/4
     # because the dequant keeps the code byte and the group scale/zero live on
     # top of the output tile.

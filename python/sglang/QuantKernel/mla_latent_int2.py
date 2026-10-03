@@ -372,6 +372,60 @@ def quantize_dequantize_reuse(x, group_size: int = 128, lloyd_max: bool = False,
 
 
 @triton.jit
+def _quant_pack_row(
+    x_row_ptr, s, codes_ptr, params_ptr,
+    D: tl.constexpr, GS: tl.constexpr, NG: tl.constexpr, LLOYD: tl.constexpr,
+    BITS: tl.constexpr, PF: tl.constexpr,
+    MASK: tl.constexpr, MAXQ: tl.constexpr,
+    T0: tl.constexpr, T1: tl.constexpr, T2: tl.constexpr,
+    LM_SPAN3: tl.constexpr, LM_RATIO: tl.constexpr, LM_C0: tl.constexpr,
+):
+    """Quantize the ``D`` values at ``x_row_ptr`` groupwise and write codes
+    and params to pool row ``s``. Shared by the scatter-pack kernel and the
+    fused decode store, so both quantize identically by construction."""
+    nb: tl.constexpr = GS // PF
+    for g in tl.static_range(NG):
+        offs = g * GS + tl.arange(0, GS)
+        x = tl.load(x_row_ptr + offs).to(tl.float32)
+        if LLOYD:
+            mean = tl.fdiv(tl.sum(x, axis=0), float(GS), ieee_rounding=True)
+            d = x - mean
+            std = tl.sqrt(
+                tl.fdiv(tl.sum(d * d, axis=0), float(GS), ieee_rounding=True) + 1e-8
+            )
+            scale = LM_SPAN3 * LM_RATIO * std
+            zero = -LM_C0 / LM_SPAN3 - tl.fdiv(mean, scale, ieee_rounding=True)
+        else:
+            x_min = tl.min(x, axis=0)
+            rng = tl.max(x, axis=0) - x_min
+            scale = tl.where(
+                tl.abs(rng) > 1e-8, tl.fdiv(rng, MAXQ, ieee_rounding=True), 1.0
+            )
+            zero = x_min
+            mean = 0.0
+            std = 1.0
+
+        ob = tl.arange(0, nb)
+        packed = tl.zeros([nb], dtype=tl.int32)
+        for j in tl.static_range(PF):
+            xj = tl.load(x_row_ptr + g * GS + PF * ob + j).to(tl.float32)
+            if LLOYD:
+                zj = tl.fdiv(xj - mean, std, ieee_rounding=True)
+                qj = ((zj >= T0).to(tl.float32)
+                      + (zj >= T1).to(tl.float32)
+                      + (zj >= T2).to(tl.float32))
+            else:
+                qj = _round_half_even(
+                    tl.fdiv(xj - zero, scale, ieee_rounding=True)
+                )
+                qj = tl.minimum(tl.maximum(qj, 0.0), MAXQ)
+            packed |= qj.to(tl.int32) << (BITS * j)
+        tl.store(codes_ptr + s * (D // PF) + g * nb + ob, packed.to(tl.uint8))
+        tl.store(params_ptr + s * (2 * NG) + 2 * g + 0, scale)
+        tl.store(params_ptr + s * (2 * NG) + 2 * g + 1, zero)
+
+
+@triton.jit
 def _scatter_pack_kernel(
     x_ptr, slots_ptr, codes_ptr, params_ptr,
     n_rows,
@@ -396,47 +450,60 @@ def _scatter_pack_kernel(
     # tokens"), rather than masking the store -- masking is unsafe under graph
     # capture because the predicate is baked in at capture time.
     s = tl.where(slot >= 0, slot, 0).to(tl.int64)
+    _quant_pack_row(
+        x_ptr + pid * D, s, codes_ptr, params_ptr,
+        D, GS, NG, LLOYD, BITS, PF, MASK, MAXQ, T0, T1, T2, LM_SPAN3, LM_RATIO, LM_C0,
+    )
 
-    nb: tl.constexpr = GS // PF
-    for g in tl.static_range(NG):
-        offs = g * GS + tl.arange(0, GS)
-        x = tl.load(x_ptr + pid * D + offs).to(tl.float32)
-        if LLOYD:
-            mean = tl.fdiv(tl.sum(x, axis=0), float(GS), ieee_rounding=True)
-            d = x - mean
-            std = tl.sqrt(
-                tl.fdiv(tl.sum(d * d, axis=0), float(GS), ieee_rounding=True) + 1e-8
-            )
-            scale = LM_SPAN3 * LM_RATIO * std
-            zero = -LM_C0 / LM_SPAN3 - tl.fdiv(mean, scale, ieee_rounding=True)
-        else:
-            x_min = tl.min(x, axis=0)
-            rng = tl.max(x, axis=0) - x_min
-            scale = tl.where(
-                tl.abs(rng) > 1e-8, tl.fdiv(rng, MAXQ, ieee_rounding=True), 1.0
-            )
-            zero = x_min
-            mean = 0.0
-            std = 1.0
 
-        ob = tl.arange(0, nb)
-        packed = tl.zeros([nb], dtype=tl.int32)
-        for j in tl.static_range(PF):
-            xj = tl.load(x_ptr + pid * D + g * GS + PF * ob + j).to(tl.float32)
-            if LLOYD:
-                zj = tl.fdiv(xj - mean, std, ieee_rounding=True)
-                qj = ((zj >= T0).to(tl.float32)
-                      + (zj >= T1).to(tl.float32)
-                      + (zj >= T2).to(tl.float32))
-            else:
-                qj = _round_half_even(
-                    tl.fdiv(xj - zero, scale, ieee_rounding=True)
-                )
-                qj = tl.minimum(tl.maximum(qj, 0.0), MAXQ)
-            packed |= qj.to(tl.int32) << (BITS * j)
-        tl.store(codes_ptr + s * (D // PF) + g * nb + ob, packed.to(tl.uint8))
-        tl.store(params_ptr + s * (2 * NG) + 2 * g + 0, scale)
-        tl.store(params_ptr + s * (2 * NG) + 2 * g + 1, zero)
+@triton.jit
+def _store_decode_kernel(
+    c_ptr, pe_ptr, loc_ptr, seq_lens_ptr, req_idx_ptr,
+    codes_ptr, params_ptr, rope_ptr, hp_ptr, hp_row_ptr, hp_owner_ptr,
+    n_rows, P, W, PER_REQ, MAX_REQS,
+    D: tl.constexpr, GS: tl.constexpr, NG: tl.constexpr, LLOYD: tl.constexpr,
+    BITS: tl.constexpr, PF: tl.constexpr,
+    MASK: tl.constexpr, MAXQ: tl.constexpr,
+    T0: tl.constexpr, T1: tl.constexpr, T2: tl.constexpr,
+    LM_SPAN3: tl.constexpr, LM_RATIO: tl.constexpr, LM_C0: tl.constexpr,
+    ROPE: tl.constexpr,
+):
+    """The whole decode write of one latent row in one launch: pack the
+    rotated latent into codes/params, copy k_pe, place the row in the BF16
+    window arena and update the slot<->arena bookkeeping. Row ``i`` belongs
+    to request ``i`` of the decode batch (one new token each), so its position
+    is ``seq_lens[i] - 1``. Same values as ``_packed_store``'s Python path,
+    which stays as the reference.
+    """
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
+    loc = tl.load(loc_ptr + pid).to(tl.int64)
+    s = tl.where(loc >= 0, loc, 0)
+    _quant_pack_row(
+        c_ptr + pid * D, s, codes_ptr, params_ptr,
+        D, GS, NG, LLOYD, BITS, PF, MASK, MAXQ, T0, T1, T2, LM_SPAN3, LM_RATIO, LM_C0,
+    )
+    ro = tl.arange(0, ROPE)
+    pe = tl.load(pe_ptr + pid * ROPE + ro)
+    tl.store(rope_ptr + s * ROPE + ro, pe.to(rope_ptr.dtype.element_ty))
+
+    # window placement, the decode case of _ring_rows
+    seq = tl.load(seq_lens_ptr + pid).to(tl.int64)
+    req = tl.load(req_idx_ptr + pid).to(tl.int64)
+    pos = seq - 1
+    keep = ((pos < P) | (pos >= seq - W)) & (req < MAX_REQS) & (loc > 0)
+    in_sink = pos < P
+    off = tl.where(in_sink, pos, P + tl.maximum(pos - P, 0) % W)
+    ring = 1 + req * PER_REQ + off
+    ring = tl.where(keep, ring, 0)
+    offs = tl.arange(0, D)
+    c = tl.load(c_ptr + pid * D + offs)
+    # every row writes its arena row (row 0 is the dummy for the ones not kept),
+    # exactly as the reference's ``hp_c[ring] = c`` does
+    tl.store(hp_ptr + ring * D + offs, c.to(hp_ptr.dtype.element_ty))
+    tl.store(hp_owner_ptr + ring, tl.where(keep, loc, -1).to(tl.int32))
+    tl.store(hp_row_ptr + s, tl.where(keep, ring, -1).to(tl.int32))
 
 
 @triton.jit
@@ -509,6 +576,61 @@ def _assemble_rows_kernel(
     tl.store(out_ptr + pid * OUT_D + D + ro, rv.to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _gather_dequant_assemble_kernel(
+    slots_ptr, codes_ptr, params_ptr, rope_ptr, hp_ptr, hp_row_ptr, hp_owner_ptr, out_ptr,
+    table_ptr,
+    n_rows,
+    D: tl.constexpr, GS: tl.constexpr, NG: tl.constexpr, LLOYD: tl.constexpr,
+    BITS: tl.constexpr, PF: tl.constexpr, MASK: tl.constexpr,
+    ROPE: tl.constexpr, OUT_D: tl.constexpr, HAS_HP: tl.constexpr, HAS_TABLE: tl.constexpr,
+):
+    """``_gather_dequant_kernel`` followed by ``_assemble_rows_kernel`` in one
+    launch: the dequantized latent never round-trips through a scratch buffer.
+    Same arithmetic, same output; the two-kernel path is the reference."""
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
+    slot = tl.load(slots_ptr + pid).to(tl.int32)
+    valid = slot >= 0
+    s = tl.where(valid, slot, 0).to(tl.int64)
+
+    offs = tl.arange(0, D)
+    gid = offs // GS
+    byte = tl.load(codes_ptr + s * (D // PF) + offs // PF).to(tl.int32)
+    q = ((byte >> (BITS * (offs % PF))) & MASK).to(tl.float32)
+    scale = tl.load(params_ptr + s * (2 * NG) + 2 * gid + 0)
+    zero = tl.load(params_ptr + s * (2 * NG) + 2 * gid + 1)
+    if LLOYD:
+        val = (q - zero) * scale
+    else:
+        val = q * scale + zero
+    # the reference path stores the latent in out's dtype and reloads it as
+    # float32 before assembling; round the same way so the bits agree
+    val = val.to(out_ptr.dtype.element_ty).to(tl.float32)
+
+    if HAS_HP:
+        r = tl.load(hp_row_ptr + s).to(tl.int32)
+        rr = tl.where(r >= 0, r, 0).to(tl.int64)
+        owner = tl.load(hp_owner_ptr + rr).to(tl.int32)
+        use_hp = (r >= 0) & (owner == slot) & valid
+        hpv = tl.load(hp_ptr + rr * D + offs).to(tl.float32)
+        val = tl.where(use_hp, hpv, val)
+
+    val = tl.where(valid, val, 0.0)
+    tl.store(out_ptr + pid * OUT_D + offs, val.to(out_ptr.dtype.element_ty))
+
+    ro = tl.arange(0, ROPE)
+    rv = tl.load(rope_ptr + s * ROPE + ro).to(tl.float32)
+    rv = tl.where(valid, rv, 0.0)
+    tl.store(out_ptr + pid * OUT_D + D + ro, rv.to(out_ptr.dtype.element_ty))
+    if HAS_TABLE:
+        # the staging table: this row's index where the slot is live, the
+        # original (negative) entry where it is a hole -- stage_decode's
+        # ``where(valid, arange, page_table)`` without the two launches
+        tl.store(table_ptr + pid, tl.where(valid, pid, slot).to(tl.int32))
+
+
 def scatter_pack_rows(x, slots, codes_buf, params_buf, group_size, lloyd_max, bits=2):
     """Quantize ``x`` (``[n, D]``, rotated frame) into ``codes/params`` at ``slots``."""
     # Lloyd-Max here is a THREE-THRESHOLD codebook, i.e. 2-bit by construction.
@@ -542,6 +664,73 @@ def gather_dequant_rows(slots, codes_buf, params_buf, out, group_size, lloyd_max
         MASK=(1 << bits) - 1, MAXQ=float((1 << bits) - 1),
     )
     return out
+
+
+def gather_dequant_assemble_rows(slots, codes_buf, params_buf, rope_buf, hp_buf,
+                                 hp_row_of_slot, hp_owner_of_row, out, group_size, lloyd_max,
+                                 bits=2, table=None):
+    """``gather_dequant_rows`` + ``assemble_rows`` as one launch; ``out`` is
+    ``[n, D + rope]`` and ``D`` is read off the packed code width. With
+    ``table`` (``[n]`` int32) the launch also writes the staging table:
+    ``i`` where ``slots[i] >= 0``, ``slots[i]`` where it is a hole."""
+    n = slots.numel()
+    if n == 0:
+        return out
+    pf = 8 // bits
+    d = codes_buf.shape[-1] * pf
+    rope_d = rope_buf.shape[-1]
+    assert out.shape[-1] == d + rope_d, (out.shape, d, rope_d)
+    has_hp = hp_buf is not None
+    has_table = table is not None
+    if has_table:
+        assert table.numel() >= n and table.dtype == torch.int32, (table.shape, table.dtype)
+    _gather_dequant_assemble_kernel[(n,)](
+        slots, codes_buf, params_buf, rope_buf,
+        hp_buf if has_hp else rope_buf,
+        hp_row_of_slot if has_hp else slots,
+        hp_owner_of_row if has_hp else slots,
+        out,
+        table if has_table else slots,
+        n,
+        D=d, GS=group_size, NG=d // group_size, LLOYD=lloyd_max, BITS=bits, PF=pf,
+        MASK=(1 << bits) - 1, ROPE=rope_d, OUT_D=out.shape[-1], HAS_HP=has_hp,
+        HAS_TABLE=has_table,
+    )
+    return out
+
+
+def store_decode_rows(c_rot, k_pe, loc, seq_lens, req_pool_indices,
+                      codes_buf, params_buf, rope_buf, hp_buf, hp_row_of_slot, hp_owner_of_row,
+                      *, sink, recent, per_req_hp, max_reqs, group_size, lloyd_max, bits=2):
+    """One launch for the decode write of ``n`` latent rows (one per request):
+    codes/params at ``loc``, ``k_pe`` into ``rope_buf``, the BF16 window arena
+    row and the slot<->arena bookkeeping. ``c_rot`` is the rotated fp32 latent
+    ``[n, D]``. Values agree with the Python write path (scatter_pack_rows +
+    the index_put sequence in ``_packed_store``), which remains the reference.
+    ``loc`` must be non-negative (sglang pads decode rows with slot 0)."""
+    assert bits in (2, 4), f"unsupported bits={bits}"
+    assert not (lloyd_max and bits != 2)
+    n, d = c_rot.shape
+    assert d % group_size == 0 and group_size % 4 == 0
+    assert recent >= 1, "the fused store needs a recent window (the modulo)"
+    if n == 0:
+        return
+    assert seq_lens.numel() == n and req_pool_indices.numel() == n and loc.numel() == n, (
+        seq_lens.shape, req_pool_indices.shape, loc.shape, n)
+    rope_d = rope_buf.shape[-1]
+    assert k_pe.shape == (n, rope_d), (k_pe.shape, n, rope_d)
+    c_rot = c_rot.contiguous().to(torch.float32)
+    k_pe = k_pe.contiguous()
+    _store_decode_kernel[(n,)](
+        c_rot, k_pe, loc, seq_lens, req_pool_indices,
+        codes_buf, params_buf, rope_buf, hp_buf, hp_row_of_slot, hp_owner_of_row,
+        n, int(sink), int(recent), int(per_req_hp), int(max_reqs),
+        D=d, GS=group_size, NG=d // group_size, LLOYD=lloyd_max, BITS=bits, PF=8 // bits,
+        MASK=(1 << bits) - 1, MAXQ=float((1 << bits) - 1),
+        T0=_LM_THRESHOLDS[0], T1=_LM_THRESHOLDS[1], T2=_LM_THRESHOLDS[2],
+        LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=_LM_RATIO, LM_C0=_LM_CENTROIDS[0],
+        ROPE=rope_d,
+    )
 
 
 def assemble_rows(c, slots, rope_buf, hp_buf, hp_row_of_slot, hp_owner_of_row, out):

@@ -178,6 +178,52 @@ def packed_latent_bytes_per_token(kv_lora_rank: int, qk_rope_head_dim: int,
     )
 
 
+def ring_rows_from_positions(pos, seq, req, write_loc, P, W, per_req_hp, max_reqs):
+    """``(ring_row, keep)`` for rows at ``pos`` of sequences of length ``seq``
+    owned by request rows ``req`` (all int64 device tensors of one shape).
+
+    This is the reference the fused decode store (``store_decode_rows``)
+    reproduces, so it is a plain function rather than a method.
+    """
+    keep = (pos < P) | (pos >= seq - W)
+    # Requests past the ring arena would alias each other's windows; drop
+    # them to the packed tier rather than corrupt a neighbour. Sizing the
+    # arena from req_to_token_pool means this is unreachable in practice.
+    keep = keep & (req < max_reqs)
+    # Slot 0 is the reserved dummy every padded row is aimed at (the paged
+    # allocator hands out page 1 upward), so a row landing there is a padded
+    # CUDA-graph replay. Its ``req_pool_indices`` entry is stale -- left over
+    # from whichever batch was captured -- and letting it write a ring row
+    # would knock a *live* request's sink out of the window on every replay.
+    keep = keep & (write_loc > 0)
+    in_sink = pos < P
+    ring = 1 + req * per_req_hp + torch.where(
+        in_sink, pos, P + (pos - P).clamp(min=0) % max(W, 1)
+    )
+    ring = torch.where(keep, ring, torch.zeros_like(ring))
+    return ring, keep
+
+
+def decode_ring_rows(seq_lens, req_pool_indices, write_loc, P, W, per_req_hp, max_reqs):
+    """The decode case: row ``i`` is the newest token of request ``i``."""
+    seq = seq_lens.to(torch.int64)
+    return ring_rows_from_positions(
+        seq - 1, seq, req_pool_indices.to(torch.int64), write_loc, P, W, per_req_hp, max_reqs
+    )
+
+
+def apply_window_writes(hp_c_li, hp_owner_of_row, hp_row_of_slot, ring, keep, loc64, c_rot, dtype):
+    """The reference arena update: every row writes its ring row (row 0 for
+    the ones not kept), then the two bookkeeping tables."""
+    hp_c_li[ring] = c_rot.to(dtype)
+    hp_owner_of_row[ring] = torch.where(
+        keep, loc64.to(torch.int32), torch.full_like(loc64, -1, dtype=torch.int32)
+    )
+    hp_row_of_slot[loc64] = torch.where(
+        keep, ring.to(torch.int32), torch.full_like(ring, -1, dtype=torch.int32)
+    )
+
+
 class _PackedLatentMixin(_Int2HPMixin):
     """Packed-storage latent, mixed into the MLA and NSA pools.
 
@@ -302,6 +348,14 @@ class _PackedLatentMixin(_Int2HPMixin):
         # the warmup forward has already grown it to the largest decode shape.
         self._read_scratch: Optional[torch.Tensor] = None
         self._deq_scratch: Optional[torch.Tensor] = None
+        from sglang.srt.environ import envs as _envs
+
+        # One-launch materialize (dequant + rope + window override); the
+        # two-kernel path stays as the reference it is tested against.
+        self._fused_materialize = bool(_envs.SGLANG_OSCAR_MLA_PACKED_FUSED_MATERIALIZE.get())
+        # One-launch decode write (pack + rope + arena + bookkeeping); the
+        # Python sequence stays as the reference it is tested against.
+        self._fused_store = bool(_envs.SGLANG_OSCAR_MLA_PACKED_FUSED_STORE.get())
         # The self-check verifies each write immediately, against a reference
         # computed from the values in hand. The obvious design -- shadow the
         # whole pool with the BF16 fake-quant result -- is not available here
@@ -508,11 +562,19 @@ class _PackedLatentMixin(_Int2HPMixin):
         if not self._latent_windows:
             return None, None
         meta = self._fb_window_meta
-        if meta is None or meta.get("fallback"):
+        if meta is None:
+            # Nobody called note_forward_batch for this forward. Quantizing
+            # everything is safe, but it must not be silent: this is exactly
+            # how the windows ran "on" in the logs and off in the pool for
+            # every packed model until the hook was traced.
+            self._window_fallback("no ForwardBatch metadata")
+            return None, None
+        if meta.get("fallback"):
             return None, None
         P, W = self._win_p, self._win_r
         req_pool_indices = meta["req_pool_indices"]
         if req_pool_indices is None:
+            self._window_fallback("ForwardBatch without req_pool_indices")
             return None, None
 
         if meta["is_decode"]:
@@ -523,9 +585,10 @@ class _PackedLatentMixin(_Int2HPMixin):
                     f"{0 if seq_lens is None else seq_lens.numel()} requests"
                 )
                 return None, None
-            pos = seq_lens.to(torch.int64) - 1
-            req = req_pool_indices.to(torch.int64)
-            seq = seq_lens.to(torch.int64)
+            return decode_ring_rows(
+                seq_lens, req_pool_indices, self._write_loc,
+                P, W, self._per_req_hp, self._max_reqs,
+            )
         else:
             positions = meta["positions"]
             extend_seq_lens = meta["extend_seq_lens"]
@@ -546,23 +609,25 @@ class _PackedLatentMixin(_Int2HPMixin):
                 req_pool_indices.to(torch.int64), ext, output_size=n_tokens
             )
 
-        keep = (pos < P) | (pos >= seq - W)
-        # Requests past the ring arena would alias each other's windows; drop
-        # them to the packed tier rather than corrupt a neighbour. Sizing the
-        # arena from req_to_token_pool means this is unreachable in practice.
-        keep = keep & (req < self._max_reqs)
-        # Slot 0 is the reserved dummy every padded row is aimed at (the paged
-        # allocator hands out page 1 upward), so a row landing there is a padded
-        # CUDA-graph replay. Its ``req_pool_indices`` entry is stale -- left over
-        # from whichever batch was captured -- and letting it write a ring row
-        # would knock a *live* request's sink out of the window on every replay.
-        keep = keep & (self._write_loc > 0)
-        in_sink = pos < P
-        ring = 1 + req * self._per_req_hp + torch.where(
-            in_sink, pos, P + (pos - P).clamp(min=0) % max(W, 1)
+        return ring_rows_from_positions(
+            pos, seq, req, self._write_loc, P, W, self._per_req_hp, self._max_reqs
         )
-        ring = torch.where(keep, ring, torch.zeros_like(ring))
-        return ring, keep
+
+    def _decode_window_args(self, n_tokens: int):
+        """``(seq_lens, req_pool_indices)`` when this forward is a plain decode
+        whose windows the fused store can place in-kernel, else None (the
+        Python path then runs and does its own fallback logging)."""
+        if not self._latent_windows:
+            return None
+        meta = self._fb_window_meta
+        if meta is None or meta.get("fallback") or not meta["is_decode"]:
+            return None
+        seq_lens, req = meta["seq_lens"], meta["req_pool_indices"]
+        if seq_lens is None or req is None or seq_lens.numel() != n_tokens:
+            return None
+        if req.numel() != n_tokens or self._win_r < 1:
+            return None
+        return seq_lens, req
 
     # ── write path ──────────────────────────────────────────────────────────
 
@@ -577,7 +642,10 @@ class _PackedLatentMixin(_Int2HPMixin):
         a cache half in each frame with nothing to catch it. The read side
         cancels it once, on the attention output.
         """
-        from sglang.QuantKernel.mla_latent_int2 import scatter_pack_rows
+        from sglang.QuantKernel.mla_latent_int2 import (
+            scatter_pack_rows,
+            store_decode_rows,
+        )
 
         # LOCAL already: HybridLinearKVPool.set_kv_buffer remaps through
         # _transfer_full_attention_id before delegating here, so this must NOT
@@ -600,6 +668,25 @@ class _PackedLatentMixin(_Int2HPMixin):
                 _wf[layer_id] = id(_R)
         pe = k_pe.reshape(-1, self.qk_rope_head_dim)
         loc64 = loc.reshape(-1).to(torch.int64)
+        self._write_loc = loc64
+
+        # Decode: one launch for pack + rope + arena + bookkeeping. The
+        # self-check needs the Python ``keep`` so it keeps the reference path.
+        if self._fused_store and self._selfcheck_budget <= 0:
+            win = self._decode_window_args(c.shape[0])
+            if win is not None:
+                seq_lens, req_idx = win
+                store_decode_rows(
+                    c, pe, loc64, seq_lens, req_idx,
+                    self.c_codes[li], self.c_params[li], self.rope_buf[li],
+                    self.hp_c[li], self.hp_row_of_slot, self.hp_owner_of_row,
+                    sink=self._win_p, recent=self._win_r,
+                    per_req_hp=self._per_req_hp, max_reqs=self._max_reqs,
+                    group_size=self._group_size, lloyd_max=self._lloyd_max,
+                    bits=self._bits,
+                )
+                self._maybe_audit(layer_id)
+                return
 
         scatter_pack_rows(
             c, loc64.to(torch.int32), self.c_codes[li], self.c_params[li],
@@ -607,15 +694,11 @@ class _PackedLatentMixin(_Int2HPMixin):
         )
         self.rope_buf[li][loc64] = pe.to(self.dtype)
 
-        self._write_loc = loc64
         ring, keep = self._ring_rows(c.shape[0])
         if ring is not None:
-            self.hp_c[li][ring] = c.to(self.dtype)
-            self.hp_owner_of_row[ring] = torch.where(
-                keep, loc64.to(torch.int32), torch.full_like(loc64, -1, dtype=torch.int32)
-            )
-            self.hp_row_of_slot[loc64] = torch.where(
-                keep, ring.to(torch.int32), torch.full_like(ring, -1, dtype=torch.int32)
+            apply_window_writes(
+                self.hp_c[li], self.hp_owner_of_row, self.hp_row_of_slot,
+                ring, keep, loc64, c, self.dtype,
             )
         else:
             # A DEVICE tensor, not the Python scalar `-1`.
@@ -650,16 +733,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         # budget is spent on *late* decode steps, not early writes: the tag it
         # checks is only interesting after the ring has wrapped, which needs
         # thousands of steps. Layer 0 only, or it fires once per layer per step.
-        if (
-            self._audit_budget > 0
-            and layer_id == self.start_layer
-            and not _is_capturing()
-            and not _tracing()
-        ):
-            self._audit_every_n += 1
-            if self._audit_every_n % self._audit_stride == 0:
-                self._audit_budget -= 1
-                self.audit_window_arena(f"step~{self._audit_every_n}")
+        self._maybe_audit(layer_id)
 
         if self._selfcheck_budget > 0 and not _is_capturing() and not _tracing():
             self._selfcheck_write(layer_id, loc64, c, keep)
@@ -673,6 +747,18 @@ class _PackedLatentMixin(_Int2HPMixin):
                 "capturing=%s tracing=%s",
                 self._selfcheck_budget, _is_capturing(), _tracing(),
             )
+
+    def _maybe_audit(self, layer_id: int) -> None:
+        if (
+            self._audit_budget > 0
+            and layer_id == self.start_layer
+            and not _is_capturing()
+            and not _tracing()
+        ):
+            self._audit_every_n += 1
+            if self._audit_every_n % self._audit_stride == 0:
+                self._audit_budget -= 1
+                self.audit_window_arena(f"step~{self._audit_every_n}")
 
     def set_kv_buffer(self, layer, loc, cache_k, cache_v):
         """NSA/triton write path: ``cache_k`` is ``[c_kv | k_pe]`` concatenated."""
@@ -742,7 +828,8 @@ class _PackedLatentMixin(_Int2HPMixin):
 
     def materialize_rows(self, layer_id: int, slots: torch.Tensor,
                          out: Optional[torch.Tensor] = None,
-                         scratch: Optional[torch.Tensor] = None) -> torch.Tensor:
+                         scratch: Optional[torch.Tensor] = None,
+                         table: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Dequantize ``slots`` into a dense ``[n, 1, R+rope]`` BF16 block.
 
         This is the reference read: whatever a fused kernel does, it must agree
@@ -758,12 +845,13 @@ class _PackedLatentMixin(_Int2HPMixin):
         already does for ``out``.
         """
         return self._materialize_rows_li(
-            self._local_layer_index(layer_id), slots, out, scratch
+            self._local_layer_index(layer_id), slots, out, scratch, table
         )
 
     def _materialize_rows_li(self, li: int, slots: torch.Tensor,
                              out: Optional[torch.Tensor] = None,
-                             scratch: Optional[torch.Tensor] = None):
+                             scratch: Optional[torch.Tensor] = None,
+                             table: Optional[torch.Tensor] = None):
         """materialize_rows by LOCAL index.
 
         The public entry point is reached from the attention backend with a
@@ -775,6 +863,7 @@ class _PackedLatentMixin(_Int2HPMixin):
         """
         from sglang.QuantKernel.mla_latent_int2 import (
             assemble_rows,
+            gather_dequant_assemble_rows,
             gather_dequant_rows,
         )
 
@@ -783,6 +872,25 @@ class _PackedLatentMixin(_Int2HPMixin):
         slots = slots.reshape(-1)
         n = slots.numel()
         slots32 = slots.to(torch.int32)
+        if self._fused_materialize:
+            # One launch: dequant straight into the assembled row, rope and the
+            # window override included. The two-kernel path below is the
+            # reference (rotation/tests/test_packed_materialize_gpu.py).
+            if out is None:
+                if self._read_scratch is None or self._read_scratch.shape[0] < n:
+                    self._read_scratch = torch.empty(
+                        (max(n, 1024), 1, D), dtype=self.dtype, device=self.device
+                    )
+                out = self._read_scratch[:n]
+            gather_dequant_assemble_rows(
+                slots32, self.c_codes[li], self.c_params[li], self.rope_buf[li],
+                self.hp_c[li] if self._latent_windows else None,
+                self.hp_row_of_slot if self._latent_windows else None,
+                self.hp_owner_of_row if self._latent_windows else None,
+                out.view(n, D), self._group_size, self._lloyd_max, self._bits,
+                table=None if table is None else table[:n],
+            )
+            return out.view(n, 1, D)
 
         if scratch is not None:
             assert scratch.shape[0] >= n and scratch.shape[1] == R, (
@@ -815,6 +923,11 @@ class _PackedLatentMixin(_Int2HPMixin):
             self.hp_owner_of_row if self._latent_windows else None,
             out.view(n, D),
         )
+        if table is not None:
+            # the staging table the fused kernel writes in-launch: row index
+            # where the slot is live, the (negative) entry where it is a hole
+            ar = torch.arange(n, dtype=torch.int32, device=slots32.device)
+            table[:n].copy_(torch.where(slots32 >= 0, ar, slots32))
         return out.view(n, 1, D)
 
     def _selfcheck_write(self, layer_id: int, loc: torch.Tensor,

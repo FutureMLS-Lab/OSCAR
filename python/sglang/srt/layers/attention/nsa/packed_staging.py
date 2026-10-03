@@ -57,6 +57,31 @@ def stage_decode(
     return out[:n_alloc], table
 
 
+MaterializeTable = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]
+
+
+def stage_decode_fused(
+    materialize_table: MaterializeTable,
+    page_table_1: torch.Tensor,
+    out: torch.Tensor,
+    table_out: torch.Tensor,
+    row_multiple: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``stage_decode`` as a single launch per layer.
+
+    ``materialize_table(slots, buf, table)`` dequantizes ``slots`` (holes
+    allowed, -1) into ``buf`` and writes the remapped table into ``table`` in
+    the same kernel, so the two ``where`` launches of ``stage_decode`` go
+    away. ``table_out`` is a ``[>= bs*topk]`` int32 buffer (static under
+    graph capture, like ``out``). Same outputs as ``stage_decode``.
+    """
+    bs, topk = page_table_1.shape
+    n = bs * topk
+    n_alloc = -(-n // row_multiple) * row_multiple
+    materialize_table(page_table_1.reshape(-1), out[:n], table_out[:n])
+    return out[:n_alloc], table_out[:n].view(bs, topk)
+
+
 def build_slot_to_ragged(flat_slots: torch.Tensor, slot_to_ragged: torch.Tensor) -> None:
     """``slot_to_ragged[flat_slots[i]] = i``. Entries for slots not in this
     batch are left stale: nothing in the batch can reference them."""

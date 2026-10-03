@@ -80,7 +80,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.nsa.packed_staging import (
     build_slot_to_ragged,
-    stage_decode,
+    stage_decode_fused,
     stage_prefill,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -445,6 +445,7 @@ class DeepseekSparseAttnBackend(
         self._packed_decode_arange: Optional[torch.Tensor] = None
         self._packed_decode_deq: Optional[torch.Tensor] = None
         self._packed_decode_static: bool = False
+        self._packed_decode_table: Optional[torch.Tensor] = None
         self._packed_prefill_rows: Optional[torch.Tensor] = None
         self._packed_slot_to_ragged: Optional[torch.Tensor] = None
         self._packed_prefill_flat: Optional[torch.Tensor] = None
@@ -1392,12 +1393,13 @@ class DeepseekSparseAttnBackend(
         self._packed_decode_deq = torch.empty(
             (n, self.kv_lora_rank), dtype=pool.dtype, device=self.device
         )
+        self._packed_decode_table = torch.empty(n, dtype=torch.int32, device=self.device)
         self._packed_decode_static = True
 
     def _packed_decode_buffers(
         self, n_rows: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(rows, arange, deq)`` able to hold ``n_rows`` staged rows.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(rows, arange, deq, table)`` able to hold ``n_rows`` staged rows.
 
         The static buffers are returned whenever they fit. A larger eager
         batch gets temporaries rather than a rebind: the captured graphs
@@ -1408,7 +1410,12 @@ class DeepseekSparseAttnBackend(
         """
         rows = self._packed_decode_rows
         if rows is not None and rows.shape[0] >= n_rows:
-            return rows, self._packed_decode_arange, self._packed_decode_deq
+            return (
+                rows,
+                self._packed_decode_arange,
+                self._packed_decode_deq,
+                self._packed_decode_table,
+            )
         pool = self.packed_pool
         n = self._packed_round_rows(n_rows)
         fresh = (
@@ -1417,6 +1424,7 @@ class DeepseekSparseAttnBackend(
             ),
             torch.arange(n, dtype=torch.int32, device=self.device),
             torch.empty((n, self.kv_lora_rank), dtype=pool.dtype, device=self.device),
+            torch.empty(n, dtype=torch.int32, device=self.device),
         )
         if self._packed_decode_static:
             assert not torch.cuda.is_current_stream_capturing(), (
@@ -1428,6 +1436,7 @@ class DeepseekSparseAttnBackend(
             self._packed_decode_rows,
             self._packed_decode_arange,
             self._packed_decode_deq,
+            self._packed_decode_table,
         ) = fresh
         return fresh
 
@@ -1526,16 +1535,17 @@ class DeepseekSparseAttnBackend(
 
         if not ragged_prefill:
             rows_q, topk = page_table_1.shape
-            rows, arange_i32, deq = self._packed_decode_buffers(rows_q * topk)
+            rows, arange_i32, deq, table_buf = self._packed_decode_buffers(rows_q * topk)
 
-            def materialize(slots: torch.Tensor, out: torch.Tensor) -> None:
-                pool.materialize_rows(layer_id, slots, out=out, scratch=deq)
+            def materialize_table(
+                slots: torch.Tensor, out: torch.Tensor, table: torch.Tensor
+            ) -> None:
+                pool.materialize_rows(layer_id, slots, out=out, scratch=deq, table=table)
 
-            return stage_decode(
-                materialize,
-                page_table_1,
-                arange_i32,
-                rows,
+            # One launch per layer: dequant, rope, window override and the
+            # remapped table together (stage_decode is the reference).
+            return stage_decode_fused(
+                materialize_table, page_table_1, rows, table_buf,
                 row_multiple=self.real_page_size,
             )
 
