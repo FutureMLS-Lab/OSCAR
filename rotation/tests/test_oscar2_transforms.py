@@ -237,3 +237,23 @@ def test_quantized_decode_under_transform_matches_dense(variant):
     err_raw = ((out - ref_raw).norm() / ref_raw.norm()).item()
     print(f"{variant}: exact-path max |d| = {(out - ref_q.float()).abs().max().item():.4f}; "
           f"relative error vs raw K/V (INT2 noise on random data) = {err_raw:.3f}")
+
+
+def test_output_metric_matches_loop():
+    """The Gram-matrix form of the rho-weighted post-W_O metric equals the pair loop."""
+    gen = torch.Generator().manual_seed(7)
+    kv, gqa, hd, hidden = 2, 4, 16, 48
+    w_o = torch.randn(hidden, kv * gqa * hd, generator=gen, dtype=torch.float64)
+    a = torch.rand(kv, gqa, gqa, generator=gen, dtype=torch.float64)
+    rho = a @ a.transpose(1, 2)
+    got = fit.head_resolved_output_metric(w_o, rho, kv, hd)
+    for h in range(kv):
+        g = torch.zeros(hd, hd, dtype=torch.float64)
+        blocks = [w_o[:, (h * gqa + j) * hd : (h * gqa + j + 1) * hd] for j in range(gqa)]
+        for j in range(gqa):
+            for jp in range(gqa):
+                g += rho[h, j, jp] * (blocks[j].T @ blocks[jp])
+        assert torch.allclose(got[h], fit.unit_mean_eig(fit._sym(g)), atol=1e-9)
+    pooled = fit.pooled_output_metric(w_o, kv, hd)
+    eye = torch.eye(gqa, dtype=torch.float64).expand(kv, gqa, gqa)
+    assert torch.allclose(pooled, fit.head_resolved_output_metric(w_o, eye.clone(), kv, hd), atol=1e-9)

@@ -187,33 +187,41 @@ def pooled_output_metric(w_o: torch.Tensor, kv_heads: int, head_dim: int) -> tor
     eigenvalue."""
     q_heads = w_o.shape[1] // head_dim
     gqa = q_heads // kv_heads
-    g = torch.zeros((kv_heads, head_dim, head_dim), dtype=torch.float64)
-    for j in range(q_heads):
-        block = w_o[:, j * head_dim : (j + 1) * head_dim]
-        g[j // gqa] += block.T @ block
-    return torch.stack([unit_mean_eig(_sym(gh)) for gh in g])
+    rho = torch.eye(gqa, dtype=torch.float64).expand(kv_heads, gqa, gqa)
+    return _rho_weighted_output_metric(w_o, rho, kv_heads, head_dim)
+
+
+def _rho_weighted_output_metric(w_o: torch.Tensor, rho: torch.Tensor, kv_heads: int, head_dim: int) -> torch.Tensor:
+    """``G_h = sum_{j,j'} rho_h[j,j'] W_{O,j}^T W_{O,j'}`` for the first
+    ``rho.shape[1]`` query heads of each KV head's group: one Gram matrix of the
+    group's W_O columns per head, then the rho-weighted block sum."""
+    q_heads = w_o.shape[1] // head_dim
+    gqa = q_heads // kv_heads
+    grp = int(rho.shape[1])
+    out = []
+    for h in range(kv_heads):
+        cols = w_o[:, h * gqa * head_dim : (h * gqa + grp) * head_dim]  # [hidden, grp*hd]
+        gram = (cols.T @ cols).reshape(grp, head_dim, grp, head_dim)
+        g = torch.einsum("jk,jakb->ab", rho[h], gram)
+        out.append(unit_mean_eig(_sym(g)))
+    return torch.stack(out)
 
 
 def head_resolved_output_metric(w_o: torch.Tensor, rho: torch.Tensor, kv_heads: int, head_dim: int) -> torch.Tensor:
     """``G_h = sum_{j,j' in G_h} rho_h[j,j'] W_{O,j}^T W_{O,j'}``: the pooled
     metric with the query heads' attention overlap weighting the pairs, so the
     cross-head terms of the post-W_O output error survive (C2.7);
-    ``[kv_heads, head_dim, head_dim]``, each at unit mean eigenvalue."""
+    ``[kv_heads, head_dim, head_dim]``, each at unit mean eigenvalue.
+
+    A rank that replicates a KV head over TP sees only the first grp of the
+    gqa query heads reading it (rank r holds q heads [r*grp, (r+1)*grp)); the
+    metric is then built from those heads, a statistical sample of the group."""
     q_heads = w_o.shape[1] // head_dim
     gqa = q_heads // kv_heads
     grp = int(rho.shape[1])
-    # A rank that replicates a KV head over TP sees only the first grp of the
-    # gqa query heads reading it (rank r holds q heads [r*grp, (r+1)*grp)); the
-    # metric is then built from those heads, a statistical sample of the group.
     if tuple(rho.shape) != (kv_heads, grp, grp) or gqa % grp:
         raise SystemExit(f"rho has shape {tuple(rho.shape)}, expected ({kv_heads}, g, g) with g dividing {gqa}")
-    g = torch.zeros((kv_heads, head_dim, head_dim), dtype=torch.float64)
-    for h in range(kv_heads):
-        blocks = [w_o[:, (h * gqa + j) * head_dim : (h * gqa + j + 1) * head_dim] for j in range(grp)]
-        for j in range(grp):
-            for jp in range(grp):
-                g[h] += float(rho[h, j, jp]) * (blocks[j].T @ blocks[jp])
-    return torch.stack([unit_mean_eig(_sym(gh)) for gh in g])
+    return _rho_weighted_output_metric(w_o, rho, kv_heads, head_dim)
 
 
 def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: dict | None):
