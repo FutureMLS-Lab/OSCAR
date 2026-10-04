@@ -799,8 +799,35 @@ moments into one basis per layer. The fitter checks on every file that
 non-orthogonal centered pair against dense attention.
 `rotation/_eval_runner/ppl_longctx.py` scores teacher-forced NLL over 32K
 WikiText-2 windows past the BF16 recent window, the low-noise metric used to
-rank the variants before GPQA. Results on Qwen3-8B are being measured and will
-be reported here with the ablation table.
+rank the variants before GPQA.
+
+Measured on Qwen3-8B (every row fitted from one startup-calibration pass;
+PPL = nine 32,768-token windows of WikiText-2 test, tokens at positions
+≥ 4096 scored through the real serving path; GPQA-Diamond at a 64K budget,
+one seed, same pod; recipe windows 128/2048, Lloyd-Max, clip .96/.92):
+
+| Row | Keys | Values | PPL@32K | vs BF16 | GPQA-198 |
+|:---|:---|:---|---:|---:|---:|
+| BF16 | — | — | 7.980 | — | 58.6 (2 seeds) |
+| V1 shared zoo rotation | `U_Q H P_br` | `E_v H P_br` | 8.164 | +2.30% | 48.0 (this pod; 51.0 over 5 seeds) |
+| startup-calibrated, shared | `E_q H P_br` | same | 8.134 | +1.93% | 51.5 |
+| per-head | per-head orthogonal | same | 8.211 | +2.89% | 51.5 |
+| **per-head + centering** | + `k_mean` | same | **8.083** | **+1.28%** | **54.0** |
+| shared + centering | + `k_mean` | same | 8.123 | +1.79% | — |
+| NOVA compact basis | `M_q^{1/2} E` | same | 172 | collapse | 39.9 |
+| flat compact basis | `M_q^{1/2} E H P_br` | same | 978 | collapse | every answer ran to the cap |
+| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | 102 | collapse | (passes the smoke, fails at 32K) |
+| output-aware values on stretch keys | stretch | post-`W_O` | 108 | collapse | — |
+
+Centering is the one closed-form change that pays under fixed-rate scalar
+INT2: it halves the long-context PPL overhead and gives the best GPQA arm.
+Per-head alone does not beat the shared basis on this model (eight KV heads
+with similar statistics; the per-head case for OSCAR-2 is the heterogeneous
+MoE heads). Every non-orthogonal key metric collapses at long context under
+scalar quantization, including the fixed-rate stretch that passes the smoke
+probe -- a non-orthogonal basis needs a vector quantizer on the read path,
+as NOVA-KV found. Output-aware values on orthogonal centered keys are being
+measured separately.
 
 ## 1-bit and 1.5-bit K with product quantization
 
