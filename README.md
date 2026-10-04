@@ -66,21 +66,21 @@ Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; 
 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family | Best quantizer |
 |:---:|:---:|:---:|:---:|:---:|:---|
-| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower | INT2 uniform, layer-shared rotation |
+| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower | INT2 uniform, per-head + centering + head-resolved values (PPL@64K 8.819 vs BF16 8.773; zoo 8.930) |
 | Qwen3-8B | 58.6 (2 seeds) | 53.3 (2 seeds, uniform levels, 2048-token window; re-measured at 512 in the final sweep) | 5.71× faster | 1.22× slower | INT2 uniform + clip .96/.92, per-head + centering + head-resolved values (PPL@64K 8.481 vs BF16 8.147 at a 512-token window; shared basis 8.837) |
-| Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower | INT2 uniform, layer-shared rotation |
-| Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower | INT2 uniform, per-head rotation |
-| Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower | INT2 uniform, layer-shared rotation |
-| Qwen3.5-35B-A3B | 81.8 | 83.8 | 3.97× faster | 1.32× slower | INT2 Lloyd-Max, layer-shared rotation |
+| Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower | INT2 uniform, per-head + centering (PPL@64K 6.515 vs BF16 6.365; zoo 6.684) |
+| Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower | INT2 uniform, per-head zoo rotation (PPL@64K 10.88 vs BF16 7.78; the calibrated per-head variants read 11.2–11.3, a shared basis 36) |
+| Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower | INT2 Lloyd-Max, per-head + centering + head-resolved values (PPL@64K 8.627 vs BF16 8.783; zoo 8.965) |
+| Qwen3.5-35B-A3B | 81.8 | 83.8 | 3.97× faster | 1.32× slower | INT2 uniform, startup-calibrated layer-shared rotation (PPL@64K 6.522 vs BF16 6.517; per-head variants 6.55–6.67 under TP-replicated KV heads) |
 | Gemma-4-12B-it | 63.1 | 64.1 | 2.03× faster | 1.51× slower (trtllm_mha) | INT2 uniform, two-geometry pool |
-| MiniMax-M2.7 | 86.9 | 87.9 | 6.66× faster | 1.27× slower | INT2 Lloyd-Max, layer-shared rotation |
-| MiniMax-M3 (MSA sparse) | 90.9 | 88.1 (2 seeds) | 1.34× slower | 1.73× slower | INT2 uniform + MSA staging |
+| MiniMax-M2.7 | 86.9 | 87.9 | 6.66× faster | 1.27× slower | INT2 uniform, per-head + centering + head-resolved values (PPL@64K 6.828 vs BF16 6.783; zoo + Lloyd-Max 6.850) |
+| MiniMax-M3 (MSA sparse) | 90.9 | 88.1 (2 seeds) | 1.34× slower | 1.73× slower | INT2 uniform + MSA staging (PPL@64K 4.597 vs BF16 4.462) |
 | GLM-4.7-FP8 | 80.8 | 78.8 | 6.54× faster | 1.18× slower | INT2 uniform, layer-shared rotation |
-| GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path | packed 2-bit latent + rotation (4.00×) |
-| GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path | packed 2-bit latent + rotation (4.00×) |
+| GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path | packed 2-bit latent + rotation, 4.00× (PPL@64K 3.034 vs BF16 3.042) |
+| GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path | packed 2-bit latent + rotation, 4.00× (PPL@64K 4.192 vs BF16 4.163) |
 | Kimi-K3 (TP 8 × PP 2) | 90.9 | 90.4 | 1.33× slower | 1.40× slower (trtllm_mla) | packed 2-bit latent + rotation (4.00×) |
 
-Best quantizer = the K/V quantizer behind the INT2 column, the best measured for that model; every row clips at .96/.92 and uses the startup-calibrated or zoo rotation of its recipe. Only Qwen3-8B has the OSCAR-2 ladder measured, and there per-head + centering is the keeper.
+Best quantizer = the best measured K/V quantizer for that model on the 64K PPL ladder (four 65,536-token WikiText-2 windows, tokens ≥ 32,768 scored, each model's recipe windows); every row clips at .96/.92. The GPQA INT2 column still carries the earlier recipe's seeds and is re-measured with these quantizers in the final sweep. Gemma-4's PPL cannot be read through this harness (BF16 itself scores garbage on raw-id /generate), so its row keeps the zoo rotation.
 
 The dense-GQA rows read the same way: INT2 decodes 1.9–3.0× faster than the
 triton BF16 arm and 2.0–3.9× slower than the FlashInfer-family kernels. Where
