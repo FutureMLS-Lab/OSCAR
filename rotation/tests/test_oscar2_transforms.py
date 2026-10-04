@@ -140,7 +140,9 @@ def test_pool_loads_transform_companions_on_cpu():
     assert pool._Q_k.shape == pool._R_k.shape == (2, 2, 64, 64) and pool._k_mean.shape == (2, 2, 64)
     k = torch.randn(3, 2, 64, dtype=torch.bfloat16)
     centered = pool._centered_keys(0, k)
-    assert torch.allclose(centered.float(), (k.float() - pool._k_mean[0].float()), atol=1e-2)
+    # same bf16 subtraction the pool does; an fp32 reference would differ by
+    # bf16 rounding on large values (one ulp above |4| is 0.03)
+    assert torch.equal(centered, k - pool._k_mean[0].to(k.dtype))
     # orthogonal V1-style files alias the companions to the rotations
     k2, v2 = fit.fit_variant("perhead", mom, shared=False, k_base="flat", o_proj=None)
     pool2 = _make_pool(_write(k2, "k_ph.pt"), _write(v2, "v_ph.pt"), device="cpu")
@@ -163,14 +165,11 @@ def _dense_reference(q, k, v, scale):
     return torch.einsum("bhn,nhd->bhd", p, vv)
 
 
-@gpu
-@pytest.mark.parametrize("variant", ["perhead", "outaware"])
-def test_quantized_decode_under_transform_matches_dense(variant):
-    """Write random K/V through the pool (INT2 tier) under the transform,
-    rotate q with the query-side matrix, decode, un-rotate the output with the
-    output-side matrix, and compare with dense BF16 attention on the raw K/V.
-    The non-orthogonal centered pair must land in the same error band as the
-    orthogonal per-head one."""
+def _decode_error_under_variant(variant: str) -> float:
+    """Write random K/V through the pool (INT2 tier) under ``variant``, rotate
+    q with the query-side matrix, decode, un-rotate the output with the
+    output-side matrix, and return the relative error against dense BF16
+    attention on the raw K/V."""
     from sglang.srt.layers.attention.quantized_kv_prefill import oscar_o_rotation, oscar_q_rotation
     from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd_int2_unified
 
@@ -187,7 +186,6 @@ def test_quantized_decode_under_transform_matches_dense(variant):
     loc = torch.arange(8, 8 + n, dtype=torch.int64, device="cuda")
     pool.set_kv_buffer(_Layer(), loc, k, v)  # raw rows: the pool centers, rotates, quantizes
     q = torch.randn(1, hq, hd, dtype=torch.bfloat16, device="cuda")
-    q_rot = (q.float() @ oscar_q_rotation(pool, 0).float().repeat_interleave(hq // heads, 0)).to(torch.bfloat16) if oscar_q_rotation(pool, 0).dim() == 3 else None
     Qm = oscar_q_rotation(pool, 0)
     Qh = Qm.repeat_interleave(hq // heads, dim=0)  # [Hq, d, d]
     q_rot = torch.einsum("bhd,hde->bhe", q.float(), Qh.float()).to(torch.bfloat16)
@@ -209,7 +207,22 @@ def test_quantized_decode_under_transform_matches_dense(variant):
     Oh = Om.repeat_interleave(hq // heads, dim=0)
     out = torch.einsum("bhe,hde->bhd", o.float(), Oh.float())  # o @ O^T per head
     ref = _dense_reference(q, k, v, hd**-0.5)
-    err = (out - ref).norm() / ref.norm()
-    print(f"{variant}: relative error vs dense BF16 attention on raw K/V = {err.item():.4f}")
     assert torch.isfinite(out).all()
-    assert err < 0.25, f"{variant}: INT2 decode under the transform is off by {err.item():.3f}"
+    err = ((out - ref).norm() / ref.norm()).item()
+    print(f"{variant}: relative error vs dense BF16 attention on raw K/V = {err:.4f}")
+    return err
+
+
+@gpu
+def test_quantized_decode_under_transform_matches_dense():
+    """The fully non-orthogonal centered pair (stretch keys, post-W_O values)
+    must land in the same INT2 error band as the orthogonal per-head one: a
+    wrong query-side or output-side matrix would show up as an O(1) error,
+    not as quantization noise."""
+    err_orth = _decode_error_under_variant("perhead")
+    err_nonorth = _decode_error_under_variant("outaware")
+    assert err_orth < 0.5, f"orthogonal per-head INT2 decode is off by {err_orth:.3f}"
+    assert err_nonorth < 0.5, f"non-orthogonal INT2 decode is off by {err_nonorth:.3f}"
+    assert err_nonorth < 2.0 * err_orth + 0.05, (
+        f"non-orthogonal pair {err_nonorth:.3f} vs orthogonal {err_orth:.3f}: the transform is not being undone"
+    )
