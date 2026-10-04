@@ -13,7 +13,10 @@ export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-128}"
 # The 3 pp previously charged to 2-bit KV was the window. Note this model needs
 # a LARGER window than Qwen3-30B-A3B, which saturates at 128/1024: the setting
 # does not transfer between models and has to be swept per model.
-export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-2048}"
+# 2026-10-04: recent window 512 (was 2048, the GPQA-neutral setting of the
+# sweep above) so the INT2 tier carries more of the context; the 128/512
+# numbers are re-measured on the 64K PPL metric and GPQA.
+export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
 # Uniform per-row min-max levels (LLOYD_MAX=0). On the clean 32K PPL metric
 # (tokens past 20480, 16K INT2 keys) the Lloyd-Max std-loaded levels cost
 # 1.3-3 points that uniform does not: shared basis 9.265 vs 8.989 against
