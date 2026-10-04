@@ -816,7 +816,7 @@ one seed, same pod; recipe windows 128/2048, Lloyd-Max, clip .96/.92):
 | shared + centering | + `k_mean` | same | 8.123 | +1.79% | — |
 | NOVA compact basis | `M_q^{1/2} E` | same | 172 | collapse | 39.9 |
 | flat compact basis | `M_q^{1/2} E H P_br` | same | 978 | collapse | every answer ran to the cap |
-| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | 102 | collapse | (passes the smoke, fails at 32K) |
+| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | 102 | collapse | 51.5 (short GPQA prompts hide the long-context collapse) |
 | output-aware values on stretch keys | stretch | post-`W_O` | 108 | collapse | — |
 
 Centering is the one closed-form change that pays under fixed-rate scalar
