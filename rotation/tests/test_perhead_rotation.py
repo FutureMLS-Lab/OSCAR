@@ -62,3 +62,16 @@ v1_stacked = torch.stack([torch.full((D, D), float(l)) for l in range(36)])
 assert _shard_rotation_heads(v1_stacked, 8, 0) is v1_stacked, "V1 [L,hd,hd] must pass through"
 print("ok 7: per-head rotations are sharded by TP rank (shared passes through)")
 print("ALL PASS")
+
+
+# Replicated KV heads: 2 heads over TP 4 -> ranks 0,1 hold head 0, ranks 2,3 hold head 1.
+R2 = torch.stack([torch.eye(D) * (h + 1) for h in range(2)])
+for rank, head in ((0, 0), (1, 0), (2, 1), (3, 1)):
+    got = _shard_rotation_heads([R2], local_head_num=1, tp_rank=rank, tp_size=4)[0]
+    assert got.shape == (1, D, D) and float(got[0, 0, 0]) == head + 1, (rank, float(got[0, 0, 0]))
+try:
+    _shard_rotation_heads([R2], local_head_num=1, tp_rank=3)  # no tp_size: cannot place rank 3
+    raise AssertionError("expected a ValueError without tp_size")
+except ValueError:
+    pass
+print("replicated-head sharding OK")

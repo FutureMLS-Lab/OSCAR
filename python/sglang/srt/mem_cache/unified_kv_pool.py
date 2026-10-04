@@ -34,6 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.mem_cache.memory_pool import (
+    _head_shard_start,
     _shard_rotation_heads,
     KVCache,
     OscarRotationConfig,
@@ -135,7 +136,7 @@ def compute_recent_ring_size(hp_recent_tokens: int, n_q: int) -> int:
 
 
 
-def _shard_head_vectors(mean, local_head_num: int, tp_rank: int):
+def _shard_head_vectors(mean, local_head_num: int, tp_rank: int, tp_size: int = 0):
     """``_shard_rotation_heads`` for per-head vectors: a stacked
     ``[L, H, hd]`` tensor or a per-layer list of ``[H, hd]`` keeps only this
     rank's KV heads; shared ``[hd]`` vectors pass through."""
@@ -151,7 +152,7 @@ def _shard_head_vectors(mean, local_head_num: int, tp_rank: int):
                 f"per-head key mean has {total} KV heads, which is not a "
                 f"multiple of this rank's {local_head_num}"
             )
-        beg = tp_rank * local_head_num
+        beg = _head_shard_start(total, local_head_num, tp_rank, tp_size)
         return m[beg : beg + local_head_num].contiguous()
 
     if isinstance(mean, (list, tuple)):
@@ -438,6 +439,7 @@ class UnifiedInt2HPKVPool(KVCache):
         )
         # Per-head rotations ship every KV head; keep only this rank's slice.
         _tp_rank = get_parallel().attn_tp_rank
+        _tp_size = get_parallel().attn_tp_size
 
         def _rot_shape(R):
             if isinstance(R, (list, tuple)):
@@ -445,8 +447,8 @@ class UnifiedInt2HPKVPool(KVCache):
             return str(tuple(R.shape))
 
         _bk, _bv = _rot_shape(self._R_k), _rot_shape(self._R_v)
-        self._R_k = _shard_rotation_heads(self._R_k, self.head_num, _tp_rank)
-        self._R_v = _shard_rotation_heads(self._R_v, self.head_num, _tp_rank)
+        self._R_k = _shard_rotation_heads(self._R_k, self.head_num, _tp_rank, _tp_size)
+        self._R_v = _shard_rotation_heads(self._R_v, self.head_num, _tp_rank, _tp_size)
         # OSCAR-2 transform family: a non-orthogonal key transform ships the
         # query-side matrix R_k^{-T} as ``q_rotation``, a non-orthogonal value
         # transform ships R_v^{-T} as ``o_rotation`` (applied as o @ O^T), and
@@ -485,15 +487,15 @@ class UnifiedInt2HPKVPool(KVCache):
             vector=True,
         )
         if self._Q_k is not None:
-            self._Q_k = _shard_rotation_heads(self._Q_k, self.head_num, _tp_rank)
+            self._Q_k = _shard_rotation_heads(self._Q_k, self.head_num, _tp_rank, _tp_size)
         else:
             self._Q_k = self._R_k
         if self._O_v is not None:
-            self._O_v = _shard_rotation_heads(self._O_v, self.head_num, _tp_rank)
+            self._O_v = _shard_rotation_heads(self._O_v, self.head_num, _tp_rank, _tp_size)
         else:
             self._O_v = self._R_v
         if self._k_mean is not None:
-            self._k_mean = _shard_head_vectors(self._k_mean, self.head_num, _tp_rank)
+            self._k_mean = _shard_head_vectors(self._k_mean, self.head_num, _tp_rank, _tp_size)
         logger.info(
             "UnifiedInt2HPKVPool: OSCAR-2 transforms: key %s, value %s, centering %s",
             "non-orthogonal (q_rotation)" if self._Q_k is not self._R_k else "orthogonal",

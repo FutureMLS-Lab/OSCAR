@@ -171,7 +171,20 @@ def load_oscar_rotation_config() -> OscarRotationConfig:
     )
 
 
-def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
+def _head_shard_start(total: int, local_head_num: int, tp_rank: int, tp_size: int = 0) -> int:
+    """First global KV head of ``tp_rank`` when ``total`` heads are spread over
+    ranks holding ``local_head_num`` each; replicated heads (``local * tp_size >
+    total``) repeat every ``rep`` consecutive ranks."""
+    rep = (local_head_num * tp_size) // total if tp_size and local_head_num * tp_size > total else 1
+    beg = (tp_rank // rep) * local_head_num
+    if beg + local_head_num > total:
+        raise ValueError(
+            f"rank {tp_rank} would take KV heads [{beg}, {beg + local_head_num}) of {total}; pass tp_size for replicated heads"
+        )
+    return beg
+
+
+def _shard_rotation_heads(R, local_head_num: int, tp_rank: int, tp_size: int = 0):
     """Slice a per-head rotation down to the KV heads this rank owns.
 
     A V2 checkpoint stores every KV head of the model, but under tensor
@@ -185,6 +198,10 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
     shape. Slicing it as heads mistakes the layer axis for a head axis and
     breaks every V1 model, so per-head sharding only happens where the head
     axis is unambiguous: a per-layer list, or a 4D ``[L, H, hd, hd]``.
+
+    With fewer KV heads than ranks (``tp_size`` given) each head is replicated
+    over ``local_head_num * tp_size / H`` consecutive ranks, so rank ``r`` owns
+    heads from ``(r // rep) * local_head_num``.
     """
 
     def _slice(m):
@@ -198,7 +215,7 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
                 f"per-head rotation has {total} KV heads, which is not a "
                 f"multiple of this rank's {local_head_num}"
             )
-        beg = tp_rank * local_head_num
+        beg = _head_shard_start(total, local_head_num, tp_rank, tp_size)
         return m[beg : beg + local_head_num].contiguous()
 
     if isinstance(R, (list, tuple)):
@@ -211,7 +228,7 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int):
                     f"per-head rotation has {total} KV heads, not a multiple "
                     f"of this rank's {local_head_num}"
                 )
-            beg = tp_rank * local_head_num
+            beg = _head_shard_start(total, local_head_num, tp_rank, tp_size)
             R = R[:, beg : beg + local_head_num].contiguous()
     return R
 
