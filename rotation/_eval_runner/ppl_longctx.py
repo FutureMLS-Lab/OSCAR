@@ -80,6 +80,7 @@ def main() -> int:
     ap.add_argument("--seq-len", type=int, default=32768)
     ap.add_argument("--score-from", type=int, default=4096)
     ap.add_argument("--max-windows", type=int, default=0, help="0 = every full window")
+    ap.add_argument("--bos", action="store_true", help="prepend the tokenizer's BOS token to every window (Gemma scores garbage without <bos>; window length is kept)")
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--text-file", default=None, help="score this file instead of WikiText-2")
     ap.add_argument("--out", required=True)
@@ -92,6 +93,10 @@ def main() -> int:
     if n_win == 0:
         raise SystemExit(f"text has {len(ids)} tokens, fewer than one window of {a.seq_len}")
     windows = [ids[i * a.seq_len : (i + 1) * a.seq_len] for i in range(n_win)]
+    if a.bos:
+        if tok.bos_token_id is None:
+            raise SystemExit("--bos given but the tokenizer has no BOS token")
+        windows = [[tok.bos_token_id] + w[:-1] for w in windows]
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
         outs = list(ex.map(lambda w: score_window(base, w, a.score_from), windows))
