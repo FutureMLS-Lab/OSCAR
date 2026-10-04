@@ -165,34 +165,34 @@ def _dense_reference(q, k, v, scale):
     return torch.einsum("bhn,nhd->bhd", p, vv)
 
 
-def _decode_error_under_variant(variant: str) -> float:
+def _decode_under_variant(variant: str):
     """Write random K/V through the pool (INT2 tier) under ``variant``, rotate
     q with the query-side matrix, decode, un-rotate the output with the
-    output-side matrix, and return the relative error against dense BF16
-    attention on the raw K/V."""
+    output-side matrix. Returns the kernel output, dense attention on the
+    *dequantized* K/V mapped back through the inverse transforms (what the
+    kernel must reproduce up to bf16), and dense attention on the raw K/V."""
     from sglang.srt.layers.attention.quantized_kv_prefill import oscar_o_rotation, oscar_q_rotation
     from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd_int2_unified
+    from sglang.srt.mem_cache.kv_quant_kernels import dequantize_kv_int2_triton
 
     hd, heads, hq = 64, 2, 8
-    mom, o_proj = _fake_moments(hd=hd, heads=heads, gqa=hq // heads, seed=11)
+    g = hq // heads
+    mom, o_proj = _fake_moments(hd=hd, heads=heads, gqa=g, seed=11)
     k_state, v_state = fit.fit_variant(variant, mom, shared=False, k_base="stretch", o_proj=o_proj)
     pool = _make_pool(_write(k_state, f"k_{variant}_gpu.pt"), _write(v_state, f"v_{variant}_gpu.pt"), device="cuda")
     torch.manual_seed(5)
     n = 160
-    # keys drawn around the calibration mean so centering has something to remove
-    mu = (mom["layers"][0]["k_sum"] / mom["layers"][0]["count"]).to(torch.bfloat16).cuda()
+    mu = (mom["layers"][0]["k_sum"] / mom["layers"][0]["count"]).to(torch.bfloat16).cuda()  # [heads, hd]
     k = torch.randn(n, heads, hd, dtype=torch.bfloat16, device="cuda") + mu
     v = torch.randn(n, heads, hd, dtype=torch.bfloat16, device="cuda")
     loc = torch.arange(8, 8 + n, dtype=torch.int64, device="cuda")
-    pool.set_kv_buffer(_Layer(), loc, k, v)  # raw rows: the pool centers, rotates, quantizes
+    pool.set_kv_buffer(_Layer(), loc, k, v)  # raw rows: the pool centers, rotates and quantizes
     q = torch.randn(1, hq, hd, dtype=torch.bfloat16, device="cuda")
-    Qm = oscar_q_rotation(pool, 0)
-    Qh = Qm.repeat_interleave(hq // heads, dim=0)  # [Hq, d, d]
-    q_rot = torch.einsum("bhd,hde->bhe", q.float(), Qh.float()).to(torch.bfloat16)
+    Qm = oscar_q_rotation(pool, 0)  # [heads, hd, hd]
+    q_rot = torch.einsum("bhd,hde->bhe", q.float(), Qm.repeat_interleave(g, dim=0).float()).to(torch.bfloat16)
     hp_indptr = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
     hp_indices = torch.zeros(1, dtype=torch.int64, device="cuda")
     q_indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
-    q_indices = loc.clone()
     ones = torch.ones(1, dtype=torch.int32, device="cuda")
     splits = 4
     logits = torch.empty(1, hq, 1 + splits, hd, dtype=torch.float32, device="cuda")
@@ -200,29 +200,38 @@ def _decode_error_under_variant(variant: str) -> float:
     o = torch.empty_like(q)
     decode_attention_fwd_int2_unified(
         q_rot, pool.hp_k_buffer[0], pool.hp_v_buffer[0], pool.k_buffer[0], pool.v_buffer[0],
-        pool.k_scales_zeros[0], pool.v_scales_zeros[0], o, hp_indptr, hp_indices, q_indptr, q_indices,
+        pool.k_scales_zeros[0], pool.v_scales_zeros[0], o, hp_indptr, hp_indices, q_indptr, loc.clone(),
         logits, lse, ones, torch.tensor([splits], dtype=torch.int32, device="cuda"), 1, splits, hd**-0.5,
     )
+    torch.cuda.synchronize()
     Om = oscar_o_rotation(pool, 0)
-    Oh = Om.repeat_interleave(hq // heads, dim=0)
-    out = torch.einsum("bhe,hde->bhd", o.float(), Oh.float())  # o @ O^T per head
-    ref = _dense_reference(q, k, v, hd**-0.5)
-    assert torch.isfinite(out).all()
-    err = ((out - ref).norm() / ref.norm()).item()
-    print(f"{variant}: relative error vs dense BF16 attention on raw K/V = {err:.4f}")
-    return err
+    out = torch.einsum("bhe,hde->bhd", o.float(), Om.repeat_interleave(g, dim=0).float())  # o @ O^T per head
+    # what the cache holds, mapped back to the model frame: k = k' R_k^{-1} + mu, v = v' R_v^{-1}
+    k_q = dequantize_kv_int2_triton(pool.k_buffer[0][loc], pool.k_scales_zeros[0][loc], hd, pool.hp_dtype).double()
+    v_q = dequantize_kv_int2_triton(pool.v_buffer[0][loc], pool.v_scales_zeros[0][loc], hd, pool.hp_dtype).double()
+    Rk_inv = torch.linalg.inv(pool._R_k[0].double())
+    Rv_inv = torch.linalg.inv(pool._R_v[0].double())
+    k_hat = torch.einsum("thd,hde->the", k_q, Rk_inv)
+    if pool._k_mean is not None:
+        k_hat = k_hat + pool._k_mean[0].double()
+    v_hat = torch.einsum("thd,hde->the", v_q, Rv_inv)
+    ref_q = _dense_reference(q, k_hat, v_hat, hd**-0.5)
+    ref_raw = _dense_reference(q, k, v, hd**-0.5)
+    return out, ref_q, ref_raw
 
 
 @gpu
-def test_quantized_decode_under_transform_matches_dense():
-    """The fully non-orthogonal centered pair (stretch keys, post-W_O values)
-    must land in the same INT2 error band as the orthogonal per-head one: a
-    wrong query-side or output-side matrix would show up as an O(1) error,
-    not as quantization noise."""
-    err_orth = _decode_error_under_variant("perhead")
-    err_nonorth = _decode_error_under_variant("outaware")
-    assert err_orth < 0.5, f"orthogonal per-head INT2 decode is off by {err_orth:.3f}"
-    assert err_nonorth < 0.5, f"non-orthogonal INT2 decode is off by {err_nonorth:.3f}"
-    assert err_nonorth < 2.0 * err_orth + 0.05, (
-        f"non-orthogonal pair {err_nonorth:.3f} vs orthogonal {err_orth:.3f}: the transform is not being undone"
-    )
+@pytest.mark.parametrize("variant", ["perhead", "outaware"])
+def test_quantized_decode_under_transform_matches_dense(variant):
+    """The kernel path (query-side matrix, centered + rotated INT2 cache,
+    output-side matrix) must reproduce dense attention on the dequantized
+    cache mapped back through the inverse transforms -- that isolates the
+    transform plumbing from INT2 noise, which on structureless random data
+    is large. The orthogonal per-head pair and the fully non-orthogonal
+    centered pair (stretch keys, post-W_O values) are both checked."""
+    out, ref_q, ref_raw = _decode_under_variant(variant)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref_q.float(), atol=4e-2, rtol=4e-2)
+    err_raw = ((out - ref_raw).norm() / ref_raw.norm()).item()
+    print(f"{variant}: exact-path max |d| = {(out - ref_q.float()).abs().max().item():.4f}; "
+          f"relative error vs raw K/V (INT2 noise on random data) = {err_raw:.3f}")
