@@ -14,7 +14,12 @@ export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-128}"
 # a LARGER window than Qwen3-30B-A3B, which saturates at 128/1024: the setting
 # does not transfer between models and has to be swept per model.
 export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-2048}"
-export LLOYD_MAX="${LLOYD_MAX:-1}"
+# Uniform per-row min-max levels (LLOYD_MAX=0). On the clean 32K PPL metric
+# (tokens past 20480, 16K INT2 keys) the Lloyd-Max std-loaded levels cost
+# 1.3-3 points that uniform does not: shared basis 9.265 vs 8.989 against
+# BF16 8.991; GPQA@64K agrees in direction on four paired seeds (+0.5 to
+# +5.6 pp, none significant alone).
+export LLOYD_MAX="${LLOYD_MAX:-0}"
 export DISABLE_RADIX="${DISABLE_RADIX:-0}"   # prefix cache ON by default
 export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND:-triton}"
 # Qwen3 (not 3.5, not the 2507 -Thinking) is trained to 40960 positions. A 64K

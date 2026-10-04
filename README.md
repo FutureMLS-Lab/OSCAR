@@ -67,7 +67,7 @@ Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family | Best quantizer |
 |:---:|:---:|:---:|:---:|:---:|:---|
 | Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower | INT2 uniform, layer-shared rotation |
-| Qwen3-8B | 58.6 (2 seeds) | 52.8 (4 seeds) | 5.71× faster | 1.22× slower | INT2 Lloyd-Max, per-head + centering (`center`: PPL@32K 8.08 vs 8.13 shared; GPQA 53.5 over 2 seeds) |
+| Qwen3-8B | 58.6 (2 seeds) | 53.3 (2 seeds, uniform levels; 52.8 over 4 seeds with Lloyd-Max) | 5.71× faster | 1.22× slower | INT2 uniform + clip .96/.92, startup-calibrated layer-shared rotation (PPL@32K 8.989 vs BF16 8.991; Lloyd-Max costs +3.05%) |
 | Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower | INT2 uniform, layer-shared rotation |
 | Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower | INT2 uniform, per-head rotation |
 | Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower | INT2 uniform, layer-shared rotation |
@@ -587,7 +587,7 @@ dense GQA. The BF16 control uses the same backend in every row.
 | Model | INT2 attention path | n / budget | GPQA (BF16) | GPQA (OSCAR INT2) | Δ |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
-| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 58.6 (2 seeds: 60.6, 56.6) | 52.8 (4 seeds: 50.0, 52.5, 56.1, 52.5) | −5.8 |
+| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 58.6 (2 seeds: 60.6, 56.6) | 53.3 (2 seeds: 52.5, 54.0; uniform levels, startup-calibrated shared rotation. Lloyd-Max levels: 52.8 over 4 seeds) | −5.3 |
 | `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | 64.1 | 59.6 | −4.5 |
 | `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.3 (2 seeds: 55.6, 55.1) | −5.8 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
 | `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
@@ -817,10 +817,12 @@ per-row min-max levels; both clip at .96/.92 unless "plain".
 | BF16 | — | — | — | 8.991 | — | 58.6 (2 seeds) |
 | V1 shared zoo rotation | `U_Q H P_br` | `E_v H P_br` | LM | 9.327 | +3.73% | 48.0 (this pod; 51.0 over 5 seeds) |
 | startup-calibrated, shared | `E_q H P_br` | same | LM | 9.265 | +3.05% | 51.5 |
-| **startup-calibrated, shared** | same | same | **uniform** | **8.989** | **−0.02%** | measuring |
+| **startup-calibrated, shared** | same | same | **uniform** | **8.989** | **−0.02%** | **53.3 (2 seeds: 52.5, 54.0)** |
 | per-head | per-head orthogonal | same | LM | 9.413 | +4.70% | 51.5 |
 | per-head + centering | + `k_mean` | same | LM | 9.126 | +1.50% | 54.0 / 53.0 (2 seeds) |
-| per-head + centering | + `k_mean` | same | uniform | 9.008 | +0.19% | measuring |
+| per-head + centering | + `k_mean` | same | uniform | 9.008 | +0.19% | 55.1 (2 seeds: 59.1, 51.0) |
+| per-head + centering, head-resolved output-aware values (`outaware_hr`, C2.7) | + `k_mean` | post-`W_O`, ρ-weighted | uniform | 8.998 | +0.08% | measuring |
+| same | same | same | LM | 9.113 | +1.36% | — |
 | per-head + centering | + `k_mean` | same | plain min-max (no clip) | 9.206 | +2.39% | — |
 | shared + centering | + `k_mean` | same | LM | 9.221 | +2.55% | — |
 | output-aware values on centered keys | per-head + centering | post-`W_O` | LM | 9.125 | +1.50% | 52.0 |
@@ -835,9 +837,15 @@ Two readings. First, the quantizer levels dominate everything else on this
 model: the Lloyd-Max std-loaded levels cost 1.3–3 points of PPL that the plain
 per-row min-max levels with the same clip do not (8.989 vs 9.265 on the same
 shared rotation; 9.008 vs 9.126 on centered per-head keys), and with uniform
-levels the INT2 cache is within noise of BF16 at 16K quantized keys. The
-GPQA arms for the uniform rows are being measured before the Qwen3-8B recipe
-switches. Second, within the Lloyd-Max rows centering is the one closed-form
+levels the INT2 cache is within noise of BF16 at 16K quantized keys. GPQA
+agrees in direction on every paired seed (uniform minus LM on the same basis
+and questions: +0.5, +2.0, +5.6, +0.5 pp; McNemar p = 1.0, 0.59, 0.07, 1.0),
+so the Qwen3-8B recipe now runs uniform levels (`LLOYD_MAX=0`). The C2.7
+head-resolved value transform fitted from the calibrator's co-attention
+statistic lands 0.1 PPL-point below centered keys with plain values under
+either level set, which is the neutral result the offline value-side replay
+predicted (post-`W_O` output error 0.0343 orthogonal vs 0.0356 pooled vs
+0.0367 head-resolved). Second, within the Lloyd-Max rows centering is the one closed-form
 change that pays (it halves the overhead of the shared basis and gives the
 best GPQA arm), per-head alone does not beat the shared basis (eight KV heads
 with similar statistics; the per-head case is the heterogeneous MoE heads),
