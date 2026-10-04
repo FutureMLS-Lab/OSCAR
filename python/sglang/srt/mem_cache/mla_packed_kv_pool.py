@@ -106,7 +106,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     unwrap_write_loc,
 )
-from sglang.srt.mem_cache.mla_int2_kv_pool import _Int2HPMixin
+from sglang.srt.mem_cache.mla_int2_kv_pool import (
+    _Int2HPMixin,
+    _load_latent_companions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +227,33 @@ def apply_window_writes(hp_c_li, hp_owner_of_row, hp_row_of_slot, ring, keep, lo
     )
 
 
+
+def latent_keys_to_frame(x: torch.Tensor, R: torch.Tensor, mean: Optional[torch.Tensor]) -> torch.Tensor:
+    """``(x - mean) @ R``: a latent row into the stored frame."""
+    shp = x.shape
+    flat = x.reshape(-1, shp[-1])
+    if mean is not None:
+        flat = flat - mean.to(flat.dtype)
+    return torch.matmul(flat, R.to(flat.dtype)).view(shp)
+
+
+def latent_query_to_frame(x: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """``x @ Q`` with ``Q = R^{-T}``, so the logit against a stored row is ``q . (k - mean)``."""
+    shp = x.shape
+    return torch.matmul(x.reshape(-1, shp[-1]), Q.to(x.dtype)).view(shp)
+
+
+def latent_output_from_frame(x: torch.Tensor, O: torch.Tensor, mean: Optional[torch.Tensor]) -> torch.Tensor:
+    """``x @ O^T + mean`` with ``O = R^{-T}``: the attention output back into the
+    model's latent frame; the mean returns because every attended row was
+    centered and the attention weights sum to one."""
+    shp = x.shape
+    out = torch.matmul(x.reshape(-1, shp[-1]), O.to(x.dtype).T)
+    if mean is not None:
+        out = out + mean.to(out.dtype)
+    return out.view(shp)
+
+
 class _PackedLatentMixin(_Int2HPMixin):
     """Packed-storage latent, mixed into the MLA and NSA pools.
 
@@ -275,6 +305,15 @@ class _PackedLatentMixin(_Int2HPMixin):
             {g: i for i, g in enumerate(rotation_layer_ids)}
             if rotation_layer_ids
             else None
+        )
+        self.latent_q_rotations, self.latent_means = _load_latent_companions(
+            rotation_path,
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            kv_lora_rank=self.kv_lora_rank,
+            device=self.device,
+            dtype=self._compute_dtype,
+            rotation_layer_ids=rotation_layer_ids,
         )
         if not self.rotations:
             raise ValueError(
@@ -462,6 +501,25 @@ class _PackedLatentMixin(_Int2HPMixin):
 
     # ── rotation hooks used by the model's MLA forward ──────────────────────
 
+    def _companion(self, table, layer_id: int, local: bool):
+        """Look up a per-layer companion (q_rotation, mean) in the same id
+        space ``latent_rotation`` uses."""
+        if not table:
+            return None
+        if local:
+            return table.get(layer_id)
+        return table.get(self.start_layer + self._local_layer_index(layer_id))
+
+    def latent_query_rotation(self, layer_id: int, local: bool = False
+                              ) -> Optional[torch.Tensor]:
+        """The matrix the absorbed query is taken into the stored frame with:
+        ``R_c^{-T}`` for a non-orthogonal latent transform, else ``R_c``."""
+        q = self._companion(getattr(self, "latent_q_rotations", None), layer_id, local)
+        return q if q is not None else self.latent_rotation(layer_id, local=local)
+
+    def latent_mean(self, layer_id: int, local: bool = False) -> Optional[torch.Tensor]:
+        return self._companion(getattr(self, "latent_means", None), layer_id, local)
+
     def latent_rotation(self, layer_id: int, local: bool = False
                         ) -> Optional[torch.Tensor]:
         """The rotation for a layer. ``local`` says which id space you hold.
@@ -502,12 +560,21 @@ class _PackedLatentMixin(_Int2HPMixin):
 
     def rotate_latent(self, layer_id: int, x: torch.Tensor,
                       local: bool = False) -> torch.Tensor:
-        """``x @ R`` -- the query side, and the fresh keys handed to a kernel."""
+        """``(x - mean) @ R`` -- the latent rows: the write, and the fresh keys
+        handed to a kernel. The query side goes through ``rotate_latent_query``."""
         R = self.latent_rotation(layer_id, local=local)
         if R is None:
             return x
-        shp = x.shape
-        return torch.matmul(x.reshape(-1, shp[-1]), R.to(x.dtype)).view(shp)
+        return latent_keys_to_frame(x, R, self.latent_mean(layer_id, local=local))
+
+    def rotate_latent_query(self, layer_id: int, x: torch.Tensor,
+                            local: bool = False) -> torch.Tensor:
+        """``x @ Q`` with ``Q = R_c^{-T}`` (``R`` when orthogonal), so
+        ``q' . k' == q . (k - mean)`` for the stored rows."""
+        Q = self.latent_query_rotation(layer_id, local=local)
+        if Q is None:
+            return x
+        return latent_query_to_frame(x, Q)
 
     def _assert_same_frame(self, R, layer_id: int) -> None:
         """The read frame must be the matrix the write actually used.
@@ -547,8 +614,11 @@ class _PackedLatentMixin(_Int2HPMixin):
         self._assert_same_frame(R, layer_id)
         if R is None:
             return x
-        shp = x.shape
-        return torch.matmul(x.reshape(-1, shp[-1]), R.to(x.dtype).T).view(shp)
+        return latent_output_from_frame(
+            x,
+            self.latent_query_rotation(layer_id, local=local),
+            self.latent_mean(layer_id, local=local),
+        )
 
     # ── window addressing ───────────────────────────────────────────────────
 

@@ -44,7 +44,9 @@ def _fake_moments(*, layers=2, heads=2, hd=64, gqa=4, tokens=1000, seed=3):
         s_k = torch.stack([_spd(hd, gen) for _ in range(heads)])
         m_k = tokens * (s_k + mu[:, :, None] * mu[:, None, :])
         s_v = torch.stack([_spd(hd, gen) for _ in range(heads)])
-        lay[lid] = {"M_q": m_q, "k_sum": tokens * mu, "M_k": m_k, "S_v": s_v, "count": tokens}
+        a = torch.rand(heads, gqa, gqa, generator=gen, dtype=torch.float64)
+        rho = (a @ a.transpose(1, 2)) / gqa  # attention overlap of the query heads: symmetric, positive
+        lay[lid] = {"M_q": m_q, "k_sum": tokens * mu, "M_k": m_k, "S_v": s_v, "rho": rho, "count": tokens}
     out["layers"] = lay
     o_proj = {lid: torch.randn(4 * hd, heads * gqa * hd, generator=gen, dtype=torch.float64) for lid in range(layers)}
     return out, o_proj
@@ -56,7 +58,7 @@ def _write(state, name):
     return path
 
 
-@pytest.mark.parametrize("variant", ["perhead", "center", "whiten", "flat", "stretch", "outaware"])
+@pytest.mark.parametrize("variant", ["perhead", "center", "whiten", "flat", "stretch", "outaware", "outaware_hr"])
 @pytest.mark.parametrize("shared", [False, True])
 def test_fitter_algebra(variant, shared):
     mom, o_proj = _fake_moments()
@@ -72,7 +74,7 @@ def test_fitter_algebra(variant, shared):
     else:
         assert "q_rotation" in e
     assert ("k_mean" in e) == (variant != "perhead")
-    if variant == "outaware":
+    if variant in ("outaware", "outaware_hr"):
         assert "o_rotation" in v_state["layers"][0]
     # the transformed key signal is decorrelated: R^T S_k R diagonal (flattened rows flat)
     m = mom["layers"][0]

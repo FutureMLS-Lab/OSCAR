@@ -41,7 +41,7 @@ import atexit
 import logging
 import math
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -158,7 +158,11 @@ def _load_or_make_rotations(
         file_id = rotation_layer_ids[j] if rotation_layer_ids is not None else i
         p = os.path.join(rotation_path, f"layer_{file_id}.pt")
         if os.path.exists(p):
-            rotations[i] = torch.load(p, map_location="cpu").to(dtype=dtype, device=device).contiguous()
+            payload = torch.load(p, map_location="cpu")
+            # A plain tensor is an orthogonal rotation; a dict carries the
+            # non-orthogonal companions read by _load_latent_companions.
+            matrix = payload["rotation"] if isinstance(payload, dict) else payload
+            rotations[i] = matrix.to(dtype=dtype, device=device).contiguous()
         else:
             rotations[i] = torch.eye(d, dtype=dtype, device=device)
     # A rotation is only invertible by its transpose while it is orthogonal, and
@@ -175,6 +179,48 @@ def _load_or_make_rotations(
         (_r0 @ _r0.T - torch.eye(d, device=_r0.device)).abs().max().item(),
     )
     return rotations
+
+
+def _load_latent_companions(
+    rotation_path: str,
+    layer_num: int,
+    start_layer: int,
+    kv_lora_rank: int,
+    device: str,
+    dtype: torch.dtype,
+    rotation_layer_ids: Optional[List[int]] = None,
+) -> Tuple[Optional[Dict[int, torch.Tensor]], Optional[Dict[int, torch.Tensor]]]:
+    """``(q_rotations, means)`` from the ``layer_<i>.pt`` files that are dicts:
+    ``q_rotation`` is ``R_c^{-T}`` of a non-orthogonal latent transform (the
+    query side, and the output side since key and value share the latent),
+    ``mean`` the latent mean subtracted before the rotation. Layers stored as
+    plain tensors get neither; both dicts are None when no layer has them.
+    Keyed like ``_load_or_make_rotations``."""
+    if not rotation_path or rotation_path == "hadamard" or not os.path.isdir(rotation_path):
+        return None, None
+    q_rotations: Dict[int, torch.Tensor] = {}
+    means: Dict[int, torch.Tensor] = {}
+    for j in range(layer_num):
+        i = start_layer + j
+        file_id = rotation_layer_ids[j] if rotation_layer_ids is not None else i
+        p = os.path.join(rotation_path, f"layer_{file_id}.pt")
+        if not os.path.exists(p):
+            continue
+        payload = torch.load(p, map_location="cpu")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("q_rotation") is not None:
+            q_rotations[i] = payload["q_rotation"].to(dtype=dtype, device=device).contiguous()
+        if payload.get("mean") is not None:
+            means[i] = payload["mean"].reshape(kv_lora_rank).to(dtype=torch.float32, device=device).contiguous()
+    if q_rotations or means:
+        logger.info(
+            "[MLAInt2] latent companions from %s: %d non-orthogonal (q_rotation) layers, %d centered (mean) layers",
+            rotation_path,
+            len(q_rotations),
+            len(means),
+        )
+    return (q_rotations or None), (means or None)
 
 
 def _load_hp_subspaces(

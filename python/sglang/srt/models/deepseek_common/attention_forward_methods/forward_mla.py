@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.mem_cache.oscar_calibration import get_active_oscar_latent_dump
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -143,7 +144,11 @@ def _packed_latent_pool():
     pool = getattr(backend, "token_to_kv_pool", None)
     if pool is None or not hasattr(pool, "packed_read_operands"):
         return None
-    if not (hasattr(pool, "rotate_latent") and hasattr(pool, "unrotate_output")):
+    if not (
+        hasattr(pool, "rotate_latent")
+        and hasattr(pool, "rotate_latent_query")
+        and hasattr(pool, "unrotate_output")
+    ):
         return None
     return pool
 
@@ -724,6 +729,17 @@ class DeepseekMLAForwardMixin:
         # bmm+attention op bypasses q_nope_out and the fused-rope kernels write
         # the cache from inside a kernel; neither is staged, so refuse both
         # rather than serve a half-rotated cache.
+        latent_dump = get_active_oscar_latent_dump()
+        if latent_dump is not None and forward_batch.forward_mode.is_extend() and q_nope_out is not None:
+            # Rows in the model's frame, before the packed pool rotates them.
+            latent_dump.observe(
+                layer_id=self.attn_mqa.layer_id,
+                c_kv=k_nope.reshape(-1, self.kv_lora_rank),
+                k_pe=k_pe.reshape(-1, self.qk_rope_head_dim),
+                q_nope=q_nope_out.reshape(-1, self.num_local_heads, self.kv_lora_rank),
+                q_pe=q_pe.reshape(-1, self.num_local_heads, self.qk_rope_head_dim),
+                positions=forward_batch.positions,
+            )
         packed_pool = _packed_latent_pool()
         if packed_pool is not None:
             if fusion_plan is not None or self._fuse_rope_for_trtllm_mla(
@@ -734,7 +750,7 @@ class DeepseekMLAForwardMixin:
                     f"fused-rope kernels of the {self.current_attention_backend} "
                     "backend"
                 )
-            q_nope_out = packed_pool.rotate_latent(self.attn_mqa.layer_id, q_nope_out)
+            q_nope_out = packed_pool.rotate_latent_query(self.attn_mqa.layer_id, q_nope_out)
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}

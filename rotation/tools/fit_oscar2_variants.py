@@ -17,6 +17,10 @@ the model and writes one K/V checkpoint pair per variant:
   outaware  values: post-W_O metric                R_v = G^{1/2} E_v H P_br,  output side G^{-1/2} E_v H P_br
             (G = pooled W_O^T W_O of the query heads reading the KV head;
              keys from --k-base, default flat)
+  outaware_hr  values: head-resolved post-W_O metric (C2.7)
+            G_h = sum_{j,j'} rho_h[j,j'] W_{O,j}^T W_{O,j'} with rho the
+            query heads' attention overlap recorded by the calibrator
+             (keys from --k-base, default center)
 
 Non-orthogonal K transforms ship their query-side matrix as ``q_rotation``
 (so q' . k' == q . k exactly), non-orthogonal V transforms ship ``o_rotation``
@@ -118,6 +122,8 @@ def load_moments(moments_dir: str) -> dict:
         cat = {}
         for key in ("M_q", "k_sum", "M_k", "S_v"):
             cat[key] = torch.cat([p["layers"][lid][key] for p in parts], dim=0).to(torch.float64)
+        rho_parts = [p["layers"][lid].get("rho") for p in parts]
+        cat["rho"] = None if any(r is None for r in rho_parts) else torch.cat(rho_parts, dim=0).to(torch.float64)
         cat["count"] = base["layers"][lid]["count"]
         layers[int(lid)] = cat
     merged["layers"] = layers
@@ -166,14 +172,32 @@ def pooled_output_metric(w_o: torch.Tensor, kv_heads: int, head_dim: int) -> tor
     return torch.stack([unit_mean_eig(_sym(gh)) for gh in g])
 
 
+def head_resolved_output_metric(w_o: torch.Tensor, rho: torch.Tensor, kv_heads: int, head_dim: int) -> torch.Tensor:
+    """``G_h = sum_{j,j' in G_h} rho_h[j,j'] W_{O,j}^T W_{O,j'}``: the pooled
+    metric with the query heads' attention overlap weighting the pairs, so the
+    cross-head terms of the post-W_O output error survive (C2.7);
+    ``[kv_heads, head_dim, head_dim]``, each at unit mean eigenvalue."""
+    q_heads = w_o.shape[1] // head_dim
+    gqa = q_heads // kv_heads
+    if tuple(rho.shape) != (kv_heads, gqa, gqa):
+        raise SystemExit(f"rho has shape {tuple(rho.shape)}, expected {(kv_heads, gqa, gqa)}")
+    g = torch.zeros((kv_heads, head_dim, head_dim), dtype=torch.float64)
+    for h in range(kv_heads):
+        blocks = [w_o[:, (h * gqa + j) * head_dim : (h * gqa + j + 1) * head_dim] for j in range(gqa)]
+        for j in range(gqa):
+            for jp in range(gqa):
+                g[h] += float(rho[h, j, jp]) * (blocks[j].T @ blocks[jp])
+    return torch.stack([unit_mean_eig(_sym(gh)) for gh in g])
+
+
 def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: dict | None):
     hd, vd = int(mom["head_dim"]), int(mom["v_head_dim"])
     h_k = build_hadamard(hd)
     h_v = build_hadamard(vd)
     k_layers: dict = {}
     v_layers: dict = {}
-    v_metric = "post_wo" if variant == "outaware" else "pre_wo"
-    k_variant = k_base if variant == "outaware" else variant
+    v_metric = {"outaware": "post_wo", "outaware_hr": "post_wo_hr"}.get(variant, "pre_wo")
+    k_variant = k_base if variant in ("outaware", "outaware_hr") else variant
     centered = k_variant in ("center", "whiten", "flat", "stretch")
     for lid, m in sorted(mom["layers"].items()):
         n = float(m["count"])
@@ -211,7 +235,13 @@ def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: d
             else:
                 if o_proj is None:
                     raise SystemExit("outaware needs --model for W_O")
-                g_all = pooled_output_metric(o_proj[lid], int(mom["global_kv_heads"]), vd)
+                if v_metric == "post_wo_hr":
+                    rho = m.get("rho")
+                    if rho is None:
+                        raise SystemExit("outaware_hr needs the co-attention statistic `rho` in the moments")
+                    g_all = head_resolved_output_metric(o_proj[lid], rho, int(mom["global_kv_heads"]), vd)
+                else:
+                    g_all = pooled_output_metric(o_proj[lid], int(mom["global_kv_heads"]), vd)
                 g = g_all.mean(0) if shared else g_all[h]
                 r, o, vals = metric_basis(g, sv, h_v)
             r_v.append(r); o_v.append(o); ev_v.append(vals)
@@ -278,7 +308,7 @@ def main() -> int:
     ap.add_argument("--moments-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--variants", default="perhead,center,whiten,flat,stretch,outaware")
-    ap.add_argument("--k-base", default="flat", help="key transform under the outaware values")
+    ap.add_argument("--k-base", default=None, help="key transform under the outaware values (default flat for outaware, center for outaware_hr)")
     ap.add_argument("--model", default=None, help="HF id or local dir with W_O (needed for outaware)")
     ap.add_argument("--revision", default=None)
     ap.add_argument("--shared", action="store_true", help="one basis per layer (V1 grouping) instead of per head")
@@ -286,12 +316,13 @@ def main() -> int:
     mom = load_moments(a.moments_dir)
     variants = [v.strip() for v in a.variants.split(",") if v.strip()]
     o_proj = None
-    if "outaware" in variants:
+    if "outaware" in variants or "outaware_hr" in variants:
         model = a.model or mom["model_path"]
         o_proj = load_o_proj(model, sorted(mom["layers"]), a.revision or mom.get("model_revision"))
     for v in variants:
         t0 = time.time()
-        k_state, v_state = fit_variant(v, mom, shared=a.shared, k_base=a.k_base, o_proj=o_proj)
+        k_base = a.k_base or {"outaware": "flat", "outaware_hr": "center"}.get(v, "flat")
+        k_state, v_state = fit_variant(v, mom, shared=a.shared, k_base=k_base, o_proj=o_proj)
         self_check(k_state, v_state)
         d = os.path.join(a.out, v + ("-shared" if a.shared else ""))
         os.makedirs(d, exist_ok=True)

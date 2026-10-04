@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 _GRAM_CHUNK_TOKENS = 512
 _COVARIANCE_CHUNK_TOKENS = 2048
 _ORTHOGONALITY_TOLERANCE = 5e-3
+# Every _RHO_QUERY_STRIDE-th calibration token keeps its query rows, so the
+# query heads' attention overlap (the C2.7 head-resolved value objective) can
+# be measured against the stored keys in save_moments; 32 leaves ~1k samples
+# at the 30k budget, enough to settle a grp x grp matrix to three digits.
+_RHO_QUERY_STRIDE = 32
 
 # The pool that owns a pending calibrator registers it here; the attention
 # layer reads it on every forward, so there is exactly one per process and the
@@ -102,6 +107,94 @@ class OscarCalibrationResult(msgspec.Struct, kw_only=True):
     generation_id: str
 
 
+_active_latent_dump: Optional["OscarLatentDump"] = None
+
+
+def get_active_oscar_latent_dump() -> Optional["OscarLatentDump"]:
+    """The MLA latent dump for ``rotation/tools/fit_mla_joint_latent.py``,
+    created on first use from SGLANG_OSCAR_MLA_LATENT_DUMP_DIR; None when the
+    knob is unset. Each TP rank writes its own heads."""
+    global _active_latent_dump
+    if _active_latent_dump is not None:
+        return _active_latent_dump
+    directory = envs.SGLANG_OSCAR_MLA_LATENT_DUMP_DIR.get()
+    if not directory:
+        return None
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    _active_latent_dump = OscarLatentDump(
+        Path(directory),
+        token_budget=envs.SGLANG_OSCAR_MLA_LATENT_DUMP_TOKENS.get(),
+        rank=rank,
+    )
+    return _active_latent_dump
+
+
+class OscarLatentDump:
+    """Collect raw MLA prefill rows for the joint latent fitter: every latent
+    ``c_kv`` and ``k_pe`` row up to ``token_budget`` per layer, plus the
+    absorbed queries ``q_nope_out`` / ``q_pe`` of every ``query_stride``-th
+    token (so the fitter can measure the heads' attention overlap against the
+    same keys). Rows are kept on the host and written once per layer when the
+    budget is met, as ``layer_<id>_rank<r>.pt``; the rows are in the model's
+    own frame, before the pool's rotation."""
+
+    def __init__(self, directory: Path, *, token_budget: int, rank: int, query_stride: int = _RHO_QUERY_STRIDE):
+        self.directory = directory
+        self.token_budget = int(token_budget)
+        self.rank = int(rank)
+        self.query_stride = int(query_stride)
+        self._rows: dict[int, list] = {}
+        self._counts: dict[int, int] = {}
+        self._written: set[int] = set()
+
+    def observe(
+        self,
+        *,
+        layer_id: int,
+        c_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        if layer_id in self._written:
+            return
+        saved = self._counts.get(layer_id, 0)
+        remaining = self.token_budget - saved
+        if remaining <= 0:
+            return
+        n = min(int(c_kv.shape[0]), remaining)
+        rows = torch.arange(saved, saved + n)
+        pick = (rows % self.query_stride) == 0
+        self._rows.setdefault(layer_id, []).append(
+            {
+                "c_kv": c_kv[:n].reshape(n, -1).detach().to("cpu", dtype=torch.bfloat16),
+                "k_pe": k_pe[:n].reshape(n, -1).detach().to("cpu", dtype=torch.bfloat16),
+                "positions": positions[:n].detach().to("cpu", dtype=torch.int32),
+                "q_rows": rows[pick],
+                "q_nope": q_nope[:n][pick.to(q_nope.device)].detach().to("cpu", dtype=torch.bfloat16),
+                "q_pe": q_pe[:n][pick.to(q_pe.device)].detach().to("cpu", dtype=torch.bfloat16),
+            }
+        )
+        self._counts[layer_id] = saved + n
+        if self._counts[layer_id] >= self.token_budget:
+            self._write(layer_id)
+
+    def _write(self, layer_id: int) -> None:
+        parts = self._rows.pop(layer_id)
+        payload = {key: torch.cat([p[key] for p in parts], dim=0) for key in ("c_kv", "k_pe", "positions", "q_rows", "q_nope", "q_pe")}
+        payload["tokens"] = self._counts[layer_id]
+        payload["rank"] = self.rank
+        payload["query_stride"] = self.query_stride
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"layer_{layer_id}_rank{self.rank}.pt"
+        tmp = str(path) + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        self._written.add(layer_id)
+        logger.info("OSCAR latent dump: layer %d, %d rows, %d query samples -> %s", layer_id, payload["tokens"], int(payload["q_rows"].numel()), path)
+
+
 class OscarOnlineCalibrator:
     """Collect exact one-pass qqt/sst sufficient statistics on the GPU.
 
@@ -148,6 +241,9 @@ class OscarOnlineCalibrator:
         self._q_grams: dict[int, torch.Tensor] = {}
         self._k_values: dict[int, torch.Tensor] = {}
         self._v_values: dict[int, torch.Tensor] = {}
+        self._q_samples: dict[int, torch.Tensor] = {}
+        self._positions: dict[int, torch.Tensor] = {}
+        self._scaling: dict[int, float] = {}
 
     def _validate_geometry(self) -> None:
         if self.max_token_budget <= 0:
@@ -202,6 +298,9 @@ class OscarOnlineCalibrator:
         }
         self._k_values = {}
         self._v_values = {}
+        self._q_samples = {}
+        self._positions = {}
+        self._scaling = {}
         self.state = "collecting"
 
     @property
@@ -214,7 +313,14 @@ class OscarOnlineCalibrator:
         return min(self._counts.values(), default=0)
 
     def observe(
-        self, *, layer_id: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        self,
+        *,
+        layer_id: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        scaling: Optional[float] = None,
     ) -> None:
         if self.state != "collecting" or layer_id not in self._counts:
             return
@@ -243,9 +349,23 @@ class OscarOnlineCalibrator:
             self._q_grams[layer_id].add_(torch.bmm(q_grouped.transpose(1, 2), q_grouped))
 
         if layer_id not in self._k_values:
-            self._allocate_host_rows(layer_id, k_dtype=k.dtype, v_dtype=v.dtype)
+            self._allocate_host_rows(
+                layer_id, k_dtype=k.dtype, v_dtype=v.dtype, q_heads=int(q.shape[1])
+            )
         self._k_values[layer_id][saved : saved + num_tokens].copy_(k, non_blocking=True)
         self._v_values[layer_id][saved : saved + num_tokens].copy_(v, non_blocking=True)
+        if positions is not None:
+            self._positions[layer_id][saved : saved + num_tokens].copy_(
+                positions[:num_tokens].to(torch.int32), non_blocking=True
+            )
+            rows = torch.arange(saved, saved + num_tokens, device=q.device)
+            pick = (rows % _RHO_QUERY_STRIDE) == 0
+            if bool(pick.any()):
+                self._q_samples[layer_id][(rows[pick] // _RHO_QUERY_STRIDE).cpu()] = (
+                    q[pick].detach().to("cpu", dtype=torch.float32)
+                )
+        if scaling is not None:
+            self._scaling[layer_id] = float(scaling)
         self._counts[layer_id] = saved + num_tokens
 
     def _gqa_ratio_for(self, layer_id: int, *, local_q_heads: int) -> int:
@@ -266,8 +386,16 @@ class OscarOnlineCalibrator:
             )
         return gqa_ratio
 
-    def _allocate_host_rows(self, layer_id: int, *, k_dtype, v_dtype) -> None:
+    def _allocate_host_rows(self, layer_id: int, *, k_dtype, v_dtype, q_heads: int) -> None:
         pin_memory = self.device.type == "cuda"
+        self._positions[layer_id] = torch.zeros(
+            (self.token_budget,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._q_samples[layer_id] = torch.zeros(
+            ((self.token_budget + _RHO_QUERY_STRIDE - 1) // _RHO_QUERY_STRIDE, q_heads, self.head_dim),
+            dtype=torch.float32,
+            device="cpu",
+        )
         self._k_values[layer_id] = torch.empty(
             (self.token_budget, self.local_kv_heads, self.head_dim),
             dtype=k_dtype,
@@ -327,6 +455,35 @@ class OscarOnlineCalibrator:
             numerator.add_(torch.einsum("th,thd,the->hde", energy, v_chunk, v_chunk))
         return numerator / denominator.clamp_min(1e-12)[:, None, None]
 
+    def _co_attention(self, layer_id: int) -> Optional[torch.Tensor]:
+        """``[H, grp, grp]``: mean over the sampled calibration queries of
+        ``sum_t a[j, t] a[j', t]`` for the query heads reading each KV head,
+        the attention overlap that weights the cross-head terms of the C2.7
+        head-resolved post-W_O value objective. None when the attention layer
+        did not hand over positions and scaling, or no sampled query had its
+        whole sequence inside the captured rows."""
+        if layer_id not in self._q_samples or layer_id not in self._scaling:
+            return None
+        gqa = self._gqa_ratios[layer_id]
+        positions = self._positions[layer_id]
+        samples = self._q_samples[layer_id]
+        rho = torch.zeros((self.local_kv_heads, gqa, gqa), dtype=torch.float64, device=self.device)
+        n = 0
+        for s in range(samples.shape[0]):
+            r = s * _RHO_QUERY_STRIDE
+            if r >= self.token_budget:
+                break
+            start = r - int(positions[r])
+            if start < 0 or int(positions[start]) != 0:
+                continue
+            keys = self._k_values[layer_id][start : r + 1].to(self.device, dtype=torch.float32)
+            q_s = samples[s].to(self.device).reshape(self.local_kv_heads, gqa, self.head_dim)
+            logits = torch.einsum("hjd,lhd->hjl", q_s, keys) * self._scaling[layer_id]
+            a = torch.softmax(logits, dim=-1)
+            rho.add_(torch.einsum("hjl,hkl->hjk", a, a).to(torch.float64))
+            n += 1
+        return None if n == 0 else rho / n
+
     def save_moments(self, directory: Path) -> str:
         """Write this rank's per-(layer, local KV head) sufficient statistics
         so the OSCAR-2 transform family (per-head, centered, whitened / flat /
@@ -339,6 +496,8 @@ class OscarOnlineCalibrator:
         * ``M_k``  ``[H, hd, hd]``   sum of ``k^T k`` over tokens
         * ``S_v``  ``[H, vd, vd]``   attention-energy-weighted value covariance
                                       (the V objective of ``sst``)
+        * ``rho``  ``[H, grp, grp]`` attention overlap of the query heads reading
+                                      each KV head (None when not observed)
         * ``count``                   tokens behind every sum
 
         Each TP rank writes its own heads (``oscar_moments_rank<r>.pt``); the
@@ -363,15 +522,18 @@ class OscarOnlineCalibrator:
                 k_sum.add_(k_chunk.sum(dim=0))
                 m_k.add_(torch.einsum("thd,the->hde", k_chunk, k_chunk))
             s_v = self._energy_weighted_v_covariance(layer_id, q_cov)
+            rho = self._co_attention(layer_id)
             layers[layer_id] = {
                 "M_q": q_cov.detach().cpu(),
                 "k_sum": k_sum.cpu(),
                 "M_k": m_k.cpu(),
                 "S_v": s_v.detach().cpu(),
+                "rho": None if rho is None else rho.cpu(),
+                "q_scaling": self._scaling.get(layer_id),
                 "count": self.token_budget,
             }
         payload = {
-            "format_version": 1,
+            "format_version": 2,
             "model_path": self.model_path,
             "model_revision": self.model_revision,
             "prompt_sha256": self.prompt_sha256,

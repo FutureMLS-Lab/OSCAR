@@ -611,6 +611,10 @@ class Envs:
     SGLANG_OSCAR_MLA_KV_ROTATION_PATH = EnvStr("")
     SGLANG_OSCAR_MLA_KV_DUMP_DIR = EnvStr("")
     SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
+    # Raw MLA latents + sampled absorbed queries for rotation/tools/
+    # fit_mla_joint_latent.py (the C2.7 joint latent objective); off when empty.
+    SGLANG_OSCAR_MLA_LATENT_DUMP_DIR = EnvStr("")
+    SGLANG_OSCAR_MLA_LATENT_DUMP_TOKENS = EnvInt(8192)
     SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
     # Bits per latent value in the packed MLA pool. 2 is the validated default.
     #

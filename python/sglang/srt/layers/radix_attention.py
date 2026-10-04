@@ -189,6 +189,8 @@ class RadixAttention(nn.Module):
                 q=q.reshape(-1, self.tp_q_head_num, self.qk_head_dim),
                 k=k,
                 v=v,
+                positions=forward_batch.positions,
+                scaling=self.scaling,
             )
 
         context = get_tc_piecewise_forward_context()
