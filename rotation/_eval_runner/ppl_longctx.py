@@ -94,9 +94,12 @@ def main() -> int:
         raise SystemExit(f"text has {len(ids)} tokens, fewer than one window of {a.seq_len}")
     windows = [ids[i * a.seq_len : (i + 1) * a.seq_len] for i in range(n_win)]
     if a.bos:
-        if tok.bos_token_id is None:
+        from transformers import AutoTokenizer
+
+        bos = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True).bos_token_id
+        if bos is None:
             raise SystemExit("--bos given but the tokenizer has no BOS token")
-        windows = [[tok.bos_token_id] + w[:-1] for w in windows]
+        windows = [[bos] + w[:-1] for w in windows]
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
         outs = list(ex.map(lambda w: score_window(base, w, a.score_from), windows))
