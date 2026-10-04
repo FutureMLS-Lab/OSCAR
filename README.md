@@ -67,7 +67,7 @@ Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; 
 | Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family | Best quantizer |
 |:---:|:---:|:---:|:---:|:---:|:---|
 | Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower | INT2 uniform, layer-shared rotation |
-| Qwen3-8B | 58.6 (2 seeds) | 53.3 (2 seeds, uniform levels; 52.8 over 4 seeds with Lloyd-Max) | 5.71× faster | 1.22× slower | INT2 uniform + clip .96/.92, startup-calibrated layer-shared rotation (PPL@32K 8.989 vs BF16 8.991; Lloyd-Max costs +3.05%) |
+| Qwen3-8B | 58.6 (2 seeds) | 53.3 (2 seeds, uniform levels, 2048-token window; re-measured at 512 in the final sweep) | 5.71× faster | 1.22× slower | INT2 uniform + clip .96/.92, per-head + centering + head-resolved values (PPL@64K 8.481 vs BF16 8.147 at a 512-token window; shared basis 8.837) |
 | Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower | INT2 uniform, layer-shared rotation |
 | Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower | INT2 uniform, per-head rotation |
 | Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower | INT2 uniform, layer-shared rotation |
@@ -803,61 +803,47 @@ non-orthogonal centered pair against dense attention.
 WikiText-2 windows past the BF16 recent window, the low-noise metric used to
 rank the variants before GPQA.
 
-Measured on Qwen3-8B (every row fitted from one startup-calibration pass).
-PPL = nine 32,768-token WikiText-2 test windows through the real serving path
-with the recipe's chunked prefill of 16,384; only tokens at positions
-≥ 20,480 are scored (110,592 tokens), so every scored token attends to the
-whole first chunk through the quant tier (128-token bf16 prefix, 16K INT2
-keys) and to its own chunk in bf16. GPQA-Diamond at a 64K budget, one seed
-unless noted, same pod. "LM" = the Lloyd-Max std-loaded levels, "uniform" =
-per-row min-max levels; both clip at .96/.92 unless "plain".
+Measured on Qwen3-8B (every row fitted from one startup-calibration pass) at
+the recipe's windows of 128 sink / 512 recent tokens. PPL = four 65,536-token
+WikiText-2 test windows through the real serving path (chunked prefill
+16,384); only tokens at positions ≥ 32,768 are scored (131,072 tokens), so
+every scored token attends to 32K–64K keys through the quant tier. "LM" = the
+Lloyd-Max std-loaded levels, "uniform" = per-row min-max levels; both clip at
+.96/.92. GPQA for these rows is re-measured at the 512 window in the final
+sweep (the earlier GPQA seeds were taken at a 2048 window and are not
+comparable).
 
-| Row | Keys | Values | Levels | PPL@32K | vs BF16 | GPQA-198 |
-|:---|:---|:---|:---|---:|---:|---:|
-| BF16 | — | — | — | 8.991 | — | 58.6 (2 seeds) |
-| V1 shared zoo rotation | `U_Q H P_br` | `E_v H P_br` | LM | 9.327 | +3.73% | 48.0 (this pod; 51.0 over 5 seeds) |
-| startup-calibrated, shared | `E_q H P_br` | same | LM | 9.265 | +3.05% | 51.5 |
-| **startup-calibrated, shared** | same | same | **uniform** | **8.989** | **−0.02%** | **53.3 (2 seeds: 52.5, 54.0)** |
-| per-head | per-head orthogonal | same | LM | 9.413 | +4.70% | 51.5 |
-| per-head + centering | + `k_mean` | same | LM | 9.126 | +1.50% | 54.0 / 53.0 (2 seeds) |
-| per-head + centering | + `k_mean` | same | uniform | 9.008 | +0.19% | 55.1 (4 seeds: 59.1, 51.0, 57.1, 53.0) |
-| per-head + centering, head-resolved output-aware values (`outaware_hr`, C2.7) | + `k_mean` | post-`W_O`, ρ-weighted | uniform | 8.998 | +0.08% | 54.3 (2 seeds: 55.1, 53.5) |
-| same | same | same | LM | 9.113 | +1.36% | — |
-| per-head + centering | + `k_mean` | same | plain min-max (no clip) | 9.206 | +2.39% | — |
-| shared + centering | + `k_mean` | same | LM | 9.221 | +2.55% | — |
-| output-aware values on centered keys | per-head + centering | post-`W_O` | LM | 9.125 | +1.50% | 52.0 |
-| whitened compact basis (`whiten`) | `M_q^{1/2} E` | same | LM | 2278 | collapse | 39.9 |
-| flat compact basis | `M_q^{1/2} E H P_br` | same | LM | 43599 | collapse | every answer ran to the cap |
-| flat, shared | same | same | LM | 12027 | collapse | — |
-| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | LM | 858 | collapse | 51.5 (short GPQA prompts hide the long-context collapse) |
-| output-aware values on stretch keys | stretch | post-`W_O` | LM | 945 | collapse | 52.5 |
-| output-aware values on flat keys | flat | post-`W_O` | LM | 60387 | collapse | — |
+| Row | Keys | Values | Levels | PPL@64K | vs BF16 |
+|:---|:---|:---|:---|---:|---:|
+| BF16 | — | — | — | 8.147 | — |
+| **per-head + centering, head-resolved output-aware values (`outaware_hr`, C2.7)** | + `k_mean` | post-`W_O`, ρ-weighted | **uniform** | **8.481** | **+4.1%** |
+| per-head + centering | + `k_mean` | `E_v H P_br` | uniform | 8.495 | +4.3% |
+| startup-calibrated, shared | `E_q H P_br` | same | uniform | 8.837 | +8.5% |
+| per-head + centering | + `k_mean` | same | LM | 9.371 | +15.0% |
+| per-head + centering, head-resolved values | + `k_mean` | post-`W_O`, ρ-weighted | LM | 9.377 | +15.1% |
+| startup-calibrated, shared | `E_q H P_br` | same | LM | 9.821 | +20.5% |
+| V1 shared zoo rotation | `U_Q H P_br` | same | LM | 10.088 | +23.8% |
+| per-head | per-head orthogonal | same | LM | 10.251 | +25.8% |
+| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | LM | 222 | collapse |
+| whitened compact basis (`whiten`) | `M_q^{1/2} E` | same | LM | 1828 | collapse |
+| flat compact basis | `M_q^{1/2} E H P_br` | same | LM | 12821 | collapse |
 
-Two readings. First, the quantizer levels dominate everything else on this
-model: the Lloyd-Max std-loaded levels cost 1.3–3 points of PPL that the plain
-per-row min-max levels with the same clip do not (8.989 vs 9.265 on the same
-shared rotation; 9.008 vs 9.126 on centered per-head keys), and with uniform
-levels the INT2 cache is within noise of BF16 at 16K quantized keys. GPQA
-agrees in direction on every paired seed (uniform minus LM on the same basis
-and questions: +0.5, +2.0, +5.6, +0.5 pp; McNemar p = 1.0, 0.59, 0.07, 1.0),
-so the Qwen3-8B recipe now runs uniform levels (`LLOYD_MAX=0`). The C2.7
-head-resolved value transform fitted from the calibrator's co-attention
-statistic lands 0.1 PPL-point below centered keys with plain values under
-either level set, which is the neutral result the offline value-side replay
-predicted (post-`W_O` output error 0.0343 orthogonal vs 0.0356 pooled vs
-0.0367 head-resolved). Second, within the Lloyd-Max rows centering is the one closed-form
-change that pays (it halves the overhead of the shared basis and gives the
-best GPQA arm), per-head alone does not beat the shared basis (eight KV heads
-with similar statistics; the per-head case is the heterogeneous MoE heads),
-and every non-orthogonal key metric collapses at long context under scalar
-quantization, including the fixed-rate stretch that passes the smoke
-probe -- a non-orthogonal basis needs a vector quantizer on the read path,
-which this fork does not have and does not plan to add. On orthogonal
-centered keys the pooled post-`W_O` value metric is neutral (9.125 vs 9.126;
-GPQA 52.0 vs 54.0, McNemar p = 0.63). Paired on the same 198 questions,
-centering beats the shared startup basis by +2.0pp (p = 0.63) and the V1 zoo
-rotation by +5.6pp (p = 0.08); single-seed GPQA cannot separate the
-orthogonal rows, the 32K PPL can.
+Three readings. First, the quantizer levels dominate: the Lloyd-Max
+std-loaded levels cost 11–15 PPL points over the plain per-row min-max
+levels on the same transform (9.821 vs 8.837 shared; 9.371 vs 8.495
+centered), so the Qwen3-8B recipe runs uniform levels (`LLOYD_MAX=0`). Second,
+with a 512-token BF16 window and 32K–64K quantized keys the OSCAR-2 key
+components pay: per-head + centering takes the overhead from +8.5% (shared)
+to +4.3%, and the C2.7 head-resolved value transform fitted from the
+calibrator's co-attention statistic adds a further small gain (+4.1%); at the
+earlier 2048-token window and 16K quantized keys the same rows were all within
+noise of BF16 (8.99–9.01 against 8.99), which is why that regime could not
+rank them. Third, every non-orthogonal key metric collapses at long context
+under scalar quantization, including the fixed-rate stretch that passes the
+smoke probe -- a non-orthogonal basis needs a vector quantizer on the read
+path, which this fork does not have and does not plan to add. The pooled
+post-`W_O` value metric on centered keys was neutral at the 2048 window
+(9.125 vs 9.126 at 32K); the head-resolved one is what the recipe carries.
 
 The collapse of the non-orthogonal rows is the method, not the engine. An
 offline replay on real Qwen3-8B post-RoPE queries and keys (one 4096-token
