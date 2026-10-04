@@ -2858,7 +2858,10 @@ class KVCacheConfigurator:
 
     @staticmethod
     def _require_oscar_calibrator(pool) -> None:
-        if isinstance(pool, UnifiedInt2HPKVPool) and pool.oscar_calibrator is not None:
+        # A hybrid linear-attention model wraps the calibrating unified pool in
+        # HybridLinearKVPool; the collector lives on the inner full-attention pool.
+        inner = pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+        if isinstance(inner, UnifiedInt2HPKVPool) and inner.oscar_calibrator is not None:
             return
         raise ValueError(
             "Startup OSCAR calibration needs the unified mixed INT2 KV pool "
