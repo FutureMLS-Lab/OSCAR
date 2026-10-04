@@ -78,7 +78,7 @@ Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; 
 | GLM-4.7-FP8 | 80.8 | 78.8 | 6.54× faster | 1.18× slower |
 | GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path |
 | GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path |
-| Kimi-K3 (TP 8 × PP 2) | 90.9 | 93.4 | 1.33× slower | 1.40× slower (trtllm_mla) |
+| Kimi-K3 (TP 8 × PP 2) | 90.9 | 90.4 | 1.33× slower | 1.40× slower (trtllm_mla) |
 
 The dense-GQA rows read the same way: INT2 decodes 1.9–3.0× faster than the
 triton BF16 arm and 2.0–3.9× slower than the FlashInfer-family kernels. Where
@@ -596,7 +596,7 @@ dense GQA. The BF16 control uses the same backend in every row.
 | `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 83.8 | −3.5 (INT2 answers run longer: median 63K vs 32K chars, 24 vs 9 without a final answer) |
 | `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 84.3 | −3.0 (INT2 answers run longer: median 51K vs 31K chars, 21 vs 8 without a final answer) |
 | `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | 80.8 | 78.8 | −2.0 |
-| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | 90.9 | 93.4 | +2.5 |
+| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | 90.9 | 90.4 |  −0.5 (re-measured with the BF16 windows on; the earlier 93.4 came from a run whose packed pool had them silently off) |
 
 **MiniMax-M3 scored 56.6 on the first INT2 run of this base.** The BF16 control
 (90.9, same MSA backend) ruled out noise: 47 of 198 INT2 answers had no final
