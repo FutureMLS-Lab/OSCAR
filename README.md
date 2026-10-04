@@ -847,8 +847,11 @@ quantization = 0.0). Storing the transformed rows in bf16 is not a factor
 the calibration moments ranks the fixed-rate stretch best, as the theory says;
 on real keys its logit RMSE is indeed lowest but its errors are heavier-tailed
 (spurious INT2 maxima for 20.7% of queries vs 14.3% for centering), and the
-softmax pays for the tail. Scripts and logs:
-`/home/admin/imgctx/diag/oscar2_nonorth/`.
+softmax pays for the tail. The tail also explains why stretch passes the
+smoke probe and GPQA but collapses at 32K: on a 16384-token window (four
+times the INT2 keys) the KL grows 1.4x for per-head and 1.8x for centering
+but 6.8x for stretch (0.83 nats), 5x for NOVA and 7.5x for flat. Scripts and
+logs: `/home/admin/imgctx/diag/oscar2_nonorth/`.
 
 ## 1-bit and 1.5-bit K with product quantization
 
