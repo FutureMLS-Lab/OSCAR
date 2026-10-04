@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     OscarCalibrationReqInput,
     OscarCalibrationReqOutput,
 )
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.oscar_calibration import OscarOnlineCalibrator
 from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 
@@ -50,6 +51,10 @@ class SchedulerOscarCalibrationControl:
                 message=f"Unknown OSCAR calibration action: {recv_req.action}",
             )
         pool = self._get_kv_pool()
+        if isinstance(pool, HybridLinearKVPool):
+            # A hybrid linear-attention model wraps the calibrating unified pool;
+            # the collector, the publish and the detach all live on the inner one.
+            pool = pool.full_kv_pool
         calibrator = (
             pool.oscar_calibrator if isinstance(pool, UnifiedInt2HPKVPool) else None
         )

@@ -230,6 +230,9 @@ class OscarOnlineCalibrator:
         self.tp_size = int(tp_size)
         self.tp_rank = int(tp_rank)
         self.tp_group = tp_group
+        # Models with fewer KV heads than TP ranks replicate each head over
+        # tp_size / total_kv_heads consecutive ranks (rank r holds head r // rep).
+        self.kv_replication = max(1, self.tp_size // max(1, self.total_kv_heads))
         self.model_path = model_path
         self.model_revision = model_revision
         self.state = "idle"
@@ -259,17 +262,17 @@ class OscarOnlineCalibrator:
                 f"Online OSCAR calibration requires power-of-two head_dim, got {self.head_dim}"
             )
         if self.tp_size > self.total_kv_heads:
-            raise ValueError(
-                "Online OSCAR calibration does not support replicated KV heads "
-                f"(TP={self.tp_size}, global KV heads={self.total_kv_heads})"
-            )
-        if self.total_kv_heads % self.tp_size:
+            if self.tp_size % self.total_kv_heads:
+                raise ValueError(
+                    f"TP ({self.tp_size}) must be a multiple of the global KV heads ({self.total_kv_heads}) when they replicate"
+                )
+        elif self.total_kv_heads % self.tp_size:
             raise ValueError(
                 f"Global KV heads ({self.total_kv_heads}) must divide TP ({self.tp_size})"
             )
-        if self.local_kv_heads * self.tp_size != self.total_kv_heads:
+        if self.local_kv_heads * self.tp_size != self.total_kv_heads * self.kv_replication:
             raise ValueError(
-                "Local/global KV-head geometry does not describe disjoint TP shards"
+                "Local/global KV-head geometry does not describe TP shards (with replication)"
             )
 
     # -- Collection ---------------------------------------------------------
@@ -505,6 +508,9 @@ class OscarOnlineCalibrator:
         """
         if not self.complete:
             raise RuntimeError("OSCAR calibration moments requested before the token budget was met")
+        if self.tp_rank % self.kv_replication:
+            logger.info("OSCAR calibration moments: rank %d replicates rank %d's KV heads, not written", self.tp_rank, self.tp_rank - self.tp_rank % self.kv_replication)
+            return ""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         layers: dict = {}
@@ -538,8 +544,10 @@ class OscarOnlineCalibrator:
             "model_revision": self.model_revision,
             "prompt_sha256": self.prompt_sha256,
             "tokens": self.token_budget,
-            "tp_rank": self.tp_rank,
-            "tp_size": self.tp_size,
+            # Primary replica ranks only, renumbered so the fitter's merge sees
+            # one file per distinct KV-head shard.
+            "tp_rank": self.tp_rank // self.kv_replication,
+            "tp_size": self.tp_size // self.kv_replication,
             "local_kv_heads": self.local_kv_heads,
             "global_kv_heads": self.total_kv_heads,
             "global_q_heads": self.total_q_heads,
@@ -548,7 +556,7 @@ class OscarOnlineCalibrator:
             "layers": layers,
         }
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"oscar_moments_rank{self.tp_rank}.pt"
+        path = directory / f"oscar_moments_rank{self.tp_rank // self.kv_replication}.pt"
         tmp = str(path) + ".tmp"
         torch.save(payload, tmp)
         os.replace(tmp, path)
@@ -584,7 +592,8 @@ class OscarOnlineCalibrator:
             self.save_moments(Path(os.path.dirname(k_path)))
         if self.tp_group is not None and self.tp_group.world_size > 1:
             torch.distributed.all_reduce(covariance_sums, group=self.tp_group.device_group)
-        covariances = covariance_sums / self.total_kv_heads
+        # Every head was summed once per replica rank.
+        covariances = covariance_sums / (self.total_kv_heads * self.kv_replication)
         covariances = (covariances + covariances.transpose(-1, -2)) / 2
 
         k_rotations, v_rotations = buffers

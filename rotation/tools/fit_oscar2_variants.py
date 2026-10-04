@@ -201,13 +201,17 @@ def head_resolved_output_metric(w_o: torch.Tensor, rho: torch.Tensor, kv_heads: 
     ``[kv_heads, head_dim, head_dim]``, each at unit mean eigenvalue."""
     q_heads = w_o.shape[1] // head_dim
     gqa = q_heads // kv_heads
-    if tuple(rho.shape) != (kv_heads, gqa, gqa):
-        raise SystemExit(f"rho has shape {tuple(rho.shape)}, expected {(kv_heads, gqa, gqa)}")
+    grp = int(rho.shape[1])
+    # A rank that replicates a KV head over TP sees only the first grp of the
+    # gqa query heads reading it (rank r holds q heads [r*grp, (r+1)*grp)); the
+    # metric is then built from those heads, a statistical sample of the group.
+    if tuple(rho.shape) != (kv_heads, grp, grp) or gqa % grp:
+        raise SystemExit(f"rho has shape {tuple(rho.shape)}, expected ({kv_heads}, g, g) with g dividing {gqa}")
     g = torch.zeros((kv_heads, head_dim, head_dim), dtype=torch.float64)
     for h in range(kv_heads):
-        blocks = [w_o[:, (h * gqa + j) * head_dim : (h * gqa + j + 1) * head_dim] for j in range(gqa)]
-        for j in range(gqa):
-            for jp in range(gqa):
+        blocks = [w_o[:, (h * gqa + j) * head_dim : (h * gqa + j + 1) * head_dim] for j in range(grp)]
+        for j in range(grp):
+            for jp in range(grp):
                 g[h] += float(rho[h, j, jp]) * (blocks[j].T @ blocks[jp])
     return torch.stack([unit_mean_eig(_sym(gh)) for gh in g])
 

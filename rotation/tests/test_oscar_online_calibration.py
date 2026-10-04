@@ -125,10 +125,14 @@ def test_hadamard_is_orthogonal():
 
 def test_geometry_errors_are_explicit():
     with envs.SGLANG_OSCAR_CALIBRATION_TOKENS.override(5):
+        # Fewer KV heads than TP ranks replicate each head over tp/kv ranks;
+        # the calibrator accepts that and knows the replication factor.
+        replicated = _calibrator(local_kv_heads=1, head_dim=128, v_head_dim=128, tp_size=4, tp_rank=3)
+        assert replicated.kv_replication == 2
         _assert_raises(
             ValueError,
-            "replicated KV heads",
-            lambda: _calibrator(local_kv_heads=1, head_dim=128, v_head_dim=128, tp_size=4),
+            "multiple of the global KV heads",
+            lambda: _calibrator(local_kv_heads=1, head_dim=128, v_head_dim=128, tp_size=3, total_kv_heads=2),
         )
         _assert_raises(
             ValueError,
