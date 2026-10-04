@@ -439,7 +439,12 @@ class UnifiedInt2HPKVPool(KVCache):
         )
         # Per-head rotations ship every KV head; keep only this rank's slice.
         _tp_rank = get_parallel().attn_tp_rank
-        _tp_size = get_parallel().attn_tp_size
+        try:
+            _tp_size = get_parallel().attn_tp_size
+        except RuntimeError:
+            # No parallel config published: a CPU unit test building the pool
+            # directly. Replicated KV heads need the width; plain shards do not.
+            _tp_size = 0
 
         def _rot_shape(R):
             if isinstance(R, (list, tuple)):
