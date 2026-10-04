@@ -133,28 +133,50 @@ def load_moments(moments_dir: str) -> dict:
     return merged
 
 
-def load_o_proj(model: str, layer_ids: list[int], revision: str | None = None) -> dict[int, torch.Tensor]:
-    """``model.layers.<i>.self_attn.o_proj.weight`` as fp64 ``[hidden, q_heads*head_dim]``."""
+def dequantize_block_fp8(weight: torch.Tensor, scale_inv: torch.Tensor, block: tuple[int, int]) -> torch.Tensor:
+    """FP8 weight with per-block ``weight_scale_inv`` back to fp64."""
+    w = weight.to(torch.float64)
+    rows = torch.arange(w.shape[0]) // block[0]
+    cols = torch.arange(w.shape[1]) // block[1]
+    return w * scale_inv.to(torch.float64)[rows][:, cols]
+
+
+def load_o_proj(model: str, layer_ids: list[int], revision: str | None = None, prefix: str = "model.") -> dict[int, torch.Tensor]:
+    """``<prefix>layers.<i>.self_attn.o_proj.weight`` as fp64 ``[hidden, q_heads*head_dim]``;
+    FP8 block-scaled checkpoints (GLM-4.7-FP8, MiniMax) are dequantized through
+    their ``weight_scale_inv``."""
     from huggingface_hub import snapshot_download
     from safetensors import safe_open
 
     local = model if os.path.isdir(model) else snapshot_download(model, revision=revision, allow_patterns=["*.safetensors", "*.json"])
     index = os.path.join(local, "model.safetensors.index.json")
-    want = {f"model.layers.{i}.self_attn.o_proj.weight": i for i in layer_ids}
-    out: dict[int, torch.Tensor] = {}
-    if os.path.exists(index):
-        wmap = json.load(open(index))["weight_map"]
-        by_file: dict[str, list[str]] = {}
-        for name, lid in want.items():
-            if name not in wmap:
-                raise SystemExit(f"{name} not in {index}")
-            by_file.setdefault(wmap[name], []).append(name)
-    else:
-        by_file = {"model.safetensors": list(want)}
+    cfg = json.load(open(os.path.join(local, "config.json")))
+    block = tuple(cfg.get("quantization_config", {}).get("weight_block_size") or (128, 128))
+    wmap = json.load(open(index))["weight_map"] if os.path.exists(index) else None
+    want = {f"{prefix}layers.{i}.self_attn.o_proj.weight": (i, "w") for i in layer_ids}
+    for i in layer_ids:
+        name = f"{prefix}layers.{i}.self_attn.o_proj.weight_scale_inv"
+        if wmap is None or name in wmap:
+            want[name] = (i, "s")
+    by_file: dict[str, list[str]] = {}
+    for name in want:
+        if wmap is not None and name not in wmap:
+            raise SystemExit(f"{name} not in {index}")
+        by_file.setdefault(wmap[name] if wmap is not None else "model.safetensors", []).append(name)
+    raw: dict = {}
     for fname, names in by_file.items():
         with safe_open(os.path.join(local, fname), framework="pt") as f:
             for name in names:
-                out[want[name]] = f.get_tensor(name).to(torch.float64)
+                try:
+                    raw[want[name]] = f.get_tensor(name)
+                except Exception:
+                    if want[name][1] != "s":
+                        raise
+    out: dict[int, torch.Tensor] = {}
+    for i in layer_ids:
+        w = raw[(i, "w")]
+        s_inv = raw.get((i, "s"))
+        out[i] = dequantize_block_fp8(w, s_inv, block) if s_inv is not None else w.to(torch.float64)
     return out
 
 
@@ -311,6 +333,7 @@ def main() -> int:
     ap.add_argument("--k-base", default=None, help="key transform under the outaware values (default flat for outaware, center for outaware_hr)")
     ap.add_argument("--model", default=None, help="HF id or local dir with W_O (needed for outaware)")
     ap.add_argument("--revision", default=None)
+    ap.add_argument("--weight-prefix", default="model.", help="tensor name prefix before `layers.<i>` (VL wrappers: language_model.model.)")
     ap.add_argument("--shared", action="store_true", help="one basis per layer (V1 grouping) instead of per head")
     a = ap.parse_args()
     mom = load_moments(a.moments_dir)
@@ -318,7 +341,7 @@ def main() -> int:
     o_proj = None
     if "outaware" in variants or "outaware_hr" in variants:
         model = a.model or mom["model_path"]
-        o_proj = load_o_proj(model, sorted(mom["layers"]), a.revision or mom.get("model_revision"))
+        o_proj = load_o_proj(model, sorted(mom["layers"]), a.revision or mom.get("model_revision"), prefix=a.weight_prefix)
     for v in variants:
         t0 = time.time()
         k_base = a.k_base or {"outaware": "flat", "outaware_hr": "center"}.get(v, "flat")
