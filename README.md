@@ -812,12 +812,13 @@ one seed, same pod; recipe windows 128/2048, Lloyd-Max, clip .96/.92):
 | V1 shared zoo rotation | `U_Q H P_br` | `E_v H P_br` | 8.164 | +2.30% | 48.0 (this pod; 51.0 over 5 seeds) |
 | startup-calibrated, shared | `E_q H P_br` | same | 8.134 | +1.93% | 51.5 |
 | per-head | per-head orthogonal | same | 8.211 | +2.89% | 51.5 |
-| **per-head + centering** | + `k_mean` | same | **8.083** | **+1.28%** | **54.0** |
+| **per-head + centering** | + `k_mean` | same | **8.083** | **+1.28%** | **54.0 / 53.0 (2 seeds)** |
 | shared + centering | + `k_mean` | same | 8.123 | +1.79% | — |
 | NOVA compact basis | `M_q^{1/2} E` | same | 172 | collapse | 39.9 |
 | flat compact basis | `M_q^{1/2} E H P_br` | same | 978 | collapse | every answer ran to the cap |
 | fixed-rate stretch | `X*^{1/2} E* H P_br` | same | 102 | collapse | 51.5 (short GPQA prompts hide the long-context collapse) |
-| output-aware values on stretch keys | stretch | post-`W_O` | 108 | collapse | — |
+| output-aware values on stretch keys | stretch | post-`W_O` | 108 | collapse | 52.5 |
+| output-aware values on centered keys | per-head + centering | post-`W_O` | 8.083 | +1.29% | 52.0 |
 
 Centering is the one closed-form change that pays under fixed-rate scalar
 INT2: it halves the long-context PPL overhead and gives the best GPQA arm.
@@ -826,8 +827,28 @@ with similar statistics; the per-head case for OSCAR-2 is the heterogeneous
 MoE heads). Every non-orthogonal key metric collapses at long context under
 scalar quantization, including the fixed-rate stretch that passes the smoke
 probe -- a non-orthogonal basis needs a vector quantizer on the read path,
-as NOVA-KV found. Output-aware values on orthogonal centered keys are being
-measured separately.
+as NOVA-KV found. On orthogonal centered keys the pooled post-`W_O` value
+metric is neutral (PPL 8.083 vs 8.083; GPQA 52.0 vs 54.0, McNemar p = 0.63).
+Paired on the same 198 questions, centering beats the shared startup basis by
++2.0pp (p = 0.63) and the V1 zoo rotation by +5.6pp (p = 0.08); single-seed
+GPQA cannot separate the orthogonal rows, the 32K PPL can.
+
+The collapse of the non-orthogonal rows is the method, not the engine. An
+offline replay on real Qwen3-8B post-RoPE queries and keys (one 4096-token
+WikiText-2 window, 36 layers x 8 KV heads, the write kernel's arithmetic in
+fp64, serving path bypassed; keys older than the 2048-token window quantized)
+reproduces the ordering as attention KL against exact attention: per-head
+0.136, centered 0.072, stretch 0.123, NOVA 0.56, flat 2.07 nats. The same
+NOVA/flat bases with a 2-bit product quantizer (g = 4, 256 centroids) stay at
+0.027/0.028, which is why NOVA-KV's basis works with its vector quantizer and
+not with a per-row scalar one (its own ablation reports basis + scalar
+quantization = 0.0). Storing the transformed rows in bf16 is not a factor
+(BF16-window-only arms: KL <= 0.0005). A Gaussian second-order simulation on
+the calibration moments ranks the fixed-rate stretch best, as the theory says;
+on real keys its logit RMSE is indeed lowest but its errors are heavier-tailed
+(spurious INT2 maxima for 20.7% of queries vs 14.3% for centering), and the
+softmax pays for the tail. Scripts and logs:
+`/home/admin/imgctx/diag/oscar2_nonorth/`.
 
 ## 1-bit and 1.5-bit K with product quantization
 
