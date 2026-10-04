@@ -418,3 +418,30 @@ def test_batch_packing_respects_page_rounded_chunk_budget():
             [[1] * 20], max_batch_size=3, chunked_prefill_size=16, page_size=4
         ),
     )
+
+
+def test_save_rows_writes_every_token_and_the_sampled_queries():
+    torch.manual_seed(7)
+    with envs.SGLANG_OSCAR_CALIBRATION_TOKENS.override(70):
+        calibrator = _calibrator(layer_ids=[2], head_dim=8, v_head_dim=8)
+    calibrator.start(prompt_sha256="c" * 64)
+    q = torch.randn(70, 4, 8)
+    k = torch.randn(70, 2, 8)
+    v = torch.randn(70, 2, 8)
+    positions = torch.cat([torch.arange(40), torch.arange(30)])
+    calibrator.observe(layer_id=2, q=q[:50], k=k[:50], v=v[:50], positions=positions[:50], scaling=0.25)
+    calibrator.observe(layer_id=2, q=q[50:], k=k[50:], v=v[50:], positions=positions[50:], scaling=0.25)
+    assert calibrator.complete
+    with tempfile.TemporaryDirectory() as d:
+        path = calibrator.save_rows(Path(d))
+        assert os.path.basename(path) == "oscar_rows_rank0.pt"
+        payload = torch.load(path)
+    layer = payload["layers"][2]
+    torch.testing.assert_close(layer["k"], k)
+    torch.testing.assert_close(layer["v"], v)
+    assert layer["positions"].tolist() == positions.tolist()
+    stride = payload["q_sample_stride"]
+    assert layer["q_samples"].shape == ((70 + stride - 1) // stride, 4, 8)
+    torch.testing.assert_close(layer["q_samples"][1], q[stride])
+    assert layer["q_scaling"] == 0.25
+    assert payload["q_head_offset"] == 0 and payload["tokens"] == 70 and payload["global_q_heads"] == 4

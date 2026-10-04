@@ -568,6 +568,69 @@ class OscarOnlineCalibrator:
         )
         return str(path)
 
+    def save_rows(self, directory: Path) -> str:
+        """Write this rank's raw calibration rows so a trainer can optimize
+        rotations through the quantizer and attention offline
+        (``rotation/tools/train_optr_rotations.py``): per layer the keys
+        ``[T, H, hd]`` and values ``[T, H, vd]`` of every calibration token in
+        their stored dtype, the sampled queries ``[ceil(T / stride), Hq, hd]``
+        (row ``s * stride``) in float32, and the token positions.
+
+        Like the moments, only primary replica ranks write, one file per
+        distinct KV-head shard; ``q_head_offset`` locates this shard's query
+        heads in the global head order (``W_O`` slices).
+        """
+        if not self.complete:
+            raise RuntimeError("OSCAR calibration rows requested before the token budget was met")
+        if self.tp_rank % self.kv_replication:
+            logger.info("OSCAR calibration rows: rank %d replicates rank %d's KV heads, not written", self.tp_rank, self.tp_rank - self.tp_rank % self.kv_replication)
+            return ""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        layers: dict = {}
+        q_heads = 0
+        for layer_id in self.local_layers:
+            q_samples = self._q_samples[layer_id]
+            q_heads = int(q_samples.shape[1])
+            layers[layer_id] = {
+                "k": self._k_values[layer_id][: self.token_budget].clone(),
+                "v": self._v_values[layer_id][: self.token_budget].clone(),
+                "q_samples": q_samples.clone(),
+                "positions": self._positions[layer_id][: self.token_budget].clone(),
+                "q_scaling": self._scaling.get(layer_id),
+                "count": self.token_budget,
+            }
+        payload = {
+            "format_version": 1,
+            "model_path": self.model_path,
+            "model_revision": self.model_revision,
+            "prompt_sha256": self.prompt_sha256,
+            "tokens": self.token_budget,
+            "tp_rank": self.tp_rank // self.kv_replication,
+            "tp_size": self.tp_size // self.kv_replication,
+            "q_head_offset": self.tp_rank * q_heads,
+            "local_kv_heads": self.local_kv_heads,
+            "global_kv_heads": self.total_kv_heads,
+            "global_q_heads": self.total_q_heads,
+            "head_dim": self.head_dim,
+            "v_head_dim": self.v_head_dim,
+            "q_sample_stride": _RHO_QUERY_STRIDE,
+            "layers": layers,
+        }
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"oscar_rows_rank{self.tp_rank // self.kv_replication}.pt"
+        tmp = str(path) + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        logger.info(
+            "OSCAR calibration rows for %d layers x %d KV heads x %d tokens written to %s",
+            len(layers),
+            self.local_kv_heads,
+            self.token_budget,
+            path,
+        )
+        return str(path)
+
     def allocate_result_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         num_layers = len(self.local_layers)
         k_rotations = torch.empty(
@@ -587,9 +650,12 @@ class OscarOnlineCalibrator:
         rotation buffers there; other ranks receive them in ``broadcast``."""
         if self.state != "collecting":
             raise RuntimeError(f"Cannot finalize OSCAR calibrator from state={self.state}")
-        if envs.SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS.get():
+        if envs.SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS.get() or envs.SGLANG_OSCAR_CALIBRATION_SAVE_ROWS.get():
             k_path, _ = get_oscar_checkpoint_pair()
-            self.save_moments(Path(os.path.dirname(k_path)))
+            if envs.SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS.get():
+                self.save_moments(Path(os.path.dirname(k_path)))
+            if envs.SGLANG_OSCAR_CALIBRATION_SAVE_ROWS.get():
+                self.save_rows(Path(os.path.dirname(k_path)))
         if self.tp_group is not None and self.tp_group.world_size > 1:
             torch.distributed.all_reduce(covariance_sums, group=self.tp_group.device_group)
         # Every head was summed once per replica rank.

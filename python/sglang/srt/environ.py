@@ -960,6 +960,11 @@ class Envs:
     # oscar_moments_rank<r>.pt, so rotation/tools/fit_oscar2_variants.py can
     # fit the OSCAR-2 transform family offline without re-running the model.
     SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS = EnvBool(False)
+    # Also write the raw calibration rows (every token's keys and values,
+    # the sampled queries with their positions) as oscar_rows_rank<r>.pt, so
+    # rotation/tools/train_optr_rotations.py can learn rotation corrections
+    # through the INT2 quantizer and attention offline. A few GiB per model.
+    SGLANG_OSCAR_CALIBRATION_SAVE_ROWS = EnvBool(False)
     # Quant-tier encoders of the unified pool. "int2": 2-bit per value with
     # per-row (or grouped) scale/zero. "pq": product quantization against a
     # per-layer codebook file (one uint8 per sub-vector, no scale); a file
