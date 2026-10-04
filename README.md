@@ -803,42 +803,53 @@ non-orthogonal centered pair against dense attention.
 WikiText-2 windows past the BF16 recent window, the low-noise metric used to
 rank the variants before GPQA.
 
-Measured on Qwen3-8B (every row fitted from one startup-calibration pass;
-PPL = nine 32,768-token windows of WikiText-2 test, tokens at positions
-≥ 4096 scored through the real serving path with the recipe's chunked
-prefill of 16,384: a chunk attends to its own keys in bf16 and to every
-earlier chunk through the quant tier (128-token bf16 prefix), so the scored
-tokens of the first chunk see no INT2 and those of the second see 16K INT2
-keys -- the deltas below are diluted about 2x and rank the variants rather
-than price them; GPQA-Diamond at a 64K budget, one seed, same pod;
-Lloyd-Max, clip .96/.92):
+Measured on Qwen3-8B (every row fitted from one startup-calibration pass).
+PPL = nine 32,768-token WikiText-2 test windows through the real serving path
+with the recipe's chunked prefill of 16,384; only tokens at positions
+≥ 20,480 are scored (110,592 tokens), so every scored token attends to the
+whole first chunk through the quant tier (128-token bf16 prefix, 16K INT2
+keys) and to its own chunk in bf16. GPQA-Diamond at a 64K budget, one seed
+unless noted, same pod. "LM" = the Lloyd-Max std-loaded levels, "uniform" =
+per-row min-max levels; both clip at .96/.92 unless "plain".
 
-| Row | Keys | Values | PPL@32K | vs BF16 | GPQA-198 |
-|:---|:---|:---|---:|---:|---:|
-| BF16 | — | — | 7.980 | — | 58.6 (2 seeds) |
-| V1 shared zoo rotation | `U_Q H P_br` | `E_v H P_br` | 8.164 | +2.30% | 48.0 (this pod; 51.0 over 5 seeds) |
-| startup-calibrated, shared | `E_q H P_br` | same | 8.134 | +1.93% | 51.5 |
-| per-head | per-head orthogonal | same | 8.211 | +2.89% | 51.5 |
-| **per-head + centering** | + `k_mean` | same | **8.083** | **+1.28%** | **54.0 / 53.0 (2 seeds)** |
-| shared + centering | + `k_mean` | same | 8.123 | +1.79% | — |
-| whitened compact basis (`whiten`) | `M_q^{1/2} E` | same | 172 | collapse | 39.9 |
-| flat compact basis | `M_q^{1/2} E H P_br` | same | 978 | collapse | every answer ran to the cap |
-| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | 102 | collapse | 51.5 (short GPQA prompts hide the long-context collapse) |
-| output-aware values on stretch keys | stretch | post-`W_O` | 108 | collapse | 52.5 |
-| output-aware values on centered keys | per-head + centering | post-`W_O` | 8.083 | +1.29% | 52.0 |
+| Row | Keys | Values | Levels | PPL@32K | vs BF16 | GPQA-198 |
+|:---|:---|:---|:---|---:|---:|---:|
+| BF16 | — | — | — | 8.991 | — | 58.6 (2 seeds) |
+| V1 shared zoo rotation | `U_Q H P_br` | `E_v H P_br` | LM | 9.327 | +3.73% | 48.0 (this pod; 51.0 over 5 seeds) |
+| startup-calibrated, shared | `E_q H P_br` | same | LM | 9.265 | +3.05% | 51.5 |
+| **startup-calibrated, shared** | same | same | **uniform** | **8.989** | **−0.02%** | measuring |
+| per-head | per-head orthogonal | same | LM | 9.413 | +4.70% | 51.5 |
+| per-head + centering | + `k_mean` | same | LM | 9.126 | +1.50% | 54.0 / 53.0 (2 seeds) |
+| per-head + centering | + `k_mean` | same | uniform | 9.008 | +0.19% | measuring |
+| per-head + centering | + `k_mean` | same | plain min-max (no clip) | 9.206 | +2.39% | — |
+| shared + centering | + `k_mean` | same | LM | 9.221 | +2.55% | — |
+| output-aware values on centered keys | per-head + centering | post-`W_O` | LM | 9.125 | +1.50% | 52.0 |
+| whitened compact basis (`whiten`) | `M_q^{1/2} E` | same | LM | 2278 | collapse | 39.9 |
+| flat compact basis | `M_q^{1/2} E H P_br` | same | LM | 43599 | collapse | every answer ran to the cap |
+| flat, shared | same | same | LM | 12027 | collapse | — |
+| fixed-rate stretch | `X*^{1/2} E* H P_br` | same | LM | 858 | collapse | 51.5 (short GPQA prompts hide the long-context collapse) |
+| output-aware values on stretch keys | stretch | post-`W_O` | LM | 945 | collapse | 52.5 |
+| output-aware values on flat keys | flat | post-`W_O` | LM | 60387 | collapse | — |
 
-Centering is the one closed-form change that pays under fixed-rate scalar
-INT2: it halves the long-context PPL overhead and gives the best GPQA arm.
-Per-head alone does not beat the shared basis on this model (eight KV heads
-with similar statistics; the per-head case for OSCAR-2 is the heterogeneous
-MoE heads). Every non-orthogonal key metric collapses at long context under
-scalar quantization, including the fixed-rate stretch that passes the smoke
+Two readings. First, the quantizer levels dominate everything else on this
+model: the Lloyd-Max std-loaded levels cost 1.3–3 points of PPL that the plain
+per-row min-max levels with the same clip do not (8.989 vs 9.265 on the same
+shared rotation; 9.008 vs 9.126 on centered per-head keys), and with uniform
+levels the INT2 cache is within noise of BF16 at 16K quantized keys. The
+GPQA arms for the uniform rows are being measured before the Qwen3-8B recipe
+switches. Second, within the Lloyd-Max rows centering is the one closed-form
+change that pays (it halves the overhead of the shared basis and gives the
+best GPQA arm), per-head alone does not beat the shared basis (eight KV heads
+with similar statistics; the per-head case is the heterogeneous MoE heads),
+and every non-orthogonal key metric collapses at long context under scalar
+quantization, including the fixed-rate stretch that passes the smoke
 probe -- a non-orthogonal basis needs a vector quantizer on the read path,
-which this fork does not have and does not plan to add. On orthogonal centered keys the pooled post-`W_O` value
-metric is neutral (PPL 8.083 vs 8.083; GPQA 52.0 vs 54.0, McNemar p = 0.63).
-Paired on the same 198 questions, centering beats the shared startup basis by
-+2.0pp (p = 0.63) and the V1 zoo rotation by +5.6pp (p = 0.08); single-seed
-GPQA cannot separate the orthogonal rows, the 32K PPL can.
+which this fork does not have and does not plan to add. On orthogonal
+centered keys the pooled post-`W_O` value metric is neutral (9.125 vs 9.126;
+GPQA 52.0 vs 54.0, McNemar p = 0.63). Paired on the same 198 questions,
+centering beats the shared startup basis by +2.0pp (p = 0.63) and the V1 zoo
+rotation by +5.6pp (p = 0.08); single-seed GPQA cannot separate the
+orthogonal rows, the 32K PPL can.
 
 The collapse of the non-orthogonal rows is the method, not the engine. An
 offline replay on real Qwen3-8B post-RoPE queries and keys (one 4096-token
