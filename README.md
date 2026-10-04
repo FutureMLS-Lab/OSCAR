@@ -64,21 +64,23 @@ OSCAR is built directly into the open-source SGLang framework (main branch), lla
 
 Base `67eab57057` (upstream SGLang main), B200, radix cache and CUDA graphs on; GPQA-Diamond @64K budget, n=198, single seed unless a cell says otherwise (then the mean over the seeds run on this tree); decode at 64K context, batch 1. Details and ms/tok in the [per-model](#per-model-gpqa-bf16-vs-oscar-int2-this-tree) and [speed](#64k-decode-on-b200-this-tree) tables.
 
-| Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family |
-|:---:|:---:|:---:|:---:|:---:|
-| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower |
-| Qwen3-8B | 58.6 (2 seeds) | 52.8 (4 seeds) | 5.71× faster | 1.22× slower |
-| Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower |
-| Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower |
-| Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower |
-| Qwen3.5-35B-A3B | 81.8 | 83.8 | 3.97× faster | 1.32× slower |
-| Gemma-4-12B-it | 63.1 | 64.1 | 2.03× faster | 1.51× slower (trtllm_mha) |
-| MiniMax-M2.7 | 86.9 | 87.9 | 6.66× faster | 1.27× slower |
-| MiniMax-M3 (MSA sparse) | 90.9 | 88.1 (2 seeds) | 1.34× slower | 1.73× slower |
-| GLM-4.7-FP8 | 80.8 | 78.8 | 6.54× faster | 1.18× slower |
-| GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path |
-| GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path |
-| Kimi-K3 (TP 8 × PP 2) | 90.9 | 90.4 | 1.33× slower | 1.40× slower (trtllm_mla) |
+| Model | GPQA BF16 | GPQA INT2 | INT2 decode vs triton BF16 | INT2 decode vs FlashInfer family | Best quantizer |
+|:---:|:---:|:---:|:---:|:---:|:---|
+| Qwen3-4B-Thinking-2507 | 63.6 | 64.6 | 6.57× faster | 1.27× slower | INT2 uniform, layer-shared rotation |
+| Qwen3-8B | 58.6 (2 seeds) | 52.8 (4 seeds) | 5.71× faster | 1.22× slower | INT2 Lloyd-Max, per-head + centering (`center`: PPL@32K 8.08 vs 8.13 shared; GPQA 53.5 over 2 seeds) |
+| Qwen3-32B | 64.1 | 59.6 | 5.45× faster | 1.20× slower | INT2 uniform, layer-shared rotation |
+| Qwen3-30B-A3B | 61.1 | 55.3 (2 seeds) | 8.39× faster | 1.40× slower | INT2 uniform, per-head rotation |
+| Qwen3.5-4B | 79.3 | 75.3 | 3.23× faster | 1.26× slower | INT2 uniform, layer-shared rotation |
+| Qwen3.5-35B-A3B | 81.8 | 83.8 | 3.97× faster | 1.32× slower | INT2 Lloyd-Max, layer-shared rotation |
+| Gemma-4-12B-it | 63.1 | 64.1 | 2.03× faster | 1.51× slower (trtllm_mha) | INT2 uniform, two-geometry pool |
+| MiniMax-M2.7 | 86.9 | 87.9 | 6.66× faster | 1.27× slower | INT2 Lloyd-Max, layer-shared rotation |
+| MiniMax-M3 (MSA sparse) | 90.9 | 88.1 (2 seeds) | 1.34× slower | 1.73× slower | INT2 uniform + MSA staging |
+| GLM-4.7-FP8 | 80.8 | 78.8 | 6.54× faster | 1.18× slower | INT2 uniform, layer-shared rotation |
+| GLM-5.2-FP8 (DSA sparse) | 87.4 | 83.8 | 1.36× slower | same DSA path | packed 2-bit latent + rotation (4.00×) |
+| GLM-5.3 (DSA sparse) | 87.4 | 84.3 | 1.36× slower | same DSA path | packed 2-bit latent + rotation (4.00×) |
+| Kimi-K3 (TP 8 × PP 2) | 90.9 | 90.4 | 1.33× slower | 1.40× slower (trtllm_mla) | packed 2-bit latent + rotation (4.00×) |
+
+Best quantizer = the K/V quantizer behind the INT2 column, the best measured for that model; every row clips at .96/.92 and uses the startup-calibrated or zoo rotation of its recipe. Only Qwen3-8B has the OSCAR-2 ladder measured, and there per-head + centering is the keeper.
 
 The dense-GQA rows read the same way: INT2 decodes 1.9–3.0× faster than the
 triton BF16 arm and 2.0–3.9× slower than the FlashInfer-family kernels. Where
@@ -778,14 +780,14 @@ energy-weighted value covariance), then
 
 ```bash
 python rotation/tools/fit_oscar2_variants.py --moments-dir $CAL --out $OUT \
-    --variants perhead,center,nova,flat,stretch,outaware --model Qwen/Qwen3-8B
+    --variants perhead,center,whiten,flat,stretch,outaware --model Qwen/Qwen3-8B
 ```
 
 | Variant | Key transform | Values |
 |:---|:---|:---|
 | `perhead` | orthogonal per KV head, `E_q H P_br` | orthogonal, `E_v H P_br` |
 | `center` | `perhead` + `k_mean` | same |
-| `nova` | centered, NOVA compact basis `M_q^{1/2} E`, query side `M_q^{-1/2} E` | same |
+| `whiten` | centered, query-whitened compact basis `M_q^{1/2} E`, query side `M_q^{-1/2} E` | same |
 | `flat` | centered, `M_q^{1/2} E H P_br` (flattened spectrum) | same |
 | `stretch` | centered, fixed-rate stretch `X*^{1/2} E* H P_br` | same |
 | `outaware` | `--k-base` (default `flat`) | post-`W_O` metric `G^{1/2} E_v H P_br`, `G = Σ W_{O,j}ᵀ W_{O,j}` pooled over the query heads reading the KV head; ships `o_rotation` |
@@ -803,8 +805,13 @@ rank the variants before GPQA.
 
 Measured on Qwen3-8B (every row fitted from one startup-calibration pass;
 PPL = nine 32,768-token windows of WikiText-2 test, tokens at positions
-≥ 4096 scored through the real serving path; GPQA-Diamond at a 64K budget,
-one seed, same pod; recipe windows 128/2048, Lloyd-Max, clip .96/.92):
+≥ 4096 scored through the real serving path with the recipe's chunked
+prefill of 16,384: a chunk attends to its own keys in bf16 and to every
+earlier chunk through the quant tier (128-token bf16 prefix), so the scored
+tokens of the first chunk see no INT2 and those of the second see 16K INT2
+keys -- the deltas below are diluted about 2x and rank the variants rather
+than price them; GPQA-Diamond at a 64K budget, one seed, same pod;
+Lloyd-Max, clip .96/.92):
 
 | Row | Keys | Values | PPL@32K | vs BF16 | GPQA-198 |
 |:---|:---|:---|---:|---:|---:|
@@ -814,7 +821,7 @@ one seed, same pod; recipe windows 128/2048, Lloyd-Max, clip .96/.92):
 | per-head | per-head orthogonal | same | 8.211 | +2.89% | 51.5 |
 | **per-head + centering** | + `k_mean` | same | **8.083** | **+1.28%** | **54.0 / 53.0 (2 seeds)** |
 | shared + centering | + `k_mean` | same | 8.123 | +1.79% | — |
-| NOVA compact basis | `M_q^{1/2} E` | same | 172 | collapse | 39.9 |
+| whitened compact basis (`whiten`) | `M_q^{1/2} E` | same | 172 | collapse | 39.9 |
 | flat compact basis | `M_q^{1/2} E H P_br` | same | 978 | collapse | every answer ran to the cap |
 | fixed-rate stretch | `X*^{1/2} E* H P_br` | same | 102 | collapse | 51.5 (short GPQA prompts hide the long-context collapse) |
 | output-aware values on stretch keys | stretch | post-`W_O` | 108 | collapse | 52.5 |
@@ -827,7 +834,7 @@ with similar statistics; the per-head case for OSCAR-2 is the heterogeneous
 MoE heads). Every non-orthogonal key metric collapses at long context under
 scalar quantization, including the fixed-rate stretch that passes the smoke
 probe -- a non-orthogonal basis needs a vector quantizer on the read path,
-as NOVA-KV found. On orthogonal centered keys the pooled post-`W_O` value
+which this fork does not have and does not plan to add. On orthogonal centered keys the pooled post-`W_O` value
 metric is neutral (PPL 8.083 vs 8.083; GPQA 52.0 vs 54.0, McNemar p = 0.63).
 Paired on the same 198 questions, centering beats the shared startup basis by
 +2.0pp (p = 0.63) and the V1 zoo rotation by +5.6pp (p = 0.08); single-seed
@@ -838,11 +845,11 @@ offline replay on real Qwen3-8B post-RoPE queries and keys (one 4096-token
 WikiText-2 window, 36 layers x 8 KV heads, the write kernel's arithmetic in
 fp64, serving path bypassed; keys older than the 2048-token window quantized)
 reproduces the ordering as attention KL against exact attention: per-head
-0.136, centered 0.072, stretch 0.123, NOVA 0.56, flat 2.07 nats. The same
-NOVA/flat bases with a 2-bit product quantizer (g = 4, 256 centroids) stay at
-0.027/0.028, which is why NOVA-KV's basis works with its vector quantizer and
-not with a per-row scalar one (its own ablation reports basis + scalar
-quantization = 0.0). Storing the transformed rows in bf16 is not a factor
+0.136, centered 0.072, stretch 0.123, whiten 0.56, flat 2.07 nats. The same
+whiten/flat bases with a 2-bit product quantizer (g = 4, 256 centroids) stay at
+0.027/0.028: the whitened basis is a vector-quantization basis, and the
+method it was borrowed from reports basis + scalar quantization = 0.0 in its
+own ablation. Storing the transformed rows in bf16 is not a factor
 (BF16-window-only arms: KL <= 0.0005). A Gaussian second-order simulation on
 the calibration moments ranks the fixed-rate stretch best, as the theory says;
 on real keys its logit RMSE is indeed lowest but its errors are heavier-tailed
@@ -850,7 +857,7 @@ on real keys its logit RMSE is indeed lowest but its errors are heavier-tailed
 softmax pays for the tail. The tail also explains why stretch passes the
 smoke probe and GPQA but collapses at 32K: on a 16384-token window (four
 times the INT2 keys) the KL grows 1.4x for per-head and 1.8x for centering
-but 6.8x for stretch (0.83 nats), 5x for NOVA and 7.5x for flat. Scripts and
+but 6.8x for stretch (0.83 nats), 5x for whiten and 7.5x for flat. Scripts and
 logs: `/home/admin/imgctx/diag/oscar2_nonorth/`.
 
 ## 1-bit and 1.5-bit K with product quantization

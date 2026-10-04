@@ -329,7 +329,7 @@ class OscarOnlineCalibrator:
 
     def save_moments(self, directory: Path) -> str:
         """Write this rank's per-(layer, local KV head) sufficient statistics
-        so the OSCAR-2 transform family (per-head, centered, NOVA / flat /
+        so the OSCAR-2 transform family (per-head, centered, whitened / flat /
         fixed-rate key metrics, output-aware values) can be fitted offline by
         ``rotation/tools/fit_oscar2_variants.py`` without re-running the model:
 

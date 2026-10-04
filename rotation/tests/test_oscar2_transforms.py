@@ -56,7 +56,7 @@ def _write(state, name):
     return path
 
 
-@pytest.mark.parametrize("variant", ["perhead", "center", "nova", "flat", "stretch", "outaware"])
+@pytest.mark.parametrize("variant", ["perhead", "center", "whiten", "flat", "stretch", "outaware"])
 @pytest.mark.parametrize("shared", [False, True])
 def test_fitter_algebra(variant, shared):
     mom, o_proj = _fake_moments()
@@ -84,7 +84,7 @@ def test_fitter_algebra(variant, shared):
     rr = r if r.dim() == 3 else r[None]
     cov = rr[0].T @ s_k[0] @ rr[0]
     off = cov - torch.diag(torch.diag(cov))
-    if variant == "nova":  # pure eigenbasis in the metric space: exactly diagonal
+    if variant == "whiten":  # pure eigenbasis in the metric space: exactly diagonal
         assert off.abs().max() < 1e-6 * cov.diag().max()
     if variant in ("flat", "stretch", "perhead", "center"):  # Hadamard spread: equal diagonal
         d = torch.diag(cov)

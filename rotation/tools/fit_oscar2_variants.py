@@ -11,7 +11,7 @@ the model and writes one K/V checkpoint pair per variant:
 
   perhead   per-KV-head orthogonal basis           R_k = E_q H P_br
   center    perhead + key centering                k_mean = mu_h
-  nova      centered, NOVA compact basis           R_k = M_q^{1/2} E,          q side M_q^{-1/2} E
+  whiten    centered, query-whitened compact basis R_k = M_q^{1/2} E,          q side M_q^{-1/2} E
   flat      centered, flattened compact basis      R_k = M_q^{1/2} E H P_br,   q side M_q^{-1/2} E H P_br
   stretch   centered, fixed-rate stretch           R_k = X^{1/2} E* H P_br,    q side X^{-1/2} E* H P_br
   outaware  values: post-W_O metric                R_v = G^{1/2} E_v H P_br,  output side G^{-1/2} E_v H P_br
@@ -26,7 +26,7 @@ Non-orthogonal K transforms ship their query-side matrix as ``q_rotation``
 grouping) for any variant.
 
   python rotation/tools/fit_oscar2_variants.py --moments-dir /scratch/oscar-calib/x \\
-      --out /scratch/oscar2/qwen3-8b --variants perhead,center,nova,flat,stretch,outaware \\
+      --out /scratch/oscar2/qwen3-8b --variants perhead,center,whiten,flat,stretch,outaware \\
       --model Qwen/Qwen3-8B
 """
 from __future__ import annotations
@@ -174,7 +174,7 @@ def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: d
     v_layers: dict = {}
     v_metric = "post_wo" if variant == "outaware" else "pre_wo"
     k_variant = k_base if variant == "outaware" else variant
-    centered = k_variant in ("center", "nova", "flat", "stretch")
+    centered = k_variant in ("center", "whiten", "flat", "stretch")
     for lid, m in sorted(mom["layers"].items()):
         n = float(m["count"])
         m_q, k_sum, m_k, s_v = m["M_q"], m["k_sum"], m["M_k"], m["S_v"]
@@ -192,7 +192,7 @@ def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: d
             if k_variant in ("perhead", "center"):
                 r, vals = orthogonal_basis(mq, h_k)
                 q = None
-            elif k_variant == "nova":
+            elif k_variant == "whiten":
                 r, q, vals = metric_basis(mq, s_k[h], None)
             elif k_variant == "flat":
                 r, q, vals = metric_basis(mq, s_k[h], h_k)
@@ -277,7 +277,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--moments-dir", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--variants", default="perhead,center,nova,flat,stretch,outaware")
+    ap.add_argument("--variants", default="perhead,center,whiten,flat,stretch,outaware")
     ap.add_argument("--k-base", default="flat", help="key transform under the outaware values")
     ap.add_argument("--model", default=None, help="HF id or local dir with W_O (needed for outaware)")
     ap.add_argument("--revision", default=None)
