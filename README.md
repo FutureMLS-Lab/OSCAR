@@ -820,8 +820,8 @@ per-row min-max levels; both clip at .96/.92 unless "plain".
 | **startup-calibrated, shared** | same | same | **uniform** | **8.989** | **−0.02%** | **53.3 (2 seeds: 52.5, 54.0)** |
 | per-head | per-head orthogonal | same | LM | 9.413 | +4.70% | 51.5 |
 | per-head + centering | + `k_mean` | same | LM | 9.126 | +1.50% | 54.0 / 53.0 (2 seeds) |
-| per-head + centering | + `k_mean` | same | uniform | 9.008 | +0.19% | 55.1 (2 seeds: 59.1, 51.0) |
-| per-head + centering, head-resolved output-aware values (`outaware_hr`, C2.7) | + `k_mean` | post-`W_O`, ρ-weighted | uniform | 8.998 | +0.08% | measuring |
+| per-head + centering | + `k_mean` | same | uniform | 9.008 | +0.19% | 55.1 (4 seeds: 59.1, 51.0, 57.1, 53.0) |
+| per-head + centering, head-resolved output-aware values (`outaware_hr`, C2.7) | + `k_mean` | post-`W_O`, ρ-weighted | uniform | 8.998 | +0.08% | 54.3 (2 seeds: 55.1, 53.5) |
 | same | same | same | LM | 9.113 | +1.36% | — |
 | per-head + centering | + `k_mean` | same | plain min-max (no clip) | 9.206 | +2.39% | — |
 | shared + centering | + `k_mean` | same | LM | 9.221 | +2.55% | — |
