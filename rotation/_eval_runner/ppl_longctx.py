@@ -33,7 +33,7 @@ def load_tokens(model: str, text_file: str | None):
     else:
         from datasets import load_dataset
 
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")  # datasets>=4 needs the namespaced id
         text = "\n\n".join(ds["text"])
         source = "wikitext-2-raw-v1/test"
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
