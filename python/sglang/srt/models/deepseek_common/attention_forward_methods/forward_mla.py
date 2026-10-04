@@ -731,7 +731,15 @@ class DeepseekMLAForwardMixin:
         # rather than serve a half-rotated cache.
         latent_dump = get_active_oscar_latent_dump()
         if latent_dump is not None and forward_batch.forward_mode.is_extend() and q_nope_out is not None:
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+        if (
+            latent_dump is not None
+            and forward_batch.forward_mode.is_extend()
+            and q_nope_out is not None
+            and not get_is_capture_mode()
+        ):
             # Rows in the model's frame, before the packed pool rotates them.
+            # Never under graph capture: the dump copies rows to the host.
             latent_dump.observe(
                 layer_id=self.attn_mqa.layer_id,
                 c_kv=k_nope.reshape(-1, self.kv_lora_rank),
