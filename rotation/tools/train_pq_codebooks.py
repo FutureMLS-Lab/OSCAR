@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Train per-layer product-quantization codebooks (PQ, or two-stage RVQ) for
-the unified pool's K or V tier from calibration dumps.
+"""Train product-quantization codebooks (PQ, or two-stage RVQ) for the
+unified pool's K or V tier: one codebook per layer, or one per (layer, KV
+head) with ``--per-head``.
 
-Inputs are the ``qkv_dumps/<dataset>/layer_<i>/{k,v}/*.pt`` chunks written by
-``rotation/<model>/save_qkv_*.sh`` and the rotation checkpoint the server will
-serve with; rows are rotated as ``x @ R`` exactly like the serving path, so a
-codebook is bound to its rotation. The output loads through
-``SGLANG_OSCAR_PQ_K_CODEBOOK`` / ``SGLANG_OSCAR_PQ_V_CODEBOOK``.
+Inputs are either the ``qkv_dumps/<dataset>/layer_<i>/{k,v}/*.pt`` chunks
+written by ``rotation/<model>/save_qkv_*.sh`` (``--dumps``) or the startup
+calibration rows ``oscar_rows_rank*.pt`` written with
+``SGLANG_OSCAR_CALIBRATION_SAVE_ROWS=1`` (``--rows-dir``), plus the rotation
+checkpoint the server will serve with; rows are centered (``k_mean``) and
+rotated exactly like the serving write path, so a codebook is bound to its
+rotation. The output loads through ``SGLANG_OSCAR_PQ_K_CODEBOOK`` /
+``SGLANG_OSCAR_PQ_V_CODEBOOK``.
 
 Example (Qwen3-8B, 1.0-bit K then 1.5-bit RVQ K and 1.0-bit V):
 
@@ -73,12 +77,39 @@ def _load_rotations(path: str) -> dict[int, torch.Tensor]:
     return rotations
 
 
-def _rotate(rows: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+def _load_means(path: str) -> dict[int, torch.Tensor]:
+    """Per-layer ``k_mean`` (``[head_dim]`` or ``[heads, head_dim]``) of a
+    centering checkpoint; empty when the checkpoint has none."""
+    state = torch.load(path, map_location="cpu")
+    means = {}
+    for key, entry in state["layers"].items():
+        if entry.get("k_mean") is not None:
+            means[int(entry.get("layer_id", key))] = entry["k_mean"].float()
+    return means
+
+
+def _rotate(rows: torch.Tensor, rotation: torch.Tensor, mean: torch.Tensor | None = None) -> torch.Tensor:
     """``rows`` is ``[tokens, heads, head_dim]``; a V2 per-head rotation is
-    ``[heads, head_dim, head_dim]``."""
+    ``[heads, head_dim, head_dim]``. Centering (``mean`` per head or shared)
+    happens before the rotation, like the pool's write path."""
+    if mean is not None:
+        rows = rows - (mean if mean.dim() == 1 else mean[None, :, :])
     if rotation.dim() == 3:
         return torch.einsum("thd,hde->the", rows, rotation)
     return rows @ rotation
+
+
+def _load_rows_dir(rows_dir: str, tensor: str) -> dict[int, torch.Tensor]:
+    """``layer -> [tokens, heads, head_dim]`` float32 from the calibration row
+    files, ranks merged along the head dimension."""
+    files = sorted(glob.glob(os.path.join(rows_dir, "oscar_rows_rank*.pt")))
+    if not files:
+        raise SystemExit(f"no oscar_rows_rank*.pt under {rows_dir}")
+    parts = sorted((torch.load(f, map_location="cpu") for f in files), key=lambda p: p["tp_rank"])
+    layers = {}
+    for lid in parts[0]["layers"]:
+        layers[int(lid)] = torch.cat([p["layers"][lid][tensor] for p in parts], dim=1).float()
+    return layers
 
 
 def _load_layer(dumps: str, layer_id: int, tensor: str, rotation, max_samples: int, head_dim: int):
@@ -96,6 +127,17 @@ def _load_layer(dumps: str, layer_id: int, tensor: str, rotation, max_samples: i
         rng = np.random.default_rng(42 + layer_id)
         rows = rows[torch.from_numpy(rng.choice(rows.shape[0], max_samples, replace=False))]
     return rows
+
+
+def _train_layer_per_head(rows: torch.Tensor, *, n_sub: int, sub_dim: int, centroids: int, iters: int, seed: int, device):
+    """``rows`` ``[tokens, heads, head_dim]`` -> stage-1 codebooks ``[heads, n_sub,
+    centroids, sub_dim]`` and the mean SQNR over heads (no residual stage)."""
+    books, sqnrs = [], []
+    for h in range(rows.shape[1]):
+        trained = _train_layer(rows[:, h], n_sub=n_sub, sub_dim=sub_dim, centroids=centroids, stage2=0, iters=iters, seed=seed + 10_000 * h, device=device)
+        books.append(trained["stage1"])
+        sqnrs.append(trained["sqnr_stage1"])
+    return {"stage1": torch.stack(books), "sqnr_stage1": float(np.mean(sqnrs))}
 
 
 def _train_layer(rows: torch.Tensor, *, n_sub: int, sub_dim: int, centroids: int, stage2: int, iters: int, seed: int, device):
@@ -118,14 +160,17 @@ def _train_layer(rows: torch.Tensor, *, n_sub: int, sub_dim: int, centroids: int
     return result
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dumps", required=True, help="qkv_dumps/<dataset> directory with layer_<i>/{k,v}/*.pt")
+    parser.add_argument("--dumps", default="", help="qkv_dumps/<dataset> directory with layer_<i>/{k,v}/*.pt")
+    parser.add_argument("--rows-dir", default="", help="directory with the calibration rows oscar_rows_rank*.pt (alternative to --dumps)")
     parser.add_argument("--rotation", required=True, help="rotation checkpoint the server will use for this tensor")
     parser.add_argument("--tensor", choices=("k", "v"), default="k")
     parser.add_argument("--out", required=True)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--n-sub", type=int, default=16)
+    parser.add_argument("--sub-dim", type=int, default=0, help="channels per sub-vector (overrides --n-sub; with --rows-dir the head dim comes from the rows)")
+    parser.add_argument("--per-head", action="store_true", help="one codebook per (layer, KV head) instead of per layer (rows input only)")
     parser.add_argument("--centroids", type=int, default=256)
     parser.add_argument("--stage2-centroids", type=int, default=0, help="> 0 trains a residual stage (RVQ)")
     parser.add_argument("--samples", type=int, default=50000, help="rows per layer used for k-means")
@@ -133,8 +178,19 @@ def main() -> int:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--layers", default="", help="comma-separated subset of layer ids (default: all dumped)")
     parser.add_argument("--model", default="", help="free-text provenance stored in the file")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
+    if bool(args.dumps) == bool(args.rows_dir):
+        parser.error("give exactly one of --dumps and --rows-dir")
+    if args.per_head and (not args.rows_dir or args.stage2_centroids > 0):
+        parser.error("--per-head needs --rows-dir and no residual stage")
+    row_layers = _load_rows_dir(args.rows_dir, args.tensor) if args.rows_dir else None
+    if row_layers is not None:
+        args.head_dim = int(next(iter(row_layers.values())).shape[-1])
+    if args.sub_dim:
+        if args.head_dim % args.sub_dim:
+            parser.error("--sub-dim must divide the head dim")
+        args.n_sub = args.head_dim // args.sub_dim
     if args.head_dim % args.n_sub:
         parser.error("--head-dim must be divisible by --n-sub")
     for name, value in (("--centroids", args.centroids), ("--stage2-centroids", args.stage2_centroids)):
@@ -142,26 +198,42 @@ def main() -> int:
             parser.error(f"{name} must be a power of two <= 256 (uint8 codes)")
     sub_dim = args.head_dim // args.n_sub
     rotations = _load_rotations(args.rotation)
-    dumped = sorted(
-        int(name.split("_")[1])
-        for name in os.listdir(args.dumps)
-        if name.startswith("layer_") and os.path.isdir(os.path.join(args.dumps, name))
-    )
-    layers = [int(x) for x in args.layers.split(",") if x] or dumped
+    means = _load_means(args.rotation) if args.tensor == "k" else {}
+    if row_layers is not None:
+        available = sorted(row_layers)
+    else:
+        available = sorted(
+            int(name.split("_")[1])
+            for name in os.listdir(args.dumps)
+            if name.startswith("layer_") and os.path.isdir(os.path.join(args.dumps, name))
+        )
+    layers = [int(x) for x in args.layers.split(",") if x] or available
     missing = [l for l in layers if l not in rotations]
     if missing:
         parser.error(f"rotation file has no entry for layers {missing}")
 
     stage1, stage2, sqnr1, sqnr_rvq = [], [], {}, {}
+    kv_heads = 0
     for layer_id in layers:
-        rows = _load_layer(args.dumps, layer_id, args.tensor, rotations[layer_id], args.samples, args.head_dim)
+        if row_layers is not None:
+            rotated = _rotate(row_layers[layer_id], rotations[layer_id], means.get(layer_id))
+            kv_heads = int(rotated.shape[1])
+            rows = rotated if args.per_head else rotated.reshape(-1, args.head_dim)
+        else:
+            rows = _load_layer(args.dumps, layer_id, args.tensor, rotations[layer_id], args.samples, args.head_dim)
         if rows is None:
             print(f"layer {layer_id}: no {args.tensor} dumps", file=sys.stderr)
             return 1
-        trained = _train_layer(
-            rows, n_sub=args.n_sub, sub_dim=sub_dim, centroids=args.centroids,
-            stage2=args.stage2_centroids, iters=args.iters, seed=42 + layer_id * 100, device=args.device,
-        )
+        if args.per_head:
+            trained = _train_layer_per_head(
+                rows, n_sub=args.n_sub, sub_dim=sub_dim, centroids=args.centroids,
+                iters=args.iters, seed=42 + layer_id * 100, device=args.device,
+            )
+        else:
+            trained = _train_layer(
+                rows, n_sub=args.n_sub, sub_dim=sub_dim, centroids=args.centroids,
+                stage2=args.stage2_centroids, iters=args.iters, seed=42 + layer_id * 100, device=args.device,
+            )
         stage1.append(trained["stage1"])
         sqnr1[layer_id] = trained["sqnr_stage1"]
         line = f"layer {layer_id:3d}: rows={rows.shape[0]:,} sqnr={trained['sqnr_stage1']:+.2f} dB"
@@ -178,8 +250,10 @@ def main() -> int:
         "model": args.model,
         "tensor": args.tensor,
         "rotation": os.path.basename(args.rotation).removesuffix(".pt"),
-        "rotation_convention": "row_times_checkpoint_rotation",
-        "data": os.path.abspath(args.dumps),
+        "rotation_convention": "centered_row_times_checkpoint_rotation" if means else "row_times_checkpoint_rotation",
+        "data": os.path.abspath(args.dumps or args.rows_dir),
+        "per_head": bool(args.per_head),
+        "kv_heads": kv_heads if args.per_head else 0,
         "sqnr_per_layer": sqnr1,
         "sqnr_avg": float(np.mean(list(sqnr1.values()))),
     }
@@ -197,7 +271,7 @@ def main() -> int:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(payload, args.out)
     bits = 8.0 * args.n_sub * (2 if args.stage2_centroids > 0 else 1) / args.head_dim
-    print(f"saved {args.out}: {len(layers)} layers, {bits:.2f} bits/value, avg sqnr {payload['sqnr_avg']:+.2f} dB"
+    print(f"saved {args.out}: {len(layers)} layers{' x %d heads' % kv_heads if args.per_head else ''}, {bits:.2f} bits/value, avg sqnr {payload['sqnr_avg']:+.2f} dB"
           + (f" (rvq {payload['sqnr_rvq_avg']:+.2f} dB)" if args.stage2_centroids > 0 else ""))
     return 0
 

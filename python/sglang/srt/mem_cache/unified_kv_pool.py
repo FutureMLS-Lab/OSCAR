@@ -49,7 +49,11 @@ from sglang.srt.mem_cache.oscar_calibration import (
     get_active_oscar_calibrator,
     set_active_oscar_calibrator,
 )
-from sglang.srt.mem_cache.oscar_pq_codebooks import PQCodebookSet, load_pq_codebook_set
+from sglang.srt.mem_cache.oscar_pq_codebooks import (
+    PQCodebookSet,
+    load_pq_codebook_set,
+    read_pq_codebook_header,
+)
 from sglang.srt.mem_cache.oscar_rotation_paths import oscar_calibration_required
 
 logger = logging.getLogger(__name__)
@@ -604,7 +608,12 @@ class UnifiedInt2HPKVPool(KVCache):
         if not k_path:
             raise ValueError("SGLANG_OSCAR_K_QUANTIZER=pq needs SGLANG_OSCAR_PQ_K_CODEBOOK")
         self._pq_k = load_pq_codebook_set(
-            k_path, head_dim=self.head_dim, layer_ids=layer_ids, device=self.device, label="PQ K"
+            k_path,
+            head_dim=self.head_dim,
+            layer_ids=layer_ids,
+            device=self.device,
+            label="PQ K",
+            head_slice=self._pq_head_slice(k_path, label="PQ K"),
         )
         if v_name == "pq":
             v_path = envs.SGLANG_OSCAR_PQ_V_CODEBOOK.get()
@@ -616,6 +625,7 @@ class UnifiedInt2HPKVPool(KVCache):
                 layer_ids=layer_ids,
                 device=self.device,
                 label="PQ V",
+                head_slice=self._pq_head_slice(v_path, label="PQ V"),
             )
         logger.info(
             "UnifiedInt2HPKVPool: K quantizer pq [%s] from %s | V quantizer %s%s",
@@ -652,6 +662,23 @@ class UnifiedInt2HPKVPool(KVCache):
     @property
     def v_quantizer(self) -> str:
         return self._v_quantizer
+
+    def _pq_head_slice(self, path: str, *, label: str) -> Optional[tuple[int, int]]:
+        """This rank's ``(start, count)`` of a per-head codebook file's KV heads,
+        the shard the per-head rotations use; None for a shared codebook."""
+        header = read_pq_codebook_header(
+            torch.load(path, map_location="cpu", weights_only=False),
+            expected_head_dim=self.head_dim if label == "PQ K" else self.v_head_dim,
+            label=label,
+        )
+        if header.kind != "per_head":
+            return None
+        tp_rank = get_parallel().attn_tp_rank
+        try:
+            tp_size = get_parallel().attn_tp_size
+        except RuntimeError:
+            tp_size = 0
+        return _head_shard_start(header.kv_heads, self.head_num, tp_rank, tp_size), self.head_num
 
     @property
     def pq_k_set(self) -> Optional[PQCodebookSet]:

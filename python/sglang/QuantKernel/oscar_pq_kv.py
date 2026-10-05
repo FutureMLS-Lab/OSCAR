@@ -6,7 +6,9 @@ centroid in a per-(layer, sub-vector) codebook of at most 256 entries, so a
 row costs ``n_sub`` bytes and carries no per-row scale. A residual (RVQ)
 stage encodes ``row - decode(codes)`` with a second codebook into a second
 code buffer of the same shape. Codebooks are fp16 ``[n_sub, n_centroids,
-sub_dim]`` and must be contiguous: the kernels index them by arithmetic."""
+sub_dim]`` shared by every KV head, or ``[heads, n_sub, n_centroids,
+sub_dim]`` per KV head; both must be contiguous: the kernels index them by
+arithmetic, with a head stride of 0 for the shared layout."""
 
 from __future__ import annotations
 
@@ -18,8 +20,15 @@ import triton.language as tl
 
 
 def pq_codebook_norms(codebook: torch.Tensor) -> torch.Tensor:
-    """Squared centroid norms ``[n_sub, n_centroids]`` in fp32."""
+    """Squared centroid norms ``[n_sub, n_centroids]`` (or ``[heads, n_sub,
+    n_centroids]`` for a per-head codebook) in fp32."""
     return (codebook.float() ** 2).sum(dim=-1).contiguous()
+
+
+def codebook_head_stride(codebook: torch.Tensor) -> int:
+    """Elements between consecutive heads' codebooks: 0 for a codebook shared
+    across heads, the leading stride for the per-head layout."""
+    return int(codebook.stride(0)) if codebook.dim() == 4 else 0
 
 
 @triton.jit
@@ -35,6 +44,8 @@ def _pq_encode_kernel(
     codes_stride_loc,
     codes_stride_head,
     codes_stride_sub,
+    cb_stride_head,
+    cb_norm2_stride_head,
     N_SUB: tl.constexpr,
     SUB_DIM: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
@@ -50,6 +61,8 @@ def _pq_encode_kernel(
     if HP_OFFSET >= 0:
         active &= cache_loc < HP_OFFSET
     cent_range = tl.arange(0, N_CENTROIDS)
+    cb_head = cb_ptr + pid_head.to(tl.int64) * cb_stride_head
+    cb_norm2_head = cb_norm2_ptr + pid_head.to(tl.int64) * cb_norm2_stride_head
     # NIBBLE: codes of sub-vectors (2j, 2j+1) share byte j, low nibble first.
     pending = tl.zeros([BLOCK_TOK], dtype=tl.int32)
 
@@ -68,11 +81,11 @@ def _pq_encode_kernel(
                 other=0.0,
             ).to(tl.float32)
             x_norm2 += x_d * x_d
-            cb_d = tl.load(cb_ptr + (s * N_CENTROIDS + cent_range) * SUB_DIM + d).to(
+            cb_d = tl.load(cb_head + (s * N_CENTROIDS + cent_range) * SUB_DIM + d).to(
                 tl.float32
             )
             dot += x_d[:, None] * cb_d[None, :]
-        cb_n2 = tl.load(cb_norm2_ptr + s * N_CENTROIDS + cent_range).to(tl.float32)
+        cb_n2 = tl.load(cb_norm2_head + s * N_CENTROIDS + cent_range).to(tl.float32)
         d2 = x_norm2[:, None] + cb_n2[None, :] - 2.0 * dot
         code = tl.argmin(d2, axis=1).to(tl.int32)
         if NIBBLE:
@@ -110,6 +123,7 @@ def _pq_decode_rows_kernel(
     out_stride_tok,
     out_stride_head,
     out_stride_dim,
+    cb_stride_head,
     N_SUB: tl.constexpr,
     SUB_DIM: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
@@ -121,6 +135,7 @@ def _pq_decode_rows_kernel(
     tok_range = pid_tok * BLOCK_TOK + tl.arange(0, BLOCK_TOK)
     active = tok_range < num_tokens
     sub_range = tl.arange(0, SUB_DIM)
+    cb_head = cb_ptr + pid_head.to(tl.int64) * cb_stride_head
     for s in tl.static_range(N_SUB):
         if NIBBLE:
             packed = tl.load(
@@ -142,7 +157,7 @@ def _pq_decode_rows_kernel(
                 other=0,
             ).to(tl.int32)
         cb_idx = (s * N_CENTROIDS + code[:, None]) * SUB_DIM + sub_range[None, :]
-        recon = tl.load(cb_ptr + cb_idx, mask=active[:, None], other=0.0)
+        recon = tl.load(cb_head + cb_idx, mask=active[:, None], other=0.0)
         out_off = (
             tok_range[:, None] * out_stride_tok
             + pid_head * out_stride_head
@@ -164,6 +179,7 @@ def _pq_decode_at_locs_kernel(
     out_stride_tok,
     out_stride_head,
     out_stride_dim,
+    cb_stride_head,
     N_SUB: tl.constexpr,
     SUB_DIM: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
@@ -183,6 +199,7 @@ def _pq_decode_at_locs_kernel(
         active &= cache_loc < HP_OFFSET
     safe_loc = tl.where(active, cache_loc, 0)
     sub_range = tl.arange(0, SUB_DIM)
+    cb_head = cb_ptr + pid_head.to(tl.int64) * cb_stride_head
     for s in tl.static_range(N_SUB):
         if NIBBLE:
             packed = tl.load(
@@ -204,7 +221,7 @@ def _pq_decode_at_locs_kernel(
                 other=0,
             ).to(tl.int32)
         cb_idx = (s * N_CENTROIDS + code[:, None]) * SUB_DIM + sub_range[None, :]
-        recon = tl.load(cb_ptr + cb_idx, mask=active[:, None], other=0.0)
+        recon = tl.load(cb_head + cb_idx, mask=active[:, None], other=0.0)
         out_off = (
             tok_range[:, None] * out_stride_tok
             + pid_head * out_stride_head
@@ -213,8 +230,19 @@ def _pq_decode_at_locs_kernel(
         tl.store(out_ptr + out_off, recon, mask=token_mask[:, None])
 
 
-def _check_codebook(codebook: torch.Tensor, head_dim: int) -> tuple[int, int, int]:
-    n_sub, n_centroids, sub_dim = (int(x) for x in codebook.shape)
+def _check_codebook(
+    codebook: torch.Tensor, head_dim: int, num_heads: Optional[int] = None
+) -> tuple[int, int, int]:
+    """``(n_sub, n_centroids, sub_dim)`` of a shared ``[n_sub, C, d]`` or
+    per-head ``[heads, n_sub, C, d]`` codebook; a per-head codebook must hold
+    exactly the heads of the rows it encodes."""
+    if codebook.dim() not in (3, 4):
+        raise ValueError(f"PQ codebook must be rank 3 or 4, got shape {tuple(codebook.shape)}")
+    if codebook.dim() == 4 and num_heads is not None and int(codebook.shape[0]) != num_heads:
+        raise ValueError(
+            f"per-head PQ codebook holds {codebook.shape[0]} heads, rows have {num_heads}"
+        )
+    n_sub, n_centroids, sub_dim = (int(x) for x in codebook.shape[-3:])
     if n_sub * sub_dim != head_dim:
         raise ValueError(
             f"PQ codebook reconstructs {n_sub}*{sub_dim} dims, rows have {head_dim}"
@@ -259,23 +287,26 @@ def pq_encode(
     num_tokens, num_heads, head_dim = rows.shape
     if num_tokens == 0:
         return
-    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim, num_heads)
     nibble = _nibble_layout(int(codes_buffer.shape[-1]), n_sub, n_centroids)
     rows_fp16 = rows.to(torch.float16).contiguous()
     cb = codebook.to(torch.float16).contiguous()
+    norms = codebook_norms.float().contiguous()
     grid = (triton.cdiv(num_tokens, block_tok), num_heads)
     _pq_encode_kernel[grid](
         rows_fp16,
         loc,
         codes_buffer,
         cb,
-        codebook_norms.float().contiguous(),
+        norms,
         num_tokens,
         rows_fp16.stride(0),
         rows_fp16.stride(1),
         codes_buffer.stride(0),
         codes_buffer.stride(1),
         codes_buffer.stride(2),
+        codebook_head_stride(cb),
+        int(norms.stride(0)) if norms.dim() == 3 else 0,
         N_SUB=n_sub,
         SUB_DIM=sub_dim,
         N_CENTROIDS=n_centroids,
@@ -292,7 +323,7 @@ def pq_decode_rows(
 ) -> torch.Tensor:
     """Reconstruct ``codes`` ``[n, heads, n_sub]`` to fp16 ``[n, heads, head_dim]``."""
     num_tokens, num_heads, code_width = codes.shape
-    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim, num_heads)
     nibble = _nibble_layout(int(code_width), n_sub, n_centroids)
     out = torch.empty(
         (num_tokens, num_heads, head_dim), dtype=torch.float16, device=codes.device
@@ -312,6 +343,7 @@ def pq_decode_rows(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        codebook_head_stride(cb),
         N_SUB=n_sub,
         SUB_DIM=sub_dim,
         N_CENTROIDS=n_centroids,
@@ -335,7 +367,7 @@ def pq_decode_at_locs(
     """Reconstruct the cache rows at ``loc`` to fp16 ``[len(loc), heads, head_dim]``."""
     num_tokens = int(loc.shape[0])
     _, num_heads, code_width = codes_buffer.shape
-    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim)
+    n_sub, n_centroids, sub_dim = _check_codebook(codebook, head_dim, num_heads)
     nibble = _nibble_layout(int(code_width), n_sub, n_centroids)
     out = torch.empty(
         (num_tokens, num_heads, head_dim), dtype=torch.float16, device=codes_buffer.device
@@ -356,6 +388,7 @@ def pq_decode_at_locs(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        codebook_head_stride(cb),
         N_SUB=n_sub,
         SUB_DIM=sub_dim,
         N_CENTROIDS=n_centroids,
@@ -369,8 +402,11 @@ def pq_decode_at_locs(
 
 
 def pq_encode_decode_reference(rows: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
-    """CPU reference: nearest-centroid encode then decode of ``[n, head_dim]`` rows."""
+    """CPU reference: nearest-centroid encode then decode of ``[n, head_dim]``
+    rows against one head's ``[n_sub, C, d]`` codebook."""
     n, head_dim = rows.shape
+    if codebook.dim() != 3:
+        raise ValueError("the reference takes one head's codebook")
     n_sub, _, sub_dim = _check_codebook(codebook, head_dim)
     x = rows.float().reshape(n, n_sub, sub_dim)
     cb = codebook.float()

@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.QuantKernel.oscar_pq_kv import _nibble_layout
+from sglang.QuantKernel.oscar_pq_kv import _nibble_layout, codebook_head_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _MIN_BLOCK_KV,
@@ -25,6 +25,9 @@ def _pq_build_lut_kernel(
     Q,
     Codebook,
     Lut,
+    cb_stride_head,
+    Q_HEADS: tl.constexpr,
+    KV_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     N_SUB: tl.constexpr,
     SUB_DIM: tl.constexpr,
@@ -32,28 +35,37 @@ def _pq_build_lut_kernel(
 ):
     batch_q_head = tl.program_id(0)
     sub = tl.program_id(1)
+    # A per-head codebook belongs to the KV head this query head reads.
+    kv_head = (batch_q_head % Q_HEADS) // KV_GROUP
+    cb = Codebook + kv_head.to(tl.int64) * cb_stride_head
     centroids = tl.arange(0, N_CENTROIDS)
     acc = tl.zeros([N_CENTROIDS], dtype=tl.float32)
     for dim in tl.static_range(SUB_DIM):
         q_value = tl.load(Q + batch_q_head * HEAD_DIM + sub * SUB_DIM + dim).to(tl.float32)
-        centroid = tl.load(Codebook + (sub * N_CENTROIDS + centroids) * SUB_DIM + dim).to(
+        centroid = tl.load(cb + (sub * N_CENTROIDS + centroids) * SUB_DIM + dim).to(
             tl.float32
         )
         acc += q_value * centroid
     tl.store(Lut + (batch_q_head * N_SUB + sub) * N_CENTROIDS + centroids, acc)
 
 
-def _build_pq_lut(q: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
-    """``lut[b, h, s, c] = q[b, h, s*sub_dim:(s+1)*sub_dim] . codebook[s, c]``."""
+def _build_pq_lut(q: torch.Tensor, codebook: torch.Tensor, kv_group_num: int) -> torch.Tensor:
+    """``lut[b, h, s, c] = q[b, h, s*sub_dim:(s+1)*sub_dim] . codebook[s, c]``
+    (``codebook[h // kv_group_num, s, c]`` for a per-head codebook)."""
     batch, q_heads, head_dim = q.shape
-    n_sub, n_centroids, sub_dim = codebook.shape
+    n_sub, n_centroids, sub_dim = codebook.shape[-3:]
     assert q.is_contiguous() and codebook.is_contiguous()
     assert head_dim == n_sub * sub_dim
+    if codebook.dim() == 4:
+        assert int(codebook.shape[0]) * kv_group_num == q_heads
     lut = torch.empty((batch, q_heads, n_sub, n_centroids), dtype=torch.float32, device=q.device)
     _pq_build_lut_kernel[(batch * q_heads, n_sub)](
         q,
         codebook,
         lut,
+        codebook_head_stride(codebook),
+        Q_HEADS=int(q_heads),
+        KV_GROUP=int(kv_group_num),
         HEAD_DIM=head_dim,
         N_SUB=int(n_sub),
         SUB_DIM=int(sub_dim),
@@ -103,6 +115,9 @@ def _fwd_grouped_kernel_stage1_pq(
     stride_vs,
     stride_vszbs,
     stride_vszh,
+    stride_kcb_h,
+    stride_kcb2_h,
+    stride_vcb_h,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -243,7 +258,10 @@ def _fwd_grouped_kernel_stage1_pq(
                     other=0,
                 ).to(tl.int64)
                 k = tl.load(
-                    K_Codebook + (k_sub[:, None] * K_N_CENTROIDS + k_code) * K_SUB_DIM + k_sub_off[:, None],
+                    K_Codebook
+                    + cur_kv_head.to(tl.int64) * stride_kcb_h
+                    + (k_sub[:, None] * K_N_CENTROIDS + k_code) * K_SUB_DIM
+                    + k_sub_off[:, None],
                     mask=mask_dk[:, None] & valid_n[None, :],
                     other=0.0,
                 ).to(q.dtype)
@@ -267,6 +285,7 @@ def _fwd_grouped_kernel_stage1_pq(
                     k_code2 = k_code2.to(tl.int64)
                     k += tl.load(
                         K_Codebook2
+                        + cur_kv_head.to(tl.int64) * stride_kcb2_h
                         + (k_sub[:, None] * K2_N_CENTROIDS + k_code2) * K_SUB_DIM
                         + k_sub_off[:, None],
                         mask=mask_dk[:, None] & valid_n[None, :],
@@ -296,7 +315,10 @@ def _fwd_grouped_kernel_stage1_pq(
                         other=0,
                     ).to(tl.int64)
                     values = tl.load(
-                        V_Codebook + (sub * V_N_CENTROIDS + code[:, None]) * V_SUB_DIM + v_dim[None, :],
+                        V_Codebook
+                        + cur_kv_head.to(tl.int64) * stride_vcb_h
+                        + (sub * V_N_CENTROIDS + code[:, None]) * V_SUB_DIM
+                        + v_dim[None, :],
                         mask=valid_n[:, None],
                         other=0.0,
                     ).to(q.dtype)
@@ -318,7 +340,10 @@ def _fwd_grouped_kernel_stage1_pq(
                     other=0,
                 ).to(tl.int64)
                 v = tl.load(
-                    V_Codebook + (v_sub[None, :] * V_N_CENTROIDS + v_code) * V_SUB_DIM + v_sub_off[None, :],
+                    V_Codebook
+                    + cur_kv_head.to(tl.int64) * stride_vcb_h
+                    + (v_sub[None, :] * V_N_CENTROIDS + v_code) * V_SUB_DIM
+                    + v_sub_off[None, :],
                     mask=valid_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 ).to(q.dtype)
@@ -418,39 +443,45 @@ def _decode_grouped_att_m_fwd_pq(
     """Launch the inline PQ/RVQ quant-tier stage-1 for MHA, GQA or MQA."""
     Lk = int(q.shape[-1])
     Lv = int(att_out.shape[-1])
-    k_n_sub, k_n_centroids, k_sub_dim = k_codebook.shape
+    k_n_sub, k_n_centroids, k_sub_dim = k_codebook.shape[-3:]
     assert int(k_n_sub) * int(k_sub_dim) == Lk
     assert k_codes.shape[-1] == k_n_sub
+    kv_heads = int(k_codes.shape[1])
+    for cb in (k_codebook, k_codebook2, v_codebook):
+        assert cb is None or cb.dim() == 3 or int(cb.shape[0]) == kv_heads, (
+            f"per-head PQ codebook holds {cb.shape[0]} heads, the pool {kv_heads}"
+        )
 
     has_k_stage2 = k_codes2 is not None
     k2_nibble = False
     if has_k_stage2:
         assert k_codebook2 is not None
-        assert k_codebook2.shape[0] == k_n_sub and k_codebook2.shape[2] == k_sub_dim
+        assert k_codebook2.shape[-3] == k_n_sub and k_codebook2.shape[-1] == k_sub_dim
         k_codes2_arg, k_codebook2_arg = k_codes2, k_codebook2
-        k2_n_centroids = int(k_codebook2.shape[1])
+        k2_n_centroids = int(k_codebook2.shape[-2])
         k2_nibble = _nibble_layout(int(k_codes2.shape[-1]), int(k_n_sub), k2_n_centroids)
     else:
         k_codes2_arg, k_codebook2_arg = k_codes, k_codebook
         k2_n_centroids = int(k_n_centroids)
 
     batch, q_head_num = q.shape[0], q.shape[1]
+    kv_group_num = q_head_num // kv_heads
     adc_mode = envs.SGLANG_OSCAR_PQ_USE_ADC.get()
     use_adc = batch < 4 if adc_mode < 0 else adc_mode != 0
     if use_adc:
-        k_lut = _build_pq_lut(q, k_codebook)
-        k_lut2 = _build_pq_lut(q, k_codebook2_arg) if has_k_stage2 else k_lut
+        k_lut = _build_pq_lut(q, k_codebook, kv_group_num)
+        k_lut2 = _build_pq_lut(q, k_codebook2_arg, kv_group_num) if has_k_stage2 else k_lut
         lut_strides = k_lut.stride()
         lut2_strides = k_lut2.stride()
     else:
         # Pointer/stride placeholders for the compile-time disabled ADC branch.
         k_lut, k_lut2 = k_codebook, k_codebook2_arg
-        lut_strides = (0, 0, k_codebook.stride(0), k_codebook.stride(1))
-        lut2_strides = (0, 0, k_codebook2_arg.stride(0), k_codebook2_arg.stride(1))
+        lut_strides = (0, 0, k_codebook.stride(-3), k_codebook.stride(-2))
+        lut2_strides = (0, 0, k_codebook2_arg.stride(-3), k_codebook2_arg.stride(-2))
 
     v_is_pq = v_codebook is not None
     if v_is_pq:
-        v_n_sub, v_n_centroids, v_sub_dim = v_codebook.shape
+        v_n_sub, v_n_centroids, v_sub_dim = v_codebook.shape[-3:]
         assert int(v_n_sub) * int(v_sub_dim) == Lv
         assert v_buffer.shape[-1] == v_n_sub
         v_codebook_arg = v_codebook
@@ -466,7 +497,6 @@ def _decode_grouped_att_m_fwd_pq(
         assert Lv % v_num_groups == 0
         v_group_size = Lv // v_num_groups
 
-    kv_group_num = q_head_num // k_codes.shape[1]
     block_h = _pick_block_h(kv_group_num, use_adc=use_adc, batch=batch)
     large_tile_safe = max(Lk, Lv) <= 128 and v_is_pq and not has_k_stage2
     block_n, num_warps, num_stages = _pick_tile(batch=batch, large_tile_safe=large_tile_safe)
@@ -503,6 +533,9 @@ def _decode_grouped_att_m_fwd_pq(
         v_buffer.stride(2),
         v_scales_zeros.stride(0),
         v_scales_zeros.stride(1),
+        codebook_head_stride(k_codebook),
+        codebook_head_stride(k_codebook2_arg),
+        codebook_head_stride(v_codebook_arg) if v_is_pq else 0,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),

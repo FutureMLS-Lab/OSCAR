@@ -32,6 +32,11 @@ grouping) for any variant.
   python rotation/tools/fit_oscar2_variants.py --moments-dir /scratch/oscar-calib/x \\
       --out /scratch/oscar2/qwen3-8b --variants perhead,center,whiten,flat,stretch,outaware \\
       --model Qwen/Qwen3-8B
+
+novakv: the whiten key basis with its columns dealt into equal-volume groups
+(default 4 coordinates) for a per-group vector quantizer; values as whiten.
+The reproduction of NOVA-KV's transform; its codebooks come from
+train_pq_codebooks.py --per-head.
 """
 from __future__ import annotations
 
@@ -97,6 +102,24 @@ def metric_basis(metric: torch.Tensor, cov: torch.Tensor, hadamard: torch.Tensor
     else:
         tail = e @ hadamard @ make_br_perm_matrix(vals)
     return a @ tail, a_inv @ tail, vals
+
+
+def equal_volume_permutation(variances: torch.Tensor, group: int) -> torch.Tensor:
+    """Column order that deals the coordinates, sorted by variance, round-robin
+    into ``hd / group`` groups of ``group`` consecutive columns, so every group
+    carries about the same volume (product of variances) and a fixed-rate
+    vector quantizer per group approaches the variable-rate optimum. The same
+    permutation is applied to the write- and read-side matrices, so it is free
+    at inference."""
+    hd = int(variances.numel())
+    if group <= 0 or hd % group:
+        raise SystemExit(f"VQ group {group} does not divide head_dim {hd}")
+    n_groups = hd // group
+    order = torch.argsort(variances, descending=True).tolist()
+    groups: list[list[int]] = [[] for _ in range(n_groups)]
+    for i, coord in enumerate(order):
+        groups[i % n_groups].append(coord)
+    return torch.tensor([c for g in groups for c in g], dtype=torch.long)
 
 
 def stretch_metric(m_q: torch.Tensor, s_k: torch.Tensor) -> torch.Tensor:
@@ -224,7 +247,7 @@ def head_resolved_output_metric(w_o: torch.Tensor, rho: torch.Tensor, kv_heads: 
     return _rho_weighted_output_metric(w_o, rho, kv_heads, head_dim)
 
 
-def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: dict | None):
+def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: dict | None, vq_group: int = 4):
     hd, vd = int(mom["head_dim"]), int(mom["v_head_dim"])
     h_k = build_hadamard(hd)
     h_v = build_hadamard(vd)
@@ -232,7 +255,7 @@ def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: d
     v_layers: dict = {}
     v_metric = {"outaware": "post_wo", "outaware_hr": "post_wo_hr"}.get(variant, "pre_wo")
     k_variant = k_base if variant in ("outaware", "outaware_hr") else variant
-    centered = k_variant in ("center", "whiten", "flat", "stretch")
+    centered = k_variant in ("center", "whiten", "flat", "stretch", "novakv")
     for lid, m in sorted(mom["layers"].items()):
         n = float(m["count"])
         m_q, k_sum, m_k, s_v = m["M_q"], m["k_sum"], m["M_k"], m["S_v"]
@@ -252,6 +275,12 @@ def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: d
                 q = None
             elif k_variant == "whiten":
                 r, q, vals = metric_basis(mq, s_k[h], None)
+            elif k_variant == "novakv":
+                # The compact basis of the query-whitened keys, columns dealt into
+                # equal-volume groups for a per-group vector quantizer.
+                r, q, vals = metric_basis(mq, s_k[h], None)
+                perm = equal_volume_permutation(vals, vq_group)
+                r, q, vals = r[:, perm], q[:, perm], vals[perm]
             elif k_variant == "flat":
                 r, q, vals = metric_basis(mq, s_k[h], h_k)
             elif k_variant == "stretch":
@@ -306,8 +335,10 @@ def fit_variant(variant: str, mom: dict, *, shared: bool, k_base: str, o_proj: d
             "created_at_unix": time.time(), "fitter": "rotation/tools/fit_oscar2_variants.py",
         },
     }
-    k_state = {**common, "objective": f"oscar2_{k_variant}", "transform": {"key": k_variant, "centered": centered,
-               "orthogonal": k_variant in ("perhead", "center")}, "layers": k_layers}
+    k_transform = {"key": k_variant, "centered": centered, "orthogonal": k_variant in ("perhead", "center")}
+    if k_variant == "novakv":
+        k_transform["equal_volume_group"] = vq_group
+    k_state = {**common, "objective": f"oscar2_{k_variant}", "transform": k_transform, "layers": k_layers}
     v_state = {**common, "objective": f"oscar2_v_{v_metric}", "transform": {"value": v_metric,
                "orthogonal": v_metric == "pre_wo"}, "layers": v_layers}
     return k_state, v_state
@@ -347,6 +378,7 @@ def main() -> int:
     ap.add_argument("--revision", default=None)
     ap.add_argument("--weight-prefix", default="model.", help="tensor name prefix before `layers.<i>` (VL wrappers: language_model.model.)")
     ap.add_argument("--shared", action="store_true", help="one basis per layer (V1 grouping) instead of per head")
+    ap.add_argument("--vq-group", type=int, default=4, help="novakv: coordinates per VQ group for the equal-volume dealing")
     a = ap.parse_args()
     mom = load_moments(a.moments_dir)
     variants = [v.strip() for v in a.variants.split(",") if v.strip()]
@@ -357,7 +389,7 @@ def main() -> int:
     for v in variants:
         t0 = time.time()
         k_base = a.k_base or {"outaware": "flat", "outaware_hr": "center"}.get(v, "flat")
-        k_state, v_state = fit_variant(v, mom, shared=a.shared, k_base=k_base, o_proj=o_proj)
+        k_state, v_state = fit_variant(v, mom, shared=a.shared, k_base=k_base, o_proj=o_proj, vq_group=a.vq_group)
         self_check(k_state, v_state)
         d = os.path.join(a.out, v + ("-shared" if a.shared else ""))
         os.makedirs(d, exist_ok=True)

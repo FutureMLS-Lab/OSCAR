@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.QuantKernel.oscar_pq_kv import _nibble_layout
+from sglang.QuantKernel.oscar_pq_kv import _nibble_layout, codebook_head_stride
 
 
 @triton.jit
@@ -36,6 +36,8 @@ def _mixed_prefix_pq_dequant_kernel(
     out_stride_token: tl.constexpr,
     out_stride_head: tl.constexpr,
     out_stride_dim: tl.constexpr,
+    cb_stride_head,
+    cb2_stride_head,
     HP_OFFSET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     SUB_DIM: tl.constexpr,
@@ -66,7 +68,10 @@ def _mixed_prefix_pq_dequant_kernel(
         other=0,
     ).to(tl.int64)
     quant_val = tl.load(
-        codebook_ptr + (sub_idx * N_CENTROIDS + code) * SUB_DIM + sub_off,
+        codebook_ptr
+        + head_idx.to(tl.int64) * cb_stride_head
+        + (sub_idx * N_CENTROIDS + code) * SUB_DIM
+        + sub_off,
         mask=(~is_hp) & dim_mask,
         other=0.0,
     ).to(tl.float32)
@@ -88,7 +93,10 @@ def _mixed_prefix_pq_dequant_kernel(
         if STAGE2_NIBBLE:
             code2 = (code2 >> code2_shift) & 0xF
         quant_val += tl.load(
-            codebook2_ptr + (sub_idx * N_CENTROIDS2 + code2) * SUB_DIM + sub_off,
+            codebook2_ptr
+            + head_idx.to(tl.int64) * cb2_stride_head
+            + (sub_idx * N_CENTROIDS2 + code2) * SUB_DIM
+            + sub_off,
             mask=(~is_hp) & dim_mask,
             other=0.0,
         ).to(tl.float32)
@@ -122,8 +130,9 @@ def mixed_prefix_dequantize_pq(
     ``out`` receives them when a caller owns the staging buffer."""
     num_tokens = prefix_indices.shape[0]
     num_heads = codes.shape[1]
-    n_sub, n_centroids, sub_dim = codebook.shape
+    n_sub, n_centroids, sub_dim = codebook.shape[-3:]
     head_dim = int(n_sub) * int(sub_dim)
+    assert codebook.dim() == 3 or int(codebook.shape[0]) == num_heads
     if out is None:
         out = torch.empty(
             (num_tokens, num_heads, head_dim), dtype=model_dtype, device=prefix_indices.device
@@ -139,9 +148,9 @@ def mixed_prefix_dequantize_pq(
     stage2_nibble = False
     if has_stage2:
         assert codebook2 is not None
-        assert codebook2.shape[0] == n_sub and codebook2.shape[2] == sub_dim
+        assert codebook2.shape[-3] == n_sub and codebook2.shape[-1] == sub_dim
         codes2_arg, codebook2_arg = codes2, codebook2
-        n_centroids2 = int(codebook2.shape[1])
+        n_centroids2 = int(codebook2.shape[-2])
         stage2_nibble = _nibble_layout(int(codes2.shape[-1]), int(n_sub), n_centroids2)
     else:
         # Triton still needs pointer arguments for the disabled constexpr branch.
@@ -170,6 +179,8 @@ def mixed_prefix_dequantize_pq(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        codebook_head_stride(codebook),
+        codebook_head_stride(codebook2_arg),
         HP_OFFSET=int(hp_offset),
         HEAD_DIM=head_dim,
         SUB_DIM=int(sub_dim),

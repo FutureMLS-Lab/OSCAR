@@ -461,3 +461,146 @@ def test_pq_prefix_dequant_matches_reconstruction(variant):
     # the quant rows must be real reconstructions, not zeros or the HP rows
     assert exp_k[~is_hp].abs().mean() > 0.05
     assert not torch.allclose(k[~is_hp].float(), exp_k[is_hp][:1].expand_as(k[~is_hp]).float())
+
+
+# -- Per-head codebooks -------------------------------------------------------
+
+
+def _per_head_codebook_path(name, *, head_dim, layer_num, kv_heads, n_sub=8, n_centroids=16, replicate=False):
+    """A ``[layers, kv_heads, n_sub, C, d]`` codebook file; ``replicate`` gives
+    every head the per-layer codebook ``_codebook_path`` would have written
+    (same generator), so a per-head pool must reproduce the shared one."""
+    sub_dim = head_dim // n_sub
+    gen = torch.Generator().manual_seed(2026)
+    shared = torch.randn(layer_num, n_sub, n_centroids, sub_dim, generator=gen)
+    if replicate:
+        books = shared[:, None].expand(layer_num, kv_heads, n_sub, n_centroids, sub_dim).clone()
+    else:
+        books = torch.randn(layer_num, kv_heads, n_sub, n_centroids, sub_dim, generator=gen)
+    path = os.path.join(_DIR, f"{name}.pt")
+    torch.save(
+        {"layer_ids": list(range(layer_num)), "n_sub": n_sub, "sub_dim": sub_dim, "n_centroids": n_centroids,
+         "per_head": True, "kv_heads": kv_heads, "codebooks_per_layer": books},
+        path,
+    )
+    return path
+
+
+def test_per_head_codebook_header_and_rank_slice_on_cpu():
+    from sglang.srt.mem_cache.oscar_pq_codebooks import load_pq_codebook_set, read_pq_codebook_header
+
+    path = _per_head_codebook_path("ph_header", head_dim=64, layer_num=2, kv_heads=4)
+    data = torch.load(path)
+    header = read_pq_codebook_header(data, expected_head_dim=64, label="t")
+    assert header.kind == "per_head" and header.kv_heads == 4 and header.code_bytes == 8
+    full = load_pq_codebook_set(path, head_dim=64, layer_ids=[1, 0], device="cpu", label="t")
+    assert full.codebooks[0].shape == (4, 8, 16, 8) and full.norms[0].shape == (4, 8, 16)
+    torch.testing.assert_close(full.codebooks[0].float(), data["codebooks_per_layer"][1].to(torch.float16).float())
+    part = load_pq_codebook_set(path, head_dim=64, layer_ids=[0], device="cpu", label="t", head_slice=(2, 2))
+    assert part.codebooks[0].shape == (2, 8, 16, 8)
+    torch.testing.assert_close(part.codebooks[0].float(), data["codebooks_per_layer"][0, 2:4].to(torch.float16).float())
+    # the pool keeps this rank's heads of a per-head file (rank 1 of two)
+    with get_parallel().override(attn_tp_rank=1):
+        k_rot, v_rot = _identity_rotation_paths(64, 64, 1)
+        with (
+            envs.SGLANG_OSCAR_K_ROTATION_PATH.override(k_rot),
+            envs.SGLANG_OSCAR_V_ROTATION_PATH.override(v_rot),
+            envs.SGLANG_OSCAR_K_QUANTIZER.override("pq"),
+            envs.SGLANG_OSCAR_V_QUANTIZER.override("int2"),
+            envs.SGLANG_OSCAR_PQ_K_CODEBOOK.override(_per_head_codebook_path("ph_rank", head_dim=64, layer_num=1, kv_heads=4)),
+            envs.SGLANG_OSCAR_PQ_V_CODEBOOK.override(""),
+            envs.SGLANG_OSCAR_CALIBRATION_ACTIVE.override(False),
+        ):
+            pool = UnifiedInt2HPKVPool(
+                num_quant_pages=4, hp_dtype=torch.bfloat16, hp_prefix_tokens=32, hp_recent_tokens=128,
+                dtype="int2", head_num=2, head_dim=64, layer_num=1, device="cpu", enable_memory_saver=False,
+                max_req_slots=8, v_head_dim=64, start_layer=0, end_layer=0, model_dtype=torch.bfloat16,
+                kv_cache_quant_group_size=None, scale_dtype=torch.float32, num_hp_prefix_slots=64,
+            )
+    books = torch.load(os.path.join(_DIR, "ph_rank.pt"))["codebooks_per_layer"]
+    assert pool.pq_k_codebook(0).shape == (2, 8, 16, 8)
+    torch.testing.assert_close(pool.pq_k_codebook(0).float(), books[0, 2:4].to(torch.float16).float())
+
+
+@gpu
+def test_per_head_codebooks_replicated_match_the_shared_pool():
+    """A per-head file whose heads all hold the per-layer codebook must give the
+    same codes, the same decode (ADC and reconstruct) and the same prefix
+    dequantization as the shared file: the head stride is the only difference."""
+    from sglang.srt.layers.attention.quantized_kv_prefill import dequantize_prefix_kv
+    from sglang.srt.layers.attention.triton_ops.decode_attention_pq import decode_attention_fwd_pq_unified
+
+    pools = {
+        "shared": _make_pool(k_codebook=_codebook_path("eq_k", head_dim=64, layer_num=1), v_codebook=_codebook_path("eq_v", head_dim=64, layer_num=1)),
+        "per_head": _make_pool(
+            k_codebook=_per_head_codebook_path("eq_k_ph", head_dim=64, layer_num=1, kv_heads=2, replicate=True),
+            v_codebook=_per_head_codebook_path("eq_v_ph", head_dim=64, layer_num=1, kv_heads=2, replicate=True),
+        ),
+    }
+    assert pools["per_head"].pq_k_codebook(0).dim() == 4 and pools["shared"].pq_k_codebook(0).dim() == 3
+    torch.manual_seed(7)
+    k = torch.randn(4, 2, 64, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(4, 2, 64, dtype=torch.bfloat16, device="cuda")
+    locs = torch.tensor([4, 5, 6, 7], dtype=torch.int64, device="cuda")
+    hp_k = torch.randn(2, 2, 64, dtype=torch.bfloat16, device="cuda")
+    hp_v = torch.randn(2, 2, 64, dtype=torch.bfloat16, device="cuda")
+    for pool in pools.values():
+        _write_quant(pool, locs, k, v)
+        pool.hp_k_buffer[0][0:2] = hp_k
+        pool.hp_v_buffer[0][0:2] = hp_v
+    torch.cuda.synchronize()
+    assert torch.equal(pools["shared"].k_buffer[0][locs], pools["per_head"].k_buffer[0][locs])
+    assert torch.equal(pools["shared"].v_buffer[0][locs], pools["per_head"].v_buffer[0][locs])
+
+    bs, q_heads = 2, 12
+    q = torch.randn(bs, q_heads, 64, dtype=torch.bfloat16, device="cuda")
+    hp_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+    hp_indices = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    quant_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda")
+    quant_indices = torch.full((16,), 10_000, dtype=torch.int64, device="cuda")
+    quant_indices[:4] = locs
+    ones = torch.ones((bs,), dtype=torch.int32, device="cuda")
+    attn_logits = torch.empty((bs, q_heads, 2, 64), dtype=torch.float32, device="cuda")
+    attn_lse = torch.empty((bs, q_heads, 2), dtype=torch.float32, device="cuda")
+    for adc in (0, 1):
+        outs = {}
+        with envs.SGLANG_OSCAR_PQ_USE_ADC.override(adc):
+            for name, pool in pools.items():
+                out = torch.empty_like(q)
+                decode_attention_fwd_pq_unified(
+                    q, pool.hp_k_buffer[0], pool.hp_v_buffer[0], pool.k_buffer[0], pool.v_buffer[0],
+                    pool.v_scales_zeros[0], out, hp_indptr, hp_indices, quant_indptr, quant_indices,
+                    attn_logits, attn_lse, ones, ones, 1, 1, 64**-0.5,
+                    k_codebook=pool.pq_k_codebook(0), v_codebook=pool.pq_v_codebook(0),
+                )
+                torch.cuda.synchronize()
+                outs[name] = out.clone()
+        torch.testing.assert_close(outs["per_head"], outs["shared"], atol=1e-6, rtol=0)
+    hp_off = pools["shared"].hp_global_offset
+    prefix = torch.tensor([hp_off, 4, 5, hp_off + 1, 6, 7], dtype=torch.int64, device="cuda")
+    ks, vs = dequantize_prefix_kv(pools["shared"], 0, prefix, torch.bfloat16)
+    kp, vp = dequantize_prefix_kv(pools["per_head"], 0, prefix, torch.bfloat16)
+    torch.cuda.synchronize()
+    assert torch.equal(ks, kp) and torch.equal(vs, vp)
+
+
+@gpu
+def test_per_head_codebooks_encode_each_head_with_its_own_book():
+    from sglang.QuantKernel.oscar_pq_kv import pq_decode_rows, pq_encode_decode_reference
+
+    pool = _make_pool(k_codebook=_per_head_codebook_path("own_k_ph", head_dim=64, layer_num=1, kv_heads=2))
+    torch.manual_seed(11)
+    k = torch.randn(6, 2, 64, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(6, 2, 64, dtype=torch.bfloat16, device="cuda")
+    locs = torch.arange(4, 10, dtype=torch.int64, device="cuda")
+    _write_quant(pool, locs, k, v)
+    torch.cuda.synchronize()
+    book = pool.pq_k_codebook(0)
+    assert book.shape == (2, 8, 16, 8)
+    recon = pq_decode_rows(pool.k_buffer[0][locs], book, head_dim=64).float().cpu()
+    for h in range(2):
+        ref = pq_encode_decode_reference(k[:, h].float().cpu(), book[h].float().cpu())
+        torch.testing.assert_close(recon[:, h], ref, atol=2e-2, rtol=2e-2)
+    # the two heads' books differ, so a head decoded with the other head's book does not match
+    other = pq_encode_decode_reference(k[:, 0].float().cpu(), book[1].float().cpu())
+    assert not torch.allclose(recon[:, 0], other, atol=2e-2, rtol=2e-2)

@@ -22,12 +22,14 @@ from sglang.QuantKernel.oscar_pq_kv import pq_code_width, pq_codebook_norms
 
 
 class PQCodebookHeader(msgspec.Struct, frozen=True, kw_only=True):
-    kind: str  # "per_layer" | "residual" | "shared"
+    kind: str  # "per_layer" | "per_head" | "residual" | "shared"
     n_sub: int
     n_centroids: int
     sub_dim: int
     layer_ids: Optional[list[int]] = None
     stage2_centroids: int = 0
+    # "per_head": codebooks_per_layer is [layers, kv_heads, n_sub, C, d].
+    kv_heads: int = 0
 
     @property
     def stage1_code_width(self) -> int:
@@ -82,6 +84,8 @@ class PQCodebookSet(msgspec.Struct, frozen=True, kw_only=True):
     def describe(self, head_dim: int) -> str:
         bits = 8.0 * self.code_bytes / head_dim
         text = f"n_sub={self.n_sub} centroids={self.header.n_centroids} {bits:.2f} bits/value"
+        if self.header.kind == "per_head":
+            text += f" (per-head codebooks, {self.codebooks[0].shape[0]} local KV heads)"
         if self.residual:
             text += f" (residual stage, {self.header.stage2_centroids} centroids)"
         return text
@@ -116,6 +120,7 @@ def read_pq_codebook_header(data: dict, *, expected_head_dim: int, label: str) -
     """Validate a loaded codebook file against the row geometry."""
     stage2_centroids = 0
     layer_ids = None
+    kv_heads = 0
     if "codebooks_stage1" in data:
         kind = "residual"
         stage1 = data["codebooks_stage1"]
@@ -138,13 +143,18 @@ def read_pq_codebook_header(data: dict, *, expected_head_dim: int, label: str) -
             data.get("layer_ids", list(range(int(stage1.shape[0])))), int(stage1.shape[0]), label
         )
     elif "codebooks_per_layer" in data:
-        kind = "per_layer"
         books = data["codebooks_per_layer"]
-        if books.ndim != 4:
+        if books.ndim == 5:
+            kind = "per_head"
+            kv_heads = int(books.shape[1])
+        elif books.ndim == 4:
+            kind = "per_layer"
+        else:
             raise ValueError(
-                f"{label} codebooks_per_layer must be rank 4, got shape={tuple(books.shape)}"
+                f"{label} codebooks_per_layer must be rank 4 (per layer) or 5 (per layer "
+                f"and KV head), got shape={tuple(books.shape)}"
             )
-        n_sub, n_centroids, sub_dim = (int(x) for x in books.shape[1:])
+        n_sub, n_centroids, sub_dim = (int(x) for x in books.shape[-3:])
         layer_ids = _as_int_layer_ids(
             data.get("layer_ids", list(range(int(books.shape[0])))), int(books.shape[0]), label
         )
@@ -183,6 +193,7 @@ def read_pq_codebook_header(data: dict, *, expected_head_dim: int, label: str) -
         sub_dim=sub_dim,
         layer_ids=layer_ids,
         stage2_centroids=stage2_centroids,
+        kv_heads=kv_heads,
     )
 
 
@@ -210,9 +221,17 @@ def _select_layers(
 
 
 def load_pq_codebook_set(
-    path: str, *, head_dim: int, layer_ids: Sequence[int], device, label: str
+    path: str,
+    *,
+    head_dim: int,
+    layer_ids: Sequence[int],
+    device,
+    label: str,
+    head_slice: Optional[tuple[int, int]] = None,
 ) -> PQCodebookSet:
-    """Load the codebooks for ``layer_ids`` (global ids, pool order) onto ``device``."""
+    """Load the codebooks for ``layer_ids`` (global ids, pool order) onto
+    ``device``; a per-head file keeps only ``head_slice = (start, count)`` of
+    its KV heads (this rank's shard) when given."""
     data = _load_file(path)
     header = read_pq_codebook_header(data, expected_head_dim=head_dim, label=label)
     dev = torch.device(device)
@@ -231,6 +250,13 @@ def load_pq_codebook_set(
         codebooks = [
             _place(b) for b in _select_layers(data[key], header.layer_ids, layer_ids, label)
         ]
+        if header.kind == "per_head" and head_slice is not None:
+            start, count = head_slice
+            if start < 0 or start + count > header.kv_heads:
+                raise ValueError(
+                    f"{label} head slice [{start}, {start + count}) outside {header.kv_heads} KV heads"
+                )
+            codebooks = [b[start : start + count].contiguous() for b in codebooks]
         norms = [pq_codebook_norms(b) for b in codebooks]
         if header.kind == "residual":
             stage2_codebooks = [
