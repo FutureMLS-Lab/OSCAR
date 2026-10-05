@@ -34,7 +34,12 @@ export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND
 # training length, 131072 max) and widen the window. Applied identically to
 # the INT2 and BF16 arms, so their comparison is unaffected.
 _req_ctx=$(( ${MAX_NEW_TOKENS:-32768} > ${BENCH_PREFILL_TOKENS:-0} ? ${MAX_NEW_TOKENS:-32768} : ${BENCH_PREFILL_TOKENS:-0} ))
-if (( _req_ctx > 32768 )); then
+if (( _req_ctx > 32768 )) && [ "${QWEN3_LONG_ROPE:-yarn}" = native ]; then
+  # native RoPE extrapolated past 40960; the window must still be widened or every 64K request gets a 400
+  export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+  export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-} --context-length $(( _req_ctx + 1024 ))"
+  echo "[run] requested context ${_req_ctx} > native 40960: QWEN3_LONG_ROPE=native, no YaRN, --context-length $(( _req_ctx + 1024 ))"
+elif (( _req_ctx > 32768 )); then
   # Three keys, not one. The first attempt set only the v4 key `rope_scaling`
   # and it never reached the model: under transformers 5 sglang reads
   # `config.rope_parameters` (get_rope_config), so the dense models silently
