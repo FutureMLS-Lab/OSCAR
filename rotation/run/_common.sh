@@ -16,6 +16,15 @@ ZOO="${ZOO:-${OSCAR_ROTATIONS:-$HERE/OSCAR-RotationZoo}/zoo}"
 
 need_rot() {
   local dir="$1"
+  if [ "${STARTUP_CALIBRATE:-0}" = 1 ]; then
+    # the pool calibrates the pair at server start when the named files are absent and writes them here;
+    # the server then runs under exactly the rope/window configuration the rotations were fitted for
+    mkdir -p "$dir"
+    export K_ROTATION_FILE=k_rotation_qqt_r_h_pbr.pt V_ROTATION_FILE=v_rotation_sst_r_h_pbr.pt
+    export K_ROT_FILENAME="$K_ROTATION_FILE" V_ROT_FILENAME="$V_ROTATION_FILE"
+    echo "[run] rotations: startup calibration into $dir ($([ -f "$dir/$K_ROTATION_FILE" ] && echo present || echo missing))"
+    return
+  fi
   if [ -n "${K_ROTATION_FILE:-}" ] || [ -n "${V_ROTATION_FILE:-}" ]; then
     for f in "${K_ROTATION_FILE:?}" "${V_ROTATION_FILE:?}"; do
       [ -f "$dir/$f" ] || { echo "FATAL: missing $dir/$f (named explicitly)"; exit 1; }
