@@ -67,7 +67,8 @@ while IFS='|' read -r name kind repo tp a rot sink recent mf quant; do
     esac
     export NO_AUTOTUNE=1
     export KV_QUANT="${quant:-int2}"
-    bash "$D/mha.sh" "$name" "$repo" "$tp" "$a" "$rot" "$sink" "$recent" "$mf" \
+    # VERIFY_EXTRA reaches mha.sh as its extra server arguments (e.g. a larger prefill chunk for long calibration prompts)
+    bash "$D/mha.sh" "$name" "$repo" "$tp" "$a" "$rot" "$sink" "$recent" "$mf" "${VERIFY_EXTRA:-}" \
       < /dev/null 2>&1 | tee "$OUT/$name.out" | tail -22
   else
     case "$name" in
