@@ -81,6 +81,11 @@ def main() -> int:
     ap.add_argument("--score-from", type=int, default=4096)
     ap.add_argument("--max-windows", type=int, default=0, help="0 = every full window")
     ap.add_argument("--bos", action="store_true", help="prepend the tokenizer's BOS token to every window (Gemma scores garbage without <bos>; window length is kept)")
+    ap.add_argument("--chat-wrap", default=None, metavar="INSTRUCTION",
+                    help="score every window as the model turn of a chat: the rendered template of this user "
+                         "instruction (with the generation prompt) is prepended and only the window's tokens are "
+                         "scored. Chat-only models (Gemma-4-12B-it: plain text after <bos> scores PPL 400+, the same "
+                         "text as a model turn ~9) have no other PPL protocol. The server context must cover the prefix.")
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--text-file", default=None, help="score this file instead of WikiText-2")
     ap.add_argument("--out", required=True)
@@ -100,9 +105,19 @@ def main() -> int:
         if bos is None:
             raise SystemExit("--bos given but the tokenizer has no BOS token")
         windows = [[bos] + w[:-1] for w in windows]
+    score_from = a.score_from
+    if a.chat_wrap:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+        prefix = tok.apply_chat_template([{"role": "user", "content": a.chat_wrap}], add_generation_prompt=True, tokenize=True)
+        prefix = list(prefix["input_ids"]) if hasattr(prefix, "keys") else list(prefix)
+        print(f"[ppl] chat-wrap: {len(prefix)}-token prefix {tok.decode(prefix)!r} before every window; scoring window tokens >= {score_from}", flush=True)
+        windows = [prefix + w for w in windows]
+        score_from += len(prefix)
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
-        outs = list(ex.map(lambda w: score_window(base, w, a.score_from), windows))
+        outs = list(ex.map(lambda w: score_window(base, w, score_from), windows))
     nll = sum(o[0] for o in outs)
     ntok = sum(o[1] for o in outs)
     res = {
@@ -112,6 +127,7 @@ def main() -> int:
         "windows": n_win,
         "seq_len": a.seq_len,
         "score_from": a.score_from,
+        "chat_wrap": a.chat_wrap,
         "sec": time.time() - t0,
         "model": a.model,
     }
