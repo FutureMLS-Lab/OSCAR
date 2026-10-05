@@ -25,6 +25,13 @@ OUT=${OUT:-/scratch/v}; mkdir -p "$OUT"
 # leftover allocation is charged to the next model: it once made a 12B report
 # 79 GiB in use and sent the diagnosis down the wrong path.
 verify_drain_gpus() {
+  # VERIFY_NO_DRAIN=1: the pod hosts other servers (a parallel PPL pipeline, a
+  # GPQA arm); killing every launch_server or waiting for every GPU to empty
+  # would take them down, so the launch proceeds on its own GPUs.
+  if [ "${VERIFY_NO_DRAIN:-0}" = "1" ]; then
+    echo "  gpu drain skipped (VERIFY_NO_DRAIN=1)"
+    return 0
+  fi
   pkill -f "sglang.launch_server" 2>/dev/null
   sleep 15
   local u=
