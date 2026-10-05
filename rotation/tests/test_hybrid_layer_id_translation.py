@@ -74,3 +74,27 @@ def test_plain_mha_pool_does_not_advertise_accessors():
             f"{name} leaked into MHATokenToKVPool -- hasattr() will pick it up "
             "and it would AttributeError on self.full_kv_pool"
         )
+
+
+PQ_ACCESSORS = ("pq_k_codebook", "pq_k_codebook2", "pq_v_codebook", "get_raw_key_buffer2")
+
+
+def test_pq_codebook_accessors_translate_sparse_ids():
+    """PQ codebooks are per full-attention layer in the inner pool; the wrapper
+    must hand it the local index (the novakv arm on Qwen3.5-4B raised
+    IndexError from pq_k_codebook with the global id)."""
+    stub = _stub()
+    inner = stub.full_kv_pool
+    books = [f"book{i}" for i in range(12)]
+    inner.pq_k_codebook = lambda i: books[i]
+    inner.pq_k_codebook2 = lambda i: None
+    inner.pq_v_codebook = lambda i: f"v{books[i]}"
+    inner.get_raw_key_buffer2 = lambda i: f"codes2-{i}"
+    stub._wait_for_layer = lambda layer_id: None
+    for name in PQ_ACCESSORS:
+        assert name in HybridLinearKVPool.__dict__, f"{name} must be a translated method on the wrapper"
+    get = lambda name: HybridLinearKVPool.__dict__[name].__get__(stub)  # noqa: E731
+    assert get("pq_k_codebook")(3) == "book0" and get("pq_k_codebook")(11) == "book2"
+    assert get("pq_v_codebook")(47) == "vbook11"
+    assert get("pq_k_codebook2")(7) is None
+    assert get("get_raw_key_buffer2")(7) == "codes2-1"

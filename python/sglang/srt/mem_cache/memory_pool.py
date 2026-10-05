@@ -4630,6 +4630,22 @@ class HybridLinearKVPool(KVCache):
             self._transfer_full_attention_id(layer_id)
         )
 
+    # PQ codebooks are per full-attention layer in the inner pool: the same
+    # sparse->local translation, or a hybrid model indexes them with a global
+    # id (IndexError in pq_k_codebook on Qwen3.5-4B's novakv arm).
+    def pq_k_codebook(self, layer_id: int):
+        return self.full_kv_pool.pq_k_codebook(self._transfer_full_attention_id(layer_id))
+
+    def pq_k_codebook2(self, layer_id: int):
+        return self.full_kv_pool.pq_k_codebook2(self._transfer_full_attention_id(layer_id))
+
+    def pq_v_codebook(self, layer_id: int):
+        return self.full_kv_pool.pq_v_codebook(self._transfer_full_attention_id(layer_id))
+
+    def get_raw_key_buffer2(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_raw_key_buffer2(self._transfer_full_attention_id(layer_id))
+
     # gemma4's per-layer geometry accessors need the same sparse->local
     # translation as the buffer getters above; without it a hybrid model
     # (Qwen3.5: full-attn layers 3, 7, 11, ...) indexes the per-layer lists
