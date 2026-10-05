@@ -24,15 +24,15 @@ export V_ROTATION_FILE="${V_ROTATION_FILE:-v_rotation_perhead.pt}"
 ROT_DIR="${ROT_DIR:-$ZOO/Qwen3-30B-A3B}"; need_rot "$ROT_DIR"
 export ROT_DIR MODEL="${MODEL:-Qwen/Qwen3-30B-A3B}" TP_SIZE="${TP_SIZE:-2}"
 export GROUP_SIZE="${GROUP_SIZE:-128}"
-# 128/1024, not 64/256. This model holds only 4 KV heads, and the window is the
-# dominant term in its accuracy -- GPQA rises monotonically with it:
+# 128/512. This model holds only 4 KV heads, and the window is the dominant
+# term in its accuracy -- GPQA rose monotonically with it in the window sweep:
 #   64/256   55.56      (the old default)
 #   64/512   60.61
 #   128/1024 62.12      against a BF16 baseline of 61.01
-# The 5.5 pp that used to be recorded as a quantization loss was the window
-# being too small; at 128/1024 INT2 is 1.1 pp AHEAD of BF16.
+# The recipe caps the BF16 recent window at 512 tokens across models
+# (2026-10-05); the 128/1024 numbers above are the sweep's, not the recipe's.
 export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-128}"
-export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-1024}"
+export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
 export DISABLE_RADIX="${DISABLE_RADIX:-0}"
 export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND:-triton}"
 # Qwen3 (not 3.5, not the 2507 -Thinking) is trained to 40960 positions. A 64K

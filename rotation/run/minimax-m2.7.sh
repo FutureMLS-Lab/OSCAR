@@ -22,13 +22,12 @@ case "$(( 1536 % (TP_SIZE * 128) ))" in
 esac
 export GROUP_SIZE="${GROUP_SIZE:-128}"
 export SGLANG_MIXED_KV_PREFIX_TOKENS="${SGLANG_MIXED_KV_PREFIX_TOKENS:-128}"
-# 128/1024. GPQA against a BF16 baseline of 83.33:
+# 128/512. The window sweep (GPQA against a BF16 baseline of 83.33):
 #     64/256    80.30   (old default)
 #     128/1024  83.33   -- exactly the baseline, delta 0.00
-# The 3 pp previously charged to 2-bit KV was the window. Each model saturates
-# at its own size -- Qwen3-30B-A3B at 128/1024, Qwen3-8B only at 128/2048 -- so
-# this is swept per model rather than copied.
-export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-1024}"
+# The recipe caps the BF16 recent window at 512 tokens across models
+# (2026-10-05); the sweep numbers above are not the recipe's.
+export SGLANG_MIXED_KV_RECENT_TOKENS="${SGLANG_MIXED_KV_RECENT_TOKENS:-512}"
 export LLOYD_MAX="${LLOYD_MAX:-1}"
 export DISABLE_RADIX="${DISABLE_RADIX:-0}"   # prefix cache ON by default
 export ATTN_BACKEND="${ATTN_BACKEND:-triton}" PREFILL_BACKEND="${PREFILL_BACKEND:-triton}"
