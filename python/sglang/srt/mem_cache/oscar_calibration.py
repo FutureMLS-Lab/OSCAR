@@ -471,6 +471,9 @@ class OscarOnlineCalibrator:
         positions = self._positions[layer_id]
         samples = self._q_samples[layer_id]
         rho = torch.zeros((self.local_kv_heads, gqa, gqa), dtype=torch.float64, device=self.device)
+        # One device copy of the layer's keys; slicing the host tensor per sample converted up to a whole
+        # prompt on one CPU thread each time (hours for 50K-token calibration prompts).
+        keys_all = self._k_values[layer_id][: self.token_budget].to(self.device, non_blocking=True)
         n = 0
         for s in range(samples.shape[0]):
             r = s * _RHO_QUERY_STRIDE
@@ -479,7 +482,7 @@ class OscarOnlineCalibrator:
             start = r - int(positions[r])
             if start < 0 or int(positions[start]) != 0:
                 continue
-            keys = self._k_values[layer_id][start : r + 1].to(self.device, dtype=torch.float32)
+            keys = keys_all[start : r + 1].to(torch.float32)
             q_s = samples[s].to(self.device).reshape(self.local_kv_heads, gqa, self.head_dim)
             logits = torch.einsum("hjd,lhd->hjl", q_s, keys) * self._scaling[layer_id]
             a = torch.softmax(logits, dim=-1)
