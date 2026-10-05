@@ -48,6 +48,8 @@ MD=$(verify_download "$REPO")
 verify_drain_gpus
 verify_release_page_cache
 
+# VERIFY_GPUS: the GPUs this launch may use (default 0..TP-1), so several harness
+# runs can share a pod without landing on the same cards.
 PORT=$((34000 + RANDOM % 1500))
 # radix cache ON (no --disable-radix-cache) and cuda graph ON (no
 # --disable-cuda-graph) -- that is the whole point of this run.
@@ -58,7 +60,7 @@ SGLANG_MIXED_KV_PREFIX_TOKENS=$SINK SGLANG_MIXED_KV_RECENT_TOKENS=$RECENT \
 SGLANG_OSCAR_K_ROTATION_PATH=$KROT SGLANG_OSCAR_V_ROTATION_PATH=$VROT \
 SGLANG_OSCAR_K_QUANTIZER=$K_QUANTIZER SGLANG_OSCAR_V_QUANTIZER=$V_QUANTIZER \
 SGLANG_OSCAR_PQ_K_CODEBOOK=$PQ_K_CB SGLANG_OSCAR_PQ_V_CODEBOOK=$PQ_V_CB \
-CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP-1))) \
+CUDA_VISIBLE_DEVICES=${VERIFY_GPUS:-$(seq -s, 0 $((TP-1)))} \
 python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
   --tp-size "$TP" --port $PORT --host 127.0.0.1 \
   --attention-backend triton --prefill-attention-backend triton \

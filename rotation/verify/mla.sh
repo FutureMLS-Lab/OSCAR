@@ -32,7 +32,7 @@ SGLANG_OSCAR_MLA_KV_GROUP_SIZE=128 \
 SGLANG_OSCAR_MLA_KV_PACKED=1 SGLANG_OSCAR_MLA_PACKED_SELFCHECK=0 \
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=64 SGLANG_MIXED_KV_RECENT_TOKENS=512 \
-CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP-1))) \
+CUDA_VISIBLE_DEVICES=${VERIFY_GPUS:-$(seq -s, 0 $((TP-1)))} \
 python3 -m sglang.launch_server --model-path "$MD" --trust-remote-code \
   --tp-size "$TP" --port $PORT --host 127.0.0.1 \
   --attention-backend "${ATTN_BACKEND:-triton}" --prefill-attention-backend "${ATTN_BACKEND:-triton}" \
