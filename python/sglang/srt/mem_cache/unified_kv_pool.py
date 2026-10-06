@@ -499,9 +499,12 @@ class UnifiedInt2HPKVPool(KVCache):
                 _ph_global,
                 self._k_clip_layer,
             )
-            local = _shard_head_vectors([_ph[i] for i in range(self.layer_num)], head_num, _ph_rank, _ph_tp)
+            # [L, global heads] -> this rank's [local heads] per layer (1-D rows: _shard_head_vectors only slices 2-D ones).
+            if _ph.shape[1] != head_num:
+                beg = _head_shard_start(int(_ph.shape[1]), head_num, _ph_rank, _ph_tp)
+                _ph = _ph[:, beg : beg + head_num]
             self._k_clip_idx_layer = [
-                clip_ratio_to_index(local[i], self.head_dim).to(torch.device(self.device)) for i in range(self.layer_num)
+                clip_ratio_to_index(_ph[i], self.head_dim).to(torch.device(self.device)) for i in range(self.layer_num)
             ]
         self._create_arenas()
 

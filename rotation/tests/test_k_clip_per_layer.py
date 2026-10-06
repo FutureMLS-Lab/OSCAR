@@ -40,3 +40,11 @@ with tempfile.TemporaryDirectory() as d:
 idx = clip_ratio_to_index(torch.tensor([0.96, 0.90, 0.85, 0.80, 1.0, 0.0], dtype=torch.float64), 128)
 assert idx.dtype == torch.int32 and idx.tolist() == [122, 115, 108, 102, 127, 0], idx.tolist()   # int(ratio*128), clamped
 print("k_clip_per_head OK")
+
+# TP sharding of the per-head table: [L, 4 global heads] -> rank r of TP2 keeps heads [2r, 2r+2) (the v114 arms on TP2
+# models died with "per-head clip index must be int32 [2], got (4,)": the 1-D rows were not sliced)
+from sglang.srt.mem_cache.memory_pool import _head_shard_start
+tbl = torch.tensor([[0.80, 0.85, 0.90, 0.93]] * 3, dtype=torch.float64)
+for rank, want in ((0, [0.80, 0.85]), (1, [0.90, 0.93])):
+    beg = _head_shard_start(4, 2, rank, 2); assert tbl[:, beg:beg + 2][0].tolist() == want, (rank, beg)
+print("per-head table sharding OK")
