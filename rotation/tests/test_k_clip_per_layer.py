@@ -22,3 +22,21 @@ assert split_layers_by_clip([0, 1, 2, 3, 4, 5], clips) == [(0.9, [0, 1]), (0.85,
 assert split_layers_by_clip([1, 3, 5], clips) == [(0.9, [1]), (0.85, [3]), (0.93, [5])]
 assert split_layers_by_clip([0, 1], [0.96, 0.96]) == [(0.96, [0, 1])], "uniform clip keeps one group (unchanged behaviour)"
 print("k_clip_per_layer OK")
+
+# per-head table: JSON {"<layer>,<head>": ratio} over GLOBAL heads, missing heads keep the layer clip; ratio -> kernel index
+from sglang.srt.mem_cache.unified_kv_pool import parse_k_clip_per_head, clip_ratio_to_index
+import torch
+with tempfile.TemporaryDirectory() as d:
+    f = os.path.join(d, "ph.json"); json.dump({"4,0": 0.80, "4,3": 0.93, "9,1": 0.85, "99,0": 0.5}, open(f, "w"))
+    t = parse_k_clip_per_head(f, ids, 4, [0.9] * 6)
+    assert t.shape == (6, 4) and t[0].tolist() == [0.80, 0.9, 0.9, 0.93] and t[5].tolist() == [0.9, 0.85, 0.9, 0.9], t
+    assert t[1:5].eq(0.9).all(), "unnamed layers keep the layer clip"
+    assert parse_k_clip_per_head("", ids, 4, [0.9] * 6) is None
+    bad = os.path.join(d, "bad.json"); json.dump({"4,7": 0.9}, open(bad, "w"))
+    try:
+        parse_k_clip_per_head(bad, ids, 4, [0.9] * 6); raise AssertionError("expected a head range error")
+    except ValueError:
+        pass
+idx = clip_ratio_to_index(torch.tensor([0.96, 0.90, 0.85, 0.80, 1.0, 0.0], dtype=torch.float64), 128)
+assert idx.dtype == torch.int32 and idx.tolist() == [122, 115, 108, 102, 127, 0], idx.tolist()   # int(ratio*128), clamped
+print("k_clip_per_head OK")

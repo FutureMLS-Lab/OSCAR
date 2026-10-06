@@ -169,6 +169,36 @@ def parse_k_clip_per_layer(spec: str, global_layer_ids, default: float) -> list:
     return out
 
 
+def parse_k_clip_per_head(spec: str, global_layer_ids, global_kv_heads, layer_clips):
+    """Per-(layer, head) K clip ratios from a JSON object {"<global layer id>,<global kv head>": ratio};
+    heads the spec does not name keep ``layer_clips[i]``. Returns None for an empty spec, else a
+    float64 tensor [L, global_kv_heads] (global head order; the caller shards it per TP rank)."""
+    if not spec:
+        return None
+    with open(spec) as f:
+        raw = json.load(f)
+    ids = [int(g) for g in global_layer_ids]
+    out = torch.tensor([[float(c)] * int(global_kv_heads) for c in layer_clips], dtype=torch.float64)
+    pos = {gid: i for i, gid in enumerate(ids)}
+    for key, val in raw.items():
+        lid, h = (int(x) for x in str(key).split(","))
+        if lid not in pos:
+            continue
+        if not (0 <= h < int(global_kv_heads)):
+            raise ValueError(f"SGLANG_OSCAR_K_CLIP_PER_HEAD: head {h} out of range for layer {lid}")
+        r = float(val)
+        if not (0.0 < r <= 1.0):
+            raise ValueError(f"SGLANG_OSCAR_K_CLIP_PER_HEAD: layer {lid} head {h} clip {r} is not in (0, 1]")
+        out[pos[lid], h] = r
+    return out
+
+
+def clip_ratio_to_index(ratios: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """The kernels' ``int(ratio * head_dim)`` clamped to [0, head_dim - 1], as int32."""
+    idx = (ratios.to(torch.float64) * head_dim).floor().to(torch.int64).clamp_(0, head_dim - 1)
+    return idx.to(torch.int32)
+
+
 def split_layers_by_clip(local_ids, clips):
     """Consecutive runs of layers sharing one clip ratio, in order: the flush
     kernel takes the clip as a compile-time index, one launch per run."""
@@ -449,6 +479,30 @@ class UnifiedInt2HPKVPool(KVCache):
             [self.start_layer + i for i in range(self.layer_num)],
             self._k_clip_ratio,
         )
+        # Per-(layer, head) K clip indices (local layer index -> int32 [local heads] on device), or None.
+        # Read here, before the arenas, because the flush groups carry the tables.
+        self._k_clip_idx_layer = None
+        if envs.SGLANG_OSCAR_K_CLIP_PER_HEAD.get():
+            if layer_groups is not None:
+                raise ValueError("SGLANG_OSCAR_K_CLIP_PER_HEAD is not supported on two-geometry pools yet")
+            _ph_rank = get_parallel().attn_tp_rank
+            try:
+                _ph_tp = get_parallel().attn_tp_size
+            except RuntimeError:
+                _ph_tp = 0
+            # Global KV-head count = this rank's heads x TP width (plain shards; replicated
+            # heads, i.e. fewer KV heads than ranks, are not supported for the per-head table).
+            _ph_global = head_num * max(1, _ph_tp)
+            _ph = parse_k_clip_per_head(
+                envs.SGLANG_OSCAR_K_CLIP_PER_HEAD.get(),
+                [self.start_layer + i for i in range(self.layer_num)],
+                _ph_global,
+                self._k_clip_layer,
+            )
+            local = _shard_head_vectors([_ph[i] for i in range(self.layer_num)], head_num, _ph_rank, _ph_tp)
+            self._k_clip_idx_layer = [
+                clip_ratio_to_index(local[i], self.head_dim).to(torch.device(self.device)) for i in range(self.layer_num)
+            ]
         self._create_arenas()
 
         # Cached attributes used by the rest of the stack.
@@ -592,7 +646,8 @@ class UnifiedInt2HPKVPool(KVCache):
                 " per-layer k_clip %s" % sorted({round(c, 4) for c in self._k_clip_layer})
                 if any(c != self._k_clip_ratio for c in self._k_clip_layer)
                 else ""
-            ),
+            )
+            + (" per-head k_clip on" if self._k_clip_idx_layer is not None else ""),
         )
         # Startup calibration: the identity stacks above are overwritten in
         # place once the collector attached below has seen its prompts.
@@ -1209,6 +1264,11 @@ class UnifiedInt2HPKVPool(KVCache):
                         "k_sz_sample": self.k_scales_zeros[l0],
                         "v_sz_sample": self.v_scales_zeros[l0],
                         "k_clip_ratio": float(_clip),
+                        "k_clip_idx": (
+                            None
+                            if self._k_clip_idx_layer is None
+                            else torch.stack([self._k_clip_idx_layer[l] for l in local_ids], dim=0)
+                        ),
                     }
                 )
 
@@ -1436,6 +1496,7 @@ class UnifiedInt2HPKVPool(KVCache):
                 k_clip,
                 self._v_clip_ratio,
                 hp_global_offset=mixed_hp_offset,
+                k_clip_idx=None if self._k_clip_idx_layer is None else self._k_clip_idx_layer[idx],
             )
             return
 
@@ -1476,6 +1537,7 @@ class UnifiedInt2HPKVPool(KVCache):
             self._v_clip_ratio,
             hp_global_offset=mixed_hp_offset,
             lloyd_max=self._lloyd_max,
+            k_clip_idx=None if self._k_clip_idx_layer is None else self._k_clip_idx_layer[idx],
         )
 
     def _set_mixed_hp_kv_buffer(

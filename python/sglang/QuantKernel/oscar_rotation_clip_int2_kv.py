@@ -18,7 +18,7 @@ constexprs (``-1`` disables clip).
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import warnings
 
 import torch
@@ -55,14 +55,21 @@ def _pretransformed_int2_set_kv_clip_single_kernel(
     sz_stride_loc,
     sz_stride_head,
     sz_stride_dim,
+    clip_idx_ptr,
     HP_OFFSET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_QUARTER: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
     CLIP_INDEX: tl.constexpr,
+    CLIP_PER_HEAD: tl.constexpr,
     LLOYD_MAX: tl.constexpr,
 ):
     """Multi-row fused threshold + single-scale clip + int2 pack.
+
+    ``CLIP_PER_HEAD`` reads this head's clip index from ``clip_idx_ptr``
+    (int32 [num_heads]) instead of the ``CLIP_INDEX`` constexpr; the
+    threshold pick is a masked sum either way, so the per-head path costs
+    one scalar load.
 
     Each program handles ``BLOCK_TOK`` consecutive tokens for the same head
     and loads a ``[BLOCK_TOK, HEAD_DIM]`` row tile in one shot. The launcher
@@ -99,7 +106,17 @@ def _pretransformed_int2_set_kv_clip_single_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    if CLIP_INDEX >= 0:
+    if CLIP_PER_HEAD:
+        cidx = tl.load(clip_idx_ptr + head_idx)
+        abs_rows = tl.abs(rows)
+        sorted_rows = tl.sort(abs_rows)
+        pick = (full_offs == cidx)[None, :]
+        thr = tl.sum(tl.where(pick, sorted_rows, 0.0), axis=1)  # [BLOCK_TOK]
+        rows = tl.minimum(
+            tl.maximum(rows, -thr[:, None]),
+            thr[:, None],
+        )
+    elif CLIP_INDEX >= 0:
         abs_rows = tl.abs(rows)
         sorted_rows = tl.sort(abs_rows)
         pick = (full_offs == CLIP_INDEX)[None, :]
@@ -218,6 +235,7 @@ def _pretransformed_int2_set_kv_clip_grouped_kernel(
     sz_stride_loc,
     sz_stride_head,
     sz_stride_dim,
+    clip_idx_ptr,
     HEAD_DIM: tl.constexpr,
     BLOCK_QUARTER: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
@@ -225,6 +243,7 @@ def _pretransformed_int2_set_kv_clip_grouped_kernel(
     HP_OFFSET: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
     CLIP_INDEX: tl.constexpr,
+    CLIP_PER_HEAD: tl.constexpr,
 ):
     """Multi-row fused threshold + groupwise clip + int2 pack.
 
@@ -259,7 +278,17 @@ def _pretransformed_int2_set_kv_clip_grouped_kernel(
         other=0.0,
     ).to(tl.float32)  # [BLOCK_TOK, HEAD_DIM]
 
-    if CLIP_INDEX >= 0:
+    if CLIP_PER_HEAD:
+        cidx = tl.load(clip_idx_ptr + head_idx)
+        abs_acc = tl.abs(acc)
+        sorted_acc = tl.sort(abs_acc)
+        pick = (full_offs == cidx)[None, :]
+        thr = tl.sum(tl.where(pick, sorted_acc, 0.0), axis=1)  # [BLOCK_TOK]
+        acc = tl.minimum(
+            tl.maximum(acc, -thr[:, None]),
+            thr[:, None],
+        )
+    elif CLIP_INDEX >= 0:
         abs_acc = tl.abs(acc)
         sorted_acc = tl.sort(abs_acc)
         pick = (full_offs == CLIP_INDEX)[None, :]
@@ -332,6 +361,29 @@ def _can_use_grouped_clip_kernel(
     return _is_power_of_two(num_groups) and _is_power_of_two(group_size)
 
 
+def _clip_idx_arg(clip_idx: Optional[torch.Tensor], num_heads: int, device) -> torch.Tensor:
+    """Kernel argument for the per-head clip index: the int32 [num_heads] table,
+    or a one-element dummy (never read) when the constexpr path is used."""
+    if clip_idx is None:
+        return torch.zeros(1, dtype=torch.int32, device=device)
+    assert clip_idx.dtype == torch.int32 and clip_idx.numel() == num_heads, (
+        f"per-head clip index must be int32 [{num_heads}], got {clip_idx.dtype} {tuple(clip_idx.shape)}"
+    )
+    assert int(clip_idx.min()) >= 0, "per-head clip indices must be >= 0 (disable clip with a scalar ratio instead)"
+    return clip_idx.contiguous()
+
+
+def clip_rows_per_head(data: torch.Tensor, clip_idx: torch.Tensor) -> torch.Tensor:
+    """Torch reference / fallback: clamp every ``[.., head, dim]`` row at the
+    ``clip_idx[head]``-th smallest ``|value|`` (what the kernels do inline)."""
+    sorted_abs = data.abs().sort(dim=-1).values
+    idx = clip_idx.to(device=data.device, dtype=torch.int64)
+    shape = [1] * data.dim()
+    shape[-2] = idx.numel()
+    threshold = torch.gather(sorted_abs, -1, idx.view(shape).expand(*data.shape[:-1], 1))
+    return torch.maximum(torch.minimum(data, threshold), -threshold)
+
+
 def _clip_index(clip_ratio: float, head_dim: int) -> int:
     """Resolve ``clip_ratio`` -> integer sort index, or ``-1`` to disable.
 
@@ -393,6 +445,7 @@ def _launch_single_clip_int2(
     clip_ratio: float,
     hp_global_offset=None,
     lloyd_max: bool = False,
+    clip_idx: Optional[torch.Tensor] = None,
 ) -> None:
     num_tokens, num_heads, head_dim = data.shape
     if num_tokens == 0:
@@ -421,11 +474,13 @@ def _launch_single_clip_int2(
         sz_buf.stride(0),
         sz_buf.stride(1),
         sz_buf.stride(2),
+        _clip_idx_arg(clip_idx, num_heads, data.device),
         HP_OFFSET=-1 if hp_global_offset is None else int(hp_global_offset),
         HEAD_DIM=head_dim,
         BLOCK_QUARTER=head_dim // 4,
         BLOCK_TOK=block_tok,
         CLIP_INDEX=_clip_index(clip_ratio, head_dim),
+        CLIP_PER_HEAD=clip_idx is not None,
         LLOYD_MAX=lloyd_max,
         num_warps=num_warps,
         num_stages=1,
@@ -439,6 +494,7 @@ def _launch_grouped_clip_int2(
     sz_buf: torch.Tensor,
     clip_ratio: float,
     hp_global_offset=None,
+    clip_idx: Optional[torch.Tensor] = None,
 ) -> None:
     num_tokens, num_heads, head_dim = data.shape
     if num_tokens == 0:
@@ -475,6 +531,7 @@ def _launch_grouped_clip_int2(
         sz_buf.stride(0),
         sz_buf.stride(1),
         sz_buf.stride(2),
+        _clip_idx_arg(clip_idx, num_heads, data.device),
         HEAD_DIM=head_dim,
         BLOCK_QUARTER=block_quarter,
         NUM_GROUPS=num_groups,
@@ -482,6 +539,7 @@ def _launch_grouped_clip_int2(
         HP_OFFSET=-1 if hp_global_offset is None else int(hp_global_offset),
         BLOCK_TOK=block_tok,
         CLIP_INDEX=_clip_index(clip_ratio, head_dim),
+        CLIP_PER_HEAD=clip_idx is not None,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -499,8 +557,12 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
     clip_ratio_v: float,
     hp_global_offset=None,
     lloyd_max: bool = False,
+    k_clip_idx: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused threshold + clip + quantize + int2-pack for already-rotated K/V.
+
+    ``k_clip_idx`` (int32 [num_heads]) replaces ``clip_ratio_k`` with one clip
+    index per KV head (per-head clip); V keeps the scalar ratio.
 
     Each (token, head) program loads its row once, derives the per-row clip
     threshold inline via ``tl.sort`` (when ``clip_ratio > 0``), clamps, and
@@ -543,13 +605,16 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
         buffer: torch.Tensor,
         scales_zeros: torch.Tensor,
         clip_ratio: float,
+        clip_idx: Optional[torch.Tensor] = None,
     ) -> None:
         head_dim = data.shape[-1]
         if not _is_power_of_two(head_dim):
             # tl.sort requires a power-of-two row. Kimi-K3 uses K=192 and
             # V=128, so retain OSCAR rotation/clipping for K and use the
             # generic uniform-int2 writer for that non-power-of-two row.
-            if clip_ratio > 0.0:
+            if clip_idx is not None:
+                data = clip_rows_per_head(data, clip_idx)
+            elif clip_ratio > 0.0:
                 index = _clip_index(clip_ratio, head_dim)
                 threshold = data.abs().sort(dim=-1).values[..., index : index + 1]
                 data = torch.maximum(torch.minimum(data, threshold), -threshold)
@@ -571,6 +636,7 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
                 clip_ratio,
                 hp_global_offset,
                 lloyd_max=lloyd_max,
+                clip_idx=clip_idx,
             )
         else:
             _launch_grouped_clip_int2(
@@ -580,9 +646,10 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
                 scales_zeros,
                 clip_ratio,
                 hp_global_offset,
+                clip_idx=clip_idx,
             )
 
-    launch(cache_k, k_cache_buffer, k_scales_zeros_buffer, clip_ratio_k)
+    launch(cache_k, k_cache_buffer, k_scales_zeros_buffer, clip_ratio_k, k_clip_idx)
     launch(cache_v, v_cache_buffer, v_scales_zeros_buffer, clip_ratio_v)
 
 
@@ -639,6 +706,7 @@ def _kv_oscar_rotate_k_clip_single_kernel(
     v_sz_stride_loc,
     v_sz_stride_head,
     v_sz_stride_dim,
+    k_clip_idx_ptr,
     HP_OFFSET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_QUARTER: tl.constexpr,
@@ -646,6 +714,7 @@ def _kv_oscar_rotate_k_clip_single_kernel(
     K_CLIP_INDEX: tl.constexpr,
     V_CLIP_INDEX: tl.constexpr,
     BSEARCH_ITERS: tl.constexpr,
+    K_CLIP_PER_HEAD: tl.constexpr,
 ):
     """Single fused kernel: rotate(K) + clip(K) + quant(K) + pack(K), then
     clip(V) + quant(V) + pack(V) sharing the same token tile. K and V share
@@ -698,7 +767,17 @@ def _kv_oscar_rotate_k_clip_single_kernel(
 
     k_rows = tl.dot(k_tile, R_tile, out_dtype=tl.float32)
 
-    if K_CLIP_INDEX >= 0:
+    if K_CLIP_PER_HEAD:
+        k_cidx = tl.load(k_clip_idx_ptr + head_idx)
+        abs_rows = tl.abs(k_rows)
+        sorted_rows = tl.sort(abs_rows)
+        pick = (full_offs == k_cidx)[None, :]
+        thr = tl.sum(tl.where(pick, sorted_rows, 0.0), axis=1)
+        k_rows = tl.minimum(
+            tl.maximum(k_rows, -thr[:, None]),
+            thr[:, None],
+        )
+    elif K_CLIP_INDEX >= 0:
         abs_rows = tl.abs(k_rows)
         if BSEARCH_ITERS > 0:
             target_above = HEAD_DIM - K_CLIP_INDEX
@@ -849,6 +928,7 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
     clip_ratio_k: float,
     clip_ratio_v: float,
     hp_global_offset=None,
+    k_clip_idx: Optional[torch.Tensor] = None,
 ) -> None:
     """Single-launch fused oscar K-rotation + clip + quantize + int2 pack for
     both K and V. V skips the rotation (caller must have absorbed R_v into the
@@ -953,6 +1033,7 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
         v_scales_zeros_buffer.stride(0),
         v_scales_zeros_buffer.stride(1),
         v_scales_zeros_buffer.stride(2),
+        _clip_idx_arg(k_clip_idx, num_heads, cache_k_unrotated.device),
         HP_OFFSET=-1 if hp_global_offset is None else int(hp_global_offset),
         HEAD_DIM=head_dim,
         BLOCK_QUARTER=head_dim // 4,
@@ -960,6 +1041,7 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
         K_CLIP_INDEX=_clip_index(clip_ratio_k, head_dim),
         V_CLIP_INDEX=_clip_index(clip_ratio_v, head_dim),
         BSEARCH_ITERS=(head_dim.bit_length() - 1) if head_dim >= 64 else 0,
+        K_CLIP_PER_HEAD=k_clip_idx is not None,
         num_warps=num_warps,
         num_stages=1,
     )

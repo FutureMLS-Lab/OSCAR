@@ -942,6 +942,9 @@ class Envs:
     # list / comma list in layer order). Layers it does not name keep
     # SGLANG_OSCAR_K_CLIP_RATIO. Chosen offline per layer on the calibration rows.
     SGLANG_OSCAR_K_CLIP_PER_LAYER = EnvStr("")
+    # Per-(layer, KV head) K clip ratios: JSON {"<global layer id>,<global kv head>": ratio}.
+    # Heads it does not name keep the layer's clip. Chosen offline on the calibration rows.
+    SGLANG_OSCAR_K_CLIP_PER_HEAD = EnvStr("")
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
     # Startup calibration of the K/V rotation pair. When the unified mixed-KV

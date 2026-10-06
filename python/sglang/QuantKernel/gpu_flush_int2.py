@@ -27,9 +27,11 @@ passes ``returned_slot_ids`` straight to ``allocator.free`` in one call.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+
+from sglang.QuantKernel.oscar_rotation_clip_int2_kv import clip_rows_per_head
 import triton
 import triton.language as tl
 
@@ -172,6 +174,8 @@ def _fused_flush_quant_body(
     CLIP_INDEX: tl.constexpr,
     BSEARCH_ITERS: tl.constexpr,
     LLOYD_MAX: tl.constexpr,
+    clip_idx_rt,                 # int32 scalar: this (layer, head)'s clip index when CLIP_PER_HEAD
+    CLIP_PER_HEAD: tl.constexpr,
 ):
     """Quantize ``BLOCK_TOK`` (src_hp_slot, head) HP rows into int2 at the
     matching ``dst_quant_slot``s.
@@ -204,7 +208,16 @@ def _fused_flush_quant_body(
         other=0.0,
     ).to(tl.float32)  # [BLOCK_TOK, HEAD_DIM]
 
-    if CLIP_INDEX >= 0:
+    if CLIP_PER_HEAD:
+        abs_acc = tl.abs(acc)
+        sorted_acc = tl.sort(abs_acc)
+        pick = (full_offs == clip_idx_rt)[None, :]
+        thr = tl.sum(tl.where(pick, sorted_acc, 0.0), axis=1)  # [BLOCK_TOK]
+        acc = tl.minimum(
+            tl.maximum(acc, -thr[:, None]),
+            thr[:, None],
+        )
+    elif CLIP_INDEX >= 0:
         abs_acc = tl.abs(acc)
         if BSEARCH_ITERS > 0:
             target_above = HEAD_DIM - CLIP_INDEX
@@ -364,6 +377,7 @@ def _fused_flush_quant_kernel(
     src_hp_slot_ptr,             # int64 [num_flush_tokens]  clamped >= 0
     dst_quant_slot_ptr,          # int64 [num_flush_tokens]
     valid_mask_ptr,              # int8  [num_flush_tokens]
+    k_clip_idx_ptr,              # int32 [num_layers * num_heads] per-(layer, head) K clip index (K_CLIP_PER_HEAD)
     num_flush_tokens,
     num_heads,
     num_layers,
@@ -401,6 +415,7 @@ def _fused_flush_quant_kernel(
     V_BSEARCH_ITERS: tl.constexpr,
     K_LLOYD_MAX: tl.constexpr,
     V_LLOYD_MAX: tl.constexpr,
+    K_CLIP_PER_HEAD: tl.constexpr,
 ):
     """Grid: ``(cdiv(num_flush_tokens, BLOCK_TOK), num_heads, num_layers)``.
 
@@ -442,6 +457,10 @@ def _fused_flush_quant_kernel(
     src = tl.load(src_hp_slot_ptr + tok_offs, mask=tok_mask, other=0).to(tl.int64)
     dst = tl.load(dst_quant_slot_ptr + tok_offs, mask=tok_mask, other=0).to(tl.int64)
     head64 = head.to(tl.int64)
+    if K_CLIP_PER_HEAD:
+        k_cidx = tl.load(k_clip_idx_ptr + layer * num_heads + head)
+    else:
+        k_cidx = 0
 
     # K side
     hp_k_base = tl.load(hp_k_ptrs_ptr + layer).to(
@@ -478,6 +497,8 @@ def _fused_flush_quant_kernel(
         K_CLIP_INDEX,
         K_BSEARCH_ITERS,
         K_LLOYD_MAX,
+        k_cidx,
+        K_CLIP_PER_HEAD,
     )
     # V side
     hp_v_base = tl.load(hp_v_ptrs_ptr + layer).to(
@@ -514,6 +535,8 @@ def _fused_flush_quant_kernel(
         V_CLIP_INDEX,
         V_BSEARCH_ITERS,
         V_LLOYD_MAX,
+        0,
+        False,
     )
 
 
@@ -586,8 +609,12 @@ def _flush_quant_unfused(
     src_hp_slot: torch.Tensor,
     dst_quant_slots: torch.Tensor,
     clip_ratio: float,
+    clip_idx: Optional[torch.Tensor] = None,
 ) -> None:
     """Flush path for head dims the fused kernel cannot express.
+
+    ``clip_idx`` (int32 [num_layers, num_heads]) clips each head at its own
+    index instead of the scalar ratio.
 
     The fused kernel derives the int2 byte layout from
     ``reshape(BLOCK_TOK, 4, HEAD_DIM // 4)``, which needs a power-of-two
@@ -600,9 +627,11 @@ def _flush_quant_unfused(
     construction, at the cost of a Python loop over layers and a materialized
     gather -- correctness path, not a fast path.
     """
-    for hp, quant, sz in zip(hp_layers, quant_layers, sz_layers):
+    for li, (hp, quant, sz) in enumerate(zip(hp_layers, quant_layers, sz_layers)):
         rows = hp[src_hp_slot]  # [n, num_heads, head_dim]
-        if clip_ratio > 0.0:
+        if clip_idx is not None:
+            rows = clip_rows_per_head(rows, clip_idx[li])
+        elif clip_ratio > 0.0:
             index = _flush_clip_index(clip_ratio, rows.shape[-1])
             if index >= 0:
                 threshold = rows.abs().sort(dim=-1).values[..., index : index + 1]
@@ -627,6 +656,17 @@ def _resolve_kv_quant_config(
     block_quarter = head_dim // 4
     group_size = head_dim // num_scale_groups
     return block_quarter, num_scale_groups, group_size
+
+
+def _flush_clip_idx_arg(clip_idx: Optional[torch.Tensor], num_layers: int, num_heads: int, device) -> torch.Tensor:
+    """int32 [num_layers * num_heads] table for ``K_CLIP_PER_HEAD``, or a dummy."""
+    if clip_idx is None:
+        return torch.zeros(1, dtype=torch.int32, device=device)
+    assert clip_idx.dtype == torch.int32 and tuple(clip_idx.shape) == (num_layers, num_heads), (
+        f"per-head clip index table must be int32 [{num_layers}, {num_heads}], got {clip_idx.dtype} {tuple(clip_idx.shape)}"
+    )
+    assert int(clip_idx.min()) >= 0, "per-head clip indices must be >= 0"
+    return clip_idx.contiguous().view(-1)
 
 
 def _flush_clip_index(clip_ratio: float, head_dim: int) -> int:
@@ -800,6 +840,7 @@ def gpu_flush_int2_apply(
     num_layers: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    k_clip_idx: Optional[torch.Tensor] = None,
     lloyd_max: bool = False,
     apply_remap: bool = True,
     # Per-layer tensors for this group, needed only when a head dim is not a
@@ -857,6 +898,7 @@ def gpu_flush_int2_apply(
                 src_hp_slot=src,
                 dst_quant_slots=dst,
                 clip_ratio=k_clip_ratio,
+                clip_idx=k_clip_idx,
             )
             _flush_quant_unfused(
                 hp_layers=hp_v_layers,
@@ -915,6 +957,7 @@ def gpu_flush_int2_apply(
         safe_src_hp_slot,
         plan.dst_quant_slots,
         plan.valid_mask,
+        _flush_clip_idx_arg(k_clip_idx, int(num_layers), num_heads, plan.valid_mask.device),
         total_flush_slots,
         num_heads,
         int(num_layers),
@@ -951,6 +994,7 @@ def gpu_flush_int2_apply(
         V_BSEARCH_ITERS=(int(v_head_dim).bit_length() - 1) if v_head_dim >= 64 else 0,
         K_LLOYD_MAX=bool(lloyd_max),
         V_LLOYD_MAX=bool(lloyd_max),
+        K_CLIP_PER_HEAD=k_clip_idx is not None,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -999,6 +1043,7 @@ def gpu_flush_int2(
     flush_interval: int,
     k_clip_ratio: float = 0.0,
     v_clip_ratio: float = 0.0,
+    k_clip_idx: Optional[torch.Tensor] = None,
     lloyd_max: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run plan -> fused quant -> remap for one decode flush step.
@@ -1063,6 +1108,7 @@ def gpu_flush_int2(
         num_layers=num_layers,
         k_clip_ratio=k_clip_ratio,
         v_clip_ratio=v_clip_ratio,
+        k_clip_idx=k_clip_idx,
         lloyd_max=lloyd_max,
     )
 
