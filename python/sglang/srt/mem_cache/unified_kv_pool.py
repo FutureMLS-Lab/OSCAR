@@ -9,7 +9,9 @@ kernels dispatch by ``slot >= HP_OFFSET``.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
@@ -138,6 +140,46 @@ def compute_recent_ring_size(hp_recent_tokens: int, n_q: int) -> int:
     return int(hp_recent_tokens) + int(n_q) - 1
 
 
+
+
+def parse_k_clip_per_layer(spec: str, global_layer_ids, default: float) -> list:
+    """Per-layer K clip ratios for ``global_layer_ids`` from ``spec``: "" ->
+    ``default`` everywhere; a path to a JSON object {global layer id: ratio}
+    or JSON list (layer order); otherwise a comma list in layer order. Layers
+    the spec does not name keep ``default``."""
+    ids = [int(g) for g in global_layer_ids]
+    if not spec:
+        return [float(default)] * len(ids)
+    if os.path.isfile(spec):
+        with open(spec) as f:
+            raw = json.load(f)
+        table = (
+            {int(k): float(v) for k, v in raw.items()}
+            if isinstance(raw, dict)
+            else {i: float(v) for i, v in enumerate(raw)}
+        )
+    else:
+        table = {i: float(x) for i, x in enumerate(v for v in spec.split(",") if v.strip())}
+    out = []
+    for gid in ids:
+        r = float(table.get(gid, default))
+        if not (0.0 <= r <= 1.0):
+            raise ValueError(f"SGLANG_OSCAR_K_CLIP_PER_LAYER: layer {gid} clip {r} is not in [0, 1]")
+        out.append(r)
+    return out
+
+
+def split_layers_by_clip(local_ids, clips):
+    """Consecutive runs of layers sharing one clip ratio, in order: the flush
+    kernel takes the clip as a compile-time index, one launch per run."""
+    runs = []
+    for l in local_ids:
+        c = clips[l]
+        if runs and runs[-1][0] == c:
+            runs[-1][1].append(l)
+        else:
+            runs.append((c, [l]))
+    return runs
 
 
 def _shard_head_vectors(mean, local_head_num, tp_rank: int, tp_size: int = 0):
@@ -424,6 +466,12 @@ class UnifiedInt2HPKVPool(KVCache):
         self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
         self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
         self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
+        # Per-layer K clip (local layer index); equals the scalar unless SGLANG_OSCAR_K_CLIP_PER_LAYER names layers.
+        self._k_clip_layer: list = parse_k_clip_per_layer(
+            envs.SGLANG_OSCAR_K_CLIP_PER_LAYER.get(),
+            [self.start_layer + i for i in range(self.layer_num)],
+            self._k_clip_ratio,
+        )
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
         # Scalar head_dim for uniform models (stacked [L,hd,hd], indexable as
         # ``self._R_k[idx]``); per-layer list for the two-geometry-group case
@@ -534,10 +582,15 @@ class UnifiedInt2HPKVPool(KVCache):
             _bv, _rot_shape(self._R_v),
         )
         logger.info(
-            "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
+            "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)%s",
             self._k_clip_ratio,
             self._v_clip_ratio,
             self._lloyd_max,
+            (
+                " per-layer k_clip %s" % sorted({round(c, 4) for c in self._k_clip_layer})
+                if any(c != self._k_clip_ratio for c in self._k_clip_layer)
+                else ""
+            ),
         )
         # Startup calibration: the identity stacks above are overwritten in
         # place once the collector attached below has seen its prompts.
@@ -1101,57 +1154,61 @@ class UnifiedInt2HPKVPool(KVCache):
             return (int(t.stride(0)), int(t.stride(1)), int(t.stride(2)))
 
         self._flush_groups = []
-        for local_ids in self._group_local_layer_ids:
-            l0 = local_ids[0]
-            hp_k_stride = _strides(self.hp_k_buffer[l0])
-            hp_v_stride = _strides(self.hp_v_buffer[l0])
-            q_k_stride = _strides(self.k_buffer[l0])
-            q_v_stride = _strides(self.v_buffer[l0])
-            k_sz_stride = _strides(self.k_scales_zeros[l0])
-            v_sz_stride = _strides(self.v_scales_zeros[l0])
-            for l in local_ids:
-                assert _strides(self.hp_k_buffer[l]) == hp_k_stride
-                assert _strides(self.hp_v_buffer[l]) == hp_v_stride
-                assert _strides(self.k_buffer[l]) == q_k_stride
-                assert _strides(self.v_buffer[l]) == q_v_stride
-                assert _strides(self.k_scales_zeros[l]) == k_sz_stride
-                assert _strides(self.v_scales_zeros[l]) == v_sz_stride
-            self._flush_groups.append(
-                {
-                    # The pointer arrays feed the fused kernel; the tensor lists
-                    # feed the unfused fallback for non-power-of-two head dims.
-                    "hp_k_layers": [self.hp_k_buffer[l] for l in local_ids],
-                    "hp_v_layers": [self.hp_v_buffer[l] for l in local_ids],
-                    "quant_k_layers": [self.k_buffer[l] for l in local_ids],
-                    "quant_v_layers": [self.v_buffer[l] for l in local_ids],
-                    "k_sz_layers": [self.k_scales_zeros[l] for l in local_ids],
-                    "v_sz_layers": [self.v_scales_zeros[l] for l in local_ids],
-                    "hp_k_ptrs": _base_ptrs(local_ids, self.hp_k_buffer),
-                    "hp_v_ptrs": _base_ptrs(local_ids, self.hp_v_buffer),
-                    "quant_k_ptrs": _base_ptrs(local_ids, self.k_buffer),
-                    "quant_v_ptrs": _base_ptrs(local_ids, self.v_buffer),
-                    "k_sz_ptrs": _base_ptrs(local_ids, self.k_scales_zeros),
-                    "v_sz_ptrs": _base_ptrs(local_ids, self.v_scales_zeros),
-                    "hp_k_stride": hp_k_stride,
-                    "hp_v_stride": hp_v_stride,
-                    "quant_k_stride": q_k_stride,
-                    "quant_v_stride": q_v_stride,
-                    "k_sz_stride": k_sz_stride,
-                    "v_sz_stride": v_sz_stride,
-                    "head_num": self._layer_head_num[l0],
-                    "head_dim": self._layer_head_dim[l0],
-                    "v_head_dim": self._layer_v_head_dim[l0],
-                    "k_num_scale_groups": self._layer_k_num_scale_groups[l0],
-                    "v_num_scale_groups": self._layer_v_num_scale_groups[l0],
-                    "num_layers": len(local_ids),
-                    "k_sample": self.k_buffer[l0],
-                    "v_sample": self.v_buffer[l0],
-                    "hp_k_sample": self.hp_k_buffer[l0],
-                    "hp_v_sample": self.hp_v_buffer[l0],
-                    "k_sz_sample": self.k_scales_zeros[l0],
-                    "v_sz_sample": self.v_scales_zeros[l0],
-                }
-            )
+        # One flush launch per (geometry group, K clip value): the kernel's clip
+        # index is a constexpr, so layers with different per-layer clips split.
+        for group_ids in self._group_local_layer_ids:
+            for _clip, local_ids in split_layers_by_clip(group_ids, self._k_clip_layer):
+                l0 = local_ids[0]
+                hp_k_stride = _strides(self.hp_k_buffer[l0])
+                hp_v_stride = _strides(self.hp_v_buffer[l0])
+                q_k_stride = _strides(self.k_buffer[l0])
+                q_v_stride = _strides(self.v_buffer[l0])
+                k_sz_stride = _strides(self.k_scales_zeros[l0])
+                v_sz_stride = _strides(self.v_scales_zeros[l0])
+                for l in local_ids:
+                    assert _strides(self.hp_k_buffer[l]) == hp_k_stride
+                    assert _strides(self.hp_v_buffer[l]) == hp_v_stride
+                    assert _strides(self.k_buffer[l]) == q_k_stride
+                    assert _strides(self.v_buffer[l]) == q_v_stride
+                    assert _strides(self.k_scales_zeros[l]) == k_sz_stride
+                    assert _strides(self.v_scales_zeros[l]) == v_sz_stride
+                self._flush_groups.append(
+                    {
+                        # The pointer arrays feed the fused kernel; the tensor lists
+                        # feed the unfused fallback for non-power-of-two head dims.
+                        "hp_k_layers": [self.hp_k_buffer[l] for l in local_ids],
+                        "hp_v_layers": [self.hp_v_buffer[l] for l in local_ids],
+                        "quant_k_layers": [self.k_buffer[l] for l in local_ids],
+                        "quant_v_layers": [self.v_buffer[l] for l in local_ids],
+                        "k_sz_layers": [self.k_scales_zeros[l] for l in local_ids],
+                        "v_sz_layers": [self.v_scales_zeros[l] for l in local_ids],
+                        "hp_k_ptrs": _base_ptrs(local_ids, self.hp_k_buffer),
+                        "hp_v_ptrs": _base_ptrs(local_ids, self.hp_v_buffer),
+                        "quant_k_ptrs": _base_ptrs(local_ids, self.k_buffer),
+                        "quant_v_ptrs": _base_ptrs(local_ids, self.v_buffer),
+                        "k_sz_ptrs": _base_ptrs(local_ids, self.k_scales_zeros),
+                        "v_sz_ptrs": _base_ptrs(local_ids, self.v_scales_zeros),
+                        "hp_k_stride": hp_k_stride,
+                        "hp_v_stride": hp_v_stride,
+                        "quant_k_stride": q_k_stride,
+                        "quant_v_stride": q_v_stride,
+                        "k_sz_stride": k_sz_stride,
+                        "v_sz_stride": v_sz_stride,
+                        "head_num": self._layer_head_num[l0],
+                        "head_dim": self._layer_head_dim[l0],
+                        "v_head_dim": self._layer_v_head_dim[l0],
+                        "k_num_scale_groups": self._layer_k_num_scale_groups[l0],
+                        "v_num_scale_groups": self._layer_v_num_scale_groups[l0],
+                        "num_layers": len(local_ids),
+                        "k_sample": self.k_buffer[l0],
+                        "v_sample": self.v_buffer[l0],
+                        "hp_k_sample": self.hp_k_buffer[l0],
+                        "hp_v_sample": self.hp_v_buffer[l0],
+                        "k_sz_sample": self.k_scales_zeros[l0],
+                        "v_sz_sample": self.v_scales_zeros[l0],
+                        "k_clip_ratio": float(_clip),
+                    }
+                )
 
         # Back-compat single-group flush metadata (used by the existing
         # common.py flush call for uniform models; the two-group path iterates
@@ -1340,7 +1397,8 @@ class UnifiedInt2HPKVPool(KVCache):
         (see ``gpu_flush_int2``); this method is *not* used for those.
         """
         idx = self._layer_index(layer_id)
-        clip_on = self._k_clip_ratio > 0.0 or self._v_clip_ratio > 0.0
+        k_clip = self._k_clip_layer[idx]
+        clip_on = k_clip > 0.0 or self._v_clip_ratio > 0.0
 
         # Fused rotate(K) + clip(KV) + quantize(KV) + set(KV). Skips the
         # standalone ``K @ R_k`` GEMM and its bf16 staging tensor by doing
@@ -1373,7 +1431,7 @@ class UnifiedInt2HPKVPool(KVCache):
                 self.v_buffer[idx],
                 self.k_scales_zeros[idx],
                 self.v_scales_zeros[idx],
-                self._k_clip_ratio,
+                k_clip,
                 self._v_clip_ratio,
                 hp_global_offset=mixed_hp_offset,
             )
@@ -1412,7 +1470,7 @@ class UnifiedInt2HPKVPool(KVCache):
             self.v_buffer[idx],
             self.k_scales_zeros[idx],
             self.v_scales_zeros[idx],
-            self._k_clip_ratio,
+            k_clip,
             self._v_clip_ratio,
             hp_global_offset=mixed_hp_offset,
             lloyd_max=self._lloyd_max,

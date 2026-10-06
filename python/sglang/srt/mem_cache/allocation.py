@@ -858,7 +858,7 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
                 k_num_scale_groups=g["k_num_scale_groups"],
                 v_num_scale_groups=g["v_num_scale_groups"],
                 num_layers=g["num_layers"],
-                k_clip_ratio=kv_pool._k_clip_ratio,
+                k_clip_ratio=g.get("k_clip_ratio", kv_pool._k_clip_ratio),
                 v_clip_ratio=kv_pool._v_clip_ratio,
                 lloyd_max=kv_pool._lloyd_max,
                 apply_remap=(gi == n_groups - 1),
