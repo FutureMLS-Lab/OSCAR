@@ -184,7 +184,7 @@ def _head_shard_start(total: int, local_head_num: int, tp_rank: int, tp_size: in
     return beg
 
 
-def _shard_rotation_heads(R, local_head_num: int, tp_rank: int, tp_size: int = 0):
+def _shard_rotation_heads(R, local_head_num, tp_rank: int, tp_size: int = 0):
     """Slice a per-head rotation down to the KV heads this rank owns.
 
     A V2 checkpoint stores every KV head of the model, but under tensor
@@ -202,24 +202,40 @@ def _shard_rotation_heads(R, local_head_num: int, tp_rank: int, tp_size: int = 0
     With fewer KV heads than ranks (``tp_size`` given) each head is replicated
     over ``local_head_num * tp_size / H`` consecutive ranks, so rank ``r`` owns
     heads from ``(r // rep) * local_head_num``.
+
+    ``local_head_num`` may be a per-layer sequence (one entry per list entry)
+    for pools whose layers differ in geometry (gemma4_unified: sliding layers
+    8 KV heads x 256, full-attention layers 1 x 512). Slicing every layer by one
+    pool-level head count cut the sliding layers' 8 per-head rotations down to
+    1 and the prefill einsum died on the head mismatch.
     """
 
-    def _slice(m):
+    def _slice(m, local):
         if m.dim() != 3:  # [hd, hd] shared -> unchanged
             return m
         total = m.shape[0]
-        if total == local_head_num:
+        if total == local:
             return m
-        if total % local_head_num != 0:
+        if total % local != 0:
             raise ValueError(
                 f"per-head rotation has {total} KV heads, which is not a "
-                f"multiple of this rank's {local_head_num}"
+                f"multiple of this rank's {local}"
             )
-        beg = _head_shard_start(total, local_head_num, tp_rank, tp_size)
-        return m[beg : beg + local_head_num].contiguous()
+        beg = _head_shard_start(total, local, tp_rank, tp_size)
+        return m[beg : beg + local].contiguous()
 
     if isinstance(R, (list, tuple)):
-        return [_slice(m) for m in R]
+        if isinstance(local_head_num, (list, tuple)):
+            if len(local_head_num) != len(R):
+                raise ValueError(
+                    f"per-layer head counts ({len(local_head_num)}) do not match "
+                    f"the {len(R)} per-layer rotations"
+                )
+            return [_slice(m, int(l)) for m, l in zip(R, local_head_num)]
+        return [_slice(m, int(local_head_num)) for m in R]
+    if isinstance(local_head_num, (list, tuple)):
+        raise ValueError("per-layer head counts need a per-layer rotation list, not a stacked tensor")
+    local_head_num = int(local_head_num)
     if R.dim() == 4:  # [L, H, hd, hd]
         total = R.shape[1]
         if total != local_head_num:

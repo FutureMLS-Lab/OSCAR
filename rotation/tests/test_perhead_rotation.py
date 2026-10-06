@@ -75,3 +75,24 @@ try:
 except ValueError:
     pass
 print("replicated-head sharding OK")
+
+
+# Two-geometry pools (gemma4_unified): per-layer head counts. A sliding layer with 8 heads next to a
+# full-attention layer with 1 head must keep its 8 under TP=1 and split 4/4 under TP=2, while the
+# 1-head layer is replicated over both ranks. (v109 sliced every layer by the pool-level 1 -> einsum death.)
+from sglang.srt.mem_cache.unified_kv_pool import _shard_head_vectors
+R8 = torch.stack([torch.full((D, D), float(h)) for h in range(8)]); R1 = torch.stack([torch.eye(D) * 7.0])
+got = _shard_rotation_heads([R8, R1], local_head_num=[8, 1], tp_rank=0, tp_size=1)
+assert got[0] is R8 and got[1] is R1, "TP=1 ragged list must pass through untouched"
+for rank, first in ((0, 0.0), (1, 4.0)):
+    got = _shard_rotation_heads([R8, R1], local_head_num=[4, 1], tp_rank=rank, tp_size=2)
+    assert got[0].shape == (4, D, D) and float(got[0][0, 0, 0]) == first, (rank, got[0].shape)
+    assert got[1].shape == (1, D, D) and float(got[1][0, 0, 0]) == 7.0, rank
+m8 = torch.stack([torch.full((D,), float(h)) for h in range(8)]); m1 = torch.full((1, D), 7.0)
+got = _shard_head_vectors([m8, m1], local_head_num=[4, 1], tp_rank=1, tp_size=2)
+assert got[0].shape == (4, D) and float(got[0][0, 0]) == 4.0 and got[1].shape == (1, D) and float(got[1][0, 0]) == 7.0
+try:
+    _shard_rotation_heads([R8, R1], local_head_num=[8], tp_rank=0); raise AssertionError("expected a length mismatch error")
+except ValueError:
+    pass
+print("ragged per-layer head counts OK")

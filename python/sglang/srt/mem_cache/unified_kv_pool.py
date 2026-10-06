@@ -140,29 +140,40 @@ def compute_recent_ring_size(hp_recent_tokens: int, n_q: int) -> int:
 
 
 
-def _shard_head_vectors(mean, local_head_num: int, tp_rank: int, tp_size: int = 0):
+def _shard_head_vectors(mean, local_head_num, tp_rank: int, tp_size: int = 0):
     """``_shard_rotation_heads`` for per-head vectors: a stacked
     ``[L, H, hd]`` tensor or a per-layer list of ``[H, hd]`` keeps only this
-    rank's KV heads; shared ``[hd]`` vectors pass through."""
+    rank's KV heads; shared ``[hd]`` vectors pass through. ``local_head_num``
+    may be a per-layer sequence for a per-layer list (two-geometry pools)."""
 
-    def _slice(m):
+    def _slice(m, local):
         if m.dim() != 2:
             return m
         total = m.shape[0]
-        if total == local_head_num:
+        if total == local:
             return m
-        if total % local_head_num != 0:
+        if total % local != 0:
             raise ValueError(
                 f"per-head key mean has {total} KV heads, which is not a "
-                f"multiple of this rank's {local_head_num}"
+                f"multiple of this rank's {local}"
             )
-        beg = _head_shard_start(total, local_head_num, tp_rank, tp_size)
-        return m[beg : beg + local_head_num].contiguous()
+        beg = _head_shard_start(total, local, tp_rank, tp_size)
+        return m[beg : beg + local].contiguous()
 
     if isinstance(mean, (list, tuple)):
-        return [_slice(m) for m in mean]
+        if isinstance(local_head_num, (list, tuple)):
+            if len(local_head_num) != len(mean):
+                raise ValueError(
+                    f"per-layer head counts ({len(local_head_num)}) do not match "
+                    f"the {len(mean)} per-layer key means"
+                )
+            return [_slice(m, int(l)) for m, l in zip(mean, local_head_num)]
+        return [_slice(m, int(local_head_num)) for m in mean]
+    if isinstance(local_head_num, (list, tuple)):
+        raise ValueError("per-layer head counts need a per-layer key-mean list, not a stacked tensor")
+    local_head_num = int(local_head_num)
     if mean.dim() == 3:
-        return torch.stack([_slice(m) for m in mean], dim=0)
+        return torch.stack([_slice(m, local_head_num) for m in mean], dim=0)
     return mean
 
 
@@ -456,8 +467,13 @@ class UnifiedInt2HPKVPool(KVCache):
             return str(tuple(R.shape))
 
         _bk, _bv = _rot_shape(self._R_k), _rot_shape(self._R_v)
-        self._R_k = _shard_rotation_heads(self._R_k, self.head_num, _tp_rank, _tp_size)
-        self._R_v = _shard_rotation_heads(self._R_v, self.head_num, _tp_rank, _tp_size)
+        # Two-geometry pools shard each layer by its own KV-head count (the
+        # pool-level head_num is one group's); single-geometry pools keep the int.
+        _shard_heads = (
+            [int(h) for h in self._layer_head_num] if self._layer_groups is not None else self.head_num
+        )
+        self._R_k = _shard_rotation_heads(self._R_k, _shard_heads, _tp_rank, _tp_size)
+        self._R_v = _shard_rotation_heads(self._R_v, _shard_heads, _tp_rank, _tp_size)
         # OSCAR-2 transform family: a non-orthogonal key transform ships the
         # query-side matrix R_k^{-T} as ``q_rotation``, a non-orthogonal value
         # transform ships R_v^{-T} as ``o_rotation`` (applied as o @ O^T), and
@@ -496,15 +512,15 @@ class UnifiedInt2HPKVPool(KVCache):
             vector=True,
         )
         if self._Q_k is not None:
-            self._Q_k = _shard_rotation_heads(self._Q_k, self.head_num, _tp_rank, _tp_size)
+            self._Q_k = _shard_rotation_heads(self._Q_k, _shard_heads, _tp_rank, _tp_size)
         else:
             self._Q_k = self._R_k
         if self._O_v is not None:
-            self._O_v = _shard_rotation_heads(self._O_v, self.head_num, _tp_rank, _tp_size)
+            self._O_v = _shard_rotation_heads(self._O_v, _shard_heads, _tp_rank, _tp_size)
         else:
             self._O_v = self._R_v
         if self._k_mean is not None:
-            self._k_mean = _shard_head_vectors(self._k_mean, self.head_num, _tp_rank, _tp_size)
+            self._k_mean = _shard_head_vectors(self._k_mean, _shard_heads, _tp_rank, _tp_size)
         logger.info(
             "UnifiedInt2HPKVPool: OSCAR-2 transforms: key %s, value %s, centering %s",
             "non-orthogonal (q_rotation)" if self._Q_k is not self._R_k else "orthogonal",
