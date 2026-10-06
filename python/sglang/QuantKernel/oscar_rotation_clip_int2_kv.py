@@ -768,11 +768,27 @@ def _kv_oscar_rotate_k_clip_single_kernel(
     k_rows = tl.dot(k_tile, R_tile, out_dtype=tl.float32)
 
     if K_CLIP_PER_HEAD:
+        # Same arithmetic as the scalar branch below (binary search when
+        # BSEARCH_ITERS > 0, else the sort pick), with this head's index.
         k_cidx = tl.load(k_clip_idx_ptr + head_idx)
         abs_rows = tl.abs(k_rows)
-        sorted_rows = tl.sort(abs_rows)
-        pick = (full_offs == k_cidx)[None, :]
-        thr = tl.sum(tl.where(pick, sorted_rows, 0.0), axis=1)
+        if BSEARCH_ITERS > 0:
+            target_above = HEAD_DIM - k_cidx
+            thr_lo = tl.zeros([BLOCK_TOK], dtype=tl.float32)
+            thr_hi = tl.max(abs_rows, axis=1)
+            for _ in tl.static_range(BSEARCH_ITERS):
+                thr_mid = (thr_lo + thr_hi) * 0.5
+                cnt_above = tl.sum(
+                    (abs_rows > thr_mid[:, None]).to(tl.int32), axis=1
+                )
+                too_many = cnt_above > target_above
+                thr_lo = tl.where(too_many, thr_mid, thr_lo)
+                thr_hi = tl.where(too_many, thr_hi, thr_mid)
+            thr = thr_hi
+        else:
+            sorted_rows = tl.sort(abs_rows)
+            pick = (full_offs == k_cidx)[None, :]
+            thr = tl.sum(tl.where(pick, sorted_rows, 0.0), axis=1)
         k_rows = tl.minimum(
             tl.maximum(k_rows, -thr[:, None]),
             thr[:, None],

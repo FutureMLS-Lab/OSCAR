@@ -209,10 +209,25 @@ def _fused_flush_quant_body(
     ).to(tl.float32)  # [BLOCK_TOK, HEAD_DIM]
 
     if CLIP_PER_HEAD:
+        # Same arithmetic as the scalar branch below, with the runtime index.
         abs_acc = tl.abs(acc)
-        sorted_acc = tl.sort(abs_acc)
-        pick = (full_offs == clip_idx_rt)[None, :]
-        thr = tl.sum(tl.where(pick, sorted_acc, 0.0), axis=1)  # [BLOCK_TOK]
+        if BSEARCH_ITERS > 0:
+            target_above = HEAD_DIM - clip_idx_rt
+            thr_lo = tl.zeros([BLOCK_TOK], dtype=tl.float32)
+            thr_hi = tl.max(abs_acc, axis=1)
+            for _ in tl.static_range(BSEARCH_ITERS):
+                thr_mid = (thr_lo + thr_hi) * 0.5
+                cnt_above = tl.sum(
+                    (abs_acc > thr_mid[:, None]).to(tl.int32), axis=1
+                )
+                too_many = cnt_above > target_above
+                thr_lo = tl.where(too_many, thr_mid, thr_lo)
+                thr_hi = tl.where(too_many, thr_hi, thr_mid)
+            thr = thr_hi
+        else:
+            sorted_acc = tl.sort(abs_acc)
+            pick = (full_offs == clip_idx_rt)[None, :]
+            thr = tl.sum(tl.where(pick, sorted_acc, 0.0), axis=1)  # [BLOCK_TOK]
         acc = tl.minimum(
             tl.maximum(acc, -thr[:, None]),
             thr[:, None],
