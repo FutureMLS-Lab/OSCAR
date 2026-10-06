@@ -438,6 +438,17 @@ class UnifiedInt2HPKVPool(KVCache):
         # The quant-tier encoders decide the code widths, so they resolve
         # before the arenas exist.
         self._init_quantizers()
+        # The clip config is read before the arenas: the decode-flush groups built
+        # there split layers by their K clip ratio.
+        self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
+        self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
+        self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
+        # Per-layer K clip (local layer index); equals the scalar unless SGLANG_OSCAR_K_CLIP_PER_LAYER names layers.
+        self._k_clip_layer: list = parse_k_clip_per_layer(
+            envs.SGLANG_OSCAR_K_CLIP_PER_LAYER.get(),
+            [self.start_layer + i for i in range(self.layer_num)],
+            self._k_clip_ratio,
+        )
         self._create_arenas()
 
         # Cached attributes used by the rest of the stack.
@@ -463,15 +474,6 @@ class UnifiedInt2HPKVPool(KVCache):
         # head_dim] / [v_head_dim, v_head_dim] are loaded in ``hp_dtype`` so
         # the ``rows @ R`` pre-pass and ``result @ R.T`` inverse are plain
         # bf16 GEMMs.
-        self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
-        self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
-        self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
-        # Per-layer K clip (local layer index); equals the scalar unless SGLANG_OSCAR_K_CLIP_PER_LAYER names layers.
-        self._k_clip_layer: list = parse_k_clip_per_layer(
-            envs.SGLANG_OSCAR_K_CLIP_PER_LAYER.get(),
-            [self.start_layer + i for i in range(self.layer_num)],
-            self._k_clip_ratio,
-        )
         self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
         # Scalar head_dim for uniform models (stacked [L,hd,hd], indexable as
         # ``self._R_k[idx]``); per-layer list for the two-geometry-group case
