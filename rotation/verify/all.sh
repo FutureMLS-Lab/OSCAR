@@ -36,6 +36,7 @@ qwen35-4b|mha|Qwen/Qwen3.5-4B|1|256|Qwen3.5-4B|64|256|0.55
 gemma4-12b|mha|google/gemma-4-12B-it|4|128|Gemma4-12B|64|512|0.45
 minimax-m27|mha|MiniMaxAI/MiniMax-M2.7|4|128|MiniMax-M2.7|64|256|0.80
 qwen35-35b|mha|Qwen/Qwen3.5-35B-A3B|4|256|Qwen3.5-35B-A3B|64|256|0.85
+qwen38-27b|mha|Qwen/Qwen3.8-27B|2|256|Qwen3.8-27B|64|256|0.60
 minimax-m3|mha|MiniMaxAI/MiniMax-M3|8|128|MiniMax-M3|64|256|0.90
 glm47|mha|zai-org/GLM-4.7-FP8|8|128|GLM-4.7-FP8/seq10000_prompt43_group128|64|256|0.85
 glm52|mla|zai-org/GLM-5.2-FP8|8|glm52-rotations|-|-|-|0.90
@@ -62,7 +63,7 @@ while IFS='|' read -r name kind repo tp a rot sink recent mf quant; do
   echo; echo "======================= $name ($kind) ======================="
   if [ "$kind" = "mha" ]; then
     case "$name" in
-      qwen35-4b|qwen35-35b) export MAMBA_STRATEGY=extra_buffer ;;
+      qwen35-4b|qwen35-35b|qwen38-27b) export MAMBA_STRATEGY=extra_buffer ;;
       *)                    unset MAMBA_STRATEGY ;;
     esac
     export NO_AUTOTUNE=1
