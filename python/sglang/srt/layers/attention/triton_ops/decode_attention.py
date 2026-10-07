@@ -170,6 +170,23 @@ def decode_attention_fwd_quantized(
 # ---------------------------------------------------------------------------
 
 
+
+@triton.jit
+def _int2_crumbs(packed, shift: tl.constexpr, dtype: tl.constexpr):
+    """Crumb `shift` of each packed byte as `dtype`, avoiding the int -> float
+    convert: OR-ing the 2-bit value into the mantissa of a power-of-two float
+    (bf16 128.0 = 0x4300, fp16 1024.0 = 0x6400, both with a 1.0 ULP) and
+    subtracting that constant is exact and keeps the dequant loop on ALU ops.
+    Measured 105.6 -> 83.6 us/layer on the unified stage-1 (Qwen3-8B, 128K,
+    bs=1, B200); bit-identical to the convert."""
+    c = (packed.to(tl.uint16) >> shift) & 0x03
+    if dtype == tl.bfloat16:
+        return (c | 0x4300).to(tl.bfloat16, bitcast=True) - 128.0
+    elif dtype == tl.float16:
+        return (c | 0x6400).to(tl.float16, bitcast=True) - 1024.0
+    else:
+        return c.to(dtype)
+
 @triton.jit
 def _fwd_kernel_stage1_quant_int2(
     Q,
@@ -897,10 +914,10 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 k_zero_q3  = k_zero_q3.to(q_q0.dtype)
                 # Dequantize INT2 K inline: unpack 4 crumbs per-group.
                 # k_packed shape: [BLOCK_D//4, BLOCK_N] (transposed)
-                k_q0 = ((k_packed & 0x03).to(q_q0.dtype) - k_zero_q0) * k_scale_q0
-                k_q1 = (((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_q1) * k_scale_q1
-                k_q2 = (((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_q2) * k_scale_q2
-                k_q3 = (((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_q3) * k_scale_q3
+                k_q0 = (_int2_crumbs(k_packed, 0, q_q0.dtype) - k_zero_q0) * k_scale_q0
+                k_q1 = (_int2_crumbs(k_packed, 2, q_q0.dtype) - k_zero_q1) * k_scale_q1
+                k_q2 = (_int2_crumbs(k_packed, 4, q_q0.dtype) - k_zero_q2) * k_scale_q2
+                k_q3 = (_int2_crumbs(k_packed, 6, q_q0.dtype) - k_zero_q3) * k_scale_q3
             else:
                 offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 k_scale_1d = tl.load(
@@ -914,16 +931,16 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     other=0.0,
                 ).to(q_q0.dtype)
                 k_q0 = (
-                    (k_packed & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                    _int2_crumbs(k_packed, 0, q_q0.dtype) - k_zero_1d[None, :]
                 ) * k_scale_1d[None, :]
                 k_q1 = (
-                    ((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                    _int2_crumbs(k_packed, 2, q_q0.dtype) - k_zero_1d[None, :]
                 ) * k_scale_1d[None, :]
                 k_q2 = (
-                    ((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                    _int2_crumbs(k_packed, 4, q_q0.dtype) - k_zero_1d[None, :]
                 ) * k_scale_1d[None, :]
                 k_q3 = (
-                    ((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                    _int2_crumbs(k_packed, 6, q_q0.dtype) - k_zero_1d[None, :]
                 ) * k_scale_1d[None, :]
 
             # Compute QK as ONE fused MMA instead of 4 small ones by stacking
@@ -1096,10 +1113,10 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                 v_scale_q3 = v_scale_q3.to(q_q0.dtype)
                 v_zero_q3  = v_zero_q3.to(q_q0.dtype)
                 # Dequantize INT2 V inline: unpack 4 crumbs per-group.
-                v_q0 = ((v_packed & 0x03).to(q_q0.dtype) - v_zero_q0) * v_scale_q0
-                v_q1 = (((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_q1) * v_scale_q1
-                v_q2 = (((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_q2) * v_scale_q2
-                v_q3 = (((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_q3) * v_scale_q3
+                v_q0 = (_int2_crumbs(v_packed, 0, q_q0.dtype) - v_zero_q0) * v_scale_q0
+                v_q1 = (_int2_crumbs(v_packed, 2, q_q0.dtype) - v_zero_q1) * v_scale_q1
+                v_q2 = (_int2_crumbs(v_packed, 4, q_q0.dtype) - v_zero_q2) * v_scale_q2
+                v_q3 = (_int2_crumbs(v_packed, 6, q_q0.dtype) - v_zero_q3) * v_scale_q3
             else:
                 offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 v_scale_1d = tl.load(
@@ -1113,16 +1130,16 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     other=0.0,
                 ).to(q_q0.dtype)
                 v_q0 = (
-                    (v_packed & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                    _int2_crumbs(v_packed, 0, q_q0.dtype) - v_zero_1d[:, None]
                 ) * v_scale_1d[:, None]
                 v_q1 = (
-                    ((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                    _int2_crumbs(v_packed, 2, q_q0.dtype) - v_zero_1d[:, None]
                 ) * v_scale_1d[:, None]
                 v_q2 = (
-                    ((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                    _int2_crumbs(v_packed, 4, q_q0.dtype) - v_zero_1d[:, None]
                 ) * v_scale_1d[:, None]
                 v_q3 = (
-                    ((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                    _int2_crumbs(v_packed, 6, q_q0.dtype) - v_zero_1d[:, None]
                 ) * v_scale_1d[:, None]
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -1931,10 +1948,10 @@ def _fwd_grouped_kernel_stage1_unified(
                     k_zero_q3  = k_zero_q3.to(q_q0.dtype)
                     # Dequantize INT2 K inline: unpack 4 crumbs per-group.
                     # k_packed shape: [BLOCK_D//4, BLOCK_N] (transposed)
-                    k_q0 = ((k_packed & 0x03).to(q_q0.dtype) - k_zero_q0) * k_scale_q0
-                    k_q1 = (((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_q1) * k_scale_q1
-                    k_q2 = (((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_q2) * k_scale_q2
-                    k_q3 = (((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_q3) * k_scale_q3
+                    k_q0 = (_int2_crumbs(k_packed, 0, q_q0.dtype) - k_zero_q0) * k_scale_q0
+                    k_q1 = (_int2_crumbs(k_packed, 2, q_q0.dtype) - k_zero_q1) * k_scale_q1
+                    k_q2 = (_int2_crumbs(k_packed, 4, q_q0.dtype) - k_zero_q2) * k_scale_q2
+                    k_q3 = (_int2_crumbs(k_packed, 6, q_q0.dtype) - k_zero_q3) * k_scale_q3
                 else:
                     offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
                     k_scale_1d = tl.load(
@@ -1948,16 +1965,16 @@ def _fwd_grouped_kernel_stage1_unified(
                         other=0.0,
                     ).to(q_q0.dtype)
                     k_q0 = (
-                        (k_packed & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                        _int2_crumbs(k_packed, 0, q_q0.dtype) - k_zero_1d[None, :]
                     ) * k_scale_1d[None, :]
                     k_q1 = (
-                        ((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                        _int2_crumbs(k_packed, 2, q_q0.dtype) - k_zero_1d[None, :]
                     ) * k_scale_1d[None, :]
                     k_q2 = (
-                        ((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                        _int2_crumbs(k_packed, 4, q_q0.dtype) - k_zero_1d[None, :]
                     ) * k_scale_1d[None, :]
                     k_q3 = (
-                        ((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_1d[None, :]
+                        _int2_crumbs(k_packed, 6, q_q0.dtype) - k_zero_1d[None, :]
                     ) * k_scale_1d[None, :]
 
                 # Compute QK as ONE fused MMA instead of 4 small ones by stacking
@@ -2130,10 +2147,10 @@ def _fwd_grouped_kernel_stage1_unified(
                     v_scale_q3 = v_scale_q3.to(q_q0.dtype)
                     v_zero_q3  = v_zero_q3.to(q_q0.dtype)
                     # Dequantize INT2 V inline: unpack 4 crumbs per-group.
-                    v_q0 = ((v_packed & 0x03).to(q_q0.dtype) - v_zero_q0) * v_scale_q0
-                    v_q1 = (((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_q1) * v_scale_q1
-                    v_q2 = (((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_q2) * v_scale_q2
-                    v_q3 = (((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_q3) * v_scale_q3
+                    v_q0 = (_int2_crumbs(v_packed, 0, q_q0.dtype) - v_zero_q0) * v_scale_q0
+                    v_q1 = (_int2_crumbs(v_packed, 2, q_q0.dtype) - v_zero_q1) * v_scale_q1
+                    v_q2 = (_int2_crumbs(v_packed, 4, q_q0.dtype) - v_zero_q2) * v_scale_q2
+                    v_q3 = (_int2_crumbs(v_packed, 6, q_q0.dtype) - v_zero_q3) * v_scale_q3
                 else:
                     offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
                     v_scale_1d = tl.load(
@@ -2147,16 +2164,16 @@ def _fwd_grouped_kernel_stage1_unified(
                         other=0.0,
                     ).to(q_q0.dtype)
                     v_q0 = (
-                        (v_packed & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                        _int2_crumbs(v_packed, 0, q_q0.dtype) - v_zero_1d[:, None]
                     ) * v_scale_1d[:, None]
                     v_q1 = (
-                        ((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                        _int2_crumbs(v_packed, 2, q_q0.dtype) - v_zero_1d[:, None]
                     ) * v_scale_1d[:, None]
                     v_q2 = (
-                        ((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                        _int2_crumbs(v_packed, 4, q_q0.dtype) - v_zero_1d[:, None]
                     ) * v_scale_1d[:, None]
                     v_q3 = (
-                        ((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_1d[:, None]
+                        _int2_crumbs(v_packed, 6, q_q0.dtype) - v_zero_1d[:, None]
                     ) * v_scale_1d[:, None]
 
                 n_e_max = tl.maximum(tl.max(qk, 1), e_max)
