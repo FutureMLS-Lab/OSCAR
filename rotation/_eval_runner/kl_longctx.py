@@ -81,8 +81,9 @@ def post_window(base_url: str, input_ids, logprob_start_len: int, retries: int =
             r = requests.post(f"{base_url}/generate", json=payload, timeout=7200)
             r.raise_for_status()
             lps = r.json()["meta_info"]["input_token_logprobs"]
-            if len(lps) < len(input_ids) - 1:
-                raise RuntimeError(f"short logprobs: {len(lps)} for a window of {len(input_ids)}")
+            # the server returns one entry per input token from logprob_start_len on
+            if len(lps) < len(input_ids) - logprob_start_len - 1:
+                raise RuntimeError(f"short logprobs: {len(lps)} for a window of {len(input_ids)} from {logprob_start_len}")
             return
         except Exception as e:  # noqa: BLE001 - retried, then raised
             if attempt == retries - 1:
