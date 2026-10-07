@@ -1005,9 +1005,13 @@ class Envs:
     # leaves most of a B200 idle at low batch, and INT2 reads 8x fewer bytes
     # per token than BF16 so more splits stay bandwidth-feasible. The
     # per-request count is still adaptive (~128*sqrt(bs)-token chunks); this
-    # is only its cap (64: measured 59 us/layer at 64K vs 74 at 32 and 206 at 8,
-    # Qwen3-8B on B200). The HP window keeps SGLANG_MIXED_KV_HP_MAX_SPLITS.
-    SGLANG_INT2_MAX_SPLITS = EnvInt(64)
+    # is only its cap. Models with few local KV heads are the ones that need it:
+    # Qwen3-30B-A3B at TP2 (2 KV heads per rank) decodes 105 -> 153 tok/s at
+    # 128K and 167 -> 197 at 32K going 64 -> 256, 512 adds nothing; Qwen3-8B
+    # (8 KV heads) is flat from 64 to 512. Same-pod bs=1 measurements, B200,
+    # 2026-10-07; PPL is bit-for-bit unchanged (fp32 partials, reduction only).
+    # The HP window keeps SGLANG_MIXED_KV_HP_MAX_SPLITS.
+    SGLANG_INT2_MAX_SPLITS = EnvInt(256)
     # Run the HP-window and INT2 stage-1 of the mixed decode kernel as one
     # grid (program_id(2) below the HP split count selects the tier) instead
     # of two launches. Per-tier numerics are unchanged; 0 restores the
