@@ -340,6 +340,11 @@ class LogitsMetadata:
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
 
+    # Carried from ForwardBatch for the strided logits dump (absolute positions
+    # of the pruned rows and the token fed at each row); references, no copies.
+    extend_prefix_lens_cpu: Optional[List[int]] = None
+    extend_input_ids: Optional[torch.Tensor] = None
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
@@ -394,6 +399,8 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+            extend_input_ids=forward_batch.input_ids,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,

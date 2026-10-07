@@ -995,6 +995,14 @@ class Envs:
     # absorbed (so V skips rotation), per-row scale (single-scale int2), and
     # at least one of K/V clip ratios > 0. Off by default; safe to leave off.
     SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT = EnvBool(False)
+    # Strided full-vocabulary logits dump from the input-logprob path (KL
+    # between serving arms at long context): every STRIDE-th predicted
+    # position >= FROM of each request that returns input logprobs is written
+    # by TP rank 0 as fp16 (row-max-subtracted) logits under DIR, one file per
+    # prefill chunk. Unset DIR = off (production).
+    SGLANG_OSCAR_LOGITS_DUMP_DIR = EnvStr(None)
+    SGLANG_OSCAR_LOGITS_DUMP_FROM = EnvInt(0)
+    SGLANG_OSCAR_LOGITS_DUMP_STRIDE = EnvInt(32)
     # Use Lloyd-Max MSE-optimal buckets for INT2 KV quantization instead of
     # the default uniform min-max. Applies only to single-scale pretransformed
     # clip kernels (num_groups == 1). Requires oscar rotation + clip enabled.

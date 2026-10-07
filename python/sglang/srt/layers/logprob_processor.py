@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 import dataclasses
 import logging
 from contextlib import nullcontext
@@ -12,6 +13,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
 )
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_utils.pool import (
     borrow_graph_pool,
@@ -472,6 +474,41 @@ def _deterministic_inference_enabled() -> bool:
 _GRAPH_POOL_BORROW_SLACK_BYTES = 64 << 20
 
 
+def logits_dump_rows(
+    rows: List[int],
+    token_to_seq_idx: List[int],
+    extend_seq_lens_cpu: List[int],
+    extend_logprob_start_lens_cpu: List[int],
+    extend_prefix_lens_cpu: List[int],
+    from_pos: int,
+    stride: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Which pruned logprob rows to dump: (index into `rows`, predicted
+    position, index into the batch's input_ids). Row r of sequence s sits at
+    absolute position prefix + start + (r - first row of s) and its logits
+    predict the next position; `start` mirrors the sampled-row exception in
+    LogitsProcessor._get_pruned_states."""
+    first: dict = {}
+    for r, s in enumerate(token_to_seq_idx):
+        first.setdefault(s, r)
+    ext_starts = [0]
+    for n in extend_seq_lens_cpu[:-1]:
+        ext_starts.append(ext_starts[-1] + n)
+    sel, pred_pos, in_idx = [], [], []
+    for j, r in enumerate(rows):
+        s = token_to_seq_idx[r]
+        start = extend_logprob_start_lens_cpu[s]
+        if extend_seq_lens_cpu[s] == start:
+            start -= 1
+        offset = r - first[s]
+        p = extend_prefix_lens_cpu[s] + start + offset + 1
+        if p >= from_pos and (p - from_pos) % stride == 0:
+            sel.append(j)
+            pred_pos.append(p)
+            in_idx.append(ext_starts[s] + start + offset)
+    return sel, pred_pos, in_idx
+
+
 class InputLogprobProcessor:
     """Input (prefill) logprob processing: single-pass or chunked.
 
@@ -496,6 +533,8 @@ class InputLogprobProcessor:
         # keeps the exact log_softmax path: the fused logsumexp reduces in a
         # different order, which breaks the prefill/decode logprob
         # bit-identity that mode guarantees.
+        self.logits_dump_dir = envs.SGLANG_OSCAR_LOGITS_DUMP_DIR.get()
+        self._logits_dump_counter = 0
         self.enable_fast_input_logprobs = (
             envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
             and not _deterministic_inference_enabled()
@@ -544,6 +583,48 @@ class InputLogprobProcessor:
                 borrow_logprob_memory and not skip_chunking_for_dp_attn
             ),
         )
+
+    def _dump_logits(
+        self,
+        chunk_logits: torch.Tensor,
+        rows: List[int],
+        token_to_seq_idx: List[int],
+        md: LogitsMetadata,
+    ) -> None:
+        """fp16 (row-max-subtracted) full-vocabulary logits of the strided rows,
+        one file per prefill chunk, TP rank 0 only (the logits are already
+        gathered across TP). The predicted position and the token fed at the
+        row let a scorer align two arms and fail on any mismatch."""
+        if get_tensor_model_parallel_rank() != 0 or not rows:
+            return
+        sel, pred_pos, in_idx = logits_dump_rows(
+            rows,
+            token_to_seq_idx,
+            md.extend_seq_lens_cpu,
+            md.extend_logprob_start_lens_cpu,
+            md.extend_prefix_lens_cpu,
+            envs.SGLANG_OSCAR_LOGITS_DUMP_FROM.get(),
+            max(1, envs.SGLANG_OSCAR_LOGITS_DUMP_STRIDE.get()),
+        )
+        if not sel:
+            return
+        dev = chunk_logits.device
+        picked = chunk_logits[torch.tensor(sel, device=dev)].float()
+        picked = (picked - picked.max(dim=-1, keepdim=True).values).to(torch.float16)
+        fed = md.extend_input_ids[torch.tensor(in_idx, device=md.extend_input_ids.device)]
+        os.makedirs(self.logits_dump_dir, exist_ok=True)
+        path = os.path.join(self.logits_dump_dir, f"chunk_{self._logits_dump_counter:06d}.pt")
+        self._logits_dump_counter += 1
+        torch.save(
+            {
+                "pred_pos": torch.tensor(pred_pos, dtype=torch.int64),
+                "input_ids": fed.to(torch.int64).cpu(),
+                "logits": picked.cpu(),
+                "prefix_lens": list(md.extend_prefix_lens_cpu),
+            },
+            path + ".tmp",
+        )
+        os.replace(path + ".tmp", path)
 
     def _can_borrow_logprob_memory(
         self,
@@ -697,6 +778,13 @@ class InputLogprobProcessor:
             with borrow_scope:
                 chunk_logprobs = chunk_logits[chunk_indices]
                 del chunk_logits
+                if self.logits_dump_dir is not None:
+                    self._dump_logits(
+                        chunk_logprobs,
+                        input_logprob_indices_cpu[lp_lo:lp_hi],
+                        token_to_seq_idx,
+                        logits_metadata,
+                    )
 
                 # End at the last row inside the chunk; token_to_seq_idx[end_idx]
                 # belongs to the next chunk and would emit its sequence twice.
