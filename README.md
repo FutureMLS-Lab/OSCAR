@@ -62,8 +62,6 @@ This repository is upstream SGLang `main` with the OSCAR low-bit KV cache added 
 
 ## Main results
 
-Numbers are from this tree's serving code (commit `9105559e8e` on upstream SGLang `67eab57057`; some runs used its parent `ff8cadade7`, which differs only in an evaluation script), except where marked ². The INT2 arm and its BF16 control share one launch path and differ only in the KV cache.
-
 | Model | Attention (INT2 path) | GPQA-Diamond BF16 → INT2 | KL@128K ↓ | Decode @128K, B200: INT2 / BF16 tok/s | Decode @128K, H100: INT2 / BF16 tok/s | KV tokens vs BF16 |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|
 | Qwen3-4B-Thinking-2507 | dense GQA | 66.7 → 60.1 | 0.096 | 124.7 / 157.8 (0.79×) | 111.0 / 96.0 (**1.16×**) | 6.4× |
@@ -313,38 +311,6 @@ python rotation/tools/train_pq_codebooks.py --dumps $CALIB/qkv_dumps/gpqa \
 ```
 
 At 1–1.5 bits the accuracy lives in the BF16 window: treat PQ as a memory lever for contexts long enough to amortize it, not as an accuracy-neutral tier. PQ decode is slower than INT2, and PQ is not available on the two-geometry (Gemma-4), MiniMax-sparse or packed-MLA pools.
-
-</details>
-
-<details>
-<summary><b>Decode-speed knobs (dense INT2 path)</b></summary>
-
-All are on by default; each can be switched off on its own for an A/B.
-
-| Env | Default | What it changes |
-|:---|:---:|:---|
-| `SGLANG_INT2_MAX_SPLITS` | `256` | split ceiling for the INT2 tier; batch-1 decode needs many programs to fill the GPU, most of all on MoE models with few KV heads |
-| `SGLANG_OSCAR_FUSED_STAGE1` | `1` | one grid for the BF16 window and the INT2 tier instead of two launches; bit-identical to the two-launch path |
-| `SGLANG_OSCAR_FAST_ROT` | `1` | decode `q @ R_k` and `o @ R_vᵀ` as one Triton launch each, per-KV-head rotations read in place |
-| `SGLANG_INT2_FAST_STAGE2` | `1` | reduce the split partials in parallel over head_dim slices instead of one serial loop per head |
-| `SGLANG_OSCAR_FAST_METADATA` | `1` | build the per-step BF16/INT2 index lists with one program per 512-token block |
-| `SGL_INT2_BLOCK_N` / `SGL_INT2_BLOCK_H` / `SGL_INT2_NUM_WARPS` / `SGL_INT2_NUM_STAGES` | shape-dependent | stage-1 tile |
-
-</details>
-
-<details>
-<summary><b>Garbling smoke (radix cache and CUDA graphs on)</b></summary>
-
-`rotation/verify/all.sh` serves a model from the image with radix cache and CUDA graphs on, sends probes through the chat template, and judges each output on shape checks. `PASS` means the output did not collapse, not that it is correct. One probe checks recall after a long generation: a four-option question sits in the BF16 window at prefill and is demoted to INT2 by the decode flush; after at least 700 words of reasoning the chosen option must be copied verbatim, otherwise `FAIL(no-recall)`.
-
-| Model | Smoke on this base (`67eab57057`) |
-|---|---|
-| Qwen3-4B-Thinking-2507, Qwen3-8B, Qwen3-32B, Qwen3-30B-A3B | PASS |
-| Qwen3.5-4B, Qwen3.5-35B-A3B, Qwen3.8-27B | PASS |
-| Gemma-4-12B-it | PASS |
-| MiniMax-M2.7, MiniMax-M3 | PASS |
-| GLM-4.7-FP8, GLM-5.2-FP8, GLM-5.3 | PASS |
-| Kimi-K3 | checked inside its two-node GPQA job (the sweep pod has eight GPUs, K3 needs sixteen) |
 
 </details>
 
