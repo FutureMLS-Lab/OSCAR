@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 import triton
@@ -433,6 +433,33 @@ def _mixed_extend_layout_counts(
     )
 
 
+def _evict_until_tier_slots_free(
+    tree_cache: BasePrefixCache | None,
+    *,
+    free_slots: Callable[[], int],
+    need_slots: int,
+    max_rounds: int = 16,
+) -> None:
+    """Evict LRU radix branches until ``free_slots()`` covers ``need_slots``.
+
+    Per-tier counterpart of ``evict_from_tree_cache`` for the mixed pool's
+    quant and HP-prefix page pools. Leaf-first eviction frees a branch's quant
+    tail long before the HP-prefix pages near the root come back, so the token
+    ask escalates each round; the loop is host-deterministic, so TP ranks stay
+    mirrored. On a tree with nothing left to evict the caller's alloc raises.
+    """
+    if need_slots <= 0 or tree_cache is None or tree_cache.is_chunk_cache():
+        return
+    ask = need_slots
+    for _ in range(max_rounds):
+        if free_slots() >= need_slots:
+            return
+        result = tree_cache.evict(EvictParams(num_tokens=ask))
+        if result.num_tokens_evicted == 0:
+            return
+        ask *= 4
+
+
 def _alloc_for_extend_mixed(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -508,24 +535,30 @@ def _alloc_for_extend_mixed(
     if pooled_need > 0:
         evict_from_tree_cache(batch.tree_cache, pooled_need)
 
-    # ``evict_from_tree_cache`` checks total free (quant + HP-prefix). A
-    # single call asking for ``pooled_need`` tokens may free mostly HP-prefix
-    # when leaves happen to be prefix-heavy, leaving the quant tier short.
-    # Loop with a small bound to converge on enough quant pages.
-    if (
-        total_quant_alloc > 0
-        and batch.tree_cache is not None
-        and not batch.tree_cache.is_chunk_cache()
-    ):
-        for _ in range(4):
-            free_quant_slots = (
-                allocator.free_pages.numel() + allocator.release_pages.numel()
-            ) * allocator.N_Q
-            if free_quant_slots >= total_quant_alloc:
-                break
-            result = batch.tree_cache.evict(EvictParams(num_tokens=total_quant_alloc))
-            if result.num_tokens_evicted == 0:
-                break
+    # ``evict_from_tree_cache`` checks total free (quant + HP-prefix), so it
+    # never fires for one starved tier while the other is large. Converge each
+    # tier on its own: the quant tier can run short when leaves happen to be
+    # prefix-heavy, and the HP-prefix tier starves under the radix cache
+    # because every cached prefix pins its sink pages (the pool holds a couple
+    # hundred sinks, so a server that has seen more distinct prompts than that
+    # crashed here before this loop existed).
+    _evict_until_tier_slots_free(
+        batch.tree_cache,
+        free_slots=lambda: (
+            allocator.free_pages.numel() + allocator.release_pages.numel()
+        )
+        * allocator.N_Q,
+        need_slots=total_quant_alloc,
+    )
+    _evict_until_tier_slots_free(
+        batch.tree_cache,
+        free_slots=lambda: (
+            allocator.hp_prefix_free_pages.numel()
+            + allocator.hp_prefix_release_pages.numel()
+        )
+        * allocator.N_Q,
+        need_slots=total_hp_prefix_alloc,
+    )
 
     quant_alloc = (
         allocator.alloc_quant(total_quant_alloc)
