@@ -15,6 +15,7 @@
 #   MAX_RUNNING    max-running-requests (default 64)
 #   CUDA_GRAPH_MAX_BS (default 32)
 #   GROUP_SIZE     int2 quant group size (default 128 — validated)
+#   SCALE_DTYPE    int2 per-row scale/zero dtype (default float32 — validated; float16 / bfloat16 cost 2.25 bits/elem at head_dim 128 instead of 2.5)
 #   MAX_NEW_TOKENS (default 32768)
 #   NUM_WORKERS    simple-evals client workers (default 32)
 #   N_REPEATS      (default 1)
@@ -334,7 +335,7 @@ SGLANG_MIXED_KV_HP_MAX_SPLITS=8 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=${SGLANG_MIXED_KV_PREFIX_TOKENS:-64} \
 SGLANG_MIXED_KV_RECENT_TOKENS=${SGLANG_MIXED_KV_RECENT_TOKENS:-256} \
 SGLANG_MIXED_KV_HP_DTYPE=bfloat16 \
-SGLANG_MIXED_KV_SCALE_DTYPE=float32 \
+SGLANG_MIXED_KV_SCALE_DTYPE="${SCALE_DTYPE:-float32}" \
 SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS="${HP_PREFIX_POOL_TOKENS:-0}" \
 SGLANG_MIXED_KV_AUDIT="${MIXED_KV_AUDIT:-0}" \
 SGLANG_MIXED_KV_AUDIT_EVERY="${MIXED_KV_AUDIT_EVERY:-25}" \
