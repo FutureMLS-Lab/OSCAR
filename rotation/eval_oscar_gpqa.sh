@@ -390,10 +390,13 @@ if ! curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
 fi
 
 # POST_HEALTH_CMD runs an arbitrary command against the live server (profiling,
-# diagnostics) and exits with its status; the trap tears the server down.
+# diagnostics) and exits with its status; the trap tears the server down. It sees
+# only the server's GPUs: a tool that picks the default CUDA device (the KL
+# scorer does) would otherwise land every parallel lane on physical GPU 0 and
+# push the server sharing that GPU out of memory.
 if [[ -n "${POST_HEALTH_CMD:-}" ]]; then
     echo "[eval-oscar] POST_HEALTH_CMD: ${POST_HEALTH_CMD}"
-    bash -c "${POST_HEALTH_CMD}" 2>&1 | tee -a "${LOG_RUNNER}"
+    CUDA_VISIBLE_DEVICES="${GPUS}" bash -c "${POST_HEALTH_CMD}" 2>&1 | tee -a "${LOG_RUNNER}"
     exit "${PIPESTATUS[0]}"
 fi
 
