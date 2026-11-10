@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="materials/oscar_logo_kv_transparent.png" alt="OSCAR INT2 KV-Cache" width="180"/>
+  <img src="materials/oscar_2_logo.png" alt="OSCAR-2 INT2 KV-Cache" width="180"/>
 </p>
 
 # OSCAR
