@@ -196,6 +196,9 @@ def build_replay_fb_view(
             None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
         ),
         num_padding=bs - raw_bs,
+        # Unpadded host copy of the real rows (FOSCAR plans graph replays from it); None when
+        # the batch keeps no CPU mirror.
+        req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,

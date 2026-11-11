@@ -15,6 +15,7 @@ def _pool(n_req=6, n_q=4):
     p.flush_interval = n_q
     p.max_req_slots = n_req
     p._flush_counter_host = [0] * n_req
+    p._quant_len_host = [0] * n_req
     p._next_slab_offset = torch.zeros(n_req, dtype=torch.int32)
     p._flush_stage = [torch.empty((n_req, 3), dtype=torch.int64) for _ in range(2)]
     p._flush_stage_i = 0

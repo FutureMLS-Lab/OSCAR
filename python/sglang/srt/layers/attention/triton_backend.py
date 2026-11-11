@@ -783,6 +783,30 @@ class TritonAttnBackend(AttentionBackend):
         self.model_dtype = model_runner.dtype
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+        # INT2 tier decoded by FOSCAR (SGLANG_OSCAR_FOSCAR): the pool owns the tier.
+        self.foscar_decode = None
+        if self.enable_mixed_kv and model_runner.token_to_kv_pool.foscar_tier is not None:
+            from sglang.srt.layers.attention.foscar_int2_decode import FoscarInt2Decode
+
+            if envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get():
+                raise ValueError(
+                    "SGLANG_OSCAR_FOSCAR plans each graph replay on the host; turn off "
+                    "SGLANG_ENABLE_METADATA_GLUE_GRAPH"
+                )
+            from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
+
+            pool = model_runner.token_to_kv_pool
+            if type(pool) is not UnifiedInt2HPKVPool:
+                # Wrapper pools (hybrid linear-attention models) remap layer ids, which the FOSCAR
+                # tier does not follow yet.
+                raise ValueError(f"SGLANG_OSCAR_FOSCAR needs the plain unified pool, got {type(pool).__name__}")
+            self.foscar_decode = FoscarInt2Decode(
+                pool.foscar_tier,
+                num_qo_heads=self.num_head,
+                sm_scale=float(pool.head_dim) ** -0.5,
+                max_context_len=self.max_context_len,
+                device=self.device,
+            )
         # Lean decode persistent-grid size (depends only on head architecture).
         kv_group_num = self.num_head // self.num_kv_head
         self.lean_total_programs, _, _ = _lean_decode_launch_params(
@@ -826,6 +850,9 @@ class TritonAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
         )
+        if self.foscar_decode is not None and self.enable_deterministic:
+            # The deterministic extend reads the pool's own INT2 buffers, which FOSCAR replaces.
+            raise ValueError("SGLANG_OSCAR_FOSCAR does not support deterministic inference")
 
         if self.enable_deterministic:
             # Fixed split tile size for batch invariance
@@ -1264,6 +1291,8 @@ class TritonAttnBackend(AttentionBackend):
             fields["mixed_quant_kv_indices"],
             bs,
         )
+        if self.foscar_decode is not None and bs > 0:
+            self._plan_foscar_eager(forward_batch, fields, bs)
         # Sliding-window mixed-decode indices (gemma4_unified two-group). For
         # SLIDING layers the HP+quant tiers must be capped to the last
         # ``sliding_window`` tokens; otherwise a sliding layer would (wrongly)
@@ -1299,10 +1328,43 @@ class TritonAttnBackend(AttentionBackend):
             )
         return fields
 
+    def _plan_foscar_eager(self, forward_batch: ForwardBatch, fields: dict, bs: int) -> None:
+        """Plan FOSCAR's eager decode for this step from the token-level INT2 indices and the
+        pool's host-side INT2 lengths (whole pages per request), without reading the device."""
+        rpi_cpu = forward_batch.req_pool_indices_cpu
+        if rpi_cpu is None:
+            raise RuntimeError("SGLANG_OSCAR_FOSCAR needs req_pool_indices_cpu on the decode batch")
+        lens = self.token_to_kv_pool.quant_lens(rpi_cpu.tolist()[:bs])
+        self.foscar_decode.plan_eager(
+            fields["mixed_quant_kv_indptr"],
+            fields["mixed_quant_kv_indices"],
+            num_tokens=sum(lens),
+            max_tokens=max(lens),
+            batch_size=bs,
+        )
+
+    def _update_foscar_graph(self, forward_batch, bs: int, in_capture: bool) -> None:
+        """Refresh FOSCAR's graph bucket for a capture (all rows padded) or a replay (real rows
+        from the pool's host-side INT2 lengths, padded rows empty), outside the graph."""
+        if in_capture:
+            self.foscar_decode.capture_graph_bucket(
+                bs, self.cuda_graph_mixed_quant_kv_indptr, self.cuda_graph_mixed_quant_kv_indices
+            )
+            return
+        rpi_cpu = forward_batch.req_pool_indices_cpu
+        n_pad = int(forward_batch.num_padding)
+        real = [] if rpi_cpu is None else rpi_cpu.tolist()[: bs - n_pad]
+        lens = self.token_to_kv_pool.quant_lens(real) + [0] * (bs - len(real))
+        self.foscar_decode.update_graph_bucket(
+            bs, self.cuda_graph_mixed_quant_kv_indptr, self.cuda_graph_mixed_quant_kv_indices, lens
+        )
+
     def _init_cuda_graph_mixed_kv_state(self, max_bs: int, max_num_tokens: int):
         """Capture-stable per-tier index buffers and stage-1 scratch for the
         unified int2 decode."""
         dev = self.device
+        if self.foscar_decode is not None:
+            self.foscar_decode.reserve_graph_workspace(max_num_tokens)
         self.cuda_graph_mixed_hp_kv_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=dev
         )
@@ -1929,6 +1991,8 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            if self.foscar_decode is not None and forward_mode.is_decode_or_idle():
+                self._update_foscar_graph(forward_batch, bs, in_capture=True)
             out_cache_loc_full_physical = self._fill_cuda_graph_write_locs(
                 forward_batch, bs
             )
@@ -1950,6 +2014,8 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            if self.foscar_decode is not None and forward_mode.is_decode_or_idle():
+                self._update_foscar_graph(forward_batch, bs, in_capture=False)
             # Metadata view is reused from capture; just refill the buffers.
             self._fill_cuda_graph_write_locs(forward_batch, bs)
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
@@ -3701,7 +3767,29 @@ class TritonAttnBackend(AttentionBackend):
                 decode_hp_kv_indices = self.forward_metadata.mixed_hp_kv_indices
                 decode_quant_kv_indptr = self.forward_metadata.mixed_quant_kv_indptr
                 decode_quant_kv_indices = self.forward_metadata.mixed_quant_kv_indices
-            if kv_pool.pq_k_set is not None:
+            if self.foscar_decode is not None:
+                if logits_soft_cap or layer.xai_temperature_len > 0:
+                    raise NotImplementedError("SGLANG_OSCAR_FOSCAR decode has no logit cap / xai temperature")
+                from sglang.srt.layers.attention.foscar_int2_decode import (
+                    decode_attention_fwd_int2_foscar,
+                )
+
+                decode_attention_fwd_int2_foscar(
+                    q_for_decode,
+                    kv_pool.get_hp_key_buffer(layer.layer_id),
+                    kv_pool.get_hp_value_buffer(layer.layer_id),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    decode_hp_kv_indptr,
+                    decode_hp_kv_indices,
+                    mixed_logits,
+                    mixed_lse,
+                    self.forward_metadata.mixed_hp_num_kv_splits[:bs],
+                    self.max_hp_kv_splits,
+                    layer.scaling,
+                    foscar=self.foscar_decode,
+                    layer_index=oscar_layer_idx,
+                )
+            elif kv_pool.pq_k_set is not None:
                 self.decode_attention_fwd_pq_unified(
                     q_for_decode,
                     kv_pool.get_hp_key_buffer(layer.layer_id),

@@ -379,8 +379,15 @@ def _mixed_extend_layout_counts(
     hp_recent_tokens: int,
     n_q: int,
     is_final_chunk: bool = True,
+    whole_quant_pages: bool = False,
 ) -> tuple[int, int, int, int, int]:
     """Return per-request mixed-KV extend counts.
+
+    ``whole_quant_pages`` (FOSCAR pages): the final chunk hands the quant middle's last
+    ``quant_count % n_q`` tokens to HP-recent instead of leaving slack in a partial quant
+    page, so every request's INT2 tier is whole pages in logical order. HP-recent then holds
+    up to ``hp_recent + n_q - 1`` tokens, the ring's capacity and its occupancy between
+    flushes anyway; the counter below keeps the next flush on the page boundary.
 
     Default (final chunk) layout: ``[HP-prefix][quant-middle][HP-recent]``.
     Non-final chunks collapse to ``[HP-prefix][quant-all]`` and skip
@@ -397,6 +404,10 @@ def _mixed_extend_layout_counts(
         hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
         quant_count = max(0, recent_start - max(pre_len, prefix_keep))
         hp_recent_count = max(0, seq_len - max(pre_len, recent_start))
+        if whole_quant_pages:
+            rem = quant_count % n_q
+            quant_count -= rem
+            hp_recent_count += rem
     else:
         prefix_keep = min(seq_len, hp_prefix_tokens)
         hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
@@ -492,6 +503,7 @@ def _alloc_for_extend_mixed(
 
     n_q = int(kv_pool.N_Q)
     hp_recent_target = int(kv_pool.hp_recent_tokens)
+    foscar = kv_pool.foscar_tier is not None
 
     hp_prefix_counts: list[int] = []
     hp_recent_counts: list[int] = []
@@ -517,6 +529,7 @@ def _alloc_for_extend_mixed(
             hp_recent_target,
             n_q,
             is_final_chunk=bool(is_final_chunk_list[i]),
+            whole_quant_pages=foscar,
         )
 
         hp_prefix_counts.append(hp_prefix_count)
@@ -703,6 +716,20 @@ def _alloc_for_extend_mixed(
     # copy + scatter so the decode hot path sees the counter without a
     # later sync.
     kv_pool.seed_flush_counters(req_pool_indices, flush_counter_inits)
+    # Every position in [hp_prefix, pre_len) is INT2 (earlier chunks / a radix hit capped
+    # below HP-recent), plus this chunk's quant middle.
+    hp_prefix_tokens = int(kv_pool.hp_prefix_tokens)
+    quant_lens_after = [
+        max(0, int(pre_len) - hp_prefix_tokens) + int(qc)
+        for pre_len, qc in zip(batch.prefix_lens, quant_counts)
+    ]
+    if foscar:
+        bad = [n for n in quant_lens_after if n % n_q]
+        if bad:
+            raise RuntimeError(
+                f"FOSCAR INT2 tier needs whole {n_q}-token pages per request; got INT2 lengths {bad[:4]}"
+            )
+    kv_pool.set_quant_lens(req_pool_indices, quant_lens_after)
 
     try:
         batch.req_to_token_pool.alloc_aux_to_lengths(
@@ -849,7 +876,19 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         # per geometry. The plan (slot ids / req_to_token positions) is
         # geometry-agnostic and shared across groups. The remap kernel only
         # needs to run once, so it is issued by the LAST group's apply.
-        if kv_pool.pq_k_set is not None or kv_pool.pq_v_set is not None:
+        if kv_pool.foscar_tier is not None:
+            from sglang.srt.mem_cache.foscar_int2_tier import foscar_flush_apply
+
+            foscar_flush_apply(
+                plan,
+                tier=kv_pool.foscar_tier,
+                hp_k_buffers=kv_pool.hp_k_buffer,
+                hp_v_buffers=kv_pool.hp_v_buffer,
+                req_pool_indices=req_idx_f,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+            )
+            groups = []
+        elif kv_pool.pq_k_set is not None or kv_pool.pq_v_set is not None:
             # PQ tiers encode row by row against their codebooks; the fused
             # INT2 kernel below cannot express them.
             gpu_flush_pq_apply(
@@ -906,6 +945,7 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         # Side caches keyed by slot id (MiniMax indexer keys) must follow the
         # demoted rows, or the indexer reads zeros for every flushed token.
         kv_pool.on_flush_applied(plan)
+        kv_pool.add_quant_lens([rpi_cpu[i] for i in flush_rows], flush_interval)
 
     if mixed_kv_audit.audit_enabled():
         # after the remap, as before: the table the audit reads is this step's

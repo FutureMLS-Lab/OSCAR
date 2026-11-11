@@ -231,10 +231,11 @@ def _get_unified_mixed_kv_bytes_per_quant_token(
     live in a parallel arena (one entry per quant slot) and are included
     here so the scheduler's cell-size matches the actual allocator size.
     """
-    # A PQ tier stores one uint8 code per sub-vector and no scales; the INT2
-    # tier's row is ``head_dim * hp_dtype_bytes / n_q`` (= head_dim // 4).
-    k_bytes = (k_head_dim * hp_dtype_bytes) // n_q if k_code_bytes is None else k_code_bytes
-    v_bytes = (v_head_dim * hp_dtype_bytes) // n_q if v_code_bytes is None else v_code_bytes
+    # A PQ tier stores one uint8 code per sub-vector and no scales; an INT2 row
+    # packs four 2-bit codes per byte. (``head_dim * hp_dtype_bytes / n_q`` is the
+    # same number only while N_Q = 4 * hp_dtype_bytes; FOSCAR pages are 64 tokens.)
+    k_bytes = k_head_dim // 4 if k_code_bytes is None else k_code_bytes
+    v_bytes = v_head_dim // 4 if v_code_bytes is None else v_code_bytes
     scales_zeros_bytes_per_quant_token = 2 * scale_dtype_bytes * (k_groups + v_groups)
     return k_bytes + v_bytes + scales_zeros_bytes_per_quant_token
 

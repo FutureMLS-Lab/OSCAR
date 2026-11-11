@@ -130,6 +130,10 @@ def compute_page_geometry(hp_dtype: torch.dtype) -> Tuple[int, int]:
     legacy callers, but no longer carries the LCM byte-equivalence invariant —
     HP and quant arenas are decoupled allocations under the slab design.
     """
+    if envs.SGLANG_OSCAR_FOSCAR.get():
+        from sglang.srt.mem_cache.foscar_int2_tier import FOSCAR_PAGE_TOKENS
+
+        return 1, FOSCAR_PAGE_TOKENS
     hp_itemsize = torch.empty(0, dtype=hp_dtype).element_size()
     return 1, 4 * hp_itemsize
 
@@ -506,6 +510,15 @@ class UnifiedInt2HPKVPool(KVCache):
             self._k_clip_idx_layer = [
                 clip_ratio_to_index(_ph[i], self.head_dim).to(torch.device(self.device)) for i in range(self.layer_num)
             ]
+        # INT2 tier stored and decoded by FOSCAR: the pool's own quant buffers become zero-row
+        # placeholders and ``foscar_tier`` holds the pages (created by ``_create_arenas``).
+        self.foscar_tier = None
+        self._foscar = envs.SGLANG_OSCAR_FOSCAR.get()
+        if self._foscar:
+            self._check_foscar_config(layer_groups)
+        # FOSCAR plans from host-side INT2 lengths: tokens of each request slot in the INT2
+        # tier, set at extend, advanced by each flush, cleared on release.
+        self._quant_len_host: List[int] = [0] * self.max_req_slots
         self._create_arenas()
 
         # Cached attributes used by the rest of the stack.
@@ -988,6 +1001,7 @@ class UnifiedInt2HPKVPool(KVCache):
         self._pending_forward_done = None
         self._next_slab_offset.zero_()
         self._flush_counter_host = [0] * self.max_req_slots
+        self._quant_len_host = [0] * self.max_req_slots
 
     def stash_pending_forward(self, event) -> None:
         """Record the most recent forward-stream completion event.
@@ -1048,10 +1062,12 @@ class UnifiedInt2HPKVPool(KVCache):
             self._next_slab_offset[idx] = 0
             for i in idx_list:
                 self._flush_counter_host[int(i)] = 0
+                self._quant_len_host[int(i)] = 0
         else:
             i = int(req_pool_idx)
             self._next_slab_offset[i] = 0
             self._flush_counter_host[i] = 0
+            self._quant_len_host[i] = 0
 
     def seed_flush_counters(self, req_pool_indices: List[int], inits: List[int]) -> None:
         """Admission (every chunk of a chunked extend re-seeds; the latest wins)."""
@@ -1125,7 +1141,7 @@ class UnifiedInt2HPKVPool(KVCache):
             self.num_hp_prefix_slots
             + self.max_req_slots * self.hp_recent_ring_size
         )
-        nq = self.num_quant_pages * self.N_Q
+        nq = 0 if self._foscar else self.num_quant_pages * self.N_Q
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1292,6 +1308,58 @@ class UnifiedInt2HPKVPool(KVCache):
         self._flush_k_sz_stride = g0["k_sz_stride"]
         self._flush_v_sz_stride = g0["v_sz_stride"]
 
+        if self._foscar:
+            from sglang.srt.mem_cache.foscar_int2_tier import FoscarInt2Tier
+
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self.foscar_tier = FoscarInt2Tier(
+                    num_quant_pages=self.num_quant_pages,
+                    layer_num=self.layer_num,
+                    head_num=self.head_num,
+                    head_dim=self.head_dim,
+                    v_head_dim=self.v_head_dim,
+                    device=self.device,
+                    k_clip_layer=self._k_clip_layer,
+                    k_clip_idx_layer=self._k_clip_idx_layer,
+                    v_clip=self._v_clip_ratio,
+                )
+
+    def _check_foscar_config(self, layer_groups) -> None:
+        from sglang.srt.mem_cache.foscar_int2_tier import FOSCAR_PAGE_TOKENS, foscar_supported
+
+        problems = []
+        if type(self) is not UnifiedInt2HPKVPool:
+            problems.append(f"{type(self).__name__} (only the plain unified pool)")
+        if not foscar_supported():
+            problems.append("the foscar package is not importable or this GPU is neither SM90 nor SM100")
+        if self.N_Q != FOSCAR_PAGE_TOKENS:
+            problems.append(f"quant page size N_Q={self.N_Q} (FOSCAR pages are {FOSCAR_PAGE_TOKENS} tokens)")
+        if layer_groups is not None:
+            problems.append("two-geometry pools")
+        if self._pq_k is not None or self._pq_v is not None:
+            problems.append("product-quantized tiers")
+        if envs.SGLANG_LLOYD_MAX.get():
+            problems.append("Lloyd-Max levels (FOSCAR stores uniform INT2)")
+        if self.head_dim != self.v_head_dim:
+            problems.append(f"head_dim {self.head_dim} != v_head_dim {self.v_head_dim}")
+        if self.scale_dtype != torch.float32:
+            problems.append(f"scale dtype {self.scale_dtype} (FOSCAR's INT2 layout keeps float32 scales)")
+        if problems:
+            raise ValueError("SGLANG_OSCAR_FOSCAR is not supported here: " + "; ".join(problems))
+
+    # -- host-side INT2 lengths (FOSCAR decode plans) -----------------------
+
+    def set_quant_lens(self, req_pool_indices: List[int], lens: List[int]) -> None:
+        for rpi, n in zip(req_pool_indices, lens):
+            self._quant_len_host[int(rpi)] = int(n)
+
+    def add_quant_lens(self, req_pool_indices: List[int], n: int) -> None:
+        for rpi in req_pool_indices:
+            self._quant_len_host[int(rpi)] += int(n)
+
+    def quant_lens(self, req_pool_indices: List[int]) -> List[int]:
+        return [self._quant_len_host[int(rpi)] for rpi in req_pool_indices]
+
     # -- KVCache interface -------------------------------------------------
 
     def get_kv_size_bytes(self):
@@ -1303,6 +1371,11 @@ class UnifiedInt2HPKVPool(KVCache):
         v = sum(get_tensor_size_bytes(t) for t in self.v_buffer)
         v += sum(get_tensor_size_bytes(s) for s in self.v_scales_zeros)
         v += sum(get_tensor_size_bytes(t) for t in self.hp_v_buffer)
+        if self.foscar_tier is not None:
+            # FOSCAR pools hold K, V and scales together; split the bytes evenly.
+            tier_bytes = self.foscar_tier.layout.bytes_per_page() * (self.num_quant_pages + 1) * self.layer_num
+            k += tier_bytes // 2
+            v += tier_bytes - tier_bytes // 2
         return k, v
 
     def _layer_index(self, layer_id: int) -> int:
@@ -1478,6 +1551,7 @@ class UnifiedInt2HPKVPool(KVCache):
 
         use_fused_rotate = (
             envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get()
+            and self.foscar_tier is None
             and not already_hadamard_transformed
             and v_rotation_absorbed
             and clip_on
@@ -1510,6 +1584,17 @@ class UnifiedInt2HPKVPool(KVCache):
         else:
             cache_k = cache_k.to(self.hp_dtype)
             cache_v = cache_v.to(self.hp_dtype)
+
+        if self.foscar_tier is not None:
+            # ``quant_loc`` is the whole extend's loc; rows bound for HP slots get slot -1,
+            # which FOSCAR's writer skips, so no compaction (and no sync) is needed. So do rows
+            # on quant page 0, the reserved padded-write page: a prefill-graph capture writes
+            # every token to slot 0, and thousands of duplicate slots serialize FOSCAR's writer.
+            slots = quant_loc.to(torch.int64)
+            hp_offset = int(mixed_hp_offset) if mixed_hp_offset is not None else int(self._hp_offset)
+            slots = torch.where((slots >= self.N_Q) & (slots < hp_offset), slots, torch.full_like(slots, -1))
+            self.foscar_tier.write(idx, cache_k, cache_v, slots)
+            return
 
         if self._pq_k is not None:
             self._store_quant_pq(idx, quant_loc, cache_k, cache_v, mixed_hp_offset)

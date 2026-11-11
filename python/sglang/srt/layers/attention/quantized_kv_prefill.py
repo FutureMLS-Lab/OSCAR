@@ -390,6 +390,56 @@ def _dequantize_mixed_prefix_pq(
     return k, v
 
 
+def _dequantize_mixed_prefix_foscar(
+    kv_pool,
+    layer_id: int,
+    prefix_indices: torch.Tensor,
+    model_dtype: torch.dtype,
+    out_k: Optional[torch.Tensor] = None,
+    out_v: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mixed prefix rows when FOSCAR holds the INT2 tier: HP rows straight from the HP
+    buffers; INT2 rows by reading their whole 64-token pages back to bf16 (FOSCAR's paged
+    dequantize) and taking each slot's position. Syncs on the page set, so not capturable."""
+    from sglang.srt.mem_cache.foscar_int2_tier import FOSCAR_PAGE_TOKENS
+
+    tier = kv_pool.foscar_tier
+    device = prefix_indices.device
+    n = prefix_indices.numel()
+    heads, dim = kv_pool.head_num, kv_pool.head_dim
+    k = out_k if out_k is not None else torch.empty((n, heads, dim), dtype=model_dtype, device=device)
+    v = out_v if out_v is not None else torch.empty((n, heads, dim), dtype=model_dtype, device=device)
+    hp_off = int(kv_pool.hp_global_offset)
+    is_hp = prefix_indices >= hp_off
+    hp_pos = is_hp.nonzero(as_tuple=True)[0]
+    if hp_pos.numel():
+        hp_rows = prefix_indices.index_select(0, hp_pos) - hp_off
+        k.index_copy_(0, hp_pos, kv_pool.get_hp_key_buffer(layer_id).index_select(0, hp_rows).to(model_dtype))
+        v.index_copy_(0, hp_pos, kv_pool.get_hp_value_buffer(layer_id).index_select(0, hp_rows).to(model_dtype))
+    q_pos = (~is_hp).nonzero(as_tuple=True)[0]
+    if q_pos.numel():
+        slots = prefix_indices.index_select(0, q_pos)
+        pages, inverse = torch.unique(
+            torch.div(slots, FOSCAR_PAGE_TOKENS, rounding_mode="floor"), return_inverse=True
+        )
+        n_pages = pages.numel()
+        stage_k = torch.empty((n_pages * FOSCAR_PAGE_TOKENS, heads, dim), dtype=torch.bfloat16, device=device)
+        stage_v = torch.empty_like(stage_k)
+        tier.dequantize(
+            kv_pool._layer_index(layer_id),
+            stage_k,
+            stage_v,
+            torch.arange(n_pages + 1, dtype=torch.int32, device=device),
+            pages.to(torch.int32),
+            torch.full((n_pages,), FOSCAR_PAGE_TOKENS, dtype=torch.int32, device=device),
+            torch.arange(n_pages, dtype=torch.int32, device=device) * FOSCAR_PAGE_TOKENS,
+        )
+        rows = inverse * FOSCAR_PAGE_TOKENS + torch.remainder(slots, FOSCAR_PAGE_TOKENS)
+        k.index_copy_(0, q_pos, stage_k.index_select(0, rows).to(model_dtype))
+        v.index_copy_(0, q_pos, stage_v.index_select(0, rows).to(model_dtype))
+    return k, v
+
+
 def dequantize_prefix_kv(
     kv_pool,
     layer_id: int,
@@ -451,6 +501,10 @@ def dequantize_prefix_kv(
         assert kv_pool.dtype == "int2", (
             f"Unsupported quantized KV dtype: {kv_pool.dtype}"
         )
+        if kv_pool.foscar_tier is not None:
+            return _dequantize_mixed_prefix_foscar(
+                kv_pool, layer_id, prefix_indices, model_dtype, out_k=out_k, out_v=out_v
+            )
         if kv_pool.pq_k_set is not None:
             return _dequantize_mixed_prefix_pq(
                 kv_pool,
