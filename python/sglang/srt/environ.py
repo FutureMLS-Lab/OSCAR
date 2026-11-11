@@ -606,6 +606,9 @@ class Envs:
     # INT2 tier stored and decoded by FOSCAR (github.com/FutureMLS-Lab/FOSCAR): 64-token quant
     # pages in FOSCAR's layout, its paged decode for the INT2 tier; needs --page-size 64.
     SGLANG_OSCAR_FOSCAR = EnvBool(False)
+    # INT2 prefill over the dequantized prefix: FlashInfer's ragged prefill where FlashAttention 3
+    # is unavailable (Blackwell); off falls back to the chunked SDPA pass.
+    SGLANG_OSCAR_PREFILL_FLASHINFER = EnvBool(True)
     # Oscar rotation + per-row clip for int2 KV cache. Learned per-layer
     # orthogonal matrices loaded from K/V rotation checkpoints.
     SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")

@@ -783,6 +783,8 @@ class TritonAttnBackend(AttentionBackend):
         self.model_dtype = model_runner.dtype
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+        # FlashInfer ragged prefill for the INT2 dense extend where FlashAttention 3 is unavailable.
+        self._int2_prefill_flashinfer = None
         # INT2 tier decoded by FOSCAR (SGLANG_OSCAR_FOSCAR): the pool owns the tier.
         self.foscar_decode = None
         if self.enable_mixed_kv and model_runner.token_to_kv_pool.foscar_tier is not None:
@@ -1596,18 +1598,35 @@ class TritonAttnBackend(AttentionBackend):
         softcap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
         # Two reasons to leave FlashAttention: it caps head_dim at 256 (gemma4's
         # full-attention layers are 512), and sgl-kernel only builds it for
-        # sm8x/sm90, so it raises on Blackwell. The SDPA pass handles arbitrary
-        # head_dim, causal + sliding window via an additive mask, and MQA/GQA via
+        # sm8x/sm90, so it raises on Blackwell. Up to head_dim 256 FlashInfer's
+        # ragged prefill takes over; the SDPA pass handles arbitrary head_dim,
+        # causal + sliding window via an additive mask, and MQA/GQA via
         # enable_gqa -- but it has no softcap, so a capping layer must not
         # silently take it.
-        use_sdpa = head_dim > 256 or not _is_fa3_supported()
+        use_fa3 = head_dim <= 256 and _is_fa3_supported()
+        use_flashinfer = (
+            not use_fa3 and head_dim <= 256 and envs.SGLANG_OSCAR_PREFILL_FLASHINFER.get()
+        )
+        use_sdpa = not use_fa3 and not use_flashinfer
         if use_sdpa and softcap:
             raise NotImplementedError(
                 f"int2 prefill needs a softcap ({softcap}) that the SDPA fallback "
                 f"cannot apply, and FlashAttention is unavailable here "
                 f"(head_dim={head_dim}, fa3_supported={_is_fa3_supported()})."
             )
-        if use_sdpa:
+        if use_flashinfer:
+            result = self._flashinfer_ragged_prefill(
+                q3,
+                unified_k,
+                unified_v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sm_scale=layer.scaling,
+                causal=causal,
+                window_left=window_size[0],
+                logits_soft_cap=softcap,
+            )
+        elif use_sdpa:
             result = self._sdpa_varlen_prefill(
                 q3,
                 unified_k_parts,
@@ -1636,6 +1655,45 @@ class TritonAttnBackend(AttentionBackend):
         result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
         o.copy_(result.view_as(o))
         return o
+
+    def _flashinfer_ragged_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        *,
+        sm_scale: float,
+        causal: bool,
+        window_left: int,
+        logits_soft_cap: Optional[float],
+    ) -> torch.Tensor:
+        """Varlen prefill over [dequantized prefix + extend] rows with FlashInfer's ragged
+        kernel. Its causal mask aligns each request's last query with its last key, which is
+        the prefix-then-extend layout here."""
+        import flashinfer
+
+        if self._int2_prefill_flashinfer is None:
+            workspace = torch.empty(256 << 20, dtype=torch.uint8, device=self.device)
+            self._int2_prefill_flashinfer = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace, kv_layout="NHD"
+            )
+        wrapper = self._int2_prefill_flashinfer
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads=q.shape[1],
+            num_kv_heads=k.shape[1],
+            head_dim_qk=q.shape[2],
+            causal=causal,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap or None,
+            sm_scale=sm_scale,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+        )
+        return wrapper.run(q, k.contiguous(), v.contiguous())
 
     # Query rows per SDPA call in the fallback path. 1024 x 32k x 8 heads x 4B
     # is ~1 GB, which fits alongside weights on every SKU we serve.
