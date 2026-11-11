@@ -2,12 +2,12 @@
   <img src="materials/oscar_2_logo.png" alt="OSCAR-2 INT2 KV-Cache" width="180"/>
 </p>
 
-# OSCAR
+# OSCAR-2
 
-### Offline Spectral Covariance-Aware Rotation for 2-bit KV Cache Quantization
+### Plug-and-Play 2-Bit KV Cache Serving with Head-Resolved GQA and Joint-Latent MLA Calibration
 
 <p align="center">
-  <a href="https://arxiv.org/pdf/2605.17757"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?logo=arxiv&logoColor=white" alt="Paper"/></a>
+  <a href="https://arxiv.org/pdf/2605.17757"><img src="https://img.shields.io/badge/OSCAR--1%20Paper-arXiv-b31b1b?logo=arxiv&logoColor=white" alt="OSCAR-1 Paper"/></a>
   <a href="https://oscar-quantize.github.io/"><img src="https://img.shields.io/badge/Website-oscar--quantize-1f77b4?logo=googlechrome&logoColor=white" alt="Website"/></a>
   <a href="https://huggingface.co/Zhongzhu/OSCAR-RotationZoo"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-RotationZoo-FFD21E" alt="HuggingFace RotationZoo"/></a>
   <br/>
@@ -16,15 +16,20 @@
   <a href="https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Qwen3-4B-Thinking-2507-INT2-KV"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20GGUF%20Qwen3--4B--Thinking--2507-INT2%20KV-FFD21E" alt="GGUF Qwen3-4B Thinking 2507 INT2 KV"/></a>
 </p>
 
-OSCAR stores the bulk of the KV cache in **2 bits** and keeps only a small BF16 sink and recent window. Each (layer, KV head) gets a rotation built from attention-aware covariance (an eigenbasis followed by a Hadamard, so every channel carries a similar share of the energy), a key mean that is subtracted before quantization, and a clipping threshold, so that four levels per row are enough. The rotation is fit **at server start** or offline on a small calibration set. With the per-row scale and zero included this is 2.25–2.5 bits per element: **6–7× more KV tokens than BF16 in the same memory** on most models, 4× for MLA latents. At 128K context and batch 1 the INT2 decode runs at **1.03–1.16× FlashInfer BF16 on H100** for dense models and 0.73–0.94× on B200.
+Deploying a 2-bit KV cache usually takes an offline calibration pipeline, model-specific transform choices, and a new kernel for every cache geometry. **OSCAR-2 makes attention-aware 2-bit rotation plug-and-play**: the server loads a model, calibrates during startup, and serves heterogeneous cache geometries through one checkpoint format and one kernel family. There is no activation dump, no model-specific calibration script and no per-model kernel.
+
+The bulk of the KV cache is stored in **2 bits**; only a small BF16 sink and recent window stay in full precision. With the per-row scale and zero included this is 2.25–2.5 bits per element: **6–7× more KV tokens than BF16 in the same memory** on most models, 4× for MLA latents. At 128K context and batch 1 the INT2 decode runs at **1.03–1.16× FlashInfer BF16 on H100** for dense models and 0.73–0.94× on B200.
 
 <p align="center">
-  <img src="materials/OSCAR_pipeline.png" alt="OSCAR pipeline" width="720"/>
+  <img src="materials/oscar2_teaser.png" alt="OSCAR-2 overview" width="960"/>
 </p>
 
-This repository is upstream SGLang `main` with the OSCAR low-bit KV cache added under `python/sglang/`. A llama.cpp port (Metal and CPU) lives on the [`zhongzhu/llamacpp`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) branch, and pre-fit rotations are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
+<p align="center"><sub><b>(a)</b> Closed-form calibration moves into model startup. <b>(b)</b> A head-resolved objective preserves query-head pairing and extends to one joint MLA latent. <b>(c)</b> The Quantizer Family configures only the 2-bit KV state. <b>(d)</b> Head-strided metadata drives fused writes and an occupancy-aware split-KV read path.</sub></p>
+
+This branch is upstream SGLang `main` with OSCAR-2 added under `python/sglang/`. OSCAR-1 (offline dump, fit and evaluate, one rotation per layer) is described in the [OSCAR-1 paper](https://arxiv.org/abs/2605.17757), and its code is on the [`main`](https://github.com/FutureMLS-Lab/OSCAR/tree/main) branch. A llama.cpp port (Metal and CPU) lives on the [`zhongzhu/llamacpp`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) branch, and pre-fit rotations are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
 ## 🔥 Latest News
+- **[2026-11-11]** **OSCAR-2**: calibration inside server startup, head-resolved GQA and joint-latent MLA objectives, a matched scalar-INT2 Quantizer Family, and one fused-write / split-KV kernel family for every cache geometry. This README follows the OSCAR-2 paper, which is in preparation.
 - **[2026-10-12]** Main results refreshed for **13 models** on the current tree (commit `9105559e8e`, upstream base `67eab57057`): GPQA-Diamond at a 64K budget, KL against BF16 at 128K on PG-19, and 128K decode on B200 and H100. On H100 the INT2 decode is **faster than FlashInfer BF16** on dense models (1.03–1.16× at 128K, batch 1); on B200 it is 0.73–0.94× after raising the default INT2 split cap to 256 and dequantizing with a bf16 bit trick. Most recipes now use per-(layer, KV head) rotations with key centering and a per-head K clip.
 - **[2026-10-03]** OSCAR moved onto **upstream SGLang main** (base `67eab57057`, the official nightly of 2026-10-02): the repository root is upstream and OSCAR is the diff. Every INT2 arm runs the model's own attention (DSA for GLM-5.x, MSA for MiniMax-M3, MLA + KDA across two nodes for Kimi-K3). Rotations can be **fit at server start**, and 1-bit / 1.5-bit K via product quantization ships as an opt-in tier.
 - **[2026-10-03]** Dense INT2 decode on B200 went from 2–3.9× to 1.2–1.5× of FlashInfer BF16 at 64K / batch 1: a separate INT2 split cap, a fused HP + INT2 stage-1, batched decode rotations, a parallel stage-2 and a parallel metadata build, all default-on and checked bit-for-bit against the two-launch path.
@@ -51,6 +56,7 @@ This repository is upstream SGLang `main` with the OSCAR low-bit KV cache added 
 </details>
 
 ## 📖 Table of Contents
+- [What OSCAR-2 adds](#what-oscar-2-adds)
 - [Main results](#main-results)
 - [Quick start](#-quick-start)
 - [Supported models](#supported-models)
@@ -60,7 +66,26 @@ This repository is upstream SGLang `main` with the OSCAR low-bit KV cache added 
 - [Citation](#citation)
 - [License & acknowledgements](#license--acknowledgements)
 
+## What OSCAR-2 adds
+
+| | OSCAR-1 | OSCAR-2 |
+|:---|:---|:---|
+| Calibration | dump Q/K/V, solve offline on the CPU, install a separate artifact | collect moments during a prefill-only startup pass, reduce over TP, eigendecompose, install before the first request |
+| Objective | pooled query / score-weighted covariance | head-resolved post-`W_O` metric for GQA; one joint key/value latent for MLA |
+| Quantizer | one rotation per layer, global K / V clip ratios | shared or per-KV-head rotations, key centering, per-head K clip, orthogonal or non-orthogonal bases, uniform or Lloyd–Max levels, all in one checkpoint format |
+| Models | dense models on `main`, hybrid and Gemma-4 on feature branches | one tree: one fused write kernel driven by head-strided metadata and one split-KV read path for dense, GQA, MoE, sliding-window, hybrid and MLA caches |
+
+**1. Startup-time closed-form calibration.** With the mixed pool on and no rotation file given, the pool starts on identity bases and the server prefills calibration prompts before it takes traffic. The attention layers accumulate per-(layer, KV head) moments, the scheduler reduces them across TP ranks and eigendecomposes them in FP64, and the rotations are installed in place, so captured decode CUDA graphs stay valid. The checkpoint is written atomically; later launches load it and skip collection. The same pass can save the per-head moments, from which every per-head variant below is fit in closed form, without an activation dump or gradient training. Code: `srt/entrypoints/oscar_startup_calibration.py`, `srt/mem_cache/oscar_calibration.py`; usage under [Advanced usage](#advanced-usage).
+
+**2. Head-resolved output awareness.** Under GQA several query heads read one KV head, each with its own attention weights and its own block of `W_O`, and pooling their moments loses that pairing. OSCAR-2 keeps the pairing and the within-group cross-head terms in the value metric `G_h = Σ_{j,j'∈G_h} ρ_{h,jj'} W_{O,j}ᵀ W_{O,j'}`, where ρ is the query heads' co-attention (variant `outaware_hr`). MLA reads one latent as both key and value, so independent key and value rotations are invalid; OSCAR-2 fits one latent transform from the joint metric `M_K/tr M_K + λ·M_V/tr M_V` and keeps the rotary part `k_pe` in BF16 (`rotation/tools/fit_mla_joint_latent.py`).
+
+**3. A matched scalar-INT2 Quantizer Family.** Granularity, key centering, clipping, transform variant and reconstruction levels change one at a time behind one checkpoint format, with the cache rate, page layout and kernels held fixed. In these sweeps per-head fitting pays off only together with key centering and per-head clipping: fitting heads independently exposes a large key-mean direction that consumes the row's dynamic range. Centering subtracts the per-head key mean before the rotation, which shifts every logit of a query by one constant and leaves the softmax unchanged.
+
+**4. Kernel and runtime co-design.** One Triton kernel centers, rotates, clips with the per-head ratio, quantizes and packs each history row. Rotation, mean and clip pointers are head-strided (stride 0 is OSCAR-1's sharing), so family members change metadata rather than launch topology. Decode runs split-KV over the packed history and the BF16 windows and merges their online-softmax statistics. The INT2 history has its own split budget (`SGLANG_INT2_MAX_SPLITS`, default 256), so TP ranks that own few KV heads still fill the GPU, and the inner loop rebuilds a 2-bit code `c` as `bitcast_bf16(c | 0x4300) − 128` instead of converting an integer. The same parameter indirection keeps every geometry compatible with radix caching and CUDA graphs.
+
 ## Main results
+
+Measured on this tree with the OSCAR-2 recipes; most rows use per-(layer, KV head) rotations with key centering and a per-head K clip. The matched OSCAR-2 tables (Quantizer Family ablation, head-resolved objectives, startup latency and serving) will be added with the paper.
 
 | Model | Attention (INT2 path) | GPQA-Diamond BF16 → INT2 | KL@128K ↓ | Decode @128K, B200: INT2 / BF16 tok/s | Decode @128K, H100: INT2 / BF16 tok/s | KV tokens vs BF16 |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|
@@ -276,6 +301,27 @@ The fitter checks on every file that `q'·k' = q·k` and that `o_rotation` inver
 </details>
 
 <details>
+<summary><b>Joint-latent transform for MLA models</b></summary>
+
+The packed MLA pool quantizes the shared latent `c_kv`, which is read as the key through `W_UK` and as the value through `W_UV` and `W_O`. The fitter takes a latent dump written with `SGLANG_OSCAR_MLA_LATENT_DUMP_DIR` and the checkpoint's `kv_b_proj` / `o_proj` weights:
+
+```bash
+python rotation/tools/fit_mla_joint_latent.py --dump-dir $DUMP --model zai-org/GLM-5.3 \
+    --out $OUT --variants cov,key,value,joint
+```
+
+| Variant | Latent metric |
+|:---|:---|
+| `cov` | the latent covariance alone, plus centering |
+| `key` | `M_K = Σ_h E[q_abs,hᵀ q_abs,h]`, the logit error |
+| `value` | `M_V = Σ_{h,h'} ρ_hh' B_h B_h'ᵀ` with `B_h = W_UV,hᵀ W_O,hᵀ`, the post-`W_O` output error |
+| `joint` | `M_K/tr M_K + λ·M_V/tr M_V` |
+
+Every variant ships the latent `mean`; non-orthogonal variants also ship `q_rotation = R_c⁻ᵀ`, which serves both the query and the output side because key and value share the latent. The rotary part `k_pe` stays in BF16.
+
+</details>
+
+<details>
 <summary><b>Offline calibration pipeline (dump, fit, evaluate)</b></summary>
 
 ```bash
@@ -355,6 +401,8 @@ materials/                      figures for this README
 - **Running locally on a Mac.** Use the `zhongzhu/llamacpp` branch or the pre-built `*-rot-kv.gguf` files on Hugging Face.
 
 ## Citation
+
+The OSCAR-2 citation will be added when the paper is public. Until then, please cite OSCAR-1:
 
 ```bibtex
 @misc{zhou2026oscarofflinespectralcovarianceaware,
