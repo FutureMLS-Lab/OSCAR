@@ -16,25 +16,20 @@
   <a href="https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Qwen3-4B-Thinking-2507-INT2-KV"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20GGUF%20Qwen3--4B--Thinking--2507-INT2%20KV-FFD21E" alt="GGUF Qwen3-4B Thinking 2507 INT2 KV"/></a>
 </p>
 
-Deploying a 2-bit KV cache usually takes an offline calibration pipeline, model-specific transform choices, and a new kernel for every cache geometry. **OSCAR-2 makes attention-aware 2-bit rotation plug-and-play**: the server loads a model, calibrates during startup, and serves heterogeneous cache geometries through one checkpoint format and one kernel family. There is no activation dump, no model-specific calibration script and no per-model kernel.
-
-The bulk of the KV cache is stored in **2 bits**; only a small BF16 sink and recent window stay in full precision. With the per-row scale and zero included this is 2.25–2.5 bits per element: **6–7× more KV tokens than BF16 in the same memory** on most models, 4× for MLA latents. At 128K context and batch 1 the INT2 decode runs at **1.03–1.16× FlashInfer BF16 on H100** for dense models and 0.73–0.94× on B200.
+A 2-bit KV cache that calibrates itself during server startup and serves every cache geometry with one checkpoint format and one kernel family: **6–7× more KV tokens than BF16** (4× for MLA latents).
 
 <p align="center">
-  <img src="materials/oscar2_teaser.png" alt="OSCAR-2 overview" width="960"/>
+  <img src="materials/oscar2_overview.png" alt="OSCAR-2 overview" width="960"/>
 </p>
 
-<p align="center"><sub><b>(a)</b> Closed-form calibration moves into model startup. <b>(b)</b> A head-resolved objective preserves query-head pairing and extends to one joint MLA latent. <b>(c)</b> The Quantizer Family configures only the 2-bit KV state. <b>(d)</b> Head-strided metadata drives fused writes and an occupancy-aware split-KV read path.</sub></p>
+Upstream SGLang `main` + OSCAR-2 · OSCAR-1: [paper](https://arxiv.org/abs/2605.17757), [`main`](https://github.com/FutureMLS-Lab/OSCAR/tree/main) · llama.cpp: [`zhongzhu/llamacpp`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) · rotations: [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo)
 
-This branch is upstream SGLang `main` with OSCAR-2 added under `python/sglang/`. OSCAR-1 (offline dump, fit and evaluate, one rotation per layer) is described in the [OSCAR-1 paper](https://arxiv.org/abs/2605.17757), and its code is on the [`main`](https://github.com/FutureMLS-Lab/OSCAR/tree/main) branch. A llama.cpp port (Metal and CPU) lives on the [`zhongzhu/llamacpp`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) branch, and pre-fit rotations are on the [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
-
-## 🔥 Latest News
-- **[2026-11-11]** **OSCAR-2**: calibration inside server startup, head-resolved GQA and joint-latent MLA objectives, a matched scalar-INT2 Quantizer Family, and one fused-write / split-KV kernel family for every cache geometry. This README follows the OSCAR-2 paper, which is in preparation.
-- **[2026-10-12]** Main results refreshed for **13 models** on the current tree (commit `9105559e8e`, upstream base `67eab57057`): GPQA-Diamond at a 64K budget, KL against BF16 at 128K on PG-19, and 128K decode on B200 and H100. On H100 the INT2 decode is **faster than FlashInfer BF16** on dense models (1.03–1.16× at 128K, batch 1); on B200 it is 0.73–0.94× after raising the default INT2 split cap to 256 and dequantizing with a bf16 bit trick. Most recipes now use per-(layer, KV head) rotations with key centering and a per-head K clip.
-- **[2026-10-03]** OSCAR moved onto **upstream SGLang main** (base `67eab57057`, the official nightly of 2026-10-02): the repository root is upstream and OSCAR is the diff. Every INT2 arm runs the model's own attention (DSA for GLM-5.x, MSA for MiniMax-M3, MLA + KDA across two nodes for Kimi-K3). Rotations can be **fit at server start**, and 1-bit / 1.5-bit K via product quantization ships as an opt-in tier.
-- **[2026-10-03]** Dense INT2 decode on B200 went from 2–3.9× to 1.2–1.5× of FlashInfer BF16 at 64K / batch 1: a separate INT2 split cap, a fused HP + INT2 stage-1, batched decode rotations, a parallel stage-2 and a parallel metadata build, all default-on and checked bit-for-bit against the two-launch path.
-- **[2026-06-26]** OSCAR is PRing into **vLLM** too, bringing INT2 KV cache support to another high-throughput serving stack.
-- **[2026-06-07]** OSCAR INT2 KV cache now runs **256K Gemma 4 12B under <code style="color : Red">!!16GB!!</code>** and **Qwen3** on the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp) — **~8× smaller KV at near-f16 quality**, with [pre-built `*-rot-kv.gguf` on Hugging Face](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV). RUN GEMMA 4 / QWEN3 with LONG CONTEXT on your LOCAL MAC!
+## 🔥 News
+- **[2026-11-11]** **OSCAR-2**: calibration at server start, head-resolved GQA / joint-latent MLA objectives, scalar-INT2 Quantizer Family, one kernel family. Paper coming soon.
+- **[2026-10-12]** 13 models on the current tree; INT2 decode at **1.03–1.16× FlashInfer BF16 on H100** (128K, batch 1).
+- **[2026-10-03]** Rebased onto upstream SGLang `main`; calibration at server start; 1 / 1.5-bit PQ tier.
+- **[2026-06-26]** vLLM integration in progress.
+- **[2026-06-07]** llama.cpp: 256K-context Gemma 4 12B in **16 GB** on a Mac, ~8× smaller KV ([GGUF](https://huggingface.co/Zhongzhu/OSCAR-LLAMACPP-Gemma-4-12B-it-INT2-KV)).
   <details>
   <summary> <b>MacBook M5 Max Gemma 4 12B OSCAR INT2 KV Local Run Video</b></summary>
   <img width="960" height="502" alt="Screen Recording 2026-06-08 at 00 47 11 - 2x" src="https://github.com/user-attachments/assets/72f7c51d-fb43-42b7-ac2b-1b5baaf256c5" />
@@ -43,54 +38,34 @@ This branch is upstream SGLang `main` with OSCAR-2 added under `python/sglang/`.
 <details>
 <summary><b>More news</b></summary>
 
-- **[2026-06-05]** OSCAR now runs its INT2 KV cache through a fused mixed-precision Flash-Attention kernel on Apple Metal in the [`zhongzhu/llamacpp` llama.cpp fork](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/llamacpp), making long-context decode up to ~15× faster (near-BF16) at ~7× less KV memory. Try to RUN QWEN-3-32B with LONG CONTEXT in your LOCAL MAC!
+- **[2026-06-05]** llama.cpp: fused INT2 Flash-Attention on Apple Metal, up to ~15× faster long-context decode.
   <details>
   <summary><b>MacBook M5 Max Qwen3-32B OSCAR INT2 KV Local Run Screenshot</b></summary>
   <img width="1003" height="654" alt="Screenshot 2026-06-05 at 09 57 31" src="https://github.com/user-attachments/assets/8ea1ccf9-c2f0-4f3e-8232-7f0b2dbdd144" />
   </details>
-- **[2026-06-04]** OSCAR now supports **Gemma 4 12B** with **SGLang INT2 KV cache** on the [`zhongzhu/gemma4-12b`](https://github.com/FutureMLS-Lab/OSCAR/tree/zhongzhu/gemma4-12b) branch.
-- **[2026-05-31]** OSCAR is now runnable on the zhongzhu/llamacpp branch of **llama.cpp**. Feedback and suggestions are very welcome!
-- **[2026-05-23]** OSCAR released the Qwen3.5 4B, 35B-A3B and MiniMax-M2.7 229B preview results (branch zhongzhu/hybrid-model at the time; these models now run from this tree).
-- **[2026-05-18]** Full release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), and [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo) are all live — runs out of the box on **SGLang**.
+- **[2026-06-04]** Gemma 4 12B on the SGLang INT2 KV cache.
+- **[2026-05-31]** llama.cpp port.
+- **[2026-05-23]** Qwen3.5 4B / 35B-A3B and MiniMax-M2.7 previews.
+- **[2026-05-18]** Release: [paper](https://arxiv.org/pdf/2605.17757), code, [website](https://oscar-quantize.github.io/), [RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
 
 </details>
 
-## 📖 Table of Contents
-- [What OSCAR-2 adds](#what-oscar-2-adds)
-- [Main results](#main-results)
-  - [Previous results](#previous-results)
-- [Quick start](#-quick-start)
-- [Supported models](#supported-models)
-- [Advanced usage](#advanced-usage)
-- [Layout](#layout)
-- [Troubleshooting](#troubleshooting)
-- [Citation](#citation)
-- [License & acknowledgements](#license--acknowledgements)
+[What's new](#whats-new-in-oscar-2) · [Main results](#main-results) · [Previous results](#previous-results) · [Quick start](#-quick-start) · [Models](#supported-models) · [Advanced usage](#advanced-usage) · [Layout](#layout) · [Troubleshooting](#troubleshooting) · [Citation](#citation)
 
-## What OSCAR-2 adds
+## What's new in OSCAR-2
 
 | | OSCAR-1 | OSCAR-2 |
 |:---|:---|:---|
-| Calibration | dump Q/K/V, solve offline on the CPU, install a separate artifact | collect moments during a prefill-only startup pass, reduce over TP, eigendecompose, install before the first request |
-| Objective | pooled query / score-weighted covariance | head-resolved post-`W_O` metric for GQA; one joint key/value latent for MLA |
-| Quantizer | one rotation per layer, global K / V clip ratios | shared or per-KV-head rotations, key centering, per-head K clip, orthogonal or non-orthogonal bases, uniform or Lloyd–Max levels, all in one checkpoint format |
-| Models | dense models on `main`, hybrid and Gemma-4 on feature branches | one tree: one fused write kernel driven by head-strided metadata and one split-KV read path for dense, GQA, MoE, sliding-window, hybrid and MLA caches |
-
-**1. Startup-time closed-form calibration.** With the mixed pool on and no rotation file given, the pool starts on identity bases and the server prefills calibration prompts before it takes traffic. The attention layers accumulate per-(layer, KV head) moments, the scheduler reduces them across TP ranks and eigendecomposes them in FP64, and the rotations are installed in place, so captured decode CUDA graphs stay valid. The checkpoint is written atomically; later launches load it and skip collection. The same pass can save the per-head moments, from which every per-head variant below is fit in closed form, without an activation dump or gradient training. Code: `srt/entrypoints/oscar_startup_calibration.py`, `srt/mem_cache/oscar_calibration.py`; usage under [Advanced usage](#advanced-usage).
-
-**2. Head-resolved output awareness.** Under GQA several query heads read one KV head, each with its own attention weights and its own block of `W_O`, and pooling their moments loses that pairing. OSCAR-2 keeps the pairing and the within-group cross-head terms in the value metric `G_h = Σ_{j,j'∈G_h} ρ_{h,jj'} W_{O,j}ᵀ W_{O,j'}`, where ρ is the query heads' co-attention (variant `outaware_hr`). MLA reads one latent as both key and value, so independent key and value rotations are invalid; OSCAR-2 fits one latent transform from the joint metric `M_K/tr M_K + λ·M_V/tr M_V` and keeps the rotary part `k_pe` in BF16 (`rotation/tools/fit_mla_joint_latent.py`).
-
-**3. A matched scalar-INT2 Quantizer Family.** Granularity, key centering, clipping, transform variant and reconstruction levels change one at a time behind one checkpoint format, with the cache rate, page layout and kernels held fixed. In these sweeps per-head fitting pays off only together with key centering and per-head clipping: fitting heads independently exposes a large key-mean direction that consumes the row's dynamic range. Centering subtracts the per-head key mean before the rotation, which shifts every logit of a query by one constant and leaves the softmax unchanged.
-
-**4. Kernel and runtime co-design.** One Triton kernel centers, rotates, clips with the per-head ratio, quantizes and packs each history row. Rotation, mean and clip pointers are head-strided (stride 0 is OSCAR-1's sharing), so family members change metadata rather than launch topology. Decode runs split-KV over the packed history and the BF16 windows and merges their online-softmax statistics. The INT2 history has its own split budget (`SGLANG_INT2_MAX_SPLITS`, default 256), so TP ranks that own few KV heads still fill the GPU, and the inner loop rebuilds a 2-bit code `c` as `bitcast_bf16(c | 0x4300) − 128` instead of converting an integer. The same parameter indirection keeps every geometry compatible with radix caching and CUDA graphs.
+| Calibration | offline: dump Q/K/V → CPU solve → separate artifact | at server start: stream moments → GPU solve → install before the first request |
+| Objective | pooled covariance per layer | head-resolved post-`W_O` (GQA), one joint latent (MLA) |
+| Quantizer | one rotation and clip per layer | per-head rotation + key centering + per-head K clip, one checkpoint format |
+| Kernels | per model family | one fused write and one split-KV read for every geometry |
 
 ## Main results
 
-Measured on this tree with the OSCAR-2 recipes; most rows use per-(layer, KV head) rotations with key centering and a per-head K clip. The OSCAR-2 paper's full matched tables (every model, startup latency, serving) will be added with the paper. Earlier measurements, including the OSCAR-1 paper results, are kept under [Previous results](#previous-results).
+GPQA-Diamond (198, 64K budget) · KL(BF16 ‖ INT2) on PG-19 at 128K · decode at 128K, batch 1 · KV tokens at equal memory.
 
-### Thirteen models
-
-| Model | Attention (INT2 path) | GPQA-Diamond BF16 → INT2 | KL@128K ↓ | Decode @128K, B200: INT2 / BF16 tok/s | Decode @128K, H100: INT2 / BF16 tok/s | KV tokens vs BF16 |
+| Model | Attention | GPQA BF16 → INT2 | KL@128K ↓ | Decode B200, INT2 / BF16 tok/s | Decode H100, INT2 / BF16 tok/s | KV tokens |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|
 | Qwen3-4B-Thinking-2507 | dense GQA | 66.7 → 60.1 | 0.096 | 124.7 / 157.8 (0.79×) | 111.0 / 96.0 (**1.16×**) | 6.4× |
 | Qwen3-8B | dense GQA | 59.1 → 55.6 | 0.097 | 110.4 / 134.3 (0.82×) | 91.2 / 79.1 (**1.15×**) | 6.4× |
@@ -106,157 +81,14 @@ Measured on this tree with the OSCAR-2 recipes; most rows use per-(layer, KV hea
 | GLM-5.3 | MLA + DSA sparse, packed 2-bit latent | 90.4 → 86.9 | 0.040 | 93.3 / 112.9 (0.83×) | — ³ | 3.7× |
 | Kimi-K3 | MLA + KDA hybrid, packed 2-bit latent | 91.9 → 90.9 | 0.012 | 36.9 / 47.7 (0.77×) ¹ | — ³ | 4.0× |
 
-- **GPQA-Diamond:** all 198 questions, 64K generation budget, one seed. Identical repeat runs of one configuration spread by about ±2.7 pp, so gaps under ~5 pp are within noise.
-- **KL@128K:** KL(BF16 ‖ INT2) in nats per token on PG-19 books (first 131,072 tokens of each, second half scored, every 32nd position), through the serving path with 512-token prefill chunks, so each position reads at most the last 512 tokens in BF16 and the rest of its history from the INT2 tier, as in decode. Lower is better.
-- **Decode:** batch 1, a 128K-token prompt and 512 generated tokens, median of three, both arms in the same pod. The BF16 arm is FlashInfer unless noted.
-- **KV tokens:** tokens the INT2 pool holds versus the BF16 pool at the same memory fraction, with the BF16 windows and the fp32 per-row scale and zero included (2.5 bits per element at head_dim 128, 2.25 at head_dim 256). MLA rows store a packed 2-bit latent (288 vs 1152 B per token per layer, 4.00×); the MiniMax-M3 and GLM-5.3 pools also hold BF16 sparse-index caches that stay unquantized.
-- ¹ BF16 arm: Gemma-4 uses `trtllm_mha` on B200 and `triton` on H100 (no FlashInfer path serves it, so its H100 pair is not like-for-like); Kimi-K3 uses `trtllm_mla` on two nodes (TP 8 × PP 2).
-- ² INT2 arm measured on an earlier tree of the same upstream base; the re-run on the current image is pending.
-- ³ The model does not fit one 8 × H100 node.
-- Recipes (windows, levels, parallelism) are in `rotation/run/<model>.sh`; the Kimi-K3 row used 128 / 512 BF16 windows, where its script defaults to 64 / 256. Most dense and hybrid rows use a per-(layer, KV head) rotation with key centering, uniform INT2 levels and a K clip chosen per head on calibration rows; Gemma-4 and MiniMax-M2.7 use one global K clip, MiniMax-M2.7 and GLM-4.7 head-resolved output-aware values, GLM-4.7 Lloyd-Max levels, and MiniMax-M3 a layer-shared rotation.
+¹ BF16 without FlashInfer: Gemma-4 `trtllm_mha` (B200) / `triton` (H100), Kimi-K3 `trtllm_mla` (TP 8 × PP 2). ² INT2 on an earlier tree. ³ Does not fit one 8×H100 node.
 
-### KL against BF16 across context lengths
+## Previous results
 
-KL(BF16 ‖ INT2) in nats per token on PG-19 with the protocol of the `KL@128K` column above: for each length L, the first L tokens of each book, the second half scored at every 32nd position, 512-token prefill chunks, B200. Top-1 agreement with BF16 is in parentheses. On the dense Qwen3 models with head_dim 128 (4B, 8B, 30B-A3B) KL is highest at 8K–32K (0.17–0.27) and falls to about 0.10 at 128K; the head_dim-256 hybrids (Qwen3.5, Qwen3.8) stay at 0.02–0.03 at every length.
-
-| Model | 8K | 16K | 32K | 64K | 128K |
-|:---|---:|---:|---:|---:|---:|
-| Qwen3-4B-Thinking-2507 | 0.2218 (80%) | 0.1977 (80%) | 0.1721 (81%) | 0.1558 (82%) | 0.0956 (86%) |
-| Qwen3-8B | 0.1751 (82%) | 0.1948 (80%) | 0.1840 (80%) | 0.1232 (83%) | 0.0969 (85%) |
-| Qwen3-32B | 0.0632 (89%) | 0.0775 (87%) | 0.0803 (87%) | 0.0925 (86%) | 0.0871 (86%) |
-| Qwen3-30B-A3B | 0.2562 (77%) | 0.2693 (76%) | 0.1955 (78%) | 0.1410 (82%) | 0.1044 (85%) |
-| Qwen3.5-4B | 0.0228 (93%) | 0.0254 (91%) | 0.0296 (92%) | 0.0314 (91%) | 0.0305 (92%) |
-| Qwen3.5-35B-A3B | 0.0182 (93%) | 0.0223 (93%) | 0.0249 (93%) | 0.0279 (93%) | 0.0323 (92%) |
-| Qwen3.8-27B | 0.0177 (94%) | 0.0203 (94%) | 0.0255 (92%) | 0.0297 (91%) | 0.0292 (92%) |
-| Gemma-4-12B-it | 0.1480 (85%) | 0.1782 (83%) | 0.1851 (83%) | 0.1843 (82%) | 0.1745 (84%) |
-| MiniMax-M2.7 | 0.0651 (89%) | 0.0725 (88%) | 0.0778 (87%) | 0.0818 (86%) | 0.0773 (87%) |
-| MiniMax-M3 | 0.0425 (91%) | 0.0456 (91%) | 0.0501 (89%) | 0.0508 (90%) | 0.0391 (90%) |
-| GLM-4.7-FP8 | 0.0409 (90%) | 0.0463 (90%) | 0.0593 (89%) | 0.0777 (86%) | 0.1024 (86%) |
-| GLM-5.3 | 0.0405 (92%) | 0.0425 (90%) | 0.0435 (91%) | 0.0514 (89%) | 0.0397 (91%) |
-| Kimi-K3 | 0.0089 (97%) | 0.0116 (96%) | 0.0135 (96%) | 0.0127 (96%) | 0.0118 (96%) |
+Earlier README snapshots, unchanged.
 
 <details>
-<summary><b>The same curves with BF16 perplexity and the NOVA-KV and OptR reimplementations</b></summary>
-
-NOVA-KV is reimplemented inside this engine: its transform and per-head PQ codebooks (g = 4, K = 256) are fit on the same 128K calibration rows as OSCAR-2; its per-token RMS scale (+0.125 bpe) and its CUDA kernels are not reproduced. OptR is reimplemented as R = R₀·exp(A − Aᵀ), trained for 80 Adam steps with a straight-through estimator through the real write kernel (keys, then values), initialized from the centered basis on the same calibration rows. "Not supported" means the method's published code does not cover the model, so no arm was fit.
-
-| Model | Arm | 8K | 16K | 32K | 64K | 128K |
-|---|---|---:|---:|---:|---:|---:|
-| **Qwen3-4B-Thinking-2507** | BF16 PPL (PG-19, same positions) | 16.81 | 16.53 | 17.28 | 18.96 | 11.36 |
-| | OSCAR-2 (scalar INT2, per head) | **0.2218 (80%)** | **0.1977 (80%)** | **0.1721 (81%)** | **0.1558 (82%)** | **0.0956 (86%)** |
-| | NOVA-KV (VQ) | 0.0364 (92%) | 0.0381 (92%) | 0.0424 (91%) | 0.0532 (90%) | 0.0527 (89%) |
-| | OptR | 0.7481 (64%) | 0.5301 (69%) | 0.3542 (75%) | 0.2126 (80%) | 0.1089 (85%) |
-| **Qwen3-8B** | BF16 PPL (PG-19, same positions) | 14.14 | 13.93 | 14.63 | 17.37 | 10.52 |
-| | OSCAR-2 (scalar INT2, per head) | **0.1751 (82%)** | **0.1948 (80%)** | **0.1840 (80%)** | **0.1232 (83%)** | **0.0969 (85%)** |
-| | NOVA-KV (VQ) | 0.0396 (92%) | 0.0436 (90%) | 0.0517 (89%) | 0.0562 (88%) | 0.0551 (89%) |
-| | OptR | 0.1865 (81%) | 0.1890 (80%) | 0.2112 (78%) | 0.1355 (82%) | 0.0903 (86%) |
-| **Qwen3-32B** | BF16 PPL (PG-19, same positions) | 10.27 | 10.38 | 11.08 | 13.12 | 8.14 |
-| | OSCAR-2 (scalar INT2, per head) | **0.0632 (89%)** | **0.0775 (87%)** | **0.0803 (87%)** | **0.0925 (86%)** | **0.0871 (86%)** |
-| | NOVA-KV (VQ) | 0.0367 (92%) | 0.0440 (90%) | 0.0456 (89%) | 0.0530 (89%) | 0.0426 (90%) |
-| | OptR | 0.0936 (85%) | 0.1239 (83%) | 0.1221 (84%) | 0.1227 (83%) | 0.0863 (86%) |
-| **Qwen3-30B-A3B** | BF16 PPL (PG-19, same positions) | 11.88 | 12.18 | 14.16 | 16.37 | 9.95 |
-| | OSCAR-2 (scalar INT2, per head) | **0.2562 (77%)** | **0.2693 (76%)** | **0.1955 (78%)** | **0.1410 (82%)** | **0.1044 (85%)** |
-| | NOVA-KV (VQ) | 0.0335 (92%) | 0.0514 (89%) | 0.0527 (89%) | 0.0567 (88%) | 0.0474 (89%) |
-| | OptR | 0.2743 (77%) | 0.2854 (75%) | 0.2231 (77%) | 0.1810 (80%) | 0.1276 (83%) |
-| **Qwen3.5-4B** | BF16 PPL (PG-19, same positions) | 10.37 | 11.21 | 11.52 | 13.70 | 8.99 |
-| | OSCAR-2 (scalar INT2, per head) | **0.0228 (93%)** | **0.0254 (91%)** | **0.0296 (92%)** | **0.0314 (91%)** | **0.0305 (92%)** |
-| | NOVA-KV (VQ) | 0.0358 (92%) | 0.0421 (90%) | 0.0501 (89%) | 0.0595 (88%) | 0.0549 (88%) |
-| | OptR | 0.0221 (93%) | 0.0248 (91%) | 0.0295 (92%) | 0.0323 (91%) | 0.0304 (92%) |
-| **Qwen3.5-35B-A3B** | BF16 PPL (PG-19, same positions) | 7.59 | 8.35 | 8.86 | 10.33 | 7.37 |
-| | OSCAR-2 (scalar INT2, per head) | **0.0182 (93%)** | **0.0223 (93%)** | **0.0249 (93%)** | **0.0279 (93%)** | **0.0323 (92%)** |
-| | NOVA-KV (VQ) | 0.0313 (92%) | 0.0399 (91%) | 0.0492 (90%) | 0.0571 (89%) | 0.0658 (88%) |
-| | OptR | 0.0178 (94%) | 0.0225 (93%) | 0.0253 (93%) | 0.0281 (93%) | 0.0310 (92%) |
-| **Qwen3.8-27B** | BF16 PPL (PG-19, same positions) | 8.02 | 8.64 | 9.25 | 10.49 | 7.55 |
-| | OSCAR-2 (scalar INT2, per head) | **0.0177 (94%)** | **0.0203 (94%)** | **0.0255 (92%)** | **0.0297 (91%)** | **0.0292 (92%)** |
-| | NOVA-KV (VQ) | 0.0295 (92%) | 0.0385 (91%) | 0.0465 (90%) | 0.0572 (89%) | 0.0550 (89%) |
-| | OptR | 0.0176 (94%) | 0.0220 (93%) | 0.0268 (92%) | 0.0303 (92%) | 0.0293 (92%) |
-| **Gemma-4-12B-it** | BF16 PPL (PG-19, same positions) | 19.22 | 20.78 | 24.23 | 29.79 | 14.88 |
-| | OSCAR-2 (scalar INT2, per head) | **0.1480 (85%)** | **0.1782 (83%)** | **0.1851 (83%)** | **0.1843 (82%)** | **0.1745 (84%)** |
-| | NOVA-KV / OptR | Not supported | | | | |
-| **MiniMax-M2.7** | BF16 PPL (PG-19, same positions) | 9.29 | 8.92 | 11.54 | 13.50 | 9.35 |
-| | OSCAR-2 (scalar INT2, per head) | **0.0651 (89%)** | **0.0725 (88%)** | **0.0778 (87%)** | **0.0818 (86%)** | **0.0773 (87%)** |
-| | NOVA-KV (VQ) | 0.1071 (86%) | 0.1161 (85%) | 0.1237 (84%) | 0.1299 (83%) | 0.1124 (85%) |
-| | OptR | 0.0598 (89%) | 0.0744 (88%) | 0.0743 (88%) | 0.0784 (86%) | 0.0721 (88%) |
-| **MiniMax-M3** | BF16 PPL (PG-19, same positions) | 7.01 | 6.86 | 8.49 | 10.41 | 7.59 |
-| | OSCAR-2 (scalar INT2, layer-shared) | **0.0425 (91%)** | **0.0456 (91%)** | **0.0501 (89%)** | **0.0508 (90%)** | **0.0391 (90%)** |
-| | NOVA-KV / OptR | Not supported | | | | |
-| **GLM-4.7-FP8** | BF16 PPL (PG-19, same positions) | 6.82 | 7.20 | 7.74 | 9.21 | 6.51 |
-| | OSCAR-2 (scalar INT2, per head) | **0.0409 (90%)** | **0.0463 (90%)** | **0.0593 (89%)** | **0.0777 (86%)** | **0.1024 (86%)** |
-| | NOVA-KV / OptR | Not supported | | | | |
-| **GLM-5.3** | BF16 PPL (PG-19, same positions) | 6.04 | 6.66 | 7.16 | 8.10 | 6.26 |
-| | OSCAR-2 (packed 2-bit latent) | **0.0405 (92%)** | **0.0425 (90%)** | **0.0435 (91%)** | **0.0514 (89%)** | **0.0397 (91%)** |
-| | NOVA-KV / OptR | Not supported | | | | |
-| **Kimi-K3** | BF16 PPL (PG-19, same positions) | 3.47 | 4.01 | 3.91 | 4.04 | 2.51 |
-| | OSCAR-2 (packed 2-bit latent) | **0.0089 (97%)** | **0.0116 (96%)** | **0.0135 (96%)** | **0.0127 (96%)** | **0.0118 (96%)** |
-| | NOVA-KV / OptR | Not supported | | | | |
-
-</details>
-
-### Qwen3-8B in depth: reasoning, long context and tool use
-
-BF16 against the OSCAR-2 recipe (2.5 bits per element), mean ± std over three runs. GPQA-Diamond uses a 64K generation budget with YaRN ×4, the other generation benchmarks 32K. RULER is the official NVIDIA suite (13 tasks, 100 samples each, greedy, no-think template, three data seeds). BFCL is the official v4 overall without the web-search category (it needs a SerpAPI key). Tool-call KL is KL(BF16 ‖ INT2) on the `<tool_call>` tokens of 400 real BFCL multi-turn tool calls replayed from BF16 trajectories (median context 8.3K tokens, 512-token prefill chunks, H100); the share of calls whose whole argmax matches BF16 is in parentheses.
-
-| Benchmark | BF16 | OSCAR-2 |
-|:---|:---:|:---:|
-| GPQA-Diamond | 55.39 ± 1.62 | 53.87 ± 2.33 |
-| AIME 2025 | 65.56 ± 5.09 | 57.78 ± 6.94 |
-| MATH-500 | 92.33 ± 0.23 | 92.00 ± 0.87 |
-| HumanEval | 88.21 ± 1.53 | 88.01 ± 1.96 |
-| LiveCodeBench v6 | 50.13 ± 0.44 | 49.36 ± 1.59 |
-| RULER 64K | 79.73 ± 0.91 | 64.51 ± 0.69 |
-| RULER 128K | 73.22 ± 0.06 | 56.31 ± 0.42 |
-| BFCL v4 (without web search) | 51.35 ± 0.97 | 47.73 ± 1.38 |
-| BFCL multi-turn | 41.21 ± 1.06 | 31.71 ± 0.26 |
-| KL@128K, PG-19 | 0 (reference) | 0.0969 |
-| Tool-call KL | 0 (reference) | 0.0253 (84.0%) |
-
-GPQA, MATH-500, HumanEval and LiveCodeBench stay within run-to-run noise of BF16; AIME 2025 is 7.8 points lower with a spread of 5–7 points per arm. Long-context retrieval (RULER) and multi-turn tool use are where 2-bit keys still cost accuracy. With Qwen3's recommended sampling (temperature 0.6, top-p 0.95, top-k 20; H100) BFCL multi-turn reads 35.88 ± 0.57 against BF16's 41.62 ± 1.76, and the share of decode steps stuck in a repetition loop drops from 2.91% to 0.35%.
-
-### Qwen3-8B against other KV-cache methods
-
-All arms except TurboQuant (vLLM) run in this engine with the protocols above, and the INT2 arms share the recipe's windows (128 BF16 sink, 512 BF16 recent). KL is on PG-19 (B200 for the OSCAR-2 recipe and NOVA-KV, H100 for the others; the recipe reads 0.0969 on B200 and 0.0974 on H100 at 128K), RULER on B200 with three data seeds, and BFCL multi-turn on H100 over three runs (BF16: one run).
-
-| Method | Bits / element | KL@8K | KL@32K | KL@128K | Tool-call KL | RULER 64K / 128K | BFCL multi-turn |
-|:---|:---:|---:|---:|---:|:---:|:---:|:---:|
-| BF16 | 16 | 0 | 0 | 0 | 0 | 79.73 / 73.22 | 40.88 |
-| SGLang FP8 (e4m3) KV | 8 | ≤ 0.022 | ≤ 0.022 | 0.0243 | 0.0018 (95.0%) | — | 41.25 ± 1.27 |
-| **OSCAR-2** (per head + centering + per-head K clip) | 2.5 | 0.1751 | 0.1840 | 0.0969 | 0.0253 (84.0%) | 64.51 / 56.31 | 30.33 ± 0.85 |
-| **OSCAR-2**, 32K calibration under YaRN ×4 | 2.5 | 0.050 | 0.064 | 0.108 | 0.0170 (87.75%) | 67.70 / 57.22 | 33.25 ± 0.33 |
-| OSCAR-1 (RotationZoo layer-shared rotation, K clip 0.96) | 2.5 | 0.146 | 0.269 | 1.08 | 0.0199 (84.5%) | — | 33.50 ± 0.87 |
-| OptR, official code (OSCAR + OptR, K clip 0.96 as in its paper) | 2.5 | 0.069 | 0.127 | 0.522 | 0.0147 (87.3%) | 66.82 / 46.73 | 34.25 ± 0.63 |
-| NOVA-KV (VQ), reimplemented in this engine | 2.125 | 0.0396 | 0.0517 | 0.0551 | — | — | — |
-| WUSH-KV, reimplemented from its paper (same 32K calibration, K clip 0.96) | 2.5 | 0.059 | 0.105 | 3.56 (collapse) | 0.129 (78.75%) | — | — |
-| TurboQuant K3V3 (vLLM, every layer quantized) | 3.25 | — | — | — | — | — | 6.62 ± 0.58 (collapse) |
-| Uniform INT2, no rotation (K clip 0.90) | 2.5 | — | — | 1.33 (collapse) | — | — | — |
-| QuaRot-INT2, Hadamard (K clip 0.96) | 2.5 | — | — | 4.25 (collapse) | — | — | — |
-
-- **32K calibration.** The same WikiText-2 text cut into 8 × ~32.6K-token prompts (262K tokens) calibrates at startup under YaRN ×4, and the per-head K clip is re-selected on queries past position 4K. It trades a little 128K KL (0.108 vs 0.0969) for much lower KL up to 64K (0.077 vs 0.123 at 64K) and better tool use. The same calibration without YaRN reads 0.157 / 0.185 / 0.106 at 8K / 32K / 128K.
-- **Repetition loops.** On BFCL multi-turn, decode steps that hit the 4096-token cap are 2.88% for the recipe, 1.46% for the 32K calibration and 0.97% for BF16.
-- **Non-orthogonal keys.** Under the same calibration and a global K clip of 0.90, WUSH-KV's key transform with our centering added beats the orthogonal basis at 8K–16K (KL 0.044 vs 0.059 at 8K) but degrades past 32K (1.00 vs 0.146 at 128K) and on tool calls (0.0191 vs 0.0153); the original WUSH-KV transform collapses at 128K. OSCAR-2 therefore keeps orthogonal key bases for scalar INT2.
-- Methods without public code (Dual-QK, AATC) or whose official code does not support Qwen3 (KIVI, KVQuant, SKVQ, RotateKV) are not in the table; WUSH-KV has no public code either and is reimplemented from its paper.
-
-### Quantizer Family ablation (Qwen3-8B)
-
-The first three rows build the recipe up one component at a time; each later row changes one component of the recipe. Same calibration, windows and kernels throughout; KL@128K on PG-19 and tool-call KL, H100.
-
-| Variant | KL@128K | Tool-call KL |
-|:---|---:|:---:|
-| Per-head rotation, no key centering, global K clip 0.90 | 4.30 (collapse; 1.28 at 8K) | — |
-| + key centering, global K clip 0.90 | 0.1060 | 0.0381 (83.0%) |
-| + per-head K clip = **the OSCAR-2 recipe** | **0.0974** | **0.0253 (84.0%)** |
-| Recipe with one shared basis per layer (per-head centering, global K clip) | 0.0999 | — |
-| Recipe with Lloyd–Max levels instead of uniform levels | 0.3817 | — |
-| Recipe with head-resolved output-aware values (`outaware_hr`) | 0.0955 | — |
-| Recipe with fp16 instead of fp32 scale and zero (2.25 bits / element) | 0.0966 | — |
-
-Per-head fitting without centering collapses: each head's key mean takes over the row's dynamic range. Centering brings it back, and the per-head K clip takes 128K KL down another 8%. The shared basis is close at 128K but 8–16% worse than per-head bases at 8K–64K. Lloyd–Max levels get worse as context grows (0.191 at 8K, 0.382 at 128K). The head-resolved value metric gives a small gain (0.0955 against 0.0974), and fp16 scales stay within 2% of the recipe at every length.
-
-### Previous results
-
-Earlier README results, kept as they were published. Their protocols differ from the tables above in places (WikiText-2 perplexity instead of PG-19 KL, 64K decode, 2048-token BF16 windows), so compare within a snapshot.
-
-<details>
-<summary><b>README of 2026-10-04: upstream-aligned tree (GPQA, decode vs triton and FlashInfer, best quantizer per model), Qwen3.5 / MiniMax-M2.7 previews, MLA models</b></summary>
+<summary><b>2026-10-04 · upstream-aligned tree, previews, MLA models</b></summary>
 
 **Results on the upstream-aligned tree**
 
@@ -431,7 +263,7 @@ upstream is not like-for-like.
 </details>
 
 <details>
-<summary><b>README of 2026-10-04: OSCAR-2 transform ladder on Qwen3-8B (PPL@64K) and why non-orthogonal keys collapse under scalar INT2</b></summary>
+<summary><b>2026-10-04 · OSCAR-2 transform ladder (Qwen3-8B, PPL@64K)</b></summary>
 
 Measured on Qwen3-8B (every row fitted from one startup-calibration pass) at
 the recipe's windows of 128 sink / 512 recent tokens. PPL = four 65,536-token
@@ -497,9 +329,9 @@ but 6.8x for stretch (0.83 nats), 5x for whiten and 7.5x for flat.
 </details>
 
 <details>
-<summary><b>README of 2026-10-04: per-model GPQA and 64K decode on B200, with the decode-speed knob ablation</b></summary>
+<summary><b>2026-10-04 · per-model GPQA and 64K decode</b></summary>
 
-_Knob defaults below are those of 2026-10-04; the INT2 split cap defaults to 256 today._
+_Knob defaults as of 2026-10-04; the INT2 split cap is now 256._
 
 **Per-model GPQA: BF16 vs OSCAR INT2**
 
@@ -604,7 +436,7 @@ metadata build then took the table row to 7.23 against 5.91.
 </details>
 
 <details>
-<summary><b>README of 2026-10-04: 1-bit and 1.5-bit K with product quantization (GPQA)</b></summary>
+<summary><b>2026-10-04 · 1 / 1.5-bit PQ</b></summary>
 
 Measured on this tree (Qwen3-8B, GPQA-Diamond at 64K, the model's recipe
 windows of 128 BF16 prefix / 2048 BF16 recent, one seed, n=198):
@@ -635,7 +467,7 @@ cover the three configurations and report `FAIL(no-recall)` on the probe.
 </details>
 
 <details>
-<summary><b>Release previews of 2026-05-23: Qwen3.5 and MiniMax-M2.7</b></summary>
+<summary><b>2026-05-23 · release previews</b></summary>
 
 Qwen3.5
 | Model | Mode | GPQA (198) | Δ vs BF16 |
@@ -656,7 +488,7 @@ MiniMax2.7
 </details>
 
 <details>
-<summary><b>OSCAR-1 paper results: five reasoning / coding benchmarks, multi-modal, LongBench-E, AIME 2025 against other INT2 methods</b></summary>
+<summary><b>OSCAR-1 paper results</b></summary>
 
 <details>
 <summary><b>Multi-Modal & LongBench</b> </summary>
@@ -763,9 +595,8 @@ tasks. Saw-INT4 is a strong INT4 reference, but OSCAR matches or beats it
 
 ## 🚀 Quick start
 
-**1. Build the image** (one image serves every model; the base is the official SGLang nightly this tree is merged onto):
-
 ```bash
+# 1. build the image
 git clone --recursive https://github.com/FutureMLS-Lab/OSCAR.git && cd OSCAR
 mkdir -p ctx/oscar-src
 git archive --format=tar HEAD | tar -x -C ctx/oscar-src
@@ -775,89 +606,74 @@ hf download Zhongzhu/OSCAR-RotationZoo --local-dir ctx/rotations/zoo
 docker build -f docker/Dockerfile.oscar --build-arg IMAGE_TAG="$(git rev-parse --short HEAD)" -t oscar-env:local ctx
 ```
 
-**2. Serve a model with an INT2 KV cache.** Without a rotation file the server fits one at startup (a prefill-only pass over GPQA-Diamond prompts, about 20–45 s), then takes traffic:
-
 ```bash
+# 2. serve; without a rotation file the server fits one at startup (~20–45 s)
 docker run --gpus all --rm -it --shm-size 32g -p 30000:30000 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" -e HF_TOKEN oscar-env:local bash
 
-# inside the container: the Qwen3-8B recipe's windows and clips
+# inside the container; set windows and clips explicitly (server defaults are not a recipe)
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
 SGLANG_MIXED_KV_PREFIX_TOKENS=128 SGLANG_MIXED_KV_RECENT_TOKENS=512 \
 SGLANG_OSCAR_K_CLIP_RATIO=0.96 SGLANG_OSCAR_V_CLIP_RATIO=0.92 \
 python -m sglang.launch_server --model-path Qwen/Qwen3-8B \
   --kv-cache-dtype int2 --kv-cache-quant-group-size 128 \
   --attention-backend triton --host 0.0.0.0 --port 30000
-```
 
-Set the windows and clips explicitly: the server's own defaults (32 / 128 windows, no clipping) are not a recipe.
-
-```bash
 curl http://localhost:30000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "What is 2-bit KV cache quantization?"}]}'
 ```
 
-**3. Run GPQA with a model's recipe**, INT2 against its BF16 control:
-
 ```bash
-oscar-selfcheck                                        # image tag and the commit it was built from
-bash /oscar/src/rotation/run/qwen3-8b.sh               # GPQA-Diamond with the INT2 KV cache
-KV_MODE=bf16 bash /oscar/src/rotation/run/qwen3-8b.sh  # the paired BF16 control
-bash /oscar/src/rotation/verify/all.sh qwen3-8b        # PASS/FAIL garbling smoke, radix cache and CUDA graphs on
+# 3. a model's recipe: GPQA with INT2, then the BF16 control (ROT_DIR=<dir> for your own rotations)
+oscar-selfcheck
+bash /oscar/src/rotation/run/qwen3-8b.sh
+KV_MODE=bf16 bash /oscar/src/rotation/run/qwen3-8b.sh
+bash /oscar/src/rotation/verify/all.sh qwen3-8b   # garbling smoke
 ```
-
-The recipes read the RotationZoo rotation by default; set `ROT_DIR=<dir>` to run your own rotation set, for example the per-head ones from [Per-head rotations](#advanced-usage).
 
 ## Supported models
 
-Every model below runs from this tree with `--kv-cache-dtype int2`; there are no feature branches. Dense and hybrid models use the mixed pool (BF16 sink and recent windows, INT2 for the rest); MLA models store the packed 2-bit latent; MiniMax-M3 stages the INT2 rows it selects into BF16 for its MSA kernels.
+All run from this tree with `--kv-cache-dtype int2`.
 
-| Model | Attention (INT2 path) | Recipe | GPUs used for the results |
+| Model | Attention (INT2 path) | Recipe | GPUs |
 |:---|:---|:---|:---:|
-| `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | `rotation/run/qwen3-4b-thinking.sh` | 1 |
-| `Qwen/Qwen3-8B` | dense GQA | `rotation/run/qwen3-8b.sh` | 1 |
-| `Qwen/Qwen3-32B` | dense GQA | `rotation/run/qwen3-32b.sh` | 2 |
-| `Qwen/Qwen3-30B-A3B` | MoE, dense GQA | `rotation/run/qwen3-30b-a3b.sh` | 2 |
-| `Qwen/Qwen3.5-4B` | hybrid GatedDeltaNet + GQA | `rotation/run/qwen3.5-4b.sh` | 1 |
-| `Qwen/Qwen3.5-35B-A3B` | hybrid GatedDeltaNet + GQA, MoE | `rotation/run/qwen3.5-35b-a3b.sh` | 4 |
-| `Qwen/Qwen3.8-27B` | hybrid GatedDeltaNet + GQA | `rotation/run/qwen3.8-27b.sh` | 2 |
-| `google/gemma-4-12B-it` | hybrid SWA, two head geometries | `rotation/run/gemma-4-12b.sh` | 1 |
-| `MiniMaxAI/MiniMax-M2.7` | dense GQA, FP8 weights | `rotation/run/minimax-m2.7.sh` | 4 |
-| `MiniMaxAI/MiniMax-M3` | VL-MoE, MSA sparse | `rotation/run/minimax-m3.sh` | 8 |
-| `zai-org/GLM-4.7-FP8` | dense GQA, FP8 weights | `rotation/run/glm-4.7.sh` | 4–8 |
-| `zai-org/GLM-5.3` | MLA + DSA sparse, packed 2-bit latent | `rotation/run/glm-5.3.sh` | 8 |
-| `zai-org/GLM-5.2-FP8` | MLA + DSA sparse, packed 2-bit latent | `rotation/run/glm-5.2.sh` | 8 |
-| `moonshotai/Kimi-K3` | MLA + KDA hybrid, packed 2-bit latent | `rotation/run/kimi-k3.sh` | 16 (TP 8 × PP 2, two nodes) |
+| `Qwen/Qwen3-4B-Thinking-2507` | dense GQA | 198 / 64K | 63.6 | 64.6 | +1.0 |
+| `Qwen/Qwen3-8B` | dense GQA | 198 / 64K | 58.6 (2 seeds: 60.6, 56.6) | 53.3 (2 seeds: 52.5, 54.0; uniform levels, startup-calibrated shared rotation. Lloyd-Max levels: 52.8 over 4 seeds) | −5.3 |
+| `Qwen/Qwen3-32B` | dense GQA | 198 / 64K | 64.1 | 59.6 | −4.5 |
+| `Qwen/Qwen3-30B-A3B` | dense GQA, per-head rotation | 198 / 64K | 61.1 | 55.3 (2 seeds: 55.6, 55.1) | −5.8 (INT2 answers run longer: median 49K vs 32K chars, 12 of 198 hit the budget without a final answer vs 0; same shape as on the previous base) |
+| `Qwen/Qwen3.5-4B` | hybrid GDN + GQA | 198 / 64K | 79.3 | 75.3 | −4.0 |
+| `Qwen/Qwen3.5-35B-A3B` | hybrid GDN + GQA | 198 / 64K | 81.8 | 83.8 | +2.0 |
+| `google/gemma-4-12B-it` | hybrid SWA, two geometries | 198 / 64K | 63.1 | 64.1 | +1.0 |
+| `MiniMaxAI/MiniMax-M2.7` | dense GQA | 198 / 64K | 86.9 | 87.9 | +1.0 |
+| `MiniMaxAI/MiniMax-M3` | MSA sparse top-k (upstream backend) | 198 / 64K | 90.9 | 88.1 (2 seeds: 88.9, 87.4) | −2.8 (after the indexer-key fix below; 56.6 before it) |
+| `zai-org/GLM-5.2-FP8` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 83.8 | −3.5 (INT2 answers run longer: median 63K vs 32K chars, 24 vs 9 without a final answer) |
+| `zai-org/GLM-5.3` | DSA sparse (upstream backend), packed latent 4.00× | 198 / 64K | 87.4 | 84.3 | −3.0 (INT2 answers run longer: median 51K vs 31K chars, 21 vs 8 without a final answer) |
+| `zai-org/GLM-4.7-FP8` | dense GQA | 198 / 64K | 80.8 | 78.8 | −2.0 |
+| `moonshotai/Kimi-K3` | MLA latent + KDA, packed latent 4.00×, TP 8 × PP 2 | 198 / 64K | 90.9 | 90.4 |  −0.5 (re-measured with the BF16 windows on; the earlier 93.4 came from a run whose packed pool had them silently off) |
 
 ## Advanced usage
 
 <details>
-<summary><b>Build details and what is in the image</b></summary>
+<summary><b>Image contents</b></summary>
 
-The build context holds this tree as `./oscar-src` and the rotations as `./rotations`; `git archive` leaves submodules out, so the GPQA scorer is archived separately. The build asserts that `import sglang` inside the image resolves to this tree and that the OSCAR modules parse. Kernels are Triton and compile at first use, so the build needs no GPU. Model weights are not in the image.
-
-| Path in the image | Contents |
+| Path | Contents |
 |---|---|
-| `/sgl-workspace/sglang` (also `/oscar/src`) | this tree; the image's editable `sglang` install resolves here |
-| `/oscar/rotations/zoo/<model>/` | K/V rotations from the RotationZoo |
-| `/oscar/IMAGE_TAG`, `/oscar/BUILT_FROM` | the tag, and the branch and commit the tree came from, so a number from a cluster can be matched to the tree that produced it |
-| `/usr/local/bin/oscar-selfcheck` | prints the tag and commit, torch and the CUDA device, then `OSCAR_SELFCHECK_OK` once `import sglang` resolves to this tree |
-
-Run `oscar-selfcheck` on a GPU node before trusting a long job to an image: it is the one check that exercises the driver.
+| `/sgl-workspace/sglang` (= `/oscar/src`) | this tree, the editable `sglang` install |
+| `/oscar/rotations/zoo/<model>/` | RotationZoo K/V rotations |
+| `/oscar/IMAGE_TAG`, `/oscar/BUILT_FROM` | image tag; branch and commit of the tree |
+| `/usr/local/bin/oscar-selfcheck` | prints tag, commit, torch and GPU; `OSCAR_SELFCHECK_OK` when `import sglang` resolves here |
 
 </details>
 
 <details>
 <summary><b>Without Docker</b></summary>
 
-Any environment that runs upstream SGLang at commit `67eab57057` runs OSCAR: install this tree's `python/` package in place of `sglang`, with the sgl-kernel and flashinfer builds the official nightly pins (CUDA 13.0, torch 2.13, transformers 5.17, flashinfer 0.7, sglang-kernel 0.4.8). OSCAR adds no compiled extension of its own. If you lay the tree over an existing install by hand, keep that install's prebuilt Rust extensions (`python/sglang/srt/**/*.so`): without the radix-tree core, models on `UnifiedRadixCache` fail at startup. `docker/Dockerfile.oscar` shows the exact steps.
+Install this tree's `python/` in place of `sglang` on an environment that runs upstream SGLang `67eab57057` (CUDA 13.0, torch 2.13, transformers 5.17, flashinfer 0.7, sglang-kernel 0.4.8). Overlaying an existing install: keep its prebuilt `python/sglang/srt/**/*.so`. See `docker/Dockerfile.oscar`.
 
 </details>
 
 <details>
-<summary><b>Server flags for a manual launch</b></summary>
-
-The recipes set all of this; the underlying launch is:
+<summary><b>Server flags</b></summary>
 
 ```bash
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
@@ -888,7 +704,7 @@ python -m sglang.launch_server \
 </details>
 
 <details>
-<summary><b>Use a pre-fit rotation from the RotationZoo</b></summary>
+<summary><b>Pre-fit rotation from the RotationZoo</b></summary>
 
 ```bash
 hf download Zhongzhu/OSCAR-RotationZoo --include "Qwen3-8B/*" --local-dir rotzoo
@@ -897,14 +713,14 @@ export SGLANG_OSCAR_K_ROTATION_PATH=$ROT/k_rotation_qqt_r_h_pbr.pt
 export SGLANG_OSCAR_V_ROTATION_PATH=$ROT/v_rotation_sst_r_h_pbr.pt
 ```
 
-Rotations are per model and do not transfer between models; a missing file at 2 bits is collapse, not a mild regression.
+Rotations are per model; a missing one at 2 bits means collapse.
 
 </details>
 
 <details>
-<summary><b>Fit the rotation at server start</b></summary>
+<summary><b>Calibration at server start</b></summary>
 
-When the mixed pool is active and the rotation pair is unset or missing, the server fits it before it accepts traffic: the pool starts on identity rotations, a prefill-only pass over calibration prompts collects the moments in the attention layers, the scheduler reduces them over TP and decomposes them in FP64, and the rotations are installed in place (captured decode CUDA graphs stay valid). The pair is written atomically under a lock and later launches load it from `$HF_HOME/oscar-rotations/<model>-<digest>/`.
+Runs when the rotation pair is unset or missing; the result is cached in `$HF_HOME/oscar-rotations/<model>-<digest>/`.
 
 | Env | Default | Effect |
 |---|---|---|
@@ -915,14 +731,12 @@ When the mixed pool is active and the rotation pair is unset or missing, the ser
 | `SGLANG_OSCAR_CALIBRATION_LOCK_DIR` | `/tmp/sglang-oscar-locks` | lock files that serialize pair publication |
 | `SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS` | 0 | also save the per-(layer, KV head) moments, the input to the per-head fitter below |
 
-Limits: single node, DP = PP = 1, no HiCache, no torch.compile, no explicit prefill CUDA-graph backend; the first launch keeps the V rotation at runtime. For long-context serving, calibrate on prompts as long as the contexts you serve: a rotation fit on short prompts degrades at positions it never saw.
+Limits: single node, DP = PP = 1, no HiCache, no torch.compile, no explicit prefill CUDA-graph backend. Calibrate on prompts as long as the contexts you serve.
 
 </details>
 
 <details>
-<summary><b>Per-head rotations, key centering and output-aware values</b></summary>
-
-Rotation checkpoints can carry three optional companions of `rotation`; each defaults to the plain orthogonal behaviour when absent, so older files load unchanged.
+<summary><b>Per-head rotations, key centering, output-aware values</b></summary>
 
 | Field (file) | Meaning | Where it acts |
 |:---|:---|:---|
@@ -930,7 +744,7 @@ Rotation checkpoints can carry three optional companions of `rotation`; each def
 | `o_rotation` (V) | `R_v⁻ᵀ` of a non-orthogonal value transform; the output is un-rotated as `o·o_rotationᵀ` | prefill and decode output |
 | `k_mean` (K) | per-head key mean subtracted before the key rotation | every stored key; all logits of a request shift by one constant, so the softmax is unchanged |
 
-Shapes follow `rotation`: `[hd, hd]` (shared) or `[kv_heads, hd, hd]` (per head). Launch once with `SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS=1`, then fit any variant from the saved moments:
+Fit from moments saved with `SGLANG_OSCAR_CALIBRATION_SAVE_MOMENTS=1`:
 
 ```bash
 python rotation/tools/fit_oscar2_variants.py --moments-dir $CAL --out $OUT \
@@ -945,14 +759,14 @@ ROT_DIR=$OUT/center bash rotation/run/qwen3-8b.sh
 | `outaware_hr` | `center` | head-resolved post-`W_O` metric `G_h^{1/2} E_v H P_br`, weighted by the query heads' co-attention |
 | `whiten`, `flat`, `stretch` | non-orthogonal compact bases | same |
 
-The fitter checks on every file that `q'·k' = q·k` and that `o_rotation` inverts the value transform. The non-orthogonal key bases collapse at long context under scalar INT2 and are kept for ablations only.
+Non-orthogonal key bases collapse at long context under scalar INT2 (ablation only).
 
 </details>
 
 <details>
-<summary><b>Joint-latent transform for MLA models</b></summary>
+<summary><b>Joint-latent transform for MLA</b></summary>
 
-The packed MLA pool quantizes the shared latent `c_kv`, which is read as the key through `W_UK` and as the value through `W_UV` and `W_O`. The fitter takes a latent dump written with `SGLANG_OSCAR_MLA_LATENT_DUMP_DIR` and the checkpoint's `kv_b_proj` / `o_proj` weights:
+From a latent dump (`SGLANG_OSCAR_MLA_LATENT_DUMP_DIR`) and the checkpoint weights; `k_pe` stays BF16.
 
 ```bash
 python rotation/tools/fit_mla_joint_latent.py --dump-dir $DUMP --model zai-org/GLM-5.3 \
@@ -966,12 +780,10 @@ python rotation/tools/fit_mla_joint_latent.py --dump-dir $DUMP --model zai-org/G
 | `value` | `M_V = Σ_{h,h'} ρ_hh' B_h B_h'ᵀ` with `B_h = W_UV,hᵀ W_O,hᵀ`, the post-`W_O` output error |
 | `joint` | `M_K/tr M_K + λ·M_V/tr M_V` |
 
-Every variant ships the latent `mean`; non-orthogonal variants also ship `q_rotation = R_c⁻ᵀ`, which serves both the query and the output side because key and value share the latent. The rotary part `k_pe` stays in BF16.
-
 </details>
 
 <details>
-<summary><b>Offline calibration pipeline (dump, fit, evaluate)</b></summary>
+<summary><b>Offline calibration (dump, fit, evaluate)</b></summary>
 
 ```bash
 bash rotation/qwen3-8B/save_qkv_8b.sh          # 1. dump Q/K/V on calibration prompts
@@ -979,8 +791,6 @@ bash rotation/qwen3-8B/compute_rotation.sh     # 2. fit {k,v}_rotation_*.pt from
 ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1) \
   bash rotation/qwen3-8B/eval_gpqa.sh          # 3. GPQA against the new rotation
 ```
-
-How the rotation is fit: for each layer, the key covariance seen by attention (`Σ_K`, the query second moment of the query heads reading each KV head) and a score-weighted value covariance (`Σ_V`) are eigendecomposed; the loaded rotation is `R · H · P_br` (eigenvectors, a head-dim Hadamard, and a bit-reversal permutation that spreads high-variance directions across quantization groups).
 
 | Env (`save_qkv_<model>.sh ENV=val`) | Default | Effect |
 |---|---|---|
@@ -993,9 +803,7 @@ How the rotation is fit: for each layer, the key covariance seen by attention (`
 </details>
 
 <details>
-<summary><b>1-bit and 1.5-bit K with product quantization</b></summary>
-
-The quant tier's encoder is selectable per tensor. `pq` stores each row as uint8 codes against a per-layer codebook trained on the rotated activations (16 codes for head_dim 128 = 1.0 bit per value); a codebook with a second stage adds a nibble-packed residual code (RVQ, 1.5 bits per value).
+<summary><b>1-bit / 1.5-bit K with product quantization</b></summary>
 
 ```bash
 SGLANG_OSCAR_K_QUANTIZER=pq SGLANG_OSCAR_PQ_K_CODEBOOK=$ROT/codebooks/k_pq_n16_c256_d8.pt       # K 1.0 bit, V INT2
@@ -1005,7 +813,7 @@ python rotation/tools/train_pq_codebooks.py --dumps $CALIB/qkv_dumps/gpqa \
   --rotation $CALIB/rotations/k_rotation_qqt_r_h_pbr.pt --tensor k --out codebooks/k_pq_n16_c256_d8.pt
 ```
 
-At 1–1.5 bits the accuracy lives in the BF16 window: treat PQ as a memory lever for contexts long enough to amortize it, not as an accuracy-neutral tier. PQ decode is slower than INT2, and PQ is not available on the two-geometry (Gemma-4), MiniMax-sparse or packed-MLA pools.
+Accuracy then lives in the BF16 window; decode is slower than INT2; not available on the Gemma-4, MiniMax-sparse or packed-MLA pools.
 
 </details>
 
@@ -1044,14 +852,14 @@ materials/                      figures for this README
 
 ## Troubleshooting
 
-- **Hybrid models (Qwen3.5, Qwen3.8, Kimi-K3).** Their prefix cache needs `--mamba-radix-cache-strategy extra_buffer` (the recipes set it); without it the Mamba radix cache asserts `page_size == 1`, which surfaces asynchronously as an illegal memory access.
-- **Qwen3 dense models past 40,960 tokens.** The recipes enable Qwen's YaRN ×4 recipe when the requested context exceeds 32K. When launching by hand under transformers 5, pass the YaRN dict as both `rope_parameters` and `rope_scaling` and raise `max_position_embeddings`; `rope_scaling` alone is silently ignored.
-- **Missing rotation file.** At 2 bits a missing rotation is collapse, not a mild regression; the recipes stop with `FATAL` instead of serving without one.
-- **Running locally on a Mac.** Use the `zhongzhu/llamacpp` branch or the pre-built `*-rot-kv.gguf` files on Hugging Face.
+- **Hybrid models (Qwen3.5, Qwen3.8, Kimi-K3):** need `--mamba-radix-cache-strategy extra_buffer` (the recipes set it).
+- **Qwen3 dense past 40,960 tokens:** YaRN ×4; by hand under transformers 5, set both `rope_parameters` and `rope_scaling` and raise `max_position_embeddings`.
+- **Missing rotation file:** collapse at 2 bits; the recipes stop with `FATAL`.
+- **Mac:** use `zhongzhu/llamacpp` or the `*-rot-kv.gguf` files.
 
 ## Citation
 
-The OSCAR-2 citation will be added when the paper is public. Until then, please cite OSCAR-1:
+OSCAR-2 citation coming with the paper; please cite OSCAR-1:
 
 ```bibtex
 @misc{zhou2026oscarofflinespectralcovarianceaware,
@@ -1065,7 +873,6 @@ The OSCAR-2 citation will be added when the paper is public. Until then, please 
 }
 ```
 
-## License & acknowledgements
+## License
 
-- Released under the MIT License.
-- Built on top of [sglang](https://github.com/sgl-project/sglang).
+MIT. Built on [sglang](https://github.com/sgl-project/sglang).
